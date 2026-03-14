@@ -1,0 +1,69 @@
+{
+  "version": 3,
+  "name": "Build & Deploy with Approval",
+  "description": "Run tests, get human approval, then create a deployment summary. Rejection loops back to re-run tests.",
+  "goal": "Build, verify, and deploy the project with human oversight",
+  "cwd": "",
+  "useOrchestrator": false,
+  "entryNodeId": "bd1",
+  "variables": [
+    { "name": "project_path", "default": "." }
+  ],
+  "limits": {
+    "maxTotalSteps": 50,
+    "maxVisitsPerNode": 10
+  },
+  "nodes": [
+    {
+      "id": "bd1",
+      "name": "Run Tests",
+      "type": "task",
+      "agent": "claude",
+      "prompt": "Run the test suite in {{var:project_path}} and report the results. Include pass/fail counts, any error details, and overall status."
+    },
+    {
+      "id": "bd2",
+      "name": "Review & Approve",
+      "type": "approval",
+      "prompt": "Review the test results before proceeding with deployment."
+    },
+    {
+      "id": "bd3",
+      "name": "Deploy Summary",
+      "type": "task",
+      "agent": "claude",
+      "prompt": "The tests passed and deployment was approved. Create a deployment summary based on the test results:\n\n{{node:bd1.output}}"
+    }
+  ],
+  "edges": [
+    {
+      "id": "bd1-success",
+      "from": "bd1",
+      "to": "bd2",
+      "outcome": "success"
+    },
+    {
+      "id": "bd2-approve",
+      "from": "bd2",
+      "to": "bd3",
+      "outcome": "success"
+    },
+    {
+      "id": "bd2-reject",
+      "from": "bd2",
+      "to": "bd1",
+      "outcome": "reject",
+      "label": "Re-run tests"
+    }
+  ],
+  "ui": {
+    "canvas": {
+      "viewport": { "x": 0, "y": 0, "zoom": 1 },
+      "nodes": {
+        "bd1": { "x": 120, "y": 140 },
+        "bd2": { "x": 380, "y": 140 },
+        "bd3": { "x": 640, "y": 140 }
+      }
+    }
+  }
+}

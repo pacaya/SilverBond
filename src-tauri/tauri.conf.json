@@ -1,0 +1,19 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "SilverBond",
+  "version": "0.1.0",
+  "identifier": "dev.aya.silverbond",
+  "build": {
+    "beforeBuildCommand": "npm run build",
+    "beforeDevCommand": "npm run build",
+    "frontendDist": "../public"
+  },
+  "app": {
+    "windows": []
+  },
+  "bundle": {
+    "active": true,
+    "icon": [],
+    "targets": "app"
+  }
+}

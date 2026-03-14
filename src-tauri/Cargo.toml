@@ -1,0 +1,13 @@
+[package]
+name = "silverbond-tauri"
+version = "0.1.0"
+edition = "2024"
+
+[build-dependencies]
+tauri-build = { version = "2.0.6", features = [] }
+
+[dependencies]
+silverbond = { path = ".." }
+anyhow = "1.0"
+tauri = { version = "2.8.5", features = [] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

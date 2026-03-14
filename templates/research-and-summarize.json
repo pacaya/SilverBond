@@ -1,0 +1,82 @@
+{
+  "version": 3,
+  "name": "Research & Summarize",
+  "description": "Research a topic with branching depth, iterative refinement, and final summary.",
+  "goal": "Research the given topic thoroughly and produce a concise summary",
+  "cwd": "",
+  "useOrchestrator": true,
+  "entryNodeId": "rs1",
+  "variables": [
+    { "name": "topic", "default": "AI safety" }
+  ],
+  "limits": {
+    "maxTotalSteps": 50,
+    "maxVisitsPerNode": 10
+  },
+  "nodes": [
+    {
+      "id": "rs1",
+      "name": "Initial Research",
+      "type": "task",
+      "agent": "claude",
+      "prompt": "Research the topic: {{var:topic}}. Provide an initial overview covering key concepts, recent developments, and open questions."
+    },
+    {
+      "id": "rs2",
+      "name": "Refine Research",
+      "type": "task",
+      "agent": "claude",
+      "prompt": "Expand on the research so far. Add more detail, find additional perspectives, and address gaps:\n\n{{previous_output}}",
+      "loopMaxIterations": 3
+    },
+    {
+      "id": "rs3",
+      "name": "Final Summary",
+      "type": "task",
+      "agent": "claude",
+      "prompt": "Synthesize all findings into a concise, well-structured summary report:\n\n{{all_predecessors}}"
+    }
+  ],
+  "edges": [
+    {
+      "id": "rs1-branch-deep",
+      "from": "rs1",
+      "to": "rs2",
+      "outcome": "branch",
+      "label": "Deep dive",
+      "branchId": "br_deep"
+    },
+    {
+      "id": "rs1-branch-quick",
+      "from": "rs1",
+      "to": "rs3",
+      "outcome": "branch",
+      "label": "Quick summary",
+      "branchId": "br_quick"
+    },
+    {
+      "id": "rs2-loop-continue",
+      "from": "rs2",
+      "to": "rs2",
+      "outcome": "loop_continue",
+      "label": "Continue research"
+    },
+    {
+      "id": "rs2-loop-exit",
+      "from": "rs2",
+      "to": "rs3",
+      "outcome": "loop_exit",
+      "label": "Summarize"
+    }
+  ],
+  "ui": {
+    "canvas": {
+      "viewport": { "x": 0, "y": 0, "zoom": 1 },
+      "nodes": {
+        "rs1": { "x": 120, "y": 140 },
+        "rs2": { "x": 400, "y": 60 },
+        "rs3": { "x": 680, "y": 140 }
+      }
+    }
+  }
+}
