@@ -4,6 +4,8 @@ pub mod driver;
 pub mod frontend;
 pub mod host;
 pub mod model;
+pub mod pty_output;
 pub mod runtime;
+pub mod session;
 pub mod storage;
 pub mod util;

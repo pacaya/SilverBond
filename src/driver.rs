@@ -1,8 +1,7 @@
 //! Agent Abstraction Layer — driver trait and implementations for CLI-based agent backends.
 //!
 //! Each agent backend (Claude, Codex, etc.) is represented by an [`AgentDriver`] implementation
-//! that knows how to build CLI arguments and parse the agent's stdout into a normalized
-//! [`AgentOutput`].
+//! that knows how to build CLI arguments for interactive PTY sessions and parse agent output.
 
 use std::path::PathBuf;
 
@@ -10,10 +9,8 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Convert a `u64` counter to `Option<u64>`, mapping zero to `None`.
-fn nonzero_u64(v: u64) -> Option<u64> {
-    (v > 0).then_some(v)
-}
+use crate::pty_output::{CostInfo, ContextInfo};
+
 
 // ---------------------------------------------------------------------------
 // Capability descriptor
@@ -72,7 +69,7 @@ pub struct ToolToggles {
     pub web_search: Option<bool>,
 }
 
-/// Fully-resolved configuration passed to a driver's `build_args` method.
+/// Fully-resolved configuration passed to a driver's `build_session_args` method.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub model: Option<String>,
@@ -153,10 +150,10 @@ pub struct AgentOutput {
 }
 
 // ---------------------------------------------------------------------------
-// Command args returned by build_args
+// Command args returned by build_session_args
 // ---------------------------------------------------------------------------
 
-/// CLI arguments and extra environment variables produced by [`AgentDriver::build_args`].
+/// CLI arguments and extra environment variables produced by [`AgentDriver::build_session_args`].
 #[derive(Debug, Clone)]
 pub struct CommandArgs {
     pub args: Vec<String>,
@@ -169,7 +166,7 @@ pub struct CommandArgs {
 // Driver trait
 // ---------------------------------------------------------------------------
 
-/// A backend-specific driver that knows how to invoke an agent CLI and parse its output.
+/// A backend-specific driver that knows how to invoke an agent CLI in interactive mode.
 pub trait AgentDriver: Send + Sync {
     /// CLI executable name (e.g. `"claude"`, `"codex"`).
     fn name(&self) -> &str;
@@ -177,16 +174,33 @@ pub trait AgentDriver: Send + Sync {
     /// Capability flags for this backend.
     fn capabilities(&self) -> AgentCapabilities;
 
-    /// Build the CLI argument list for a given prompt and configuration.
-    fn build_args(&self, prompt: &str, config: &AgentConfig) -> anyhow::Result<CommandArgs>;
+    /// Build CLI args for interactive session (no --print, no --output-format json).
+    /// Unlike the old build_args, this does NOT take a prompt — prompts are sent via PTY stdin.
+    fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs>;
 
-    /// Parse raw CLI output into a normalised [`AgentOutput`].
-    fn parse_output(
-        &self,
-        stdout: &str,
-        stderr: &str,
-        exit_code: i32,
-    ) -> anyhow::Result<AgentOutput>;
+    /// Wrap a user prompt with instructions for the agent to print a sentinel
+    /// marker when it has finished responding.
+    fn wrap_prompt_with_sentinel(&self, prompt: &str, sentinel: &str) -> String {
+        format!(
+            "{}\n\n[After completing your full response, print exactly this marker on its own line: {}]",
+            prompt, sentinel
+        )
+    }
+
+    /// Command to query cost (e.g., "/cost"), if supported.
+    fn cost_command(&self) -> Option<&str>;
+
+    /// Command to query context usage (e.g., "/context"), if supported.
+    fn context_command(&self) -> Option<&str>;
+
+    /// Command to exit the agent session.
+    fn exit_command(&self) -> &str;
+
+    /// Parse cost command output into structured data.
+    fn parse_cost_response(&self, output: &str) -> Option<CostInfo>;
+
+    /// Parse context command output into structured data.
+    fn parse_context_response(&self, output: &str) -> Option<ContextInfo>;
 }
 
 // ===========================================================================
@@ -221,12 +235,8 @@ impl AgentDriver for ClaudeDriver {
         }
     }
 
-    fn build_args(&self, prompt: &str, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
-        let mut args = vec![
-            "--print".to_string(),
-            "--output-format".to_string(),
-            "json".to_string(),
-        ];
+    fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
+        let mut args = Vec::new();
 
         // Model selection
         if let Some(model) = &config.model {
@@ -248,12 +258,6 @@ impl AgentDriver for ClaudeDriver {
         if let Some(turns) = config.max_turns {
             args.push("--max-turns".to_string());
             args.push(turns.to_string());
-        }
-
-        // JSON Schema for structured output
-        if let Some(schema) = &config.json_schema {
-            args.push("--json-schema".to_string());
-            args.push(serde_json::to_string(schema)?);
         }
 
         // Session handling
@@ -312,9 +316,6 @@ impl AgentDriver for ClaudeDriver {
             args.push("WebFetch".to_string());
         }
 
-        // Prompt is always the final positional argument.
-        args.push(prompt.to_string());
-
         Ok(CommandArgs {
             args,
             env: Vec::new(),
@@ -322,102 +323,16 @@ impl AgentDriver for ClaudeDriver {
         })
     }
 
-    fn parse_output(
-        &self,
-        stdout: &str,
-        _stderr: &str,
-        exit_code: i32,
-    ) -> anyhow::Result<AgentOutput> {
-        let parsed: Value = serde_json::from_str(stdout.trim())
-            .context("Failed to parse Claude JSON output")?;
+    fn cost_command(&self) -> Option<&str> { Some("/cost") }
+    fn context_command(&self) -> Option<&str> { Some("/context") }
+    fn exit_command(&self) -> &str { "/exit" }
 
-        let subtype = parsed
-            .get("subtype")
-            .and_then(|v| v.as_str())
-            .unwrap_or("success");
+    fn parse_cost_response(&self, output: &str) -> Option<CostInfo> {
+        crate::pty_output::parse_claude_cost(output)
+    }
 
-        let outcome = match subtype {
-            "success" => NodeOutcome::Success,
-            "error_max_turns" => NodeOutcome::ErrorMaxTurns,
-            "error_max_budget_usd" => NodeOutcome::ErrorMaxBudget,
-            "error_during_execution" => NodeOutcome::ErrorExecution,
-            _ => {
-                if exit_code != 0 {
-                    NodeOutcome::ErrorExecution
-                } else {
-                    NodeOutcome::Success
-                }
-            }
-        };
-
-        let response_text = parsed
-            .get("result")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let session_id = parsed
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let cost_usd = parsed.get("total_cost_usd").and_then(|v| v.as_f64());
-
-        let usage = parsed.get("usage");
-        let input_tokens = usage
-            .and_then(|u| u.get("input_tokens"))
-            .and_then(|v| v.as_u64());
-        let output_tokens = usage
-            .and_then(|u| u.get("output_tokens"))
-            .and_then(|v| v.as_u64());
-        let cache_read_tokens = usage
-            .and_then(|u| u.get("cache_read_input_tokens"))
-            .and_then(|v| v.as_u64());
-        let cache_write_tokens = usage
-            .and_then(|u| u.get("cache_creation_input_tokens"))
-            .and_then(|v| v.as_u64());
-
-        let num_turns = parsed
-            .get("num_turns")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32);
-        let duration_api_ms = parsed.get("duration_ms").and_then(|v| v.as_u64());
-
-        let model_used = parsed
-            .get("modelUsage")
-            .and_then(|v| v.as_object())
-            .and_then(|m| m.keys().next())
-            .map(|s| s.to_string());
-
-        let structured_output = parsed.get("structured_output").cloned();
-
-        let is_error = parsed
-            .get("is_error")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
-        let error_message = if is_error || !outcome.is_success() {
-            Some(response_text.clone())
-        } else {
-            None
-        };
-
-        Ok(AgentOutput {
-            response_text,
-            session_id,
-            cost_usd,
-            input_tokens,
-            output_tokens,
-            thinking_tokens: None,
-            cache_read_tokens,
-            cache_write_tokens,
-            model_used,
-            num_turns,
-            duration_api_ms,
-            structured_output,
-            outcome,
-            error_message,
-        })
+    fn parse_context_response(&self, output: &str) -> Option<ContextInfo> {
+        crate::pty_output::parse_claude_context(output)
     }
 }
 
@@ -453,7 +368,7 @@ impl AgentDriver for CodexDriver {
         }
     }
 
-    fn build_args(&self, prompt: &str, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
+    fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
         let mut args = Vec::new();
 
         // Sub-command: `exec resume <id>` or plain `exec`
@@ -464,9 +379,6 @@ impl AgentDriver for CodexDriver {
         } else {
             args.push("exec".to_string());
         }
-
-        // JSON output
-        args.push("--json".to_string());
 
         // Model selection
         if let Some(model) = &config.model {
@@ -520,131 +432,18 @@ impl AgentDriver for CodexDriver {
             args.push("--search".to_string());
         }
 
-        // JSON Schema for structured output — write to temp file
-        let mut temp_dir = None;
-        if let Some(schema) = &config.json_schema {
-            let dir = tempfile::Builder::new()
-                .prefix("silverbond-codex-schema-")
-                .tempdir()
-                .context("Failed to create temp directory for Codex output schema")?;
-            let schema_path = dir.path().join("output_schema.json");
-            std::fs::write(&schema_path, serde_json::to_string(schema)?)?;
-            args.push("--output-schema".to_string());
-            args.push(schema_path.to_string_lossy().to_string());
-            temp_dir = Some(dir.keep());
-        }
-
-        // Prompt is the final positional argument.
-        args.push(prompt.to_string());
-
         Ok(CommandArgs {
             args,
             env: Vec::new(),
-            temp_dir,
+            temp_dir: None,
         })
     }
 
-    fn parse_output(
-        &self,
-        stdout: &str,
-        _stderr: &str,
-        _exit_code: i32,
-    ) -> anyhow::Result<AgentOutput> {
-        let mut session_id = None;
-        let mut input_tokens: u64 = 0;
-        let mut output_tokens: u64 = 0;
-        let mut reasoning_tokens: u64 = 0;
-        let mut response_text = String::new();
-        let mut outcome = NodeOutcome::Success;
-        let mut error_message = None;
-
-        for line in stdout.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let Ok(event) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-
-            let event_type = event
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            match event_type {
-                "thread.started" => {
-                    session_id = event
-                        .get("thread_id")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string());
-                }
-                "turn.completed" => {
-                    if let Some(tokens) = event.get("input_tokens").and_then(|v| v.as_u64()) {
-                        input_tokens += tokens;
-                    }
-                    if let Some(tokens) = event.get("output_tokens").and_then(|v| v.as_u64()) {
-                        output_tokens += tokens;
-                    }
-                    if let Some(tokens) =
-                        event.get("reasoning_output_tokens").and_then(|v| v.as_u64())
-                    {
-                        reasoning_tokens += tokens;
-                    }
-                }
-                "turn.failed" => {
-                    outcome = NodeOutcome::ErrorExecution;
-                    error_message = event
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .or_else(|| Some("Turn failed".to_string()));
-                }
-                "item.completed" => {
-                    // Extract text from the last text content block.
-                    if let Some(text) = event
-                        .get("content")
-                        .and_then(|v| v.as_array())
-                        .and_then(|arr| {
-                            arr.iter()
-                                .rev()
-                                .find(|item| {
-                                    item.get("type").and_then(|v| v.as_str()) == Some("text")
-                                })
-                        })
-                        .and_then(|item| item.get("text"))
-                        .and_then(|v| v.as_str())
-                    {
-                        response_text = text.to_string();
-                    }
-                    // Fallback: direct `text` field.
-                    if response_text.is_empty() {
-                        if let Some(text) = event.get("text").and_then(|v| v.as_str()) {
-                            response_text = text.to_string();
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        Ok(AgentOutput {
-            response_text,
-            session_id,
-            cost_usd: None,
-            input_tokens: nonzero_u64(input_tokens),
-            output_tokens: nonzero_u64(output_tokens),
-            thinking_tokens: nonzero_u64(reasoning_tokens),
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            model_used: None,
-            num_turns: None,
-            duration_api_ms: None,
-            structured_output: None,
-            outcome,
-            error_message,
-        })
-    }
+    fn cost_command(&self) -> Option<&str> { None }
+    fn context_command(&self) -> Option<&str> { None }
+    fn exit_command(&self) -> &str { "/exit" }
+    fn parse_cost_response(&self, _output: &str) -> Option<CostInfo> { None }
+    fn parse_context_response(&self, _output: &str) -> Option<ContextInfo> { None }
 }
 
 // ===========================================================================
@@ -784,13 +583,8 @@ impl AgentDriver for GeminiDriver {
         }
     }
 
-    fn build_args(&self, prompt: &str, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
-        let mut args = vec![
-            "--prompt".to_string(),
-            "--output-format".to_string(),
-            "json".to_string(),
-        ];
-
+    fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
+        let mut args = Vec::new();
         let mut env = Vec::new();
         let mut temp_dir = None;
 
@@ -829,20 +623,6 @@ impl AgentDriver for GeminiDriver {
             temp_dir = Some(dir);
         }
 
-        // Structured output fallback: prompt injection for JSON schema
-        // (Gemini doesn't support native --json-schema)
-        let final_prompt = if let Some(schema) = &config.json_schema {
-            let hint = schema_to_prompt_hint(schema);
-            format!(
-                "{prompt}\n\nIMPORTANT: You MUST respond with valid JSON only. \
-                 No markdown, no explanation — just a single JSON object.{hint}"
-            )
-        } else {
-            prompt.to_string()
-        };
-
-        args.push(final_prompt);
-
         Ok(CommandArgs {
             args,
             env,
@@ -850,101 +630,11 @@ impl AgentDriver for GeminiDriver {
         })
     }
 
-    fn parse_output(
-        &self,
-        stdout: &str,
-        _stderr: &str,
-        exit_code: i32,
-    ) -> anyhow::Result<AgentOutput> {
-        let parsed: Value = serde_json::from_str(stdout.trim())
-            .context("Failed to parse Gemini JSON output")?;
-
-        // Check for error object
-        let error = parsed.get("error");
-        let error_code = error.and_then(|e| e.get("code")).and_then(|v| v.as_i64());
-        let error_message = error
-            .and_then(|e| e.get("message"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let outcome = match (exit_code, error_code) {
-            (0, None) => NodeOutcome::Success,
-            (_, Some(53)) => NodeOutcome::ErrorMaxTurns,
-            (_, Some(42)) => NodeOutcome::ErrorExecution, // input error
-            _ => {
-                if error.is_some() || exit_code != 0 {
-                    NodeOutcome::ErrorExecution
-                } else {
-                    NodeOutcome::Success
-                }
-            }
-        };
-
-        let response_text = parsed
-            .get("response")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        let session_id = parsed
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        // Extract token stats from stats.models.*
-        let mut input_tokens: u64 = 0;
-        let mut output_tokens: u64 = 0;
-        let mut thinking_tokens: u64 = 0;
-        let mut cached_tokens: u64 = 0;
-        let mut model_used = None;
-
-        if let Some(models) = parsed
-            .get("stats")
-            .and_then(|s| s.get("models"))
-            .and_then(|m| m.as_object())
-        {
-            for (model_name, stats) in models {
-                if model_used.is_none() {
-                    model_used = Some(model_name.clone());
-                }
-                if let Some(v) = stats.get("prompt").and_then(|v| v.as_u64()) {
-                    input_tokens += v;
-                }
-                if let Some(v) = stats.get("candidates").and_then(|v| v.as_u64()) {
-                    output_tokens += v;
-                }
-                if let Some(v) = stats.get("thoughts").and_then(|v| v.as_u64()) {
-                    thinking_tokens += v;
-                }
-                if let Some(v) = stats.get("cached").and_then(|v| v.as_u64()) {
-                    cached_tokens += v;
-                }
-            }
-        }
-
-        let final_error = if !outcome.is_success() {
-            error_message.or_else(|| Some(response_text.clone()))
-        } else {
-            None
-        };
-
-        Ok(AgentOutput {
-            response_text,
-            session_id,
-            cost_usd: None, // Gemini doesn't report cost
-            input_tokens: nonzero_u64(input_tokens),
-            output_tokens: nonzero_u64(output_tokens),
-            thinking_tokens: nonzero_u64(thinking_tokens),
-            cache_read_tokens: nonzero_u64(cached_tokens),
-            cache_write_tokens: None,
-            model_used,
-            num_turns: None,
-            duration_api_ms: None,
-            structured_output: None,
-            outcome,
-            error_message: final_error,
-        })
-    }
+    fn cost_command(&self) -> Option<&str> { None }
+    fn context_command(&self) -> Option<&str> { None }
+    fn exit_command(&self) -> &str { "/exit" }
+    fn parse_cost_response(&self, _output: &str) -> Option<CostInfo> { None }
+    fn parse_context_response(&self, _output: &str) -> Option<ContextInfo> { None }
 }
 
 // ===========================================================================
@@ -1002,18 +692,19 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ClaudeDriver::build_args
+    // ClaudeDriver::build_session_args
     // -----------------------------------------------------------------------
 
     #[test]
     fn claude_default_args() {
         let driver = ClaudeDriver;
-        let cmd = driver.build_args("hello", &default_config()).unwrap();
-        assert!(args_contain(&cmd.args, "--print"));
-        assert_eq!(arg_after(&cmd.args, "--output-format"), Some("json"));
+        let cmd = driver.build_session_args(&default_config()).unwrap();
+        // Interactive mode: no --print, no --output-format json
+        assert!(!args_contain(&cmd.args, "--print"));
+        assert!(!args_contain(&cmd.args, "--output-format"));
+        assert!(!args_contain(&cmd.args, "--json-schema"));
         assert!(args_contain(&cmd.args, "--no-session-persistence"));
         assert!(args_contain(&cmd.args, "--dangerously-skip-permissions"));
-        assert_eq!(cmd.args.last().unwrap(), "hello");
     }
 
     #[test]
@@ -1023,7 +714,7 @@ mod tests {
             model: Some("claude-sonnet-4-20250514".into()),
             ..default_config()
         };
-        let cmd = driver.build_args("hi", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--model"), Some("claude-sonnet-4-20250514"));
     }
 
@@ -1035,7 +726,7 @@ mod tests {
             max_turns: Some(5),
             ..default_config()
         };
-        let cmd = driver.build_args("go", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--max-budget-usd"), Some("1.5"));
         assert_eq!(arg_after(&cmd.args, "--max-turns"), Some("5"));
     }
@@ -1047,25 +738,11 @@ mod tests {
             system_prompt: Some("Be concise.".into()),
             ..default_config()
         };
-        let cmd = driver.build_args("do it", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(
             arg_after(&cmd.args, "--append-system-prompt"),
             Some("Be concise.")
         );
-    }
-
-    #[test]
-    fn claude_json_schema() {
-        let driver = ClaudeDriver;
-        let schema = json!({"type": "object", "properties": {"name": {"type": "string"}}});
-        let config = AgentConfig {
-            json_schema: Some(schema.clone()),
-            ..default_config()
-        };
-        let cmd = driver.build_args("extract", &config).unwrap();
-        let schema_str = arg_after(&cmd.args, "--json-schema").unwrap();
-        let parsed: Value = serde_json::from_str(schema_str).unwrap();
-        assert_eq!(parsed, schema);
     }
 
     #[test]
@@ -1076,7 +753,7 @@ mod tests {
             ephemeral_session: false,
             ..default_config()
         };
-        let cmd = driver.build_args("continue", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--resume"), Some("sess-42"));
         assert!(!args_contain(&cmd.args, "--no-session-persistence"));
     }
@@ -1088,7 +765,7 @@ mod tests {
             access_mode: AccessMode::ReadOnly,
             ..default_config()
         };
-        let cmd = driver.build_args("look", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--permission-mode"), Some("plan"));
         assert!(!args_contain(&cmd.args, "--dangerously-skip-permissions"));
     }
@@ -1100,7 +777,7 @@ mod tests {
             access_mode: AccessMode::Edit,
             ..default_config()
         };
-        let cmd = driver.build_args("fix", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert!(args_contain(&cmd.args, "--allowedTools"));
         assert!(!args_contain(&cmd.args, "--dangerously-skip-permissions"));
         // Should include known edit tools
@@ -1129,7 +806,7 @@ mod tests {
             },
             ..default_config()
         };
-        let cmd = driver.build_args("search", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         let disallowed: Vec<&str> = cmd
             .args
             .windows(2)
@@ -1153,7 +830,7 @@ mod tests {
             allowed_tools: Some(vec!["Read".into(), "Grep".into()]),
             ..default_config()
         };
-        let cmd = driver.build_args("peek", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         // Should NOT have --permission-mode because fine-grained overrides
         assert!(!args_contain(&cmd.args, "--permission-mode"));
         let allowed: Vec<&str> = cmd
@@ -1171,18 +848,49 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // CodexDriver::build_args
+    // ClaudeDriver PTY methods
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn claude_wrap_prompt_with_sentinel() {
+        let driver = ClaudeDriver;
+        let wrapped = driver.wrap_prompt_with_sentinel("Hello", "SILVERBOND_DONE_abc123");
+        assert!(wrapped.contains("Hello"));
+        assert!(wrapped.contains("SILVERBOND_DONE_abc123"));
+    }
+
+    #[test]
+    fn claude_cost_command() {
+        let driver = ClaudeDriver;
+        assert_eq!(driver.cost_command(), Some("/cost"));
+    }
+
+    #[test]
+    fn claude_context_command() {
+        let driver = ClaudeDriver;
+        assert_eq!(driver.context_command(), Some("/context"));
+    }
+
+    #[test]
+    fn claude_exit_command() {
+        let driver = ClaudeDriver;
+        assert_eq!(driver.exit_command(), "/exit");
+    }
+
+    // -----------------------------------------------------------------------
+    // CodexDriver::build_session_args
     // -----------------------------------------------------------------------
 
     #[test]
     fn codex_default_args() {
         let driver = CodexDriver;
-        let cmd = driver.build_args("hello", &default_config()).unwrap();
+        let cmd = driver.build_session_args(&default_config()).unwrap();
         assert_eq!(cmd.args[0], "exec");
-        assert!(args_contain(&cmd.args, "--json"));
+        // Interactive mode: no --json, no --output-schema
+        assert!(!args_contain(&cmd.args, "--json"));
+        assert!(!args_contain(&cmd.args, "--output-schema"));
         assert!(args_contain(&cmd.args, "--ephemeral"));
         assert!(args_contain(&cmd.args, "--full-auto"));
-        assert_eq!(cmd.args.last().unwrap(), "hello");
     }
 
     #[test]
@@ -1192,7 +900,7 @@ mod tests {
             model: Some("o3-mini".into()),
             ..default_config()
         };
-        let cmd = driver.build_args("hi", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--model"), Some("o3-mini"));
     }
 
@@ -1203,7 +911,7 @@ mod tests {
             reasoning_level: Some(ReasoningLevel::High),
             ..default_config()
         };
-        let cmd = driver.build_args("think", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "-c"), Some("model_reasoning_effort=high"));
     }
 
@@ -1215,7 +923,7 @@ mod tests {
             ephemeral_session: false,
             ..default_config()
         };
-        let cmd = driver.build_args("go on", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(cmd.args[0], "exec");
         assert_eq!(cmd.args[1], "resume");
         assert_eq!(cmd.args[2], "thread-42");
@@ -1229,7 +937,7 @@ mod tests {
             access_mode: AccessMode::ReadOnly,
             ..default_config()
         };
-        let cmd = driver.build_args("look", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--sandbox"), Some("read-only"));
         assert_eq!(arg_after(&cmd.args, "-a"), Some("never"));
     }
@@ -1241,7 +949,7 @@ mod tests {
             access_mode: AccessMode::Edit,
             ..default_config()
         };
-        let cmd = driver.build_args("fix", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--sandbox"), Some("workspace-write"));
         assert_eq!(arg_after(&cmd.args, "-a"), Some("untrusted"));
     }
@@ -1253,7 +961,7 @@ mod tests {
             access_mode: AccessMode::Unrestricted,
             ..default_config()
         };
-        let cmd = driver.build_args("yolo", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(
             arg_after(&cmd.args, "--sandbox"),
             Some("danger-full-access")
@@ -1269,153 +977,24 @@ mod tests {
             },
             ..default_config()
         };
-        let cmd = driver.build_args("find", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert!(args_contain(&cmd.args, "--search"));
     }
 
+    // -----------------------------------------------------------------------
+    // CodexDriver PTY methods
+    // -----------------------------------------------------------------------
+
     #[test]
-    fn codex_json_schema_creates_temp_file() {
+    fn codex_cost_command() {
         let driver = CodexDriver;
-        let schema = json!({"type": "object", "properties": {"name": {"type": "string"}}});
-        let config = AgentConfig {
-            json_schema: Some(schema.clone()),
-            ..default_config()
-        };
-        let cmd = driver.build_args("extract", &config).unwrap();
-        assert!(args_contain(&cmd.args, "--output-schema"));
-        let schema_path = arg_after(&cmd.args, "--output-schema").unwrap();
-        // Verify temp file was created and contains the schema
-        let contents = std::fs::read_to_string(schema_path).unwrap();
-        let parsed: Value = serde_json::from_str(&contents).unwrap();
-        assert_eq!(parsed, schema);
-        // Clean up temp dir
-        if let Some(dir) = cmd.temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // ClaudeDriver::parse_output
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn claude_parse_success() {
-        let driver = ClaudeDriver;
-        let stdout = r#"{
-            "type": "result",
-            "subtype": "success",
-            "session_id": "abc-123",
-            "result": "Hello world",
-            "total_cost_usd": 0.054,
-            "usage": {
-                "input_tokens": 1245,
-                "output_tokens": 856,
-                "cache_creation_input_tokens": 512,
-                "cache_read_input_tokens": 256
-            },
-            "modelUsage": {
-                "claude-sonnet-4-20250514": {
-                    "inputTokens": 1245,
-                    "outputTokens": 856,
-                    "costUSD": 0.054
-                }
-            },
-            "num_turns": 3,
-            "duration_ms": 12345,
-            "is_error": false
-        }"#;
-
-        let out = driver.parse_output(stdout, "", 0).unwrap();
-        assert_eq!(out.outcome, NodeOutcome::Success);
-        assert_eq!(out.response_text, "Hello world");
-        assert_eq!(out.session_id.as_deref(), Some("abc-123"));
-        assert_eq!(out.cost_usd, Some(0.054));
-        assert_eq!(out.input_tokens, Some(1245));
-        assert_eq!(out.output_tokens, Some(856));
-        assert_eq!(out.cache_write_tokens, Some(512));
-        assert_eq!(out.cache_read_tokens, Some(256));
-        assert_eq!(out.num_turns, Some(3));
-        assert_eq!(out.duration_api_ms, Some(12345));
-        assert_eq!(out.model_used.as_deref(), Some("claude-sonnet-4-20250514"));
-        assert!(out.error_message.is_none());
+        assert_eq!(driver.cost_command(), None);
     }
 
     #[test]
-    fn claude_parse_error_max_turns() {
-        let driver = ClaudeDriver;
-        let stdout = r#"{
-            "type": "result",
-            "subtype": "error_max_turns",
-            "session_id": "abc-456",
-            "result": "Max turns reached",
-            "total_cost_usd": 0.1,
-            "usage": { "input_tokens": 5000, "output_tokens": 3000 },
-            "num_turns": 10,
-            "is_error": true
-        }"#;
-
-        let out = driver.parse_output(stdout, "", 1).unwrap();
-        assert_eq!(out.outcome, NodeOutcome::ErrorMaxTurns);
-        assert!(!out.outcome.is_success());
-        assert_eq!(out.response_text, "Max turns reached");
-        assert_eq!(out.error_message.as_deref(), Some("Max turns reached"));
-        assert_eq!(out.num_turns, Some(10));
-        assert_eq!(out.cost_usd, Some(0.1));
-    }
-
-    #[test]
-    fn claude_parse_error_max_budget() {
-        let driver = ClaudeDriver;
-        let stdout = r#"{
-            "type": "result",
-            "subtype": "error_max_budget_usd",
-            "session_id": "abc-789",
-            "result": "Budget exceeded",
-            "total_cost_usd": 2.0,
-            "usage": { "input_tokens": 10000, "output_tokens": 8000 },
-            "num_turns": 20,
-            "is_error": true
-        }"#;
-
-        let out = driver.parse_output(stdout, "", 1).unwrap();
-        assert_eq!(out.outcome, NodeOutcome::ErrorMaxBudget);
-        assert_eq!(out.error_message.as_deref(), Some("Budget exceeded"));
-    }
-
-    // -----------------------------------------------------------------------
-    // CodexDriver::parse_output
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn codex_parse_success() {
+    fn codex_exit_command() {
         let driver = CodexDriver;
-        let stdout = r#"{"type":"thread.started","thread_id":"thread-789"}
-{"type":"turn.completed","input_tokens":500,"output_tokens":200,"reasoning_output_tokens":50,"total_tokens":750}
-{"type":"item.completed","content":[{"type":"text","text":"Result from codex"}]}"#;
-
-        let out = driver.parse_output(stdout, "", 0).unwrap();
-        assert_eq!(out.outcome, NodeOutcome::Success);
-        assert_eq!(out.response_text, "Result from codex");
-        assert_eq!(out.session_id.as_deref(), Some("thread-789"));
-        assert_eq!(out.input_tokens, Some(500));
-        assert_eq!(out.output_tokens, Some(200));
-        assert_eq!(out.thinking_tokens, Some(50));
-        assert!(out.error_message.is_none());
-    }
-
-    #[test]
-    fn codex_parse_error() {
-        let driver = CodexDriver;
-        let stdout = r#"{"type":"thread.started","thread_id":"thread-err"}
-{"type":"turn.failed","error":"Something went wrong"}"#;
-
-        let out = driver.parse_output(stdout, "", 1).unwrap();
-        assert_eq!(out.outcome, NodeOutcome::ErrorExecution);
-        assert_eq!(
-            out.error_message.as_deref(),
-            Some("Something went wrong")
-        );
-        assert_eq!(out.session_id.as_deref(), Some("thread-err"));
+        assert_eq!(driver.exit_command(), "/exit");
     }
 
     // -----------------------------------------------------------------------
@@ -1533,17 +1112,17 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // GeminiDriver::build_args
+    // GeminiDriver::build_session_args
     // -----------------------------------------------------------------------
 
     #[test]
     fn gemini_default_args() {
         let driver = GeminiDriver;
-        let cmd = driver.build_args("hello", &default_config()).unwrap();
-        assert!(args_contain(&cmd.args, "--prompt"));
-        assert_eq!(arg_after(&cmd.args, "--output-format"), Some("json"));
+        let cmd = driver.build_session_args(&default_config()).unwrap();
+        // Interactive mode: no --prompt, no --output-format json
+        assert!(!args_contain(&cmd.args, "--prompt"));
+        assert!(!args_contain(&cmd.args, "--output-format"));
         assert_eq!(arg_after(&cmd.args, "--approval-mode"), Some("yolo"));
-        assert_eq!(cmd.args.last().unwrap(), "hello");
         assert!(cmd.temp_dir.is_none());
     }
 
@@ -1554,7 +1133,7 @@ mod tests {
             model: Some("gemini-2.5-pro".into()),
             ..default_config()
         };
-        let cmd = driver.build_args("hi", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--model"), Some("gemini-2.5-pro"));
     }
 
@@ -1566,7 +1145,7 @@ mod tests {
             ephemeral_session: false,
             ..default_config()
         };
-        let cmd = driver.build_args("continue", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--resume"), Some("gem-sess-1"));
     }
 
@@ -1577,7 +1156,7 @@ mod tests {
             access_mode: AccessMode::ReadOnly,
             ..default_config()
         };
-        let cmd = driver.build_args("look", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--approval-mode"), Some("plan"));
     }
 
@@ -1588,7 +1167,7 @@ mod tests {
             access_mode: AccessMode::Edit,
             ..default_config()
         };
-        let cmd = driver.build_args("fix", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--approval-mode"), Some("auto_edit"));
     }
 
@@ -1599,7 +1178,7 @@ mod tests {
             access_mode: AccessMode::Execute,
             ..default_config()
         };
-        let cmd = driver.build_args("run", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--approval-mode"), Some("yolo"));
     }
 
@@ -1610,7 +1189,7 @@ mod tests {
             access_mode: AccessMode::Unrestricted,
             ..default_config()
         };
-        let cmd = driver.build_args("go", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--approval-mode"), Some("yolo"));
     }
 
@@ -1621,7 +1200,7 @@ mod tests {
             reasoning_level: Some(ReasoningLevel::High),
             ..default_config()
         };
-        let cmd = driver.build_args("think", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
 
         // Should have GEMINI_CLI_HOME env var pointing to a temp dir
         let home = cmd
@@ -1669,7 +1248,7 @@ mod tests {
             },
             ..default_config()
         };
-        let cmd = driver.build_args("search", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
 
         let home = cmd
             .env
@@ -1700,7 +1279,7 @@ mod tests {
             },
             ..default_config()
         };
-        let cmd = driver.build_args("go", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
 
         let home = cmd
             .env
@@ -1725,33 +1304,9 @@ mod tests {
     #[test]
     fn gemini_no_temp_settings_when_not_needed() {
         let driver = GeminiDriver;
-        let cmd = driver.build_args("hello", &default_config()).unwrap();
+        let cmd = driver.build_session_args(&default_config()).unwrap();
         assert!(cmd.temp_dir.is_none());
         assert!(cmd.env.is_empty());
-    }
-
-    #[test]
-    fn gemini_json_schema_prompt_injection() {
-        let driver = GeminiDriver;
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "User name" },
-                "age": { "type": "integer" }
-            },
-            "required": ["name"]
-        });
-        let config = AgentConfig {
-            json_schema: Some(schema),
-            ..default_config()
-        };
-        let cmd = driver.build_args("extract data", &config).unwrap();
-        let prompt = cmd.args.last().unwrap();
-        assert!(prompt.contains("extract data"));
-        assert!(prompt.contains("valid JSON only"));
-        assert!(prompt.contains("name (string, required)"));
-        assert!(prompt.contains("age (integer)"));
-        assert!(prompt.contains("User name"));
     }
 
     #[test]
@@ -1762,121 +1317,23 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // GeminiDriver::parse_output
+    // GeminiDriver PTY methods
     // -----------------------------------------------------------------------
 
     #[test]
-    fn gemini_parse_success() {
+    fn gemini_cost_command() {
         let driver = GeminiDriver;
-        let stdout = r#"{
-            "session_id": "gem-123",
-            "response": "Hello from Gemini",
-            "stats": {
-                "models": {
-                    "gemini-2.5-pro": {
-                        "prompt": 800,
-                        "candidates": 400,
-                        "total": 1200,
-                        "cached": 100,
-                        "thoughts": 50
-                    }
-                },
-                "tools": { "totalCalls": 2, "totalSuccess": 2 },
-                "files": { "totalLinesAdded": 10, "totalLinesRemoved": 3 }
-            }
-        }"#;
-
-        let out = driver.parse_output(stdout, "", 0).unwrap();
-        assert_eq!(out.outcome, NodeOutcome::Success);
-        assert_eq!(out.response_text, "Hello from Gemini");
-        assert_eq!(out.session_id.as_deref(), Some("gem-123"));
-        assert_eq!(out.input_tokens, Some(800));
-        assert_eq!(out.output_tokens, Some(400));
-        assert_eq!(out.thinking_tokens, Some(50));
-        assert_eq!(out.cache_read_tokens, Some(100));
-        assert_eq!(out.model_used.as_deref(), Some("gemini-2.5-pro"));
-        assert!(out.cost_usd.is_none()); // Gemini doesn't report cost
-        assert!(out.error_message.is_none());
+        assert_eq!(driver.cost_command(), None);
     }
 
     #[test]
-    fn gemini_parse_error_turn_limit() {
+    fn gemini_exit_command() {
         let driver = GeminiDriver;
-        let stdout = r#"{
-            "session_id": "gem-456",
-            "response": "",
-            "error": {
-                "type": "turn_limit",
-                "message": "Session turn limit exceeded",
-                "code": 53
-            }
-        }"#;
-
-        let out = driver.parse_output(stdout, "", 53).unwrap();
-        assert_eq!(out.outcome, NodeOutcome::ErrorMaxTurns);
-        assert_eq!(
-            out.error_message.as_deref(),
-            Some("Session turn limit exceeded")
-        );
-        assert_eq!(out.session_id.as_deref(), Some("gem-456"));
-    }
-
-    #[test]
-    fn gemini_parse_error_input() {
-        let driver = GeminiDriver;
-        let stdout = r#"{
-            "error": {
-                "type": "input_error",
-                "message": "Invalid prompt",
-                "code": 42
-            }
-        }"#;
-
-        let out = driver.parse_output(stdout, "", 42).unwrap();
-        assert_eq!(out.outcome, NodeOutcome::ErrorExecution);
-        assert_eq!(out.error_message.as_deref(), Some("Invalid prompt"));
-    }
-
-    #[test]
-    fn gemini_parse_general_error() {
-        let driver = GeminiDriver;
-        let stdout = r#"{
-            "response": "partial output",
-            "error": {
-                "type": "general",
-                "message": "Something broke"
-            }
-        }"#;
-
-        let out = driver.parse_output(stdout, "", 1).unwrap();
-        assert_eq!(out.outcome, NodeOutcome::ErrorExecution);
-        assert_eq!(out.error_message.as_deref(), Some("Something broke"));
-        assert_eq!(out.response_text, "partial output");
-    }
-
-    #[test]
-    fn gemini_parse_no_stats() {
-        let driver = GeminiDriver;
-        let stdout = r#"{
-            "session_id": "gem-789",
-            "response": "Simple response"
-        }"#;
-
-        let out = driver.parse_output(stdout, "", 0).unwrap();
-        assert_eq!(out.outcome, NodeOutcome::Success);
-        assert_eq!(out.response_text, "Simple response");
-        assert!(out.input_tokens.is_none());
-        assert!(out.output_tokens.is_none());
-        assert!(out.thinking_tokens.is_none());
-        assert!(out.model_used.is_none());
+        assert_eq!(driver.exit_command(), "/exit");
     }
 
     // -----------------------------------------------------------------------
-    // GeminiDriver capabilities
-    // -----------------------------------------------------------------------
-
-    // -----------------------------------------------------------------------
-    // Stage 9: Capability gating — unsupported options silently ignored
+    // Capability gating — unsupported options silently ignored
     // -----------------------------------------------------------------------
 
     #[test]
@@ -1886,7 +1343,7 @@ mod tests {
             reasoning_level: Some(ReasoningLevel::High),
             ..default_config()
         };
-        let cmd = driver.build_args("think", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         // Claude doesn't support reasoning_config — no flag should appear
         assert!(!args_contain(&cmd.args, "-c"));
         assert!(!cmd.args.iter().any(|a| a.contains("reasoning")));
@@ -1899,7 +1356,7 @@ mod tests {
             system_prompt: Some("Be concise.".into()),
             ..default_config()
         };
-        let cmd = driver.build_args("go", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert!(!args_contain(&cmd.args, "--append-system-prompt"));
         assert!(!cmd.args.iter().any(|a| a.contains("Be concise")));
     }
@@ -1911,7 +1368,7 @@ mod tests {
             max_budget_usd: Some(5.0),
             ..default_config()
         };
-        let cmd = driver.build_args("go", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert!(!args_contain(&cmd.args, "--max-budget-usd"));
     }
 
@@ -1923,7 +1380,7 @@ mod tests {
             disallowed_tools: Some(vec!["Bash".into()]),
             ..default_config()
         };
-        let cmd = driver.build_args("go", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert!(!args_contain(&cmd.args, "--allowedTools"));
         assert!(!args_contain(&cmd.args, "--disallowedTools"));
     }
@@ -1935,7 +1392,7 @@ mod tests {
             system_prompt: Some("Be concise.".into()),
             ..default_config()
         };
-        let cmd = driver.build_args("go", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert!(!args_contain(&cmd.args, "--append-system-prompt"));
         assert!(!cmd.args.iter().any(|a| a.contains("Be concise")));
     }
@@ -1948,7 +1405,7 @@ mod tests {
             max_turns: Some(10),
             ..default_config()
         };
-        let cmd = driver.build_args("go", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert!(!args_contain(&cmd.args, "--max-budget-usd"));
         assert!(!args_contain(&cmd.args, "--max-turns"));
     }
@@ -1961,36 +1418,34 @@ mod tests {
             disallowed_tools: Some(vec!["Bash".into()]),
             ..default_config()
         };
-        let cmd = driver.build_args("go", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert!(!args_contain(&cmd.args, "--allowedTools"));
         assert!(!args_contain(&cmd.args, "--disallowedTools"));
     }
 
     // -----------------------------------------------------------------------
-    // Stage 9: Full config combination tests (mixed agent scenarios)
+    // Full config combination tests (mixed agent scenarios)
     // -----------------------------------------------------------------------
 
     #[test]
     fn claude_full_config_combination() {
         let driver = ClaudeDriver;
-        let schema = json!({"type": "object", "properties": {"x": {"type": "string"}}});
         let config = AgentConfig {
             model: Some("claude-opus-4-20250514".into()),
             system_prompt: Some("You are helpful.".into()),
             max_turns: Some(10),
             max_budget_usd: Some(2.0),
-            json_schema: Some(schema),
             access_mode: AccessMode::Edit,
             tool_toggles: ToolToggles { web_search: Some(false) },
             ephemeral_session: true,
             ..default_config()
         };
-        let cmd = driver.build_args("do everything", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--model"), Some("claude-opus-4-20250514"));
         assert_eq!(arg_after(&cmd.args, "--append-system-prompt"), Some("You are helpful."));
         assert_eq!(arg_after(&cmd.args, "--max-turns"), Some("10"));
         assert_eq!(arg_after(&cmd.args, "--max-budget-usd"), Some("2"));
-        assert!(args_contain(&cmd.args, "--json-schema"));
+        assert!(!args_contain(&cmd.args, "--json-schema"));
         assert!(args_contain(&cmd.args, "--allowedTools"));
         assert!(args_contain(&cmd.args, "--no-session-persistence"));
     }
@@ -2006,7 +1461,7 @@ mod tests {
             ephemeral_session: true,
             ..default_config()
         };
-        let cmd = driver.build_args("do it", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--model"), Some("o3-mini"));
         assert_eq!(arg_after(&cmd.args, "-c"), Some("model_reasoning_effort=medium"));
         assert_eq!(arg_after(&cmd.args, "--sandbox"), Some("workspace-write"));
@@ -2017,24 +1472,18 @@ mod tests {
     #[test]
     fn gemini_full_config_combination() {
         let driver = GeminiDriver;
-        let schema = json!({"type": "object", "properties": {"y": {"type": "integer"}}});
         let config = AgentConfig {
             model: Some("gemini-2.5-flash".into()),
             reasoning_level: Some(ReasoningLevel::Low),
             access_mode: AccessMode::ReadOnly,
             tool_toggles: ToolToggles { web_search: Some(true) },
-            json_schema: Some(schema),
             ..default_config()
         };
-        let cmd = driver.build_args("analyze", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--model"), Some("gemini-2.5-flash"));
         assert_eq!(arg_after(&cmd.args, "--approval-mode"), Some("plan"));
         // Reasoning + web search → temp settings with GEMINI_CLI_HOME
         assert!(cmd.env.iter().any(|(k, _)| k == "GEMINI_CLI_HOME"));
-        // Schema injected into prompt (no native support)
-        let prompt = cmd.args.last().unwrap();
-        assert!(prompt.contains("valid JSON only"));
-        assert!(prompt.contains("y (integer)"));
         // Cleanup
         if let Some(dir) = cmd.temp_dir {
             let _ = std::fs::remove_dir_all(dir);
@@ -2042,7 +1491,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Stage 9: Claude capabilities
+    // Capabilities
     // -----------------------------------------------------------------------
 
     #[test]

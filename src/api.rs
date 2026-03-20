@@ -46,6 +46,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/runs/{run_id}/dismiss", post(dismiss_run))
         .route("/api/interrupted-runs", get(interrupted_runs))
+        .route("/api/sessions", get(list_sessions))
+        .route("/api/sessions/{id}/history", get(session_history))
         .route("/api/logs", get(list_logs))
         .route("/api/logs/{id}", get(get_log).delete(delete_log))
         .with_state(state)
@@ -351,6 +353,24 @@ async fn delete_log(
 ) -> Result<Json<Value>, ApiError> {
     state.runtime.db.delete_log(&id).await?;
     Ok(Json(json!({ "success": true })))
+}
+
+async fn list_sessions(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let sessions = state.runtime.session_manager.list_sessions().await;
+    Ok(Json(serde_json::to_value(sessions)?))
+}
+
+async fn session_history(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let history = state
+        .runtime
+        .session_manager
+        .get_history(&id)
+        .await
+        .map_err(|_| ApiError::status(StatusCode::NOT_FOUND, "Session not found"))?;
+    Ok(Json(serde_json::to_value(history)?))
 }
 
 fn node_from_value(value: Value) -> anyhow::Result<WorkflowNode> {

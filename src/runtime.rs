@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
-    ffi::{OsStr, OsString},
+    ffi::OsStr,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -16,20 +16,19 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::{
-    process::Command,
     sync::{Mutex, broadcast, oneshot},
     task::JoinSet,
-    time::timeout,
 };
 use uuid::Uuid;
 
 use crate::{
-    driver::{self, AgentConfig, AgentOutput, NodeOutcome},
+    driver::{self, AgentConfig, NodeOutcome},
     model::{
         self, ContextSource, ResponseFormat, SplitFailurePolicy, WorkflowEdge,
         WorkflowEdgeOutcome, WorkflowGraph, WorkflowNode, WorkflowNodeType, WorkflowV3,
         evaluate_condition, get_nested_field,
     },
+    session::SessionManager,
     storage::Database,
     util::{djb2, now_iso, slugify_filename},
 };
@@ -118,6 +117,8 @@ pub struct AgentExecutionMetadata {
     pub model_used: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub num_turns: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_used_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -454,10 +455,11 @@ trait NodeRunner: Send + Sync {
     ) -> BoxFuture<'static, anyhow::Result<NodeResult>>;
 }
 
-#[derive(Debug)]
-struct CliNodeRunner;
+struct PtyNodeRunner {
+    session_manager: Arc<SessionManager>,
+}
 
-impl NodeRunner for CliNodeRunner {
+impl NodeRunner for PtyNodeRunner {
     fn run(
         &self,
         agent: String,
@@ -466,8 +468,9 @@ impl NodeRunner for CliNodeRunner {
         timeout_secs: Option<u64>,
         config: Option<AgentConfig>,
     ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+        let sm = self.session_manager.clone();
         Box::pin(async move {
-            run_cli_command(&agent, &prompt, &cwd, timeout_secs, config.as_ref()).await
+            run_pty_command(sm, &agent, &prompt, &cwd, timeout_secs, config.as_ref()).await
         })
     }
 }
@@ -587,23 +590,33 @@ pub struct RuntimeContext {
     pub db: Database,
     pub registry: RunRegistry,
     runner: Arc<dyn NodeRunner>,
+    pub session_manager: Arc<SessionManager>,
 }
 
 impl RuntimeContext {
     pub fn new(db: Database) -> Self {
+        let artifact_dir = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("artifacts");
+        let session_manager = Arc::new(SessionManager::new(artifact_dir));
         Self {
             db,
             registry: RunRegistry::default(),
-            runner: Arc::new(CliNodeRunner),
+            runner: Arc::new(PtyNodeRunner {
+                session_manager: session_manager.clone(),
+            }),
+            session_manager,
         }
     }
 
     #[cfg(test)]
     fn with_runner(db: Database, runner: Arc<dyn NodeRunner>) -> Self {
+        let session_manager = Arc::new(SessionManager::new(PathBuf::from("/tmp/test-artifacts")));
         Self {
             db,
             registry: RunRegistry::default(),
             runner,
+            session_manager,
         }
     }
 
@@ -865,48 +878,17 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn joined_search_path(search_paths: &[PathBuf]) -> anyhow::Result<OsString> {
-    std::env::join_paths(search_paths).context("Failed to construct executable search PATH")
-}
-
-/// Resolved executable path + CLI arguments for spawning an agent process.
-#[derive(Debug)]
-struct ResolvedAgentCommand {
-    executable: PathBuf,
-    args: Vec<String>,
-    env: Vec<(String, String)>,
-    /// Temporary directory to clean up after the agent process exits.
-    temp_dir: Option<PathBuf>,
-}
-
-fn resolve_agent_command(
+/// Resolve executable path for an agent command, searching the given paths.
+fn resolve_agent_executable(
     agent_name: &str,
-    prompt: &str,
     search_paths: &[PathBuf],
-    config: Option<&AgentConfig>,
-) -> anyhow::Result<ResolvedAgentCommand> {
-    let executable = resolve_executable(agent_name, search_paths).with_context(|| {
+) -> anyhow::Result<PathBuf> {
+    resolve_executable(agent_name, search_paths).with_context(|| {
         format!(
             "Could not find '{}' on PATH. Install the CLI and ensure it is available to SilverBond.",
             agent_name
         )
-    })?;
-
-    // Try to use the driver for arg building
-    if let Some(drv) = driver::get_driver(agent_name) {
-        let default_config = AgentConfig::default();
-        let cfg = config.unwrap_or(&default_config);
-        let cmd = drv.build_args(prompt, cfg)?;
-        return Ok(ResolvedAgentCommand {
-            executable,
-            args: cmd.args,
-            env: cmd.env,
-            temp_dir: cmd.temp_dir,
-        });
-    }
-
-    // Fallback for unknown agents (shouldn't happen with registry)
-    anyhow::bail!("Unsupported agent: {}", agent_name)
+    })
 }
 
 pub async fn run_node_preview(
@@ -944,7 +926,6 @@ pub async fn run_node_preview(
     );
 
     let agent = node.agent.clone().unwrap_or_else(|| DEFAULT_AGENT.to_string());
-    let json_schema = build_json_schema_for_agent(node, &agent);
     let config = crate::model::resolve_agent_config(
         &BTreeMap::new(),
         cwd,
@@ -952,10 +933,11 @@ pub async fn run_node_preview(
         node,
         None,
         false,
-        json_schema.clone(),
+        None,
     );
-    let resolved_prompt = wrap_prompt_for_json(node, resolved_prompt, &json_schema);
-    let mut result = run_cli_command(&agent, &resolved_prompt, cwd, node.timeout, Some(&config)).await?;
+    let resolved_prompt = wrap_prompt_for_json(node, resolved_prompt, &None);
+    let sm = Arc::new(SessionManager::new(PathBuf::from("/tmp/silverbond-preview")));
+    let mut result = run_pty_command(sm, &agent, &resolved_prompt, cwd, node.timeout, Some(&config)).await?;
     parse_structured_output(node, &mut result);
 
     let routing_preview = preview_routing(node, &result.parsed_output);
@@ -1955,6 +1937,7 @@ async fn run_cursor_task(
         )
         .await?;
         let orchestrator = run_orchestrator_refinement(
+            ctx.session_manager.clone(),
             &run_ctx.workflow_goal,
             &node,
             &resolved_prompt,
@@ -1996,7 +1979,6 @@ async fn run_cursor_task(
     }
 
     let agent_name = node.agent.clone().unwrap_or_else(|| DEFAULT_AGENT.to_string());
-    let json_schema = build_json_schema_for_agent(&node, &agent_name);
 
     // Session reuse: resolve resume_session_id from referenced node's result
     let resume_session_id = node
@@ -2010,6 +1992,8 @@ async fn run_cursor_task(
         });
     let needs_session_persistence = run_ctx.shared.session_persistence_nodes.contains(&node.id);
 
+    // Artifact-based JSON output: no native schema passing, all agents use artifact files
+    let json_schema = None;
     let agent_config = crate::model::resolve_agent_config(
         &run_ctx.shared.agent_defaults,
         &run_ctx.cwd,
@@ -2017,9 +2001,10 @@ async fn run_cursor_task(
         &node,
         resume_session_id,
         needs_session_persistence,
-        json_schema.clone(),
+        json_schema,
     );
-    resolved_prompt = wrap_prompt_for_json(&node, resolved_prompt, &json_schema);
+    // For JSON response nodes, wrap prompt with artifact instructions
+    resolved_prompt = wrap_prompt_for_json(&node, resolved_prompt, &None);
     emit_event(
         &ctx,
         &run_ctx.run_id,
@@ -3030,7 +3015,7 @@ async fn select_next_decision(
         }
         if chosen.is_none() && checkpoint.use_orchestrator {
             let orchestration =
-                run_orchestrator_branch(&workflow.goal, node, &result.output, &branch_edges, &checkpoint.cwd)
+                run_orchestrator_branch(ctx.session_manager.clone(), &workflow.goal, node, &result.output, &branch_edges, &checkpoint.cwd)
                     .await?;
             let chosen_id = orchestration.output.trim().trim_matches('"').trim_matches('\'');
             chosen = branch_edges
@@ -3251,28 +3236,6 @@ struct TemplateRuntimeContext<'a> {
 }
 
 /// Checks if a given agent supports native JSON schema output.
-fn agent_has_native_json_schema(agent_name: &str) -> bool {
-    driver::get_driver(agent_name)
-        .map(|d| d.capabilities().native_json_schema)
-        .unwrap_or(false)
-}
-
-/// Returns the node's `output_schema` as a JSON Schema Value for agents that
-/// support native JSON schema validation. The schema is already in JSON Schema
-/// format (migrated from legacy format at deserialization time if needed).
-fn build_json_schema_for_agent(node: &WorkflowNode, agent_name: &str) -> Option<Value> {
-    if node.response_format != Some(ResponseFormat::Json)
-        || !agent_has_native_json_schema(agent_name)
-    {
-        return None;
-    }
-    let schema = node.output_schema.as_ref()?;
-    // Skip empty objects
-    if schema.as_object().is_some_and(|o| o.is_empty()) {
-        return None;
-    }
-    Some(schema.clone())
-}
 
 /// Appends JSON format instructions to the prompt when the agent can't enforce
 /// the schema natively (i.e. when `native_json_schema` is `None`).
@@ -3372,7 +3335,9 @@ fn build_log_id(workflow_name: &str) -> String {
     format!("{}_{}", slug, Utc::now().format("%Y-%m-%dT%H-%M-%S"))
 }
 
-async fn run_cli_command(
+/// Run an agent command via PTY session.
+async fn run_pty_command(
+    session_manager: Arc<SessionManager>,
     agent: &str,
     prompt: &str,
     cwd: &str,
@@ -3391,159 +3356,123 @@ async fn run_cli_command(
         std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
     };
     let search_paths = executable_search_paths(std::env::var_os("PATH").as_deref());
-    let resolved = resolve_agent_command(agent_spec.name, prompt, &search_paths, config)?;
-    let path_env = joined_search_path(&search_paths)?;
-    let start = std::time::Instant::now();
-    let mut command = Command::new(&resolved.executable);
-    command
-        .args(&resolved.args)
-        .current_dir(&work_dir)
-        .env("HOME", std::env::var("HOME").unwrap_or_default())
-        .env("PATH", &path_env)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    // Set any extra environment variables from the driver
-    for (key, value) in &resolved.env {
-        command.env(key, value);
-    }
-    let child = command
-        .spawn()
-        .with_context(|| {
-            format!(
-                "Failed to start '{}' from {}",
-                agent_spec.name,
-                resolved.executable.display()
-            )
-        })?;
+    let executable = resolve_agent_executable(agent_spec.name, &search_paths)?;
 
-    let empty_result = |extra: NodeResultMetadata| NodeResult {
-        success: false,
-        output: String::new(),
-        stderr: extra.stderr.unwrap_or_default(),
-        exit_code: extra.exit_code.unwrap_or(-1),
-        duration: format!("{:.1}", start.elapsed().as_secs_f64()),
+    let drv = driver::get_driver(agent_spec.name)
+        .with_context(|| format!("No driver for agent: {}", agent_spec.name))?;
+
+    let default_config = AgentConfig::default();
+    let cfg = config.unwrap_or(&default_config);
+    let cmd = drv.build_session_args(cfg)?;
+    let temp_dir = cmd.temp_dir;
+
+    let start = std::time::Instant::now();
+
+    // Create a PTY session
+    let session_id = session_manager
+        .create_session(
+            agent_spec.name,
+            &executable.display().to_string(),
+            cmd.args,
+            cmd.env,
+            &work_dir,
+        )
+        .await
+        .with_context(|| format!("Failed to create PTY session for {}", agent_spec.name))?;
+
+    // Wrap prompt with sentinel for completion detection
+    let sentinel = format!("SILVERBOND_DONE_{}", uuid::Uuid::new_v4());
+    let wrapped_prompt = drv.wrap_prompt_with_sentinel(prompt, &sentinel);
+
+    // Send the prompt and wait for response
+    let timeout_duration = Duration::from_secs(timeout_secs.unwrap_or(300));
+    let response = session_manager
+        .send_prompt(&session_id, &wrapped_prompt, &sentinel, timeout_duration)
+        .await;
+
+    let elapsed = start.elapsed().as_secs_f64();
+
+    let response = match response {
+        Ok(resp) => resp,
+        Err(e) => {
+            let _ = session_manager.close_session(&session_id).await;
+            // Clean up temp dir
+            if let Some(dir) = &temp_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            return Ok(NodeResult {
+                success: false,
+                output: String::new(),
+                stderr: e.to_string(),
+                exit_code: -1,
+                duration: format!("{:.1}", elapsed),
+                agent: agent_spec.name.to_string(),
+                prompt: prompt.to_string(),
+                metadata: AgentExecutionMetadata {
+                    outcome: Some(NodeOutcome::ErrorExecution),
+                    error_type: Some("pty_error".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+        }
+    };
+
+    // Query cost metadata if supported
+    let cost = if let Some(cost_cmd) = drv.cost_command() {
+        session_manager
+            .send_command(&session_id, cost_cmd)
+            .await
+            .ok()
+            .and_then(|out| drv.parse_cost_response(&out))
+    } else {
+        None
+    };
+
+    // Query context usage if supported
+    let context_pct = if let Some(ctx_cmd) = drv.context_command() {
+        session_manager
+            .send_command(&session_id, ctx_cmd)
+            .await
+            .ok()
+            .and_then(|out| drv.parse_context_response(&out))
+            .and_then(|info| info.used_percentage)
+    } else {
+        None
+    };
+
+    // Clean up temp dir from driver args
+    if let Some(dir) = &temp_dir {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    Ok(NodeResult {
+        success: true,
+        output: response.text,
+        stderr: String::new(),
+        exit_code: 0,
+        duration: format!("{:.1}", elapsed),
         agent: agent_spec.name.to_string(),
         prompt: prompt.to_string(),
+        raw_output: Some(String::from_utf8_lossy(&response.raw).to_string()),
         metadata: AgentExecutionMetadata {
-            outcome: extra.outcome,
-            error_type: extra.error_type,
+            outcome: Some(NodeOutcome::Success),
+            agent_session_id: Some(session_id),
+            cost_usd: cost.as_ref().and_then(|c| c.total_cost_usd),
+            input_tokens: cost.as_ref().and_then(|c| c.input_tokens),
+            output_tokens: cost.as_ref().and_then(|c| c.output_tokens),
+            thinking_tokens: cost.as_ref().and_then(|c| c.thinking_tokens),
+            cache_read_tokens: cost.as_ref().and_then(|c| c.cache_read_tokens),
+            cache_write_tokens: cost.as_ref().and_then(|c| c.cache_write_tokens),
+            context_used_pct: context_pct,
             ..Default::default()
         },
-        ..Default::default()
-    };
-
-    let cleanup = || {
-        if let Some(dir) = &resolved.temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    };
-
-    let output = if let Some(timeout_secs) = timeout_secs {
-        match timeout(Duration::from_secs(timeout_secs), child.wait_with_output()).await {
-            Ok(output) => output?,
-            Err(_) => {
-                cleanup();
-                return Ok(empty_result(NodeResultMetadata {
-                    stderr: Some(format!("Step timed out after {}s", timeout_secs)),
-                    exit_code: Some(-2),
-                    outcome: Some(NodeOutcome::ErrorTimeout),
-                    error_type: Some("timeout".to_string()),
-                }));
-            }
-        }
-    } else {
-        child.wait_with_output().await?
-    };
-
-    cleanup();
-
-    let stdout_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let stderr_str = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let exit_code = output.status.code().unwrap_or(-1);
-
-    // Try to parse output using the driver
-    let drv = driver::get_driver(agent_spec.name);
-    if let Some(drv) = &drv {
-        if let Ok(agent_output) = drv.parse_output(&stdout_str, &stderr_str, exit_code) {
-            return Ok(node_result_from_agent_output(
-                agent_spec.name,
-                prompt,
-                &stdout_str,
-                &stderr_str,
-                exit_code,
-                start.elapsed().as_secs_f64(),
-                agent_output,
-            ));
-        }
-    }
-
-    // Fallback: raw text output (if driver parsing fails)
-    Ok(NodeResult {
-        success: output.status.success(),
-        output: stdout_str,
-        stderr: stderr_str,
-        exit_code,
-        duration: format!("{:.1}", start.elapsed().as_secs_f64()),
-        agent: agent_spec.name.to_string(),
-        prompt: prompt.to_string(),
         ..Default::default()
     })
 }
 
-struct NodeResultMetadata {
-    stderr: Option<String>,
-    exit_code: Option<i32>,
-    outcome: Option<NodeOutcome>,
-    error_type: Option<String>,
-}
-
-fn node_result_from_agent_output(
-    agent_name: &str,
-    prompt: &str,
-    raw_stdout: &str,
-    stderr: &str,
-    exit_code: i32,
-    elapsed_secs: f64,
-    agent_output: AgentOutput,
-) -> NodeResult {
-    let success = agent_output.outcome.is_success();
-    let error_type = if !success {
-        Some(format!("{:?}", agent_output.outcome))
-    } else {
-        None
-    };
-    NodeResult {
-        success,
-        output: agent_output.response_text,
-        stderr: stderr.to_string(),
-        exit_code,
-        duration: format!("{:.1}", elapsed_secs),
-        agent: agent_name.to_string(),
-        prompt: prompt.to_string(),
-        raw_output: Some(raw_stdout.to_string()),
-        parsed_output: agent_output.structured_output,
-        parse_error: None,
-        resolved_prompt: None,
-        stale: false,
-        preserved_from_run_id: None,
-        metadata: AgentExecutionMetadata {
-            outcome: Some(agent_output.outcome),
-            error_type,
-            agent_session_id: agent_output.session_id,
-            cost_usd: agent_output.cost_usd,
-            input_tokens: agent_output.input_tokens,
-            output_tokens: agent_output.output_tokens,
-            thinking_tokens: agent_output.thinking_tokens,
-            cache_read_tokens: agent_output.cache_read_tokens,
-            cache_write_tokens: agent_output.cache_write_tokens,
-            model_used: agent_output.model_used,
-            num_turns: agent_output.num_turns,
-        },
-    }
-}
-
 async fn run_orchestrator_refinement(
+    session_manager: Arc<SessionManager>,
     goal: &str,
     node: &WorkflowNode,
     original_prompt: &str,
@@ -3563,10 +3492,11 @@ async fn run_orchestrator_refinement(
             previous_output
         }
     );
-    run_cli_command(DEFAULT_AGENT, &prompt, cwd, None, None).await
+    run_pty_command(session_manager, DEFAULT_AGENT, &prompt, cwd, None, None).await
 }
 
 async fn run_orchestrator_branch(
+    session_manager: Arc<SessionManager>,
     goal: &str,
     node: &WorkflowNode,
     output: &str,
@@ -3588,7 +3518,7 @@ async fn run_orchestrator_branch(
         "You are an AI orchestrator deciding which branch a workflow should take.\n\nWORKFLOW GOAL: {goal}\nSTEP JUST COMPLETED: \"{}\"\nOUTPUT OF THAT STEP:\n{}\n\nAVAILABLE BRANCHES:\n{}\n\nBased on the output and the workflow goal, choose the most appropriate branch.\nRespond with ONLY the branch id string (e.g. branch_a). Nothing else.",
         node.name, output, branch_list
     );
-    run_cli_command(DEFAULT_AGENT, &prompt, cwd, None, None).await
+    run_pty_command(session_manager, DEFAULT_AGENT, &prompt, cwd, None, None).await
 }
 
 #[cfg(test)]
@@ -3966,21 +3896,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn resolves_agent_command_uses_driver() {
+    fn resolves_agent_executable_finds_binary() {
         let temp = TempDir::new().unwrap();
         let executable = temp.path().join("codex");
         std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
         make_executable(&executable);
         let search_paths = vec![PathBuf::from(temp.path())];
 
-        let command =
-            resolve_agent_command("codex", "prompt body", &search_paths, None).unwrap();
-
-        assert_eq!(command.executable, executable);
-        // Driver produces JSON-mode args: exec --json --full-auto --ephemeral <prompt>
-        assert!(command.args.contains(&"exec".to_string()));
-        assert!(command.args.contains(&"--json".to_string()));
-        assert!(command.args.contains(&"prompt body".to_string()));
+        let resolved = super::resolve_agent_executable("codex", &search_paths).unwrap();
+        assert_eq!(resolved, executable);
     }
 
     #[tokio::test]
@@ -4424,83 +4348,6 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn build_json_schema_returns_schema_for_native_agent() {
-        let mut node = task_node("n1", "Test", "prompt");
-        node.response_format = Some(ResponseFormat::Json);
-        node.output_schema = Some(json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string" },
-                "age": { "type": "integer" }
-            },
-            "required": ["name", "age"]
-        }));
-
-        // "claude" has native_json_schema = true
-        let result = super::build_json_schema_for_agent(&node, "claude");
-        assert!(result.is_some());
-        let val = result.unwrap();
-        assert_eq!(val["type"], "object");
-        assert_eq!(val["properties"]["name"]["type"], "string");
-        assert_eq!(val["properties"]["age"]["type"], "integer");
-    }
-
-    #[test]
-    fn build_json_schema_returns_none_when_no_native_support() {
-        let mut node = task_node("n1", "Test", "prompt");
-        node.response_format = Some(ResponseFormat::Json);
-        node.output_schema = Some(json!({
-            "type": "object",
-            "properties": { "name": { "type": "string" } },
-            "required": ["name"]
-        }));
-
-        // "gemini" has native_json_schema = false
-        let result = super::build_json_schema_for_agent(&node, "gemini");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn build_json_schema_returns_none_for_text_format() {
-        let mut node = task_node("n1", "Test", "prompt");
-        node.response_format = None;
-        node.output_schema = Some(json!({
-            "type": "object",
-            "properties": { "name": { "type": "string" } },
-            "required": ["name"]
-        }));
-
-        let result = super::build_json_schema_for_agent(&node, "claude");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn build_json_schema_returns_none_for_empty_schema() {
-        let mut node = task_node("n1", "Test", "prompt");
-        node.response_format = Some(ResponseFormat::Json);
-        node.output_schema = Some(json!({}));
-
-        let result = super::build_json_schema_for_agent(&node, "claude");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn wrap_prompt_skips_injection_when_native_json_schema() {
-        let mut node = task_node("n1", "Test", "prompt");
-        node.response_format = Some(ResponseFormat::Json);
-        node.output_schema = Some(json!({
-            "type": "object",
-            "properties": { "name": { "type": "string" } },
-            "required": ["name"]
-        }));
-
-        let prompt = "Do something".to_string();
-        let native_schema = Some(json!({"type": "object"}));
-        let result = super::wrap_prompt_for_json(&node, prompt.clone(), &native_schema);
-        assert_eq!(result, prompt);
-    }
-
-    #[test]
     fn wrap_prompt_injects_when_no_native_json_schema() {
         let mut node = task_node("n1", "Test", "prompt");
         node.response_format = Some(ResponseFormat::Json);
@@ -4573,85 +4420,6 @@ mod tests {
         assert_eq!(result.parsed_output, Some(json!({"name": "Bob"})));
     }
 
-    #[test]
-    fn node_result_from_agent_output_carries_structured_output() {
-        use crate::driver::{AgentOutput, NodeOutcome};
-
-        let agent_output = AgentOutput {
-            response_text: "response".to_string(),
-            session_id: Some("sess-123".to_string()),
-            cost_usd: Some(0.05),
-            input_tokens: Some(100),
-            output_tokens: Some(200),
-            thinking_tokens: Some(50),
-            cache_read_tokens: Some(10),
-            cache_write_tokens: Some(20),
-            model_used: Some("claude-sonnet-4-20250514".to_string()),
-            num_turns: Some(3),
-            duration_api_ms: Some(5000),
-            structured_output: Some(json!({"name": "test"})),
-            outcome: NodeOutcome::Success,
-            error_message: None,
-        };
-
-        let result = super::node_result_from_agent_output(
-            "claude",
-            "test prompt",
-            r#"{"type":"result"}"#,
-            "",
-            0,
-            1.5,
-            agent_output,
-        );
-
-        assert!(result.success);
-        assert_eq!(result.output, "response");
-        assert_eq!(result.parsed_output, Some(json!({"name": "test"})));
-        assert_eq!(result.metadata.agent_session_id, Some("sess-123".to_string()));
-        assert_eq!(result.metadata.cost_usd, Some(0.05));
-        assert_eq!(result.metadata.input_tokens, Some(100));
-        assert_eq!(result.metadata.output_tokens, Some(200));
-        assert_eq!(result.metadata.thinking_tokens, Some(50));
-        assert_eq!(result.metadata.cache_read_tokens, Some(10));
-        assert_eq!(result.metadata.cache_write_tokens, Some(20));
-        assert_eq!(
-            result.metadata.model_used,
-            Some("claude-sonnet-4-20250514".to_string())
-        );
-        assert_eq!(result.metadata.num_turns, Some(3));
-        assert_eq!(result.raw_output, Some(r#"{"type":"result"}"#.to_string()));
-        assert!(result.metadata.error_type.is_none());
-    }
-
-    #[test]
-    fn node_result_from_agent_output_maps_error_outcomes() {
-        use crate::driver::{AgentOutput, NodeOutcome};
-
-        let agent_output = AgentOutput {
-            response_text: String::new(),
-            session_id: None,
-            cost_usd: None,
-            input_tokens: None,
-            output_tokens: None,
-            thinking_tokens: None,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
-            model_used: None,
-            num_turns: None,
-            duration_api_ms: None,
-            structured_output: None,
-            outcome: NodeOutcome::ErrorMaxTurns,
-            error_message: Some("hit turn limit".to_string()),
-        };
-
-        let result =
-            super::node_result_from_agent_output("claude", "prompt", "", "err", 1, 2.0, agent_output);
-
-        assert!(!result.success);
-        assert_eq!(result.metadata.outcome, Some(NodeOutcome::ErrorMaxTurns));
-        assert_eq!(result.metadata.error_type, Some("ErrorMaxTurns".to_string()));
-    }
-
     // -----------------------------------------------------------------------
     // Stage 5: Output schema enhancement tests
     // -----------------------------------------------------------------------
@@ -4684,25 +4452,6 @@ mod tests {
     fn schema_to_prompt_hint_empty_for_non_object() {
         let hint = super::schema_to_prompt_hint(&json!("not an object"));
         assert!(hint.is_empty());
-    }
-
-    #[test]
-    fn build_json_schema_passes_full_schema_through() {
-        let mut node = task_node("n1", "Test", "prompt");
-        node.response_format = Some(ResponseFormat::Json);
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "summary": { "type": "string", "description": "Brief summary" },
-                "score": { "type": "number", "minimum": 0, "maximum": 100 }
-            },
-            "required": ["summary", "score"],
-            "additionalProperties": false
-        });
-        node.output_schema = Some(schema.clone());
-
-        let result = super::build_json_schema_for_agent(&node, "claude");
-        assert_eq!(result, Some(schema));
     }
 
     #[test]
@@ -4791,7 +4540,7 @@ mod tests {
         assert_eq!(claude_config.max_budget_usd, Some(1.5)); // from node override
 
         let claude_driver = get_driver("claude").unwrap();
-        let claude_cmd = claude_driver.build_args("prompt1", &claude_config).unwrap();
+        let claude_cmd = claude_driver.build_session_args(&claude_config).unwrap();
         assert!(claude_cmd.args.iter().any(|a| a == "--model"));
         assert!(claude_cmd.args.iter().any(|a| a == "--max-budget-usd"));
 
@@ -4804,47 +4553,29 @@ mod tests {
         assert_eq!(codex_config.reasoning_level, Some(ReasoningLevel::Medium));
 
         let codex_driver = get_driver("codex").unwrap();
-        let codex_cmd = codex_driver.build_args("prompt2", &codex_config).unwrap();
+        let codex_cmd = codex_driver.build_session_args(&codex_config).unwrap();
         assert!(codex_cmd.args.iter().any(|a| a == "--model"));
         assert!(codex_cmd.args.iter().any(|a| a.contains("model_reasoning_effort=medium")));
     }
 
     #[test]
-    fn integration_json_schema_native_vs_prompt_injection() {
-        // Claude uses native --json-schema, Gemini uses prompt injection
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "User name" },
-                "age": { "type": "integer" }
-            },
-            "required": ["name"]
-        });
-
-        // Claude: native JSON schema
+    fn integration_session_args_no_json_mode_flags() {
+        // With PTY mode, no agent should have --json-schema, --print, --json, etc.
         let claude_driver = get_driver("claude").unwrap();
-        let claude_config = AgentConfig {
-            json_schema: Some(schema.clone()),
-            ..Default::default()
-        };
-        let claude_cmd = claude_driver.build_args("extract", &claude_config).unwrap();
-        assert!(claude_cmd.args.iter().any(|a| a == "--json-schema"));
-        // Prompt should NOT contain schema hint (native mode)
-        let claude_prompt = claude_cmd.args.last().unwrap();
-        assert!(!claude_prompt.contains("valid JSON only"));
+        let claude_cmd = claude_driver.build_session_args(&Default::default()).unwrap();
+        assert!(!claude_cmd.args.iter().any(|a| a == "--json-schema"));
+        assert!(!claude_cmd.args.iter().any(|a| a == "--print"));
+        assert!(!claude_cmd.args.iter().any(|a| a == "--output-format"));
 
-        // Gemini: prompt injection (move schema — last use)
+        let codex_driver = get_driver("codex").unwrap();
+        let codex_cmd = codex_driver.build_session_args(&Default::default()).unwrap();
+        assert!(!codex_cmd.args.iter().any(|a| a == "--json"));
+        assert!(!codex_cmd.args.iter().any(|a| a == "--output-schema"));
+
         let gemini_driver = get_driver("gemini").unwrap();
-        let gemini_config = AgentConfig {
-            json_schema: Some(schema),
-            ..Default::default()
-        };
-        let gemini_cmd = gemini_driver.build_args("extract", &gemini_config).unwrap();
-        assert!(!gemini_cmd.args.iter().any(|a| a == "--json-schema"));
-        // Prompt should contain schema hint (prompt injection)
-        let gemini_prompt = gemini_cmd.args.last().unwrap();
-        assert!(gemini_prompt.contains("valid JSON only"));
-        assert!(gemini_prompt.contains("name (string, required)"));
+        let gemini_cmd = gemini_driver.build_session_args(&Default::default()).unwrap();
+        assert!(!gemini_cmd.args.iter().any(|a| a == "--output-format"));
+        assert!(!gemini_cmd.args.iter().any(|a| a == "--prompt"));
 
         if let Some(dir) = gemini_cmd.temp_dir {
             let _ = std::fs::remove_dir_all(dir);
@@ -4865,7 +4596,7 @@ mod tests {
         assert!(!config.ephemeral_session);
 
         let driver = get_driver("claude").unwrap();
-        let cmd = driver.build_args("continue", &config).unwrap();
+        let cmd = driver.build_session_args(&config).unwrap();
         assert!(cmd.args.iter().any(|a| a == "--resume"));
         assert!(!cmd.args.iter().any(|a| a == "--no-session-persistence"));
     }
@@ -4888,7 +4619,7 @@ mod tests {
             // All three agents should handle all access modes without error
             for agent_name in &["claude", "codex", "gemini"] {
                 let driver = get_driver(agent_name).unwrap();
-                let result = driver.build_args("test", &config);
+                let result = driver.build_session_args(&config);
                 assert!(result.is_ok(), "{} failed with {:?}", agent_name, mode);
 
                 let cmd = result.unwrap();
