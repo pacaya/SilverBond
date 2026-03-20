@@ -7,9 +7,9 @@
     onchange: (val: Record<string, unknown> | null) => void;
   } = $props();
 
-  let useCustom = $state(false);
-  let jsonDraft = $state("");
+  let jsonDraft = $state(value ? JSON.stringify(value, null, 2) : "");
   let jsonError = $state("");
+  let useCustomOverride = $state<boolean | null>(null);
 
   const presets: Array<{ label: string; description: string; schema: Record<string, unknown>; json: string }> = [
     {
@@ -47,26 +47,21 @@
     },
   ];
 
-  // Sync from prop
-  $effect(() => {
-    jsonDraft = value ? JSON.stringify(value, null, 2) : "";
-    if (value) {
-      const valueJson = JSON.stringify(value);
-      const match = presets.some((p) => p.json === valueJson);
-      useCustom = !match;
-    } else {
-      useCustom = false;
-    }
+  let useCustom = $derived.by(() => {
+    if (useCustomOverride !== null) return useCustomOverride;
+    if (!value) return false;
+    const vj = JSON.stringify(value);
+    return !presets.some((p) => p.json === vj);
   });
 
   function applyPreset(schema: Record<string, unknown>) {
     onchange(schema);
-    useCustom = false;
+    useCustomOverride = false;
   }
 
   function clearSchema() {
     onchange(null);
-    useCustom = false;
+    useCustomOverride = null;
     jsonDraft = "";
     jsonError = "";
   }
@@ -100,7 +95,7 @@
     ></textarea>
     {#if jsonError}<small class="issue issue--error">{jsonError}</small>{/if}
     <div class="schemaPresets__actions">
-      <button class="linkBtn" onclick={() => useCustom = false}>
+      <button class="linkBtn" onclick={() => useCustomOverride = null}>
         Use preset
       </button>
       <button class="linkBtn" onclick={clearSchema}>
@@ -121,7 +116,7 @@
       {/each}
     </div>
     <div class="schemaPresets__actions">
-      <button class="linkBtn" onclick={() => { useCustom = true; jsonDraft = value ? JSON.stringify(value, null, 2) : ""; }}>
+      <button class="linkBtn" onclick={() => { useCustomOverride = true; jsonDraft = value ? JSON.stringify(value, null, 2) : ""; }}>
         Edit as JSON
       </button>
       {#if value}

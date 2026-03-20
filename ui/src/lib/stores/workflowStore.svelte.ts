@@ -261,11 +261,10 @@ class WorkflowStore {
     this.nodeStates = {};
   }
 
-  setRunState(patch: { runId?: string | null; running?: boolean; approval?: ApprovalState | null; interaction?: InteractionState | null }) {
+  setRunState(patch: { runId?: string | null; running?: boolean; approval?: ApprovalState | null }) {
     if (patch.runId !== undefined) this.runId = patch.runId;
     if (patch.running !== undefined) this.running = patch.running;
     if (patch.approval !== undefined) this.approval = patch.approval;
-    if (patch.interaction !== undefined) this.interaction = patch.interaction;
   }
 
   setNodeRuntimeState(nodeId: string, state: NodeRuntimeState) {

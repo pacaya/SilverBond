@@ -231,11 +231,16 @@ button {
 .workspace__actions,
 .runPanel__actions,
 .approvalCard__actions,
+.interactionCard__actions,
 .historyCard__actions {
   display: flex;
   gap: 10px;
   align-items: center;
   flex-wrap: wrap;
+}
+
+.interactionCard__warning {
+  color: var(--red);
 }
 
 .statusPill {
@@ -591,6 +596,7 @@ button {
 }
 
 .approvalCard,
+.interactionCard,
 .historyDetail {
   display: flex;
   flex-direction: column;
@@ -602,6 +608,7 @@ button {
 }
 
 .approvalCard__header,
+.interactionCard__header,
 .historyExecution__header {
   display: flex;
   justify-content: space-between;
@@ -1430,9 +1437,9 @@ button {
   font-size: 0.88rem;
 }
 
-.conditionBuilder__raw {
+.conditionBuilder__raw,
+.schemaPresets__editor {
   width: 100%;
-  min-height: 72px;
   resize: vertical;
   border-radius: 10px;
   border: 1px solid var(--border);
@@ -1441,6 +1448,10 @@ button {
   padding: 10px 12px;
   font-family: "SF Mono", "Fira Code", monospace;
   font-size: 0.82rem;
+}
+
+.conditionBuilder__raw {
+  min-height: 72px;
 }
 
 .linkBtn {
@@ -1508,16 +1519,7 @@ button {
 }
 
 .schemaPresets__editor {
-  width: 100%;
   min-height: 96px;
-  resize: vertical;
-  border-radius: 10px;
-  border: 1px solid var(--border);
-  background: rgba(15, 23, 42, 0.66);
-  color: var(--text-bright);
-  padding: 10px 12px;
-  font-family: "SF Mono", "Fira Code", monospace;
-  font-size: 0.82rem;
 }
 
 .schemaPresets__actions {

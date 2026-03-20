@@ -24,6 +24,7 @@ pnpm-debug.log*
 /.agents
 /.claude
 /.gemini
+/.superset
 /_bmad
 
 # OS metadata

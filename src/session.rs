@@ -251,18 +251,26 @@ impl SessionManager {
         let cmd = command.to_string();
 
         let output = tokio::task::spawn_blocking(move || {
+            // Send the command under the lock
+            {
+                let mut sessions_guard = sessions_ref.blocking_lock();
+                let session = sessions_guard
+                    .get_mut(&sid)
+                    .context("Session not found")?;
+                session.session.send_line(&cmd)
+                    .context("Failed to send command to PTY")?;
+                Ok::<(), anyhow::Error>(())
+            }?;
+
+            // Sleep outside the lock to let output arrive
+            std::thread::sleep(Duration::from_millis(500));
+
+            // Re-acquire lock to read the buffer
             let mut sessions_guard = sessions_ref.blocking_lock();
             let session = sessions_guard
                 .get_mut(&sid)
-                .context("Session not found")?;
+                .context("Session not found after command")?;
 
-            session.session.send_line(&cmd)
-                .context("Failed to send command to PTY")?;
-
-            // Brief sleep to let the command output arrive
-            std::thread::sleep(Duration::from_millis(500));
-
-            // Read whatever is available in the buffer
             let mut buf = vec![0u8; 8192];
             let mut collected = Vec::new();
 
@@ -318,12 +326,13 @@ impl SessionManager {
 
     /// Close and clean up a single session.
     pub async fn close_session(&self, session_id: &str) -> anyhow::Result<()> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(mut session) = sessions.remove(session_id) {
-            // Try to send exit command gracefully
+        let removed = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.remove(session_id)
+        };
+        if let Some(mut session) = removed {
             let _ = session.session.send_line("/exit");
-            // Give the process a moment, then drop (which cleans up the PTY)
-            std::thread::sleep(Duration::from_millis(200));
+            tokio::time::sleep(Duration::from_millis(200)).await;
             session.state = SessionState::Completed;
         }
         Ok(())
@@ -331,10 +340,13 @@ impl SessionManager {
 
     /// Close all active sessions. Called on workflow completion.
     pub async fn close_all(&self) -> anyhow::Result<()> {
-        let mut sessions = self.sessions.lock().await;
-        for (_, mut session) in sessions.drain() {
+        let drained: Vec<_> = {
+            let mut sessions = self.sessions.lock().await;
+            sessions.drain().collect()
+        };
+        for (_, mut session) in drained {
             let _ = session.session.send_line("/exit");
-            std::thread::sleep(Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
         Ok(())
     }
@@ -380,54 +392,52 @@ impl SessionManager {
         let sid = session_id.to_string();
 
         tokio::task::spawn_blocking(move || {
-            let mut sessions_guard = sessions_ref.blocking_lock();
-            let session = sessions_guard
-                .get_mut(&sid)
-                .context("Session not found for warmup")?;
-
             let deadline = std::time::Instant::now() + warmup_timeout;
             let chunk_timeout = Duration::from_millis(500);
 
             while std::time::Instant::now() < deadline {
-                session.session.set_expect_timeout(Some(chunk_timeout));
+                // Acquire lock only for the read/write portion, release during sleeps
+                let read_result = {
+                    let mut sessions_guard = sessions_ref.blocking_lock();
+                    let session = sessions_guard
+                        .get_mut(&sid)
+                        .context("Session not found for warmup")?;
 
-                // Try to read whatever is in the buffer
-                let mut buf = vec![0u8; 8192];
-                let mut collected = Vec::new();
+                    session.session.set_expect_timeout(Some(chunk_timeout));
 
-                loop {
-                    match session.session.try_read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => collected.extend_from_slice(&buf[..n]),
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
+                    let mut buf = vec![0u8; 8192];
+                    let mut collected = Vec::new();
+
+                    loop {
+                        match session.session.try_read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => collected.extend_from_slice(&buf[..n]),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
                     }
-                }
 
-                if collected.is_empty() {
-                    // Brief sleep before retrying
-                    std::thread::sleep(Duration::from_millis(200));
-                    continue;
-                }
-
-                let text = strip_ansi(&collected);
-
-                // Check against auto-respond patterns
-                let mut matched = false;
-                for (pattern, response) in &auto_patterns {
-                    if pattern.is_match(&text) {
-                        let _ = session.session.send_line(response);
-                        session.last_activity = Utc::now();
-                        matched = true;
-                        // Brief wait for the response to be processed
-                        std::thread::sleep(Duration::from_millis(300));
-                        break;
+                    if collected.is_empty() {
+                        Ok::<Option<bool>, anyhow::Error>(None) // no data
+                    } else {
+                        let text = strip_ansi(&collected);
+                        let mut matched = false;
+                        for (pattern, response) in &auto_patterns {
+                            if pattern.is_match(&text) {
+                                let _ = session.session.send_line(response);
+                                session.last_activity = Utc::now();
+                                matched = true;
+                                break;
+                            }
+                        }
+                        Ok(Some(matched))
                     }
-                }
+                }; // lock released here
 
-                if !matched {
-                    // No pattern matched — continue reading to drain buffer
-                    continue;
+                match read_result? {
+                    None => std::thread::sleep(Duration::from_millis(200)),
+                    Some(true) => std::thread::sleep(Duration::from_millis(300)),
+                    Some(false) => continue, // drain buffer
                 }
             }
 
@@ -448,7 +458,7 @@ impl SessionManager {
         session_id: &str,
         prompt: &str,
         sentinel: &str,
-        interaction_patterns: Vec<(regex::Regex, InteractionKind, String)>,
+        interaction_patterns: Arc<[(regex::Regex, InteractionKind, String)]>,
         intermediate_timeout: Duration,
         total_timeout: Duration,
     ) -> anyhow::Result<PromptEvent> {
@@ -483,9 +493,9 @@ impl SessionManager {
                 .context("Session disappeared during interactive read")?;
 
             let total_deadline = std::time::Instant::now() + total_timeout;
-            let sentinel_regex = regex::Regex::new(
-                &format!(r"\s*{}\s*", regex::escape(&sentinel_owned))
-            ).context("Failed to compile sentinel regex")?;
+            let sentinel_pat_str = format!(r"\s*{}\s*", regex::escape(&sentinel_owned));
+            let sentinel_regex = regex::Regex::new(&sentinel_pat_str)
+                .context("Failed to compile sentinel regex")?;
 
             let mut accumulated_output = Vec::new();
             let mut accumulated_text = String::new();
@@ -502,9 +512,7 @@ impl SessionManager {
                 session.session.set_expect_timeout(Some(this_timeout));
 
                 // Try reading with the sentinel pattern
-                let sentinel_pattern = expectrl::Regex(
-                    format!(r"\s*{}\s*", regex::escape(&sentinel_owned))
-                );
+                let sentinel_pattern = expectrl::Regex(sentinel_pat_str.clone());
 
                 match session.session.expect(sentinel_pattern) {
                     Ok(captures) => {
@@ -544,7 +552,7 @@ impl SessionManager {
                             // No new output — check if stale
                             if !accumulated_text.is_empty() || !accumulated_output.is_empty() {
                                 // Check for interaction patterns in accumulated text
-                                for (pattern, kind, desc) in &interaction_patterns {
+                                for (pattern, kind, desc) in interaction_patterns.iter() {
                                     if pattern.is_match(&accumulated_text) {
                                         session.state = SessionState::WaitingInteraction;
                                         return Ok(PromptEvent::InteractionRequired {
@@ -586,9 +594,9 @@ impl SessionManager {
                             }));
                         }
 
-                        // Check for interaction patterns in the new output
-                        for (pattern, kind, desc) in &interaction_patterns {
-                            if pattern.is_match(&new_text) || pattern.is_match(&accumulated_text) {
+                        // Check for interaction patterns in accumulated text
+                        for (pattern, kind, desc) in interaction_patterns.iter() {
+                            if pattern.is_match(&accumulated_text) {
                                 session.state = SessionState::WaitingInteraction;
                                 return Ok(PromptEvent::InteractionRequired {
                                     kind: kind.clone(),

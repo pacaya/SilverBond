@@ -66,13 +66,15 @@
   /* ── Session-level open sections (persists across node switches) ── */
   let manualSections = $state(new Set<string>());
 
-  function autoShowSections(node: WorkflowNode): Set<string> {
+  let autoSections = $derived.by(() => {
+    if (!selectedNode) return new Set<string>();
     const auto = new Set<string>();
     for (const id of SECTION_IDS) {
-      if (sectionHasValues(node, id)) auto.add(id);
+      if (sectionHasValues(selectedNode, id)) auto.add(id);
     }
+    if (selectedNode.responseFormat === "json") auto.add("output-schema");
     return auto;
-  }
+  });
 
   function toggleSection(sectionId: string) {
     const next = new Set(manualSections);
@@ -91,11 +93,8 @@
   }
 
   let openSections = $derived.by(() => {
-    if (!selectedNode) return new Set<string>();
-    const combined = new Set(autoShowSections(selectedNode));
+    const combined = new Set(autoSections);
     for (const s of manualSections) combined.add(s);
-    // Auto-show output schema when response format is json
-    if (selectedNode.responseFormat === "json") combined.add("output-schema");
     return combined;
   });
 

@@ -32,18 +32,12 @@
     }
   });
 
-  /* auto-scroll approval card into view when it appears */
+  /* auto-scroll approval/interaction card into view when it appears */
   $effect(() => {
-    if (store.approval && approvalCard) {
-      approvalCard.scrollIntoView({ behavior: "smooth" });
-    }
-  });
-
-  /* auto-scroll interaction card into view when it appears */
-  $effect(() => {
-    if (store.interaction && interactionCard) {
-      interactionCard.scrollIntoView({ behavior: "smooth" });
-    }
+    const el = (store.approval && approvalCard) ? approvalCard
+             : (store.interaction && interactionCard) ? interactionCard
+             : null;
+    el?.scrollIntoView({ behavior: "smooth" });
   });
 </script>
 

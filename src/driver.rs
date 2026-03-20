@@ -28,6 +28,18 @@ pub enum InteractionKind {
     DestructiveWarning,
 }
 
+impl InteractionKind {
+    /// Event type string for serialization to the frontend.
+    pub fn event_type(&self) -> &'static str {
+        match self {
+            Self::AutoRespond { .. } => "auto_respond",
+            Self::PermissionRequest => "permission",
+            Self::SubagentActive => "subagent_active",
+            Self::DestructiveWarning => "destructive_warning",
+        }
+    }
+}
+
 /// A regex pattern that matches interactive prompts in PTY output.
 #[derive(Debug, Clone)]
 pub struct InteractionPattern {
@@ -37,15 +49,15 @@ pub struct InteractionPattern {
 }
 
 /// Shared destructive patterns common to all agent backends.
-pub fn shared_destructive_patterns() -> Vec<String> {
-    vec![
-        r"rm\s+-rf".to_string(),
-        r"(?i)drop\s+(table|database)".to_string(),
-        r"(?i)force[- ]push".to_string(),
-        r"(?i)git\s+push\s+--force".to_string(),
-        r"(?i)delete\s+\d+\s+files".to_string(),
-        r"(?i)chmod\s+777".to_string(),
-        r"(?i)truncate\s+".to_string(),
+pub fn shared_destructive_patterns() -> &'static [&'static str] {
+    &[
+        r"rm\s+-rf",
+        r"(?i)drop\s+(table|database)",
+        r"(?i)force[- ]push",
+        r"(?i)git\s+push\s+--force",
+        r"(?i)delete\s+\d+\s+files",
+        r"(?i)chmod\s+777",
+        r"(?i)truncate\s+",
     ]
 }
 
@@ -248,7 +260,7 @@ pub trait AgentDriver: Send + Sync {
 
     /// Return regex patterns for destructive commands that should always
     /// escalate to human approval, even when auto-approve is on.
-    fn destructive_blocklist(&self) -> Vec<String> { shared_destructive_patterns() }
+    fn destructive_blocklist(&self) -> &[&str] { shared_destructive_patterns() }
 }
 
 // ===========================================================================

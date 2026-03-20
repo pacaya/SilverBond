@@ -21,70 +21,56 @@ async function apiFetch<T>(input: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
+function postJson<T>(url: string, body?: unknown): Promise<T> {
+  return apiFetch<T>(url, {
+    method: "POST",
+    ...(body !== undefined && {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  });
+}
+
 export const api = {
   capabilities: () => apiFetch<RuntimeCapabilities>("/api/capabilities"),
   workflows: () => apiFetch<WorkflowItem[]>("/api/workflows"),
   workflow: (name: string) =>
     apiFetch<WorkflowItem>(`/api/workflows/${encodeURIComponent(name)}`),
   saveWorkflow: (name: string, workflow: WorkflowDocument) =>
-    apiFetch<{ success: boolean; name: string }>("/api/workflows", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, workflow }),
-    }),
+    postJson<{ success: boolean; name: string }>("/api/workflows", { name, workflow }),
   deleteWorkflow: (name: string) =>
     apiFetch<{ success: boolean }>(`/api/workflows/${encodeURIComponent(name)}`, {
       method: "DELETE",
     }),
   templates: () => apiFetch<TemplateItem[]>("/api/templates"),
   validateWorkflow: (workflow: WorkflowDocument) =>
-    apiFetch<ValidationResponse>("/api/validate-workflow", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workflow }),
-    }),
+    postJson<ValidationResponse>("/api/validate-workflow", { workflow }),
   testNode: (node: WorkflowDocument["nodes"][number], cwd: string, mockContext: NodeTestContext) =>
-    apiFetch<NodeTestPreview>("/api/test-node", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ node, cwd, mockContext }),
-    }),
+    postJson<NodeTestPreview>("/api/test-node", { node, cwd, mockContext }),
   createRun: (workflow: WorkflowDocument, variableOverrides: Record<string, string>) =>
-    apiFetch<{ success: boolean; runId: string }>("/api/runs", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workflow, variableOverrides, startNodeId: workflow.entryNodeId || null }),
+    postJson<{ success: boolean; runId: string }>("/api/runs", {
+      workflow, variableOverrides, startNodeId: workflow.entryNodeId || null,
     }),
   approveRun: (runId: string, approved: boolean, userInput: string) =>
-    apiFetch<{ success: boolean }>(`/api/runs/${encodeURIComponent(runId)}/approve`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ approved, userInput }),
-    }),
+    postJson<{ success: boolean }>(
+      `/api/runs/${encodeURIComponent(runId)}/approve`, { approved, userInput },
+    ),
   respondToInteraction: (runId: string, response: string) =>
-    apiFetch<{ success: boolean }>(`/api/runs/${encodeURIComponent(runId)}/respond-interaction`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ response }),
-    }),
+    postJson<{ success: boolean }>(
+      `/api/runs/${encodeURIComponent(runId)}/respond-interaction`, { response },
+    ),
   abortRun: (runId: string) =>
-    apiFetch<{ success: boolean }>(`/api/runs/${encodeURIComponent(runId)}/abort`, {
-      method: "POST",
-    }),
+    postJson<{ success: boolean }>(`/api/runs/${encodeURIComponent(runId)}/abort`),
   resumeRun: (runId: string) =>
-    apiFetch<{ success: boolean; runId: string }>(
+    postJson<{ success: boolean; runId: string }>(
       `/api/runs/${encodeURIComponent(runId)}/resume`,
-      { method: "POST" },
     ),
   restartFromNode: (runId: string, nodeId: string) =>
-    apiFetch<{ success: boolean; runId: string }>(
+    postJson<{ success: boolean; runId: string }>(
       `/api/runs/${encodeURIComponent(runId)}/restart-from/${encodeURIComponent(nodeId)}`,
-      { method: "POST" },
     ),
   dismissRun: (runId: string) =>
-    apiFetch<{ success: boolean }>(`/api/runs/${encodeURIComponent(runId)}/dismiss`, {
-      method: "POST",
-    }),
+    postJson<{ success: boolean }>(`/api/runs/${encodeURIComponent(runId)}/dismiss`),
   interruptedRuns: () => apiFetch<InterruptedRun[]>("/api/interrupted-runs"),
   logs: () => apiFetch<LogListItem[]>("/api/logs"),
   log: (id: string) => apiFetch<ExecutionLogDetail>(`/api/logs/${encodeURIComponent(id)}`),

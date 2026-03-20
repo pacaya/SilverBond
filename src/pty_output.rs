@@ -2,6 +2,8 @@
 //!
 //! Provides ANSI stripping, cost/context parsing for agent-driven PTY sessions.
 
+use std::sync::LazyLock;
+
 use regex::Regex;
 
 /// Strip ANSI escape codes from raw bytes and return a UTF-8 string.
@@ -70,12 +72,12 @@ impl ParsedResponse {
 /// Cache write tokens: 512
 /// ```
 pub fn parse_claude_cost(output: &str) -> Option<CostInfo> {
-    let cost_re = Regex::new(r"(?i)total\s+cost:\s*\$?([\d.]+)").ok()?;
-    let input_re = Regex::new(r"(?i)input\s+tokens:\s*([\d,]+)").ok()?;
-    let output_re = Regex::new(r"(?i)output\s+tokens:\s*([\d,]+)").ok()?;
-    let thinking_re = Regex::new(r"(?i)thinking\s+tokens:\s*([\d,]+)").ok()?;
-    let cache_read_re = Regex::new(r"(?i)cache\s+read\s+tokens:\s*([\d,]+)").ok()?;
-    let cache_write_re = Regex::new(r"(?i)cache\s+write\s+tokens:\s*([\d,]+)").ok()?;
+    static COST_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)total\s+cost:\s*\$?([\d.]+)").unwrap());
+    static INPUT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)input\s+tokens:\s*([\d,]+)").unwrap());
+    static OUTPUT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)output\s+tokens:\s*([\d,]+)").unwrap());
+    static THINKING_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)thinking\s+tokens:\s*([\d,]+)").unwrap());
+    static CACHE_READ_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)cache\s+read\s+tokens:\s*([\d,]+)").unwrap());
+    static CACHE_WRITE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)cache\s+write\s+tokens:\s*([\d,]+)").unwrap());
 
     let parse_u64 = |caps: regex::Captures| -> Option<u64> {
         caps.get(1)
@@ -84,14 +86,14 @@ pub fn parse_claude_cost(output: &str) -> Option<CostInfo> {
     };
 
     let info = CostInfo {
-        total_cost_usd: cost_re
+        total_cost_usd: COST_RE
             .captures(output)
             .and_then(|c| c.get(1)?.as_str().parse().ok()),
-        input_tokens: input_re.captures(output).and_then(parse_u64),
-        output_tokens: output_re.captures(output).and_then(parse_u64),
-        thinking_tokens: thinking_re.captures(output).and_then(parse_u64),
-        cache_read_tokens: cache_read_re.captures(output).and_then(parse_u64),
-        cache_write_tokens: cache_write_re.captures(output).and_then(parse_u64),
+        input_tokens: INPUT_RE.captures(output).and_then(parse_u64),
+        output_tokens: OUTPUT_RE.captures(output).and_then(parse_u64),
+        thinking_tokens: THINKING_RE.captures(output).and_then(parse_u64),
+        cache_read_tokens: CACHE_READ_RE.captures(output).and_then(parse_u64),
+        cache_write_tokens: CACHE_WRITE_RE.captures(output).and_then(parse_u64),
     };
 
     // Return None only if every field is absent.
@@ -115,12 +117,11 @@ pub fn parse_claude_cost(output: &str) -> Option<CostInfo> {
 /// Context: 45000/200000 tokens (22.5%)
 /// ```
 pub fn parse_claude_context(output: &str) -> Option<ContextInfo> {
-    let re = Regex::new(
-        r"(?i)context:\s*([\d,]+)\s*/\s*([\d,]+)\s*tokens\s*\(\s*([\d.]+)%\s*\)",
-    )
-    .ok()?;
+    static CONTEXT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)context:\s*([\d,]+)\s*/\s*([\d,]+)\s*tokens\s*\(\s*([\d.]+)%\s*\)").unwrap()
+    });
 
-    let caps = re.captures(output)?;
+    let caps = CONTEXT_RE.captures(output)?;
     let parse_u64 = |s: &str| -> Option<u64> { s.replace(',', "").parse().ok() };
 
     Some(ContextInfo {

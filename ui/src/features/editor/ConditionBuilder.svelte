@@ -13,6 +13,8 @@
     onchange: (val: StructuredCondition | SkipCondition | null) => void;
   } = $props();
 
+  import { untrack } from "svelte";
+
   let useRawJson = $state(false);
   let rawDraft = $state("");
   let rawError = $state("");
@@ -31,8 +33,14 @@
   const skipTypes = ["contains", "not_contains", "equals", "not_equals", "empty", "not_empty"];
   const skipSources = ["previous_output", "context", "variable"];
 
-  // Sync from prop value to local state
+  // Track last-committed JSON to avoid re-sync loops from our own onchange calls
+  let lastCommitted = $state(JSON.stringify(value));
+
+  // Sync from prop to local state only when the external value actually changed
   $effect(() => {
+    const incoming = JSON.stringify(value);
+    if (incoming === untrack(() => lastCommitted)) return;
+    lastCommitted = incoming;
     if (mode === "structured" && value) {
       const v = value as StructuredCondition;
       sField = v.field ?? "";
@@ -44,7 +52,7 @@
       skType = v.type ?? "contains";
       skValue = v.value ?? "";
     }
-    if (!useRawJson) {
+    if (!untrack(() => useRawJson)) {
       rawDraft = value ? JSON.stringify(value, null, 2) : "";
     }
   });
@@ -56,16 +64,19 @@
     } else {
       next = (!skValue && skType !== "empty" && skType !== "not_empty") ? null : { source: skSource, type: skType, value: skValue };
     }
-    if (JSON.stringify(next) !== JSON.stringify(value)) {
+    const nextJson = JSON.stringify(next);
+    if (nextJson !== JSON.stringify(value)) {
+      lastCommitted = nextJson;
       onchange(next);
     }
   }
 
   function commitRaw() {
     const d = rawDraft.trim();
-    if (!d) { onchange(null); rawError = ""; return; }
+    if (!d) { lastCommitted = "null"; onchange(null); rawError = ""; return; }
     try {
       const parsed = JSON.parse(d);
+      lastCommitted = JSON.stringify(parsed);
       onchange(parsed);
       rawError = "";
     } catch (err) {

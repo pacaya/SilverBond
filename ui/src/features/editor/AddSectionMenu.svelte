@@ -1,13 +1,6 @@
 <script lang="ts">
   import type { AgentCapabilities, WorkflowNode } from "@/lib/types/workflow";
-  import { sectionHasValues } from "@/lib/utils/sectionUtils";
-  import type { SectionId } from "@/lib/utils/sectionUtils";
-
-  interface SectionDef {
-    id: SectionId;
-    label: string;
-    tooltip: string;
-  }
+  import { sectionHasValues, SECTION_DEFS, isSectionAvailable } from "@/lib/utils/sectionUtils";
 
   let {
     node,
@@ -21,24 +14,8 @@
     onToggle: (sectionId: string) => void;
   } = $props();
 
-  const allSections: SectionDef[] = [
-    { id: "agent-tuning", label: "Agent tuning", tooltip: "Customize how the agent behaves for this node" },
-    { id: "guards-retry", label: "Guards & retry", tooltip: "Add failure recovery and time limits" },
-    { id: "loop-control", label: "Loop control", tooltip: "Make this node repeat until a condition is met" },
-    { id: "output-schema", label: "Output schema", tooltip: "Define the structure of the response" },
-    { id: "tool-permissions", label: "Tool permissions", tooltip: "Control which tools the agent can use" },
-    { id: "skip-condition", label: "Skip condition", tooltip: "Skip this node based on previous output" },
-  ];
-
-  function isAvailable(sectionId: string): boolean {
-    if (!agentCaps) return sectionId !== "agent-tuning" && sectionId !== "tool-permissions";
-    if (sectionId === "tool-permissions") return !!agentCaps.toolAllowlist;
-    return true;
-  }
-
-  /** Sections not currently open and not auto-shown */
   let availableSections = $derived(
-    allSections.filter((s) => isAvailable(s.id) && !openSections.has(s.id))
+    SECTION_DEFS.filter((s) => isSectionAvailable(s.id, agentCaps) && !openSections.has(s.id))
   );
 </script>
 

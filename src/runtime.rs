@@ -522,18 +522,12 @@ struct ApprovalDecision {
     user_input: String,
 }
 
-/// Response to an interactive agent prompt (permission, question, destructive warning).
-#[derive(Debug)]
-struct InteractionResponse {
-    response: String,
-}
-
 #[derive(Debug, Clone)]
 struct ActiveRun {
     sender: broadcast::Sender<RuntimeEvent>,
     abort_flag: Arc<AtomicBool>,
     approval_sender: Arc<Mutex<Option<oneshot::Sender<ApprovalDecision>>>>,
-    interaction_sender: Arc<Mutex<Option<oneshot::Sender<InteractionResponse>>>>,
+    interaction_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -632,7 +626,7 @@ impl RunRegistry {
     async fn set_pending_interaction(
         &self,
         run_id: &str,
-        sender: oneshot::Sender<InteractionResponse>,
+        sender: oneshot::Sender<String>,
     ) -> anyhow::Result<()> {
         let active = self
             .inner
@@ -662,7 +656,7 @@ impl RunRegistry {
             anyhow::bail!("no active interaction for this run");
         };
         sender
-            .send(InteractionResponse { response })
+            .send(response)
             .map_err(|_| anyhow::anyhow!("interaction receiver dropped"))?;
         Ok(())
     }
@@ -3531,7 +3525,7 @@ async fn run_pty_command_with_context(
     }
 
     // --- Build interaction pattern regexes for the sentinel loop ---
-    let compiled_patterns: Vec<(regex::Regex, driver::InteractionKind, String)> =
+    let compiled_patterns: Arc<[(regex::Regex, driver::InteractionKind, String)]> =
         interaction_patterns
             .iter()
             .filter_map(|p| {
@@ -3599,7 +3593,7 @@ async fn run_pty_command_with_context(
                 &session_id,
                 &wrapped_prompt,
                 &sentinel,
-                compiled_patterns.clone(),
+                Arc::clone(&compiled_patterns),
                 intermediate_timeout,
                 remaining,
             )
@@ -3626,83 +3620,42 @@ async fn run_pty_command_with_context(
 
                     // Permission request
                     driver::InteractionKind::PermissionRequest => {
-                        // Check if output contains destructive patterns
                         let is_destructive = destructive_regexes
                             .iter()
                             .any(|r| r.is_match(&output_so_far));
 
                         if is_destructive {
-                            // Tier 4: Always escalate destructive patterns
-                            if let Some(ictx) = interaction_ctx {
-                                let response = escalate_to_human(
-                                    ictx,
-                                    &session_id,
-                                    "destructive_warning",
-                                    &description,
-                                    &output_so_far,
-                                )
-                                .await?;
-                                session_manager
-                                    .respond_to_interaction(&session_id, &response)
-                                    .await?;
-                                continue;
-                            }
-                            // No interaction context — auto-reject destructive
-                            session_manager
-                                .respond_to_interaction(&session_id, "n")
-                                .await?;
+                            let reply = escalate_or_fallback(
+                                interaction_ctx, &session_id,
+                                driver::InteractionKind::DestructiveWarning.event_type(),
+                                &description, &output_so_far, "n",
+                            ).await?;
+                            session_manager.respond_to_interaction(&session_id, &reply).await?;
                             continue;
                         }
 
                         if cfg.auto_approve {
-                            // Tier 2: Auto-approve non-destructive
-                            session_manager
-                                .respond_to_interaction(&session_id, "y")
-                                .await?;
+                            session_manager.respond_to_interaction(&session_id, "y").await?;
                             continue;
                         }
 
-                        // Tier 4: Escalate to human
-                        if let Some(ictx) = interaction_ctx {
-                            let response = escalate_to_human(
-                                ictx,
-                                &session_id,
-                                "permission",
-                                &description,
-                                &output_so_far,
-                            )
-                            .await?;
-                            session_manager
-                                .respond_to_interaction(&session_id, &response)
-                                .await?;
-                            continue;
-                        }
-                        // No interaction context — auto-approve as fallback
-                        session_manager
-                            .respond_to_interaction(&session_id, "y")
-                            .await?;
+                        let reply = escalate_or_fallback(
+                            interaction_ctx, &session_id,
+                            driver::InteractionKind::PermissionRequest.event_type(),
+                            &description, &output_so_far, "y",
+                        ).await?;
+                        session_manager.respond_to_interaction(&session_id, &reply).await?;
                         continue;
                     }
 
                     // Destructive warning (from pattern matching directly)
                     driver::InteractionKind::DestructiveWarning => {
-                        if let Some(ictx) = interaction_ctx {
-                            let response = escalate_to_human(
-                                ictx,
-                                &session_id,
-                                "destructive_warning",
-                                &description,
-                                &output_so_far,
-                            )
-                            .await?;
-                            session_manager
-                                .respond_to_interaction(&session_id, &response)
-                                .await?;
-                            continue;
-                        }
-                        session_manager
-                            .respond_to_interaction(&session_id, "n")
-                            .await?;
+                        let reply = escalate_or_fallback(
+                            interaction_ctx, &session_id,
+                            kind.event_type(),
+                            &description, &output_so_far, "n",
+                        ).await?;
+                        session_manager.respond_to_interaction(&session_id, &reply).await?;
                         continue;
                     }
                 }
@@ -3741,23 +3694,17 @@ async fn run_pty_command_with_context(
                 }
 
                 // Tier 4: Escalate to human after repeated stale detections
-                if let Some(ictx) = interaction_ctx {
-                    let response = escalate_to_human(
-                        ictx,
-                        &session_id,
-                        "question",
+                if interaction_ctx.is_some() {
+                    let reply = escalate_or_fallback(
+                        interaction_ctx, &session_id, "question",
                         "Agent output appears stale — it may be waiting for input",
-                        &output_so_far,
-                    )
-                    .await?;
-                    session_manager
-                        .respond_to_interaction(&session_id, &response)
-                        .await?;
+                        &output_so_far, "",
+                    ).await?;
+                    if !reply.is_empty() {
+                        session_manager.respond_to_interaction(&session_id, &reply).await?;
+                    }
                     stale_count = 0;
-                    continue;
                 }
-
-                // No interaction context — continue waiting
                 continue;
             }
 
@@ -3841,6 +3788,22 @@ async fn run_pty_command_with_context(
     })
 }
 
+/// Escalate to human if interaction context is available, otherwise return `fallback`.
+async fn escalate_or_fallback(
+    interaction_ctx: Option<&InteractionContext>,
+    session_id: &str,
+    interaction_type: &str,
+    description: &str,
+    output_so_far: &str,
+    fallback: &str,
+) -> anyhow::Result<String> {
+    if let Some(ictx) = interaction_ctx {
+        escalate_to_human(ictx, session_id, interaction_type, description, output_so_far).await
+    } else {
+        Ok(fallback.to_string())
+    }
+}
+
 /// Escalate an interaction to the human via UI events and wait for their response.
 async fn escalate_to_human(
     ictx: &InteractionContext,
@@ -3868,7 +3831,7 @@ async fn escalate_to_human(
         .set_pending_interaction(&ictx.run_id, sender)
         .await?;
 
-    let interaction_response = receiver
+    let response = receiver
         .await
         .map_err(|_| anyhow::anyhow!("Interaction channel closed"))?;
 
@@ -3879,11 +3842,11 @@ async fn escalate_to_human(
         RuntimeEvent::new("agent_interaction_resolved")
             .with("sessionId", session_id)
             .with("description", description)
-            .with("response", &interaction_response.response),
+            .with("response", &response),
     )
     .await?;
 
-    Ok(interaction_response.response)
+    Ok(response)
 }
 
 async fn run_orchestrator_refinement(
