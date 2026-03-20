@@ -1110,3 +1110,417 @@ button {
   color: var(--blue);
   letter-spacing: 0.02em;
 }
+
+/* ── Node Header (compact) ───────────────────────────────────────── */
+
+.nodeHeader {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 0 14px;
+}
+
+.nodeHeader__typeBadge {
+  display: inline-flex;
+  align-items: center;
+  font-family: "IBM Plex Mono", monospace;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--badge-color) 15%, transparent);
+  border: 1px solid color-mix(in srgb, var(--badge-color) 35%, transparent);
+  color: var(--badge-color);
+  flex-shrink: 0;
+}
+
+.nodeHeader__name {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-bright);
+  font-size: 1.1rem;
+  font-weight: 600;
+  padding: 4px 8px;
+  border-radius: 8px;
+  transition: 120ms ease;
+}
+
+.nodeHeader__name:hover,
+.nodeHeader__name:focus {
+  border-color: var(--border);
+  background: rgba(15, 23, 42, 0.44);
+}
+
+.nodeHeader__actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.nodeHeader__menuWrap {
+  position: relative;
+}
+
+.nodeHeader__menuBtn,
+.nodeHeader__deleteBtn {
+  background: none;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  font-size: 1.2rem;
+  padding: 4px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  transition: 120ms ease;
+  line-height: 1;
+}
+
+.nodeHeader__menuBtn:hover,
+.nodeHeader__deleteBtn:hover {
+  border-color: var(--border);
+  color: var(--text-bright);
+}
+
+.nodeHeader__deleteBtn:hover {
+  color: var(--red);
+  border-color: rgba(248, 113, 113, 0.3);
+}
+
+.nodeHeader__menuBackdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 49;
+}
+
+.nodeHeader__menu {
+  position: absolute;
+  right: 0;
+  top: 100%;
+  z-index: 50;
+  min-width: 180px;
+  background: var(--surface-strong);
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  padding: 6px 0;
+  overflow: hidden;
+}
+
+.nodeHeader__menuItem {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: var(--text-soft);
+  padding: 10px 16px;
+  font-size: 0.88rem;
+  cursor: pointer;
+  transition: 100ms ease;
+}
+
+.nodeHeader__menuItem:hover {
+  background: rgba(96, 165, 250, 0.1);
+  color: var(--text-bright);
+}
+
+/* ── Inspector with footer layout ────────────────────────────────── */
+
+.inspector--withFooter {
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 0;
+}
+
+.inspector__body {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+  padding-bottom: 12px;
+}
+
+/* ── Removable section header ────────────────────────────────────── */
+
+.inspectorSection--removable {
+  position: relative;
+}
+
+.inspectorSection__titleRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.inspectorSection__removeBtn {
+  background: none;
+  border: 0;
+  color: var(--text-dim);
+  font-size: 1.2rem;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease;
+}
+
+.inspectorSection--removable:hover .inspectorSection__removeBtn {
+  opacity: 1;
+}
+
+.inspectorSection__removeBtn:hover {
+  color: var(--red);
+}
+
+/* ── Add Section Menu ────────────────────────────────────────────── */
+
+.addSectionMenu {
+  padding: 14px 0 18px;
+  border-top: 1px solid var(--border);
+}
+
+.addSectionMenu__title {
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  font-family: "IBM Plex Mono", monospace;
+  margin-bottom: 10px;
+}
+
+.addSectionMenu__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.addSectionMenu__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(15, 23, 42, 0.52);
+  border: 1px dashed var(--border);
+  color: var(--text-soft);
+  padding: 8px 14px;
+  border-radius: 999px;
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: 160ms ease;
+}
+
+.addSectionMenu__item:hover {
+  border-color: var(--border-strong);
+  border-style: solid;
+  color: var(--text-bright);
+  background: rgba(96, 165, 250, 0.06);
+}
+
+.addSectionMenu__label {
+  white-space: nowrap;
+}
+
+.addSectionMenu__dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--blue);
+  flex-shrink: 0;
+}
+
+/* ── Sticky Test Footer ──────────────────────────────────────────── */
+
+.testFooter {
+  border-top: 1px solid var(--border);
+  background: rgba(6, 13, 25, 0.92);
+  flex-shrink: 0;
+}
+
+.testFooter__bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 12px 14px;
+  background: none;
+  border: 0;
+  color: var(--text-soft);
+  cursor: pointer;
+  font-size: 0.88rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  transition: 120ms ease;
+}
+
+.testFooter__bar:hover {
+  color: var(--text-bright);
+}
+
+.testFooter__icon {
+  font-size: 0.7rem;
+  color: var(--text-dim);
+}
+
+.testFooter__spinner {
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.testFooter__body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 14px 14px;
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+/* ── Condition Builder ───────────────────────────────────────────── */
+
+.conditionBuilder {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.conditionBuilder__row {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: 8px;
+}
+
+.conditionBuilder__field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.conditionBuilder__field small {
+  text-transform: uppercase;
+  font-size: 0.65rem;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  font-family: "IBM Plex Mono", monospace;
+}
+
+.conditionBuilder__field--narrow {
+  max-width: 100px;
+}
+
+.conditionBuilder__field input,
+.conditionBuilder__field select {
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.66);
+  color: var(--text-bright);
+  padding: 8px 10px;
+  font-size: 0.88rem;
+}
+
+.conditionBuilder__raw {
+  width: 100%;
+  min-height: 72px;
+  resize: vertical;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.66);
+  color: var(--text-bright);
+  padding: 10px 12px;
+  font-family: "SF Mono", "Fira Code", monospace;
+  font-size: 0.82rem;
+}
+
+.linkBtn {
+  align-self: flex-start;
+  background: none;
+  border: 0;
+  color: var(--text-dim);
+  font-size: 0.78rem;
+  cursor: pointer;
+  padding: 2px 0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.linkBtn:hover {
+  color: var(--blue);
+}
+
+/* ── Schema Presets ──────────────────────────────────────────────── */
+
+.schemaPresets {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.schemaPresets__grid {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.schemaPresets__preset {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  text-align: left;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.44);
+  cursor: pointer;
+  transition: 160ms ease;
+}
+
+.schemaPresets__preset:hover {
+  border-color: var(--border-strong);
+  background: rgba(96, 165, 250, 0.06);
+}
+
+.schemaPresets__preset--active {
+  border-color: var(--blue);
+  background: rgba(96, 165, 250, 0.08);
+}
+
+.schemaPresets__presetLabel {
+  color: var(--text-bright);
+  font-size: 0.88rem;
+  font-weight: 500;
+}
+
+.schemaPresets__presetDesc {
+  color: var(--text-dim);
+  font-size: 0.78rem;
+}
+
+.schemaPresets__editor {
+  width: 100%;
+  min-height: 96px;
+  resize: vertical;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: rgba(15, 23, 42, 0.66);
+  color: var(--text-bright);
+  padding: 10px 12px;
+  font-family: "SF Mono", "Fira Code", monospace;
+  font-size: 0.82rem;
+}
+
+.schemaPresets__actions {
+  display: flex;
+  gap: 12px;
+}

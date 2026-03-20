@@ -17,6 +17,11 @@
   } from "@/lib/types/workflow";
   import PromptTextarea from "@/lib/components/PromptTextarea.svelte";
   import { buildSuggestions } from "@/lib/utils/templateSuggestions";
+  import { sectionHasValues, SECTION_IDS } from "@/lib/utils/sectionUtils";
+  import NodeHeader from "./NodeHeader.svelte";
+  import AddSectionMenu from "./AddSectionMenu.svelte";
+  import ConditionBuilder from "./ConditionBuilder.svelte";
+  import SchemaPresets from "./SchemaPresets.svelte";
 
   let {
     workflow,
@@ -31,7 +36,7 @@
   let previousOutput = $state("");
   let testResult = $state("");
   let testLoading = $state(false);
-  let showAdvancedTools = $state(false);
+  let testExpanded = $state(false);
   let showAgentDefaultsFor = $state<string | null>(null);
 
   /* JSON editor local state */
@@ -58,7 +63,43 @@
     catch (err) { jsonErrors[key] = err instanceof Error ? err.message : "Invalid JSON"; }
   }
 
-  /* Reset json drafts when selection changes */
+  /* ── Session-level open sections (persists across node switches) ── */
+  let manualSections = $state(new Set<string>());
+
+  function autoShowSections(node: WorkflowNode): Set<string> {
+    const auto = new Set<string>();
+    for (const id of SECTION_IDS) {
+      if (sectionHasValues(node, id)) auto.add(id);
+    }
+    return auto;
+  }
+
+  function toggleSection(sectionId: string) {
+    const next = new Set(manualSections);
+    if (next.has(sectionId)) {
+      next.delete(sectionId);
+    } else {
+      next.add(sectionId);
+    }
+    manualSections = next;
+  }
+
+  function removeSection(sectionId: string) {
+    const next = new Set(manualSections);
+    next.delete(sectionId);
+    manualSections = next;
+  }
+
+  let openSections = $derived.by(() => {
+    if (!selectedNode) return new Set<string>();
+    const combined = new Set(autoShowSections(selectedNode));
+    for (const s of manualSections) combined.add(s);
+    // Auto-show output schema when response format is json
+    if (selectedNode.responseFormat === "json") combined.add("output-schema");
+    return combined;
+  });
+
+  /* Reset state when selection changes */
   $effect(() => {
     const _sel = store.selection;
     jsonDrafts = {};
@@ -66,7 +107,7 @@
     previousOutput = "";
     testResult = "";
     testLoading = false;
-    showAdvancedTools = false;
+    testExpanded = false;
     showAgentDefaultsFor = null;
   });
 
@@ -275,20 +316,9 @@
 
 {#if selectedNode}
   {@const nodeIssues = issues.filter((i) => i.nodeId === selectedNode.id)}
-  <div class="inspector">
-    <div class="inspector__header">
-      <div>
-        <small>Node</small>
-        <h3>{selectedNode.name || selectedNode.id}</h3>
-      </div>
-      <button class="button button--danger" title="Delete node (⌫)" onclick={() => {
-        if (confirm(`Delete node "${selectedNode!.name || selectedNode!.id}"? Connected edges will also be removed.`)) {
-          store.removeNode(selectedNode!.id);
-        }
-      }}>
-        Delete <kbd class="shortcutHint">⌫</kbd>
-      </button>
-    </div>
+  <div class="inspector inspector--withFooter">
+    <!-- Compact Header -->
+    <NodeHeader node={selectedNode} {workflow} />
 
     {#if nodeIssues.length > 0}
       <div class="issueList">
@@ -298,387 +328,404 @@
       </div>
     {/if}
 
-    <!-- Identity -->
-    <section class="inspectorSection">
-      <div class="inspectorSection__title">Identity</div>
-      <label class="field">
-        <span>Name</span>
-        <input
-          value={selectedNode.name}
-          oninput={(e) => store.updateWorkflow((wf) => {
-            const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-            if (n) n.name = (e.target as HTMLInputElement).value;
-          })}
-        />
-      </label>
-      <label class="field">
-        <span>Type</span>
-        <input value={selectedNode.type} disabled />
-      </label>
-      <label class="field toggle-field">
-        <span>Entry node</span>
-        <input
-          type="checkbox"
-          class="toggle"
-          checked={workflow.entryNodeId === selectedNode.id}
-          onchange={(e) => store.updateWorkflow((wf) => {
-            wf.entryNodeId = (e.target as HTMLInputElement).checked ? selectedNode!.id : "";
-          })}
-        />
-      </label>
-    </section>
-
-    {#if selectedNode.type === "task"}
-      <section class="inspectorSection">
-        <div class="inspectorSection__title">Execution</div>
-        <label class="field">
-          <span>Agent</span>
-          <select
-            value={selectedNode.agent ?? "claude"}
-            onchange={(e) => store.updateWorkflow((wf) => {
-              const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-              if (n) n.agent = (e.target as HTMLSelectElement).value;
-            })}
-          >
-            {#each Object.entries(capabilities?.agents ?? {}) as [agent, info] (agent)}
-              <option value={agent} disabled={!info.available}>{agent}{!info.available ? " (not installed)" : ""}</option>
-            {/each}
-          </select>
-          {#if agentCaps}
-            <div class="capBadges">
-              {#each capBadges.filter((b) => agentCaps![b.key]) as badge (badge.key)}
-                <span class="capBadge">{badge.label}</span>
-              {/each}
-            </div>
-          {/if}
-        </label>
-        <div class="field field--prompt">
-          <span>Prompt</span>
-          <PromptTextarea
-            value={selectedNode.prompt}
-            suggestions={promptSuggestions}
-            oninput={(e) => store.updateWorkflow((wf) => {
-              const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-              if (n) n.prompt = (e.target as HTMLTextAreaElement).value;
-            })}
-          />
-        </div>
-        <label class="field">
-          <span>Response format</span>
-          <select
-            value={selectedNode.responseFormat ?? "text"}
-            onchange={(e) => store.updateWorkflow((wf) => {
-              const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-              if (n) n.responseFormat = (e.target as HTMLSelectElement).value as WorkflowNode["responseFormat"];
-            })}
-          >
-            <option value="text">text</option>
-            <option value="json">json</option>
-          </select>
-        </label>
-        <!-- Output schema (JSON) -->
-        <label class="field">
-          <span>Output schema</span>
-          <textarea
-            value={formatJsonDraft("outputSchema", selectedNode.outputSchema)}
-            placeholder={'{"type":"object","properties":{"field":{"type":"string"}},"required":["field"]}'}
-            oninput={(e) => setJsonDraft("outputSchema", (e.target as HTMLTextAreaElement).value)}
-            onblur={() => commitJson("outputSchema", (val) => store.updateWorkflow((wf) => {
-              const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-              if (n) n.outputSchema = (val as Record<string, unknown> | null) ?? null;
-            }))}
-          ></textarea>
-          {#if getJsonError("outputSchema")}<small class="issue issue--error">{getJsonError("outputSchema")}</small>{/if}
-        </label>
-      </section>
-
-      <!-- Agent configuration (capability-gated) -->
-      {#if agentCaps}
+    <!-- Scrollable content area -->
+    <div class="inspector__body">
+      {#if selectedNode.type === "task"}
+        <!-- PROMPT SECTION (always visible, primary) -->
         <section class="inspectorSection">
-          <div class="inspectorSection__title">Agent configuration</div>
-          {@render agentConfigFields(
-            agentCaps,
-            nodeConfig,
-            (key, value) => updateNodeConfig(key as keyof AgentNodeConfig, value),
-            { model: "workflow default", systemPrompt: "workflow default" },
-          )}
-
-          <!-- Per-node working directory -->
+          <div class="inspectorSection__title">Prompt</div>
           <label class="field">
-            <span>Working directory</span>
-            <input
-              value={selectedNode.cwd ?? ""}
-              placeholder={workflow.cwd || "inherit workflow cwd"}
-              onblur={(e) => store.updateWorkflow((wf) => {
+            <span>Agent</span>
+            <select
+              value={selectedNode.agent ?? "claude"}
+              onchange={(e) => store.updateWorkflow((wf) => {
                 const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-                if (n) n.cwd = (e.target as HTMLInputElement).value || null;
+                if (n) n.agent = (e.target as HTMLSelectElement).value;
+              })}
+            >
+              {#each Object.entries(capabilities?.agents ?? {}) as [agent, info] (agent)}
+                <option value={agent} disabled={!info.available}>{agent}{!info.available ? " (not installed)" : ""}</option>
+              {/each}
+            </select>
+            {#if agentCaps}
+              <div class="capBadges">
+                {#each capBadges.filter((b) => agentCaps![b.key]) as badge (badge.key)}
+                  <span class="capBadge">{badge.label}</span>
+                {/each}
+              </div>
+            {/if}
+          </label>
+          <div class="field field--prompt">
+            <span>Prompt</span>
+            <PromptTextarea
+              value={selectedNode.prompt}
+              suggestions={promptSuggestions}
+              oninput={(e) => store.updateWorkflow((wf) => {
+                const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                if (n) n.prompt = (e.target as HTMLTextAreaElement).value;
               })}
             />
+          </div>
+          <label class="field">
+            <span>Response format</span>
+            <select
+              value={selectedNode.responseFormat ?? "text"}
+              onchange={(e) => store.updateWorkflow((wf) => {
+                const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                if (n) n.responseFormat = (e.target as HTMLSelectElement).value as WorkflowNode["responseFormat"];
+              })}
+            >
+              <option value="text">text</option>
+              <option value="json">json</option>
+            </select>
           </label>
-
-          <!-- Continue session from (session reuse) -->
-          {#if agentCaps?.sessionReuse}
-            {@const currentAgent = selectedNode.agent ?? "claude"}
-            {@const eligibleNodes = workflow.nodes.filter(
-              (n) => n.type === "task" && n.id !== selectedNode!.id && (n.agent ?? "claude") === currentAgent
-            )}
-            {#if eligibleNodes.length > 0}
-              <label class="field">
-                <span>Continue session from</span>
-                <select
-                  value={selectedNode.continueSessionFrom ?? ""}
-                  onchange={(e) => store.updateWorkflow((wf) => {
-                    const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-                    if (n) n.continueSessionFrom = (e.target as HTMLSelectElement).value || null;
-                  })}
-                >
-                  <option value="">None (fresh session)</option>
-                  {#each eligibleNodes as n (n.id)}
-                    <option value={n.id}>{n.name}</option>
-                  {/each}
-                </select>
-              </label>
-            {/if}
-          {/if}
         </section>
 
-        <!-- Advanced tool control (Claude only) -->
-        {#if agentCaps.toolAllowlist}
-          <section class="inspectorSection">
-            <button
-              class="inspectorSection__title inspectorSection__title--collapsible"
-              onclick={() => showAdvancedTools = !showAdvancedTools}
-            >
-              <span class="chevron" class:chevron--open={showAdvancedTools}>&#9654;</span>
-              Advanced tool control
-            </button>
-            {#if showAdvancedTools}
-              <small class="helperText">Overrides access mode for this agent.</small>
-              <label class="field">
-                <span>Allowed tools</span>
-                <textarea
-                  value={(nodeConfig.allowedTools ?? []).join("\n")}
-                  placeholder={'Read\nEdit\nBash(git *)'}
-                  onblur={(e) => {
-                    const tools = (e.target as HTMLTextAreaElement).value.split("\n").map((s) => s.trim()).filter(Boolean);
-                    updateNodeConfig("allowedTools", tools.length ? tools : undefined);
-                  }}
-                  class="field--shortTextarea"
-                ></textarea>
-              </label>
-              <label class="field">
-                <span>Disallowed tools</span>
-                <textarea
-                  value={(nodeConfig.disallowedTools ?? []).join("\n")}
-                  placeholder={'Bash(rm *)'}
-                  onblur={(e) => {
-                    const tools = (e.target as HTMLTextAreaElement).value.split("\n").map((s) => s.trim()).filter(Boolean);
-                    updateNodeConfig("disallowedTools", tools.length ? tools : undefined);
-                  }}
-                  class="field--shortTextarea"
-                ></textarea>
-              </label>
+        <!-- CONTEXT SOURCES (promoted, always visible) -->
+        <section class="inspectorSection">
+          <div class="inspectorSection__title">Context sources</div>
+          {#each (selectedNode.contextSources ?? []) as context, index (`${context.name}-${index}`)}
+            <div class="contextRow">
+              <input
+                value={context.name}
+                placeholder="alias"
+                oninput={(e) => store.updateWorkflow((wf) => {
+                  const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                  if (!n) return;
+                  n.contextSources = n.contextSources ?? [];
+                  n.contextSources[index].name = (e.target as HTMLInputElement).value;
+                })}
+              />
+              <select
+                value={context.nodeId}
+                onchange={(e) => store.updateWorkflow((wf) => {
+                  const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                  if (!n) return;
+                  n.contextSources = n.contextSources ?? [];
+                  n.contextSources[index].nodeId = (e.target as HTMLSelectElement).value;
+                })}
+              >
+                <option value="">Select node</option>
+                {#each workflow.nodes.filter((n) => n.id !== selectedNode!.id) as n (n.id)}
+                  <option value={n.id}>{n.name}</option>
+                {/each}
+              </select>
+              <button
+                class="button button--ghost"
+                onclick={() => store.updateWorkflow((wf) => {
+                  const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                  if (!n) return;
+                  n.contextSources = (n.contextSources ?? []).filter((_, i) => i !== index);
+                })}
+              >
+                Remove
+              </button>
+            </div>
+          {/each}
+          <button
+            class="button button--ghost"
+            onclick={() => store.updateWorkflow((wf) => {
+              const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+              if (!n) return;
+              n.contextSources = [...(n.contextSources ?? []), { name: "", nodeId: "" } satisfies ContextSource];
+            })}
+          >
+            + Add source
+          </button>
+        </section>
+
+        <!-- OPT-IN SECTIONS -->
+
+        <!-- Agent Tuning -->
+        {#if openSections.has("agent-tuning") && agentCaps}
+          <section class="inspectorSection inspectorSection--removable">
+            <div class="inspectorSection__titleRow">
+              <div class="inspectorSection__title">Agent tuning</div>
+              <button class="inspectorSection__removeBtn" title="Hide section" onclick={() => removeSection("agent-tuning")}>&times;</button>
+            </div>
+            {@render agentConfigFields(
+              agentCaps,
+              nodeConfig,
+              (key, value) => updateNodeConfig(key as keyof AgentNodeConfig, value),
+              { model: "workflow default", systemPrompt: "workflow default" },
+            )}
+
+            <!-- Per-node working directory -->
+            <label class="field">
+              <span>Working directory</span>
+              <input
+                value={selectedNode.cwd ?? ""}
+                placeholder={workflow.cwd || "inherit workflow cwd"}
+                onblur={(e) => store.updateWorkflow((wf) => {
+                  const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                  if (n) n.cwd = (e.target as HTMLInputElement).value || null;
+                })}
+              />
+            </label>
+
+            <!-- Continue session from (session reuse) -->
+            {#if agentCaps?.sessionReuse}
+              {@const currentAgent = selectedNode.agent ?? "claude"}
+              {@const eligibleNodes = workflow.nodes.filter(
+                (n) => n.type === "task" && n.id !== selectedNode!.id && (n.agent ?? "claude") === currentAgent
+              )}
+              {#if eligibleNodes.length > 0}
+                <label class="field">
+                  <span>Continue session from</span>
+                  <select
+                    value={selectedNode.continueSessionFrom ?? ""}
+                    onchange={(e) => store.updateWorkflow((wf) => {
+                      const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                      if (n) n.continueSessionFrom = (e.target as HTMLSelectElement).value || null;
+                    })}
+                  >
+                    <option value="">None (fresh session)</option>
+                    {#each eligibleNodes as n (n.id)}
+                      <option value={n.id}>{n.name}</option>
+                    {/each}
+                  </select>
+                </label>
+              {/if}
             {/if}
           </section>
         {/if}
-      {/if}
 
-      <!-- Guards and loop -->
-      <section class="inspectorSection">
-        <div class="inspectorSection__title">Guards and loop</div>
-        <label class="field field--split">
-          <span>Timeout</span>
-          <input
-            type="number"
-            value={selectedNode.timeout ?? ""}
-            oninput={(e) => store.updateWorkflow((wf) => {
-              const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-              if (n) n.timeout = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null;
-            })}
-          />
-        </label>
-        <label class="field field--split">
-          <span>Retry count</span>
-          <input
-            type="number"
-            value={selectedNode.retryCount ?? ""}
-            oninput={(e) => store.updateWorkflow((wf) => {
-              const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-              if (n) n.retryCount = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null;
-            })}
-          />
-        </label>
-        <label class="field field--split">
-          <span>Retry delay</span>
-          <input
-            type="number"
-            value={selectedNode.retryDelay ?? ""}
-            oninput={(e) => store.updateWorkflow((wf) => {
-              const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-              if (n) n.retryDelay = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null;
-            })}
-          />
-        </label>
-        <label class="field field--split">
-          <span>Loop max iterations</span>
-          <input
-            type="number"
-            value={selectedNode.loopMaxIterations ?? ""}
-            oninput={(e) => store.updateWorkflow((wf) => {
-              const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-              if (n) n.loopMaxIterations = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null;
-            })}
-          />
-        </label>
-        <!-- Loop condition (JSON) -->
-        <label class="field">
-          <span>Loop condition</span>
-          <textarea
-            value={formatJsonDraft("loopCondition", selectedNode.loopCondition)}
-            placeholder={'{"field":"status","operator":"==","value":"done"}'}
-            oninput={(e) => { setJsonDraft("loopCondition", (e.target as HTMLTextAreaElement).value); }}
-            onblur={() => commitJson("loopCondition", (val) => store.updateWorkflow((wf) => {
-              const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-              if (n) n.loopCondition = (val as WorkflowNode["loopCondition"]) ?? null;
-            }))}
-          ></textarea>
-          {#if getJsonError("loopCondition")}<small class="issue issue--error">{getJsonError("loopCondition")}</small>{/if}
-        </label>
-        <!-- Skip condition (JSON) -->
-        <label class="field">
-          <span>Skip condition</span>
-          <textarea
-            value={formatJsonDraft("skipCondition", selectedNode.skipCondition)}
-            placeholder={'{"source":"previous_output","type":"contains","value":"skip"}'}
-            oninput={(e) => { setJsonDraft("skipCondition", (e.target as HTMLTextAreaElement).value); }}
-            onblur={() => commitJson("skipCondition", (val) => store.updateWorkflow((wf) => {
-              const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-              if (n) n.skipCondition = (val as WorkflowNode["skipCondition"]) ?? null;
-            }))}
-          ></textarea>
-          {#if getJsonError("skipCondition")}<small class="issue issue--error">{getJsonError("skipCondition")}</small>{/if}
-        </label>
-      </section>
+        <!-- Guards & Retry -->
+        {#if openSections.has("guards-retry")}
+          <section class="inspectorSection inspectorSection--removable">
+            <div class="inspectorSection__titleRow">
+              <div class="inspectorSection__title">Guards & retry</div>
+              <button class="inspectorSection__removeBtn" title="Hide section" onclick={() => removeSection("guards-retry")}>&times;</button>
+            </div>
+            <label class="field field--split">
+              <span>Timeout</span>
+              <input
+                type="number"
+                value={selectedNode.timeout ?? ""}
+                oninput={(e) => store.updateWorkflow((wf) => {
+                  const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                  if (n) n.timeout = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null;
+                })}
+              />
+            </label>
+            <label class="field field--split">
+              <span>Retry count</span>
+              <input
+                type="number"
+                value={selectedNode.retryCount ?? ""}
+                oninput={(e) => store.updateWorkflow((wf) => {
+                  const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                  if (n) n.retryCount = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null;
+                })}
+              />
+            </label>
+            <label class="field field--split">
+              <span>Retry delay</span>
+              <input
+                type="number"
+                value={selectedNode.retryDelay ?? ""}
+                oninput={(e) => store.updateWorkflow((wf) => {
+                  const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                  if (n) n.retryDelay = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null;
+                })}
+              />
+            </label>
+          </section>
+        {/if}
 
-      <!-- Context sources -->
-      <section class="inspectorSection">
-        <div class="inspectorSection__title">Context sources</div>
-        {#each (selectedNode.contextSources ?? []) as context, index (`${context.name}-${index}`)}
-          <div class="contextRow">
-            <input
-              value={context.name}
-              placeholder="alias"
-              oninput={(e) => store.updateWorkflow((wf) => {
+        <!-- Loop Control -->
+        {#if openSections.has("loop-control")}
+          <section class="inspectorSection inspectorSection--removable">
+            <div class="inspectorSection__titleRow">
+              <div class="inspectorSection__title">Loop control</div>
+              <button class="inspectorSection__removeBtn" title="Hide section" onclick={() => removeSection("loop-control")}>&times;</button>
+            </div>
+            <label class="field field--split">
+              <span>Max iterations</span>
+              <input
+                type="number"
+                value={selectedNode.loopMaxIterations ?? ""}
+                oninput={(e) => store.updateWorkflow((wf) => {
+                  const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                  if (n) n.loopMaxIterations = (e.target as HTMLInputElement).value ? Number((e.target as HTMLInputElement).value) : null;
+                })}
+              />
+            </label>
+            <label class="field">
+              <span>Loop condition</span>
+              <ConditionBuilder
+                mode="structured"
+                value={selectedNode.loopCondition ?? null}
+                onchange={(val) => store.updateWorkflow((wf) => {
+                  const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                  if (n) n.loopCondition = val as WorkflowNode["loopCondition"] ?? null;
+                })}
+              />
+            </label>
+          </section>
+        {/if}
+
+        <!-- Output Schema -->
+        {#if openSections.has("output-schema")}
+          <section class="inspectorSection inspectorSection--removable">
+            <div class="inspectorSection__titleRow">
+              <div class="inspectorSection__title">Output schema</div>
+              <button class="inspectorSection__removeBtn" title="Hide section" onclick={() => removeSection("output-schema")}>&times;</button>
+            </div>
+            <SchemaPresets
+              value={selectedNode.outputSchema ?? null}
+              onchange={(val) => store.updateWorkflow((wf) => {
                 const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-                if (!n) return;
-                n.contextSources = n.contextSources ?? [];
-                n.contextSources[index].name = (e.target as HTMLInputElement).value;
+                if (n) n.outputSchema = val;
               })}
             />
+          </section>
+        {/if}
+
+        <!-- Tool Permissions -->
+        {#if openSections.has("tool-permissions") && agentCaps?.toolAllowlist}
+          <section class="inspectorSection inspectorSection--removable">
+            <div class="inspectorSection__titleRow">
+              <div class="inspectorSection__title">Tool permissions</div>
+              <button class="inspectorSection__removeBtn" title="Hide section" onclick={() => removeSection("tool-permissions")}>&times;</button>
+            </div>
+            <small class="helperText">Overrides access mode for this agent.</small>
+            <label class="field">
+              <span>Allowed tools</span>
+              <textarea
+                value={(nodeConfig.allowedTools ?? []).join("\n")}
+                placeholder={'Read\nEdit\nBash(git *)'}
+                onblur={(e) => {
+                  const tools = (e.target as HTMLTextAreaElement).value.split("\n").map((s) => s.trim()).filter(Boolean);
+                  updateNodeConfig("allowedTools", tools.length ? tools : undefined);
+                }}
+                class="field--shortTextarea"
+              ></textarea>
+            </label>
+            <label class="field">
+              <span>Disallowed tools</span>
+              <textarea
+                value={(nodeConfig.disallowedTools ?? []).join("\n")}
+                placeholder={'Bash(rm *)'}
+                onblur={(e) => {
+                  const tools = (e.target as HTMLTextAreaElement).value.split("\n").map((s) => s.trim()).filter(Boolean);
+                  updateNodeConfig("disallowedTools", tools.length ? tools : undefined);
+                }}
+                class="field--shortTextarea"
+              ></textarea>
+            </label>
+          </section>
+        {/if}
+
+        <!-- Skip Condition -->
+        {#if openSections.has("skip-condition")}
+          <section class="inspectorSection inspectorSection--removable">
+            <div class="inspectorSection__titleRow">
+              <div class="inspectorSection__title">Skip condition</div>
+              <button class="inspectorSection__removeBtn" title="Hide section" onclick={() => removeSection("skip-condition")}>&times;</button>
+            </div>
+            <ConditionBuilder
+              mode="skip"
+              value={selectedNode.skipCondition ?? null}
+              onchange={(val) => store.updateWorkflow((wf) => {
+                const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                if (n) n.skipCondition = val as WorkflowNode["skipCondition"] ?? null;
+              })}
+            />
+          </section>
+        {/if}
+
+        <!-- ADD SECTION MENU -->
+        <AddSectionMenu
+          node={selectedNode}
+          {agentCaps}
+          {openSections}
+          onToggle={toggleSection}
+        />
+
+      {:else if selectedNode.type === "approval"}
+        <section class="inspectorSection">
+          <div class="inspectorSection__title">Approval</div>
+          <div class="field field--prompt">
+            <span>Prompt</span>
+            <PromptTextarea
+              value={selectedNode.prompt}
+              suggestions={promptSuggestions}
+              oninput={(e) => store.updateWorkflow((wf) => {
+                const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                if (n) n.prompt = (e.target as HTMLTextAreaElement).value;
+              })}
+            />
+          </div>
+        </section>
+      {:else if selectedNode.type === "split"}
+        <section class="inspectorSection">
+          <div class="inspectorSection__title">Split</div>
+          <label class="field">
+            <span>Failure policy</span>
             <select
-              value={context.nodeId}
+              value={selectedNode.splitFailurePolicy ?? "best_effort_continue"}
               onchange={(e) => store.updateWorkflow((wf) => {
                 const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-                if (!n) return;
-                n.contextSources = n.contextSources ?? [];
-                n.contextSources[index].nodeId = (e.target as HTMLSelectElement).value;
+                if (n) n.splitFailurePolicy = (e.target as HTMLSelectElement).value as SplitFailurePolicy;
               })}
             >
-              <option value="">Select node</option>
-              {#each workflow.nodes.filter((n) => n.id !== selectedNode!.id) as n (n.id)}
-                <option value={n.id}>{n.name}</option>
-              {/each}
+              <option value="best_effort_continue">best_effort_continue</option>
+              <option value="fail_fast_cancel">fail_fast_cancel</option>
+              <option value="drain_then_fail">drain_then_fail</option>
             </select>
-            <button
-              class="button button--ghost"
-              onclick={() => store.updateWorkflow((wf) => {
-                const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-                if (!n) return;
-                n.contextSources = (n.contextSources ?? []).filter((_, i) => i !== index);
-              })}
-            >
-              Remove
-            </button>
-          </div>
-        {/each}
-        <button
-          class="button button--ghost"
-          onclick={() => store.updateWorkflow((wf) => {
-            const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-            if (!n) return;
-            n.contextSources = [...(n.contextSources ?? []), { name: "", nodeId: "" } satisfies ContextSource];
-          })}
-        >
-          Add context source
-        </button>
-      </section>
+          </label>
+        </section>
+      {:else if selectedNode.type === "collector"}
+        <section class="inspectorSection">
+          <div class="inspectorSection__title">Collector</div>
+          <p style="margin: 0; color: var(--text-dim); line-height: 1.5;">
+            Collectors wait for all inbound success paths in the current execution epoch, merge their inputs, and continue through a single success edge.
+          </p>
+        </section>
+      {/if}
+    </div>
 
-      <!-- Test node -->
-      <section class="inspectorSection inspectorSection--test">
-        <div class="inspectorSection__title">Test node</div>
-        <label class="field">
-          <span>Previous output</span>
-          <textarea bind:value={previousOutput}></textarea>
-        </label>
+    <!-- STICKY TEST FOOTER (task nodes only) -->
+    {#if selectedNode.type === "task"}
+      <div class="testFooter" class:testFooter--expanded={testExpanded}>
         <button
-          class="button button--primary"
-          disabled={testLoading}
-          onclick={async () => {
-            testLoading = true;
-            try {
-              const preview = await api.testNode(selectedNode!, workflow.cwd, { previousOutput });
-              testResult = JSON.stringify(preview, null, 2);
-            } finally {
-              testLoading = false;
-            }
-          }}
+          class="testFooter__bar"
+          onclick={() => testExpanded = !testExpanded}
         >
-          {testLoading ? "Running..." : "Run preview"}
+          <span class="testFooter__icon">{testExpanded ? "▼" : "▶"}</span>
+          <span>Test</span>
+          {#if testLoading}
+            <span class="testFooter__spinner"></span>
+          {/if}
         </button>
-        {#if testResult}
-          <pre class="previewBlock">{testResult}</pre>
+        {#if testExpanded}
+          <div class="testFooter__body">
+            <label class="field">
+              <span>Previous output</span>
+              <textarea bind:value={previousOutput} class="field--shortTextarea"></textarea>
+            </label>
+            <button
+              class="button button--primary"
+              disabled={testLoading}
+              onclick={async () => {
+                testLoading = true;
+                try {
+                  const preview = await api.testNode(selectedNode!, workflow.cwd, { previousOutput });
+                  testResult = JSON.stringify(preview, null, 2);
+                } finally {
+                  testLoading = false;
+                }
+              }}
+            >
+              {testLoading ? "Running..." : "Run preview"}
+            </button>
+            {#if testResult}
+              <pre class="previewBlock">{testResult}</pre>
+            {/if}
+          </div>
         {/if}
-      </section>
-    {:else if selectedNode.type === "approval"}
-      <section class="inspectorSection">
-        <div class="inspectorSection__title">Approval</div>
-        <div class="field field--prompt">
-          <span>Prompt</span>
-          <PromptTextarea
-            value={selectedNode.prompt}
-            suggestions={promptSuggestions}
-            oninput={(e) => store.updateWorkflow((wf) => {
-              const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-              if (n) n.prompt = (e.target as HTMLTextAreaElement).value;
-            })}
-          />
-        </div>
-      </section>
-    {:else if selectedNode.type === "split"}
-      <section class="inspectorSection">
-        <div class="inspectorSection__title">Split</div>
-        <label class="field">
-          <span>Failure policy</span>
-          <select
-            value={selectedNode.splitFailurePolicy ?? "best_effort_continue"}
-            onchange={(e) => store.updateWorkflow((wf) => {
-              const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-              if (n) n.splitFailurePolicy = (e.target as HTMLSelectElement).value as SplitFailurePolicy;
-            })}
-          >
-            <option value="best_effort_continue">best_effort_continue</option>
-            <option value="fail_fast_cancel">fail_fast_cancel</option>
-            <option value="drain_then_fail">drain_then_fail</option>
-          </select>
-        </label>
-      </section>
-    {:else if selectedNode.type === "collector"}
-      <section class="inspectorSection">
-        <div class="inspectorSection__title">Collector</div>
-        <p style="margin: 0; color: var(--text-dim); line-height: 1.5;">
-          Collectors wait for all inbound success paths in the current execution epoch, merge their inputs, and continue through a single success edge.
-        </p>
-      </section>
+      </div>
     {/if}
   </div>
 
@@ -730,19 +777,17 @@
           })}
         />
       </label>
-      <!-- Condition (JSON) -->
+      <!-- Condition -->
       <label class="field">
         <span>Condition</span>
-        <textarea
-          value={formatJsonDraft("condition", selectedEdge.condition)}
-          placeholder={'{"field":"result.status","operator":"==","value":"ok"}'}
-          oninput={(e) => { setJsonDraft("condition", (e.target as HTMLTextAreaElement).value); }}
-          onblur={() => commitJson("condition", (val) => store.updateWorkflow((wf) => {
+        <ConditionBuilder
+          mode="structured"
+          value={selectedEdge.condition ?? null}
+          onchange={(val) => store.updateWorkflow((wf) => {
             const edge = wf.edges.find((ed) => ed.id === selectedEdge!.id);
-            if (edge) edge.condition = (val as WorkflowEdge["condition"]) ?? null;
-          }))}
-        ></textarea>
-        {#if getJsonError("condition")}<small class="issue issue--error">{getJsonError("condition")}</small>{/if}
+            if (edge) edge.condition = val as WorkflowEdge["condition"] ?? null;
+          })}
+        />
       </label>
     </section>
   </div>
