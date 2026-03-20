@@ -38,6 +38,7 @@ pub struct ContextInfo {
 // ---------------------------------------------------------------------------
 
 /// A parsed agent response, with both ANSI-stripped text and original bytes.
+#[derive(Debug)]
 pub struct ParsedResponse {
     /// ANSI-stripped response text.
     pub text: String,

@@ -453,6 +453,21 @@ trait NodeRunner: Send + Sync {
         timeout_secs: Option<u64>,
         config: Option<AgentConfig>,
     ) -> BoxFuture<'static, anyhow::Result<NodeResult>>;
+
+    /// Run with interaction context for escalation ladder support.
+    fn run_with_interaction(
+        &self,
+        agent: String,
+        prompt: String,
+        cwd: String,
+        timeout_secs: Option<u64>,
+        config: Option<AgentConfig>,
+        _ctx: RuntimeContext,
+        _run_id: String,
+    ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+        // Default: fall back to basic run (ignoring interaction context)
+        self.run(agent, prompt, cwd, timeout_secs, config)
+    }
 }
 
 struct PtyNodeRunner {
@@ -473,6 +488,32 @@ impl NodeRunner for PtyNodeRunner {
             run_pty_command(sm, &agent, &prompt, &cwd, timeout_secs, config.as_ref()).await
         })
     }
+
+    fn run_with_interaction(
+        &self,
+        agent: String,
+        prompt: String,
+        cwd: String,
+        timeout_secs: Option<u64>,
+        config: Option<AgentConfig>,
+        ctx: RuntimeContext,
+        run_id: String,
+    ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+        let sm = self.session_manager.clone();
+        Box::pin(async move {
+            let ictx = InteractionContext { ctx, run_id };
+            run_pty_command_with_context(
+                sm,
+                &agent,
+                &prompt,
+                &cwd,
+                timeout_secs,
+                config.as_ref(),
+                Some(&ictx),
+            )
+            .await
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -481,11 +522,18 @@ struct ApprovalDecision {
     user_input: String,
 }
 
+/// Response to an interactive agent prompt (permission, question, destructive warning).
+#[derive(Debug)]
+struct InteractionResponse {
+    response: String,
+}
+
 #[derive(Debug, Clone)]
 struct ActiveRun {
     sender: broadcast::Sender<RuntimeEvent>,
     abort_flag: Arc<AtomicBool>,
     approval_sender: Arc<Mutex<Option<oneshot::Sender<ApprovalDecision>>>>,
+    interaction_sender: Arc<Mutex<Option<oneshot::Sender<InteractionResponse>>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -502,6 +550,7 @@ impl RunRegistry {
                 sender,
                 abort_flag: Arc::new(AtomicBool::new(false)),
                 approval_sender: Arc::new(Mutex::new(None)),
+                interaction_sender: Arc::new(Mutex::new(None)),
             }
         });
     }
@@ -577,6 +626,44 @@ impl RunRegistry {
                 user_input,
             })
             .map_err(|_| anyhow::anyhow!("approval receiver dropped"))?;
+        Ok(())
+    }
+
+    async fn set_pending_interaction(
+        &self,
+        run_id: &str,
+        sender: oneshot::Sender<InteractionResponse>,
+    ) -> anyhow::Result<()> {
+        let active = self
+            .inner
+            .lock()
+            .await
+            .get(run_id)
+            .cloned()
+            .context("run is not active")?;
+        *active.interaction_sender.lock().await = Some(sender);
+        Ok(())
+    }
+
+    pub(crate) async fn resolve_interaction(
+        &self,
+        run_id: &str,
+        response: String,
+    ) -> anyhow::Result<()> {
+        let active = self
+            .inner
+            .lock()
+            .await
+            .get(run_id)
+            .cloned()
+            .context("no active interaction for this run")?;
+        let sender = active.interaction_sender.lock().await.take();
+        let Some(sender) = sender else {
+            anyhow::bail!("no active interaction for this run");
+        };
+        sender
+            .send(InteractionResponse { response })
+            .map_err(|_| anyhow::anyhow!("interaction receiver dropped"))?;
         Ok(())
     }
 
@@ -783,6 +870,16 @@ impl RuntimeContext {
     pub async fn abort_run(&self, run_id: &str) -> anyhow::Result<()> {
         self.registry.set_abort(run_id).await;
         Ok(())
+    }
+
+    pub async fn respond_interaction(
+        &self,
+        run_id: &str,
+        response: String,
+    ) -> anyhow::Result<()> {
+        self.registry
+            .resolve_interaction(run_id, response)
+            .await
     }
 }
 
@@ -2024,12 +2121,14 @@ async fn run_cursor_task(
         attempts += 1;
         let step_result = ctx
             .runner
-            .run(
+            .run_with_interaction(
                 agent_name.clone(),
                 resolved_prompt.clone(),
                 run_ctx.cwd.clone(),
                 node.timeout,
                 Some(agent_config.clone()),
+                ctx.clone(),
+                run_ctx.run_id.clone(),
             )
             .await?;
         if step_result.success || attempts >= max_attempts {
@@ -3335,7 +3434,20 @@ fn build_log_id(workflow_name: &str) -> String {
     format!("{}_{}", slug, Utc::now().format("%Y-%m-%dT%H-%M-%S"))
 }
 
-/// Run an agent command via PTY session.
+/// Optional context for interactive prompt escalation during PTY command execution.
+/// When provided, allows the escalation ladder to emit events and wait for human responses.
+struct InteractionContext {
+    ctx: RuntimeContext,
+    run_id: String,
+}
+
+/// Run an agent command via PTY session with the 4-tier escalation ladder.
+///
+/// Tier 0: CLI flags already suppress most prompts (handled by driver args).
+/// Tier 1: Regex auto-respond for known prompts (warmup + interaction patterns).
+/// Tier 2: Auto-approve mode sends affirmative to detected prompts (unless destructive).
+/// Tier 3: Orchestrator LLM classifies stale output (future: via separate PTY session).
+/// Tier 4: Human-in-the-loop via UI (emits event, waits on channel).
 async fn run_pty_command(
     session_manager: Arc<SessionManager>,
     agent: &str,
@@ -3343,6 +3455,20 @@ async fn run_pty_command(
     cwd: &str,
     timeout_secs: Option<u64>,
     config: Option<&AgentConfig>,
+) -> anyhow::Result<NodeResult> {
+    run_pty_command_with_context(session_manager, agent, prompt, cwd, timeout_secs, config, None)
+        .await
+}
+
+/// Inner implementation that optionally accepts interaction context for event emission.
+async fn run_pty_command_with_context(
+    session_manager: Arc<SessionManager>,
+    agent: &str,
+    prompt: &str,
+    cwd: &str,
+    timeout_secs: Option<u64>,
+    config: Option<&AgentConfig>,
+    interaction_ctx: Option<&InteractionContext>,
 ) -> anyhow::Result<NodeResult> {
     let agent_spec = find_agent(agent).with_context(|| format!("Unknown agent: {}", agent))?;
     anyhow::ensure!(
@@ -3380,43 +3506,287 @@ async fn run_pty_command(
         .await
         .with_context(|| format!("Failed to create PTY session for {}", agent_spec.name))?;
 
+    // --- Phase 2: Warmup — auto-respond to startup prompts ---
+    let interaction_patterns = drv.interaction_patterns();
+    let auto_respond_patterns: Vec<(regex::Regex, String)> = interaction_patterns
+        .iter()
+        .filter_map(|p| {
+            if let driver::InteractionKind::AutoRespond { response } = &p.kind {
+                regex::Regex::new(&p.pattern)
+                    .ok()
+                    .map(|r| (r, response.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !auto_respond_patterns.is_empty() {
+        if let Err(e) = session_manager
+            .warmup_session(&session_id, auto_respond_patterns, Duration::from_secs(8))
+            .await
+        {
+            tracing::warn!("Warmup phase failed (non-fatal): {}", e);
+        }
+    }
+
+    // --- Build interaction pattern regexes for the sentinel loop ---
+    let compiled_patterns: Vec<(regex::Regex, driver::InteractionKind, String)> =
+        interaction_patterns
+            .iter()
+            .filter_map(|p| {
+                // Skip AutoRespond patterns — those are handled in warmup
+                if matches!(p.kind, driver::InteractionKind::AutoRespond { .. }) {
+                    return None;
+                }
+                regex::Regex::new(&p.pattern)
+                    .ok()
+                    .map(|r| (r, p.kind.clone(), p.description.clone()))
+            })
+            .collect();
+
+    // Build destructive pattern regexes
+    let destructive_regexes: Vec<regex::Regex> = drv
+        .destructive_blocklist()
+        .iter()
+        .filter_map(|p| regex::Regex::new(p).ok())
+        .collect();
+
     // Wrap prompt with sentinel for completion detection
     let sentinel = format!("SILVERBOND_DONE_{}", uuid::Uuid::new_v4());
     let wrapped_prompt = drv.wrap_prompt_with_sentinel(prompt, &sentinel);
 
-    // Send the prompt and wait for response
-    let timeout_duration = Duration::from_secs(timeout_secs.unwrap_or(300));
-    let response = session_manager
-        .send_prompt(&session_id, &wrapped_prompt, &sentinel, timeout_duration)
-        .await;
+    // --- Phase 3: Interactive sentinel loop ---
+    let total_timeout = Duration::from_secs(timeout_secs.unwrap_or(300));
+    let intermediate_timeout = Duration::from_secs(10);
+    let subagent_timeout = cfg
+        .orchestrator
+        .as_ref()
+        .and_then(|o| o.subagent_timeout_secs)
+        .map(|s| Duration::from_secs(s as u64))
+        .unwrap_or(Duration::from_secs(600));
 
-    let elapsed = start.elapsed().as_secs_f64();
+    let mut total_deadline = std::time::Instant::now() + total_timeout;
+    let mut stale_count = 0u32;
 
-    let response = match response {
-        Ok(resp) => resp,
-        Err(e) => {
+    let response = loop {
+        let remaining = total_deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            let elapsed = start.elapsed().as_secs_f64();
             let _ = session_manager.close_session(&session_id).await;
-            // Clean up temp dir
             if let Some(dir) = &temp_dir {
                 let _ = std::fs::remove_dir_all(dir);
             }
             return Ok(NodeResult {
                 success: false,
                 output: String::new(),
-                stderr: e.to_string(),
+                stderr: "Total timeout exceeded".to_string(),
                 exit_code: -1,
                 duration: format!("{:.1}", elapsed),
                 agent: agent_spec.name.to_string(),
                 prompt: prompt.to_string(),
                 metadata: AgentExecutionMetadata {
-                    outcome: Some(NodeOutcome::ErrorExecution),
-                    error_type: Some("pty_error".to_string()),
+                    outcome: Some(NodeOutcome::ErrorTimeout),
+                    error_type: Some("timeout".to_string()),
                     ..Default::default()
                 },
                 ..Default::default()
             });
         }
+
+        let event = session_manager
+            .send_prompt_interactive(
+                &session_id,
+                &wrapped_prompt,
+                &sentinel,
+                compiled_patterns.clone(),
+                intermediate_timeout,
+                remaining,
+            )
+            .await?;
+
+        match event {
+            crate::session::PromptEvent::Completed(resp) => {
+                break resp;
+            }
+
+            crate::session::PromptEvent::InteractionRequired { kind, description, output_so_far } => {
+                match kind {
+                    // Tier 1: Auto-respond (shouldn't reach here since handled in warmup, but safety net)
+                    driver::InteractionKind::AutoRespond { response } => {
+                        session_manager.respond_to_interaction(&session_id, &response).await?;
+                        continue;
+                    }
+
+                    // Subagent detected — extend timeout and continue
+                    driver::InteractionKind::SubagentActive => {
+                        total_deadline = std::time::Instant::now() + subagent_timeout;
+                        continue;
+                    }
+
+                    // Permission request
+                    driver::InteractionKind::PermissionRequest => {
+                        // Check if output contains destructive patterns
+                        let is_destructive = destructive_regexes
+                            .iter()
+                            .any(|r| r.is_match(&output_so_far));
+
+                        if is_destructive {
+                            // Tier 4: Always escalate destructive patterns
+                            if let Some(ictx) = interaction_ctx {
+                                let response = escalate_to_human(
+                                    ictx,
+                                    &session_id,
+                                    "destructive_warning",
+                                    &description,
+                                    &output_so_far,
+                                )
+                                .await?;
+                                session_manager
+                                    .respond_to_interaction(&session_id, &response)
+                                    .await?;
+                                continue;
+                            }
+                            // No interaction context — auto-reject destructive
+                            session_manager
+                                .respond_to_interaction(&session_id, "n")
+                                .await?;
+                            continue;
+                        }
+
+                        if cfg.auto_approve {
+                            // Tier 2: Auto-approve non-destructive
+                            session_manager
+                                .respond_to_interaction(&session_id, "y")
+                                .await?;
+                            continue;
+                        }
+
+                        // Tier 4: Escalate to human
+                        if let Some(ictx) = interaction_ctx {
+                            let response = escalate_to_human(
+                                ictx,
+                                &session_id,
+                                "permission",
+                                &description,
+                                &output_so_far,
+                            )
+                            .await?;
+                            session_manager
+                                .respond_to_interaction(&session_id, &response)
+                                .await?;
+                            continue;
+                        }
+                        // No interaction context — auto-approve as fallback
+                        session_manager
+                            .respond_to_interaction(&session_id, "y")
+                            .await?;
+                        continue;
+                    }
+
+                    // Destructive warning (from pattern matching directly)
+                    driver::InteractionKind::DestructiveWarning => {
+                        if let Some(ictx) = interaction_ctx {
+                            let response = escalate_to_human(
+                                ictx,
+                                &session_id,
+                                "destructive_warning",
+                                &description,
+                                &output_so_far,
+                            )
+                            .await?;
+                            session_manager
+                                .respond_to_interaction(&session_id, &response)
+                                .await?;
+                            continue;
+                        }
+                        session_manager
+                            .respond_to_interaction(&session_id, "n")
+                            .await?;
+                        continue;
+                    }
+                }
+            }
+
+            crate::session::PromptEvent::StaleDetected { output_so_far } => {
+                stale_count += 1;
+
+                // Check if process is still alive
+                if !session_manager.is_alive(&session_id).await {
+                    let elapsed = start.elapsed().as_secs_f64();
+                    let _ = session_manager.close_session(&session_id).await;
+                    if let Some(dir) = &temp_dir {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
+                    return Ok(NodeResult {
+                        success: !output_so_far.is_empty(),
+                        output: output_so_far,
+                        stderr: "Agent process exited without sentinel".to_string(),
+                        exit_code: -1,
+                        duration: format!("{:.1}", elapsed),
+                        agent: agent_spec.name.to_string(),
+                        prompt: prompt.to_string(),
+                        metadata: AgentExecutionMetadata {
+                            outcome: Some(NodeOutcome::ErrorExecution),
+                            error_type: Some("process_exited".to_string()),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+                }
+
+                // First few stale events — just continue waiting (agent may be thinking)
+                if stale_count <= 3 {
+                    continue;
+                }
+
+                // Tier 4: Escalate to human after repeated stale detections
+                if let Some(ictx) = interaction_ctx {
+                    let response = escalate_to_human(
+                        ictx,
+                        &session_id,
+                        "question",
+                        "Agent output appears stale — it may be waiting for input",
+                        &output_so_far,
+                    )
+                    .await?;
+                    session_manager
+                        .respond_to_interaction(&session_id, &response)
+                        .await?;
+                    stale_count = 0;
+                    continue;
+                }
+
+                // No interaction context — continue waiting
+                continue;
+            }
+
+            crate::session::PromptEvent::Timeout { output_so_far } => {
+                let elapsed = start.elapsed().as_secs_f64();
+                let _ = session_manager.close_session(&session_id).await;
+                if let Some(dir) = &temp_dir {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+                return Ok(NodeResult {
+                    success: false,
+                    output: output_so_far,
+                    stderr: "Timeout waiting for agent response".to_string(),
+                    exit_code: -1,
+                    duration: format!("{:.1}", elapsed),
+                    agent: agent_spec.name.to_string(),
+                    prompt: prompt.to_string(),
+                    metadata: AgentExecutionMetadata {
+                        outcome: Some(NodeOutcome::ErrorTimeout),
+                        error_type: Some("timeout".to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+            }
+        }
     };
+
+    let elapsed = start.elapsed().as_secs_f64();
 
     // Query cost metadata if supported
     let cost = if let Some(cost_cmd) = drv.cost_command() {
@@ -3469,6 +3839,51 @@ async fn run_pty_command(
         },
         ..Default::default()
     })
+}
+
+/// Escalate an interaction to the human via UI events and wait for their response.
+async fn escalate_to_human(
+    ictx: &InteractionContext,
+    session_id: &str,
+    interaction_type: &str,
+    description: &str,
+    output_so_far: &str,
+) -> anyhow::Result<String> {
+    // Emit event to UI
+    emit_event(
+        &ictx.ctx,
+        &ictx.run_id,
+        RuntimeEvent::new("agent_interaction_required")
+            .with("sessionId", session_id)
+            .with("interactionType", interaction_type)
+            .with("description", description)
+            .with("outputSoFar", output_so_far),
+    )
+    .await?;
+
+    // Wait for human response via oneshot channel
+    let (sender, receiver) = oneshot::channel();
+    ictx.ctx
+        .registry
+        .set_pending_interaction(&ictx.run_id, sender)
+        .await?;
+
+    let interaction_response = receiver
+        .await
+        .map_err(|_| anyhow::anyhow!("Interaction channel closed"))?;
+
+    // Emit resolved event
+    emit_event(
+        &ictx.ctx,
+        &ictx.run_id,
+        RuntimeEvent::new("agent_interaction_resolved")
+            .with("sessionId", session_id)
+            .with("description", description)
+            .with("response", &interaction_response.response),
+    )
+    .await?;
+
+    Ok(interaction_response.response)
 }
 
 async fn run_orchestrator_refinement(

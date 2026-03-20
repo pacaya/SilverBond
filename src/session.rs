@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::driver::InteractionKind;
 use crate::pty_output::{ParsedResponse, strip_ansi};
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,7 @@ pub struct SessionEntry {
 pub enum SessionState {
     Idle,
     Processing,
+    WaitingInteraction,
     Completed,
     Error,
 }
@@ -334,6 +336,301 @@ impl SessionManager {
             let _ = session.session.send_line("/exit");
             std::thread::sleep(Duration::from_millis(100));
         }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Interactive prompt handling
+// ---------------------------------------------------------------------------
+
+/// Events produced by `send_prompt_interactive` during the sentinel wait loop.
+#[derive(Debug)]
+pub enum PromptEvent {
+    /// Sentinel was found — the agent completed its response.
+    Completed(ParsedResponse),
+    /// An interactive prompt was detected that needs handling.
+    InteractionRequired {
+        kind: InteractionKind,
+        description: String,
+        output_so_far: String,
+    },
+    /// No new output for the intermediate timeout while the process is alive.
+    StaleDetected {
+        output_so_far: String,
+    },
+    /// The total timeout was exceeded.
+    Timeout {
+        output_so_far: String,
+    },
+}
+
+impl SessionManager {
+    /// Run a warmup phase after session creation, auto-responding to known prompts.
+    ///
+    /// This handles trust-folder prompts, welcome screens, and other startup
+    /// interactions before the first real prompt is sent.
+    pub async fn warmup_session(
+        &self,
+        session_id: &str,
+        auto_patterns: Vec<(regex::Regex, String)>,
+        warmup_timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let sessions_ref = self.sessions.clone();
+        let sid = session_id.to_string();
+
+        tokio::task::spawn_blocking(move || {
+            let mut sessions_guard = sessions_ref.blocking_lock();
+            let session = sessions_guard
+                .get_mut(&sid)
+                .context("Session not found for warmup")?;
+
+            let deadline = std::time::Instant::now() + warmup_timeout;
+            let chunk_timeout = Duration::from_millis(500);
+
+            while std::time::Instant::now() < deadline {
+                session.session.set_expect_timeout(Some(chunk_timeout));
+
+                // Try to read whatever is in the buffer
+                let mut buf = vec![0u8; 8192];
+                let mut collected = Vec::new();
+
+                loop {
+                    match session.session.try_read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => collected.extend_from_slice(&buf[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
+                }
+
+                if collected.is_empty() {
+                    // Brief sleep before retrying
+                    std::thread::sleep(Duration::from_millis(200));
+                    continue;
+                }
+
+                let text = strip_ansi(&collected);
+
+                // Check against auto-respond patterns
+                let mut matched = false;
+                for (pattern, response) in &auto_patterns {
+                    if pattern.is_match(&text) {
+                        let _ = session.session.send_line(response);
+                        session.last_activity = Utc::now();
+                        matched = true;
+                        // Brief wait for the response to be processed
+                        std::thread::sleep(Duration::from_millis(300));
+                        break;
+                    }
+                }
+
+                if !matched {
+                    // No pattern matched — continue reading to drain buffer
+                    continue;
+                }
+            }
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .context("Warmup task panicked")??;
+
+        Ok(())
+    }
+
+    /// Send a prompt and wait for the sentinel, watching for interactive prompts.
+    ///
+    /// Unlike `send_prompt`, this method returns `PromptEvent` variants that
+    /// indicate whether the agent completed, needs interaction, or went stale.
+    pub async fn send_prompt_interactive(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        sentinel: &str,
+        interaction_patterns: Vec<(regex::Regex, InteractionKind, String)>,
+        intermediate_timeout: Duration,
+        total_timeout: Duration,
+    ) -> anyhow::Result<PromptEvent> {
+        // Send the prompt
+        {
+            let mut sessions = self.sessions.lock().await;
+            let session = sessions
+                .get_mut(session_id)
+                .context("Session not found")?;
+            session.state = SessionState::Processing;
+            session.last_activity = Utc::now();
+            session.output_history.push(SessionEntry {
+                role: Role::User,
+                content: prompt.to_string(),
+                timestamp: Utc::now(),
+                raw_bytes: Vec::new(),
+            });
+            session
+                .session
+                .send_line(prompt)
+                .context("Failed to write prompt to PTY")?;
+        }
+
+        let sessions_ref = self.sessions.clone();
+        let sid = session_id.to_string();
+        let sentinel_owned = sentinel.to_string();
+
+        let event = tokio::task::spawn_blocking(move || -> anyhow::Result<PromptEvent> {
+            let mut sessions_guard = sessions_ref.blocking_lock();
+            let session = sessions_guard
+                .get_mut(&sid)
+                .context("Session disappeared during interactive read")?;
+
+            let total_deadline = std::time::Instant::now() + total_timeout;
+            let sentinel_regex = regex::Regex::new(
+                &format!(r"\s*{}\s*", regex::escape(&sentinel_owned))
+            ).context("Failed to compile sentinel regex")?;
+
+            let mut accumulated_output = Vec::new();
+            let mut accumulated_text = String::new();
+
+            loop {
+                let remaining = total_deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Ok(PromptEvent::Timeout {
+                        output_so_far: accumulated_text,
+                    });
+                }
+
+                let this_timeout = intermediate_timeout.min(remaining);
+                session.session.set_expect_timeout(Some(this_timeout));
+
+                // Try reading with the sentinel pattern
+                let sentinel_pattern = expectrl::Regex(
+                    format!(r"\s*{}\s*", regex::escape(&sentinel_owned))
+                );
+
+                match session.session.expect(sentinel_pattern) {
+                    Ok(captures) => {
+                        let before_bytes = captures.before().to_vec();
+                        let text = strip_ansi(&before_bytes);
+                        accumulated_output.extend_from_slice(&before_bytes);
+                        accumulated_text.push_str(&text);
+
+                        session.state = SessionState::Idle;
+                        session.last_activity = Utc::now();
+                        session.output_history.push(SessionEntry {
+                            role: Role::Agent,
+                            content: accumulated_text.trim().to_string(),
+                            timestamp: Utc::now(),
+                            raw_bytes: accumulated_output.clone(),
+                        });
+
+                        return Ok(PromptEvent::Completed(ParsedResponse {
+                            text: accumulated_text.trim().to_string(),
+                            raw: accumulated_output,
+                        }));
+                    }
+                    Err(_) => {
+                        // Timeout on sentinel — read whatever is in the buffer
+                        let mut buf = vec![0u8; 16384];
+                        let mut new_output = Vec::new();
+                        loop {
+                            match session.session.try_read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => new_output.extend_from_slice(&buf[..n]),
+                                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                Err(_) => break,
+                            }
+                        }
+
+                        if new_output.is_empty() {
+                            // No new output — check if stale
+                            if !accumulated_text.is_empty() || !accumulated_output.is_empty() {
+                                // Check for interaction patterns in accumulated text
+                                for (pattern, kind, desc) in &interaction_patterns {
+                                    if pattern.is_match(&accumulated_text) {
+                                        session.state = SessionState::WaitingInteraction;
+                                        return Ok(PromptEvent::InteractionRequired {
+                                            kind: kind.clone(),
+                                            description: desc.clone(),
+                                            output_so_far: accumulated_text,
+                                        });
+                                    }
+                                }
+                            }
+                            return Ok(PromptEvent::StaleDetected {
+                                output_so_far: accumulated_text,
+                            });
+                        }
+
+                        let new_text = strip_ansi(&new_output);
+                        accumulated_output.extend_from_slice(&new_output);
+                        accumulated_text.push_str(&new_text);
+
+                        // Check sentinel in accumulated text
+                        if sentinel_regex.is_match(&accumulated_text) {
+                            let parts: Vec<&str> = accumulated_text
+                                .splitn(2, &sentinel_owned)
+                                .collect();
+                            let response_text = parts[0].trim().to_string();
+
+                            session.state = SessionState::Idle;
+                            session.last_activity = Utc::now();
+                            session.output_history.push(SessionEntry {
+                                role: Role::Agent,
+                                content: response_text.clone(),
+                                timestamp: Utc::now(),
+                                raw_bytes: accumulated_output.clone(),
+                            });
+
+                            return Ok(PromptEvent::Completed(ParsedResponse {
+                                text: response_text,
+                                raw: accumulated_output,
+                            }));
+                        }
+
+                        // Check for interaction patterns in the new output
+                        for (pattern, kind, desc) in &interaction_patterns {
+                            if pattern.is_match(&new_text) || pattern.is_match(&accumulated_text) {
+                                session.state = SessionState::WaitingInteraction;
+                                return Ok(PromptEvent::InteractionRequired {
+                                    kind: kind.clone(),
+                                    description: desc.clone(),
+                                    output_so_far: accumulated_text,
+                                });
+                            }
+                        }
+
+                        // Output is still flowing — continue the loop
+                    }
+                }
+            }
+        })
+        .await
+        .context("Interactive PTY read task panicked")??;
+
+        Ok(event)
+    }
+
+    /// Send a response to an interactive prompt (e.g., "y" to approve).
+    pub async fn respond_to_interaction(
+        &self,
+        session_id: &str,
+        response: &str,
+    ) -> anyhow::Result<()> {
+        let mut sessions = self.sessions.lock().await;
+        let session = sessions
+            .get_mut(session_id)
+            .context("Session not found")?;
+        session
+            .session
+            .send_line(response)
+            .context("Failed to send interaction response to PTY")?;
+        session.state = SessionState::Processing;
+        session.last_activity = Utc::now();
+        session.output_history.push(SessionEntry {
+            role: Role::User,
+            content: format!("[interaction response] {}", response),
+            timestamp: Utc::now(),
+            raw_bytes: Vec::new(),
+        });
         Ok(())
     }
 }

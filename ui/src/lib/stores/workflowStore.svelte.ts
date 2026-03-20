@@ -40,6 +40,13 @@ export interface ApprovalState {
   lastOutput: string;
 }
 
+export interface InteractionState {
+  sessionId: string;
+  description: string;
+  outputSoFar: string;
+  interactionType: "permission" | "question" | "destructive_warning";
+}
+
 function defaultNodeName(type: WorkflowNodeType, count: number): string {
   switch (type) {
     case "approval":
@@ -77,6 +84,7 @@ class WorkflowStore {
   lines = $state<RunLine[]>([]);
   nodeStates = $state<Record<string, NodeRuntimeState>>({});
   approval = $state<ApprovalState | null>(null);
+  interaction = $state<InteractionState | null>(null);
   errorMessage = $state<string>("");
 
   /* ── undo/redo ────────────────────────────────────────────────────── */
@@ -249,13 +257,15 @@ class WorkflowStore {
     this.runId = null;
     this.running = false;
     this.approval = null;
+    this.interaction = null;
     this.nodeStates = {};
   }
 
-  setRunState(patch: { runId?: string | null; running?: boolean; approval?: ApprovalState | null }) {
+  setRunState(patch: { runId?: string | null; running?: boolean; approval?: ApprovalState | null; interaction?: InteractionState | null }) {
     if (patch.runId !== undefined) this.runId = patch.runId;
     if (patch.running !== undefined) this.running = patch.running;
     if (patch.approval !== undefined) this.approval = patch.approval;
+    if (patch.interaction !== undefined) this.interaction = patch.interaction;
   }
 
   setNodeRuntimeState(nodeId: string, state: NodeRuntimeState) {
@@ -372,9 +382,23 @@ class WorkflowStore {
       case "sys_warn":
         push("warning", String(event.message ?? "Warning"));
         break;
+      case "agent_interaction_required":
+        push("warning", `Agent interaction required: ${String(event.description ?? "")}`);
+        this.interaction = {
+          sessionId: String(event.sessionId ?? ""),
+          description: String(event.description ?? ""),
+          outputSoFar: String(event.outputSoFar ?? ""),
+          interactionType: (event.interactionType as InteractionState["interactionType"]) ?? "question",
+        };
+        break;
+      case "agent_interaction_resolved":
+        push("detail", `Interaction resolved: ${String(event.description ?? "")}`);
+        this.interaction = null;
+        break;
       case "done":
         push(event.aborted ? "error" : "success", event.aborted ? "Workflow aborted" : "Workflow complete");
         this.approval = null;
+        this.interaction = null;
         this.running = false;
         break;
       default:

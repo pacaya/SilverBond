@@ -11,6 +11,43 @@ use serde_json::Value;
 
 use crate::pty_output::{CostInfo, ContextInfo};
 
+// ---------------------------------------------------------------------------
+// Interaction types (for interactive prompt handling)
+// ---------------------------------------------------------------------------
+
+/// The kind of interactive prompt detected from PTY output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteractionKind {
+    /// Known prompt with a deterministic response — auto-send immediately.
+    AutoRespond { response: String },
+    /// Agent is requesting permission to perform an action.
+    PermissionRequest,
+    /// Agent has spawned a subagent; silence is expected.
+    SubagentActive,
+    /// A destructive pattern was detected — always escalate to human.
+    DestructiveWarning,
+}
+
+/// A regex pattern that matches interactive prompts in PTY output.
+#[derive(Debug, Clone)]
+pub struct InteractionPattern {
+    pub kind: InteractionKind,
+    pub pattern: String,
+    pub description: String,
+}
+
+/// Shared destructive patterns common to all agent backends.
+pub fn shared_destructive_patterns() -> Vec<String> {
+    vec![
+        r"rm\s+-rf".to_string(),
+        r"(?i)drop\s+(table|database)".to_string(),
+        r"(?i)force[- ]push".to_string(),
+        r"(?i)git\s+push\s+--force".to_string(),
+        r"(?i)delete\s+\d+\s+files".to_string(),
+        r"(?i)chmod\s+777".to_string(),
+        r"(?i)truncate\s+".to_string(),
+    ]
+}
 
 // ---------------------------------------------------------------------------
 // Capability descriptor
@@ -85,6 +122,8 @@ pub struct AgentConfig {
     pub allowed_tools: Option<Vec<String>>,
     pub disallowed_tools: Option<Vec<String>>,
     pub cwd: String,
+    pub auto_approve: bool,
+    pub orchestrator: Option<crate::model::OrchestratorConfig>,
 }
 
 impl Default for AgentConfig {
@@ -103,6 +142,8 @@ impl Default for AgentConfig {
             allowed_tools: None,
             disallowed_tools: None,
             cwd: String::new(),
+            auto_approve: false,
+            orchestrator: None,
         }
     }
 }
@@ -201,6 +242,13 @@ pub trait AgentDriver: Send + Sync {
 
     /// Parse context command output into structured data.
     fn parse_context_response(&self, output: &str) -> Option<ContextInfo>;
+
+    /// Return patterns that match interactive prompts for this agent backend.
+    fn interaction_patterns(&self) -> Vec<InteractionPattern> { vec![] }
+
+    /// Return regex patterns for destructive commands that should always
+    /// escalate to human approval, even when auto-approve is on.
+    fn destructive_blocklist(&self) -> Vec<String> { shared_destructive_patterns() }
 }
 
 // ===========================================================================
@@ -334,6 +382,31 @@ impl AgentDriver for ClaudeDriver {
     fn parse_context_response(&self, output: &str) -> Option<ContextInfo> {
         crate::pty_output::parse_claude_context(output)
     }
+
+    fn interaction_patterns(&self) -> Vec<InteractionPattern> {
+        vec![
+            InteractionPattern {
+                kind: InteractionKind::AutoRespond { response: "y".to_string() },
+                pattern: r"(?i)do you trust.*\?\s*$".to_string(),
+                description: "Trust folder prompt".to_string(),
+            },
+            InteractionPattern {
+                kind: InteractionKind::PermissionRequest,
+                pattern: r"(?i)(allow|wants to use)\s+\w+.*\?\s*\(y/n\)".to_string(),
+                description: "Tool permission prompt".to_string(),
+            },
+            InteractionPattern {
+                kind: InteractionKind::SubagentActive,
+                pattern: r"(?i)(launching|spawning)\s+agent".to_string(),
+                description: "Agent spawning a subagent".to_string(),
+            },
+            InteractionPattern {
+                kind: InteractionKind::SubagentActive,
+                pattern: r"(?i)agent.*running.*background".to_string(),
+                description: "Subagent running in background".to_string(),
+            },
+        ]
+    }
 }
 
 // ===========================================================================
@@ -444,6 +517,16 @@ impl AgentDriver for CodexDriver {
     fn exit_command(&self) -> &str { "/exit" }
     fn parse_cost_response(&self, _output: &str) -> Option<CostInfo> { None }
     fn parse_context_response(&self, _output: &str) -> Option<ContextInfo> { None }
+
+    fn interaction_patterns(&self) -> Vec<InteractionPattern> {
+        vec![
+            InteractionPattern {
+                kind: InteractionKind::PermissionRequest,
+                pattern: r"(?i)allow this action.*\[y/n\]".to_string(),
+                description: "Action approval prompt".to_string(),
+            },
+        ]
+    }
 }
 
 // ===========================================================================
@@ -635,6 +718,16 @@ impl AgentDriver for GeminiDriver {
     fn exit_command(&self) -> &str { "/exit" }
     fn parse_cost_response(&self, _output: &str) -> Option<CostInfo> { None }
     fn parse_context_response(&self, _output: &str) -> Option<ContextInfo> { None }
+
+    fn interaction_patterns(&self) -> Vec<InteractionPattern> {
+        vec![
+            InteractionPattern {
+                kind: InteractionKind::PermissionRequest,
+                pattern: r"(?i)approve.*\?\s*\(y/n\)".to_string(),
+                description: "Approval prompt".to_string(),
+            },
+        ]
+    }
 }
 
 // ===========================================================================

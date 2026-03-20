@@ -183,7 +183,7 @@
       hadError = true;
       store.setError(`Run failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
-      store.setRunState({ running: false, approval: null, runId: null });
+      store.setRunState({ running: false, approval: null, interaction: null, runId: null });
       showRunResult(hadError);
       await queryClient.invalidateQueries({ queryKey: ["logs"] });
       await queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] });
@@ -203,7 +203,7 @@
       hadError = true;
       store.setError(`Resume failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
-      store.setRunState({ running: false, approval: null, runId: null });
+      store.setRunState({ running: false, approval: null, interaction: null, runId: null });
       showRunResult(hadError);
       await queryClient.invalidateQueries({ queryKey: ["logs"] });
       await queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] });
@@ -223,7 +223,7 @@
       hadError = true;
       store.setError(`Restart failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
-      store.setRunState({ running: false, approval: null, runId: null });
+      store.setRunState({ running: false, approval: null, interaction: null, runId: null });
       showRunResult(hadError);
       await queryClient.invalidateQueries({ queryKey: ["logs"] });
       await queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] });
@@ -427,6 +427,9 @@
         }}
         onApproval={(approved, userInput) => {
           if (store.runId) api.approveRun(store.runId, approved, userInput);
+        }}
+        onInteractionResponse={(response) => {
+          if (store.runId) api.respondToInteraction(store.runId, response);
         }}
       />
     {:else if store.panelTab === "history"}

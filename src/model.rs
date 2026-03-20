@@ -6,6 +6,39 @@ use serde_json::Value;
 
 use crate::driver::{AccessMode, AgentConfig, ReasoningLevel, ToolToggles};
 
+// ---------------------------------------------------------------------------
+// Orchestrator configuration
+// ---------------------------------------------------------------------------
+
+/// When the orchestrator LLM is activated to classify ambiguous output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestratorActivation {
+    /// Only call orchestrator after N seconds of no output (default).
+    #[default]
+    StaleOnly,
+    /// Classify all output that doesn't match a known regex pattern.
+    AlwaysOn,
+}
+
+/// Configuration for the orchestrator LLM that classifies ambiguous PTY output.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OrchestratorConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub activation: OrchestratorActivation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_timeout_secs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subagent_timeout_secs: Option<u32>,
+}
+
 /// Default agent used when a node has no explicit `agent` field.
 pub const DEFAULT_AGENT: &str = "claude";
 
@@ -120,6 +153,10 @@ pub struct AgentDefaults {
     pub max_turns: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_budget_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_approve: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestrator: Option<OrchestratorConfig>,
 }
 
 /// Per-node agent configuration override. Extends `AgentDefaults` with fine-grained tool control.
@@ -182,6 +219,8 @@ pub fn resolve_agent_config(
         allowed_tools: overrides.and_then(|o| o.allowed_tools.clone()),
         disallowed_tools: overrides.and_then(|o| o.disallowed_tools.clone()),
         cwd,
+        auto_approve: merge!(auto_approve).unwrap_or(false),
+        orchestrator: merge!(orchestrator),
     }
 }
 

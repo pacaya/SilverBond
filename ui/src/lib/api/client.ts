@@ -61,6 +61,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ approved, userInput }),
     }),
+  respondToInteraction: (runId: string, response: string) =>
+    apiFetch<{ success: boolean }>(`/api/runs/${encodeURIComponent(runId)}/respond-interaction`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ response }),
+    }),
   abortRun: (runId: string) =>
     apiFetch<{ success: boolean }>(`/api/runs/${encodeURIComponent(runId)}/abort`, {
       method: "POST",

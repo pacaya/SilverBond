@@ -38,6 +38,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/runs/{run_id}/stream", get(stream_run))
         .route("/api/runs/{run_id}/events", get(run_events))
         .route("/api/runs/{run_id}/approve", post(approve_run))
+        .route(
+            "/api/runs/{run_id}/respond-interaction",
+            post(respond_interaction),
+        )
         .route("/api/runs/{run_id}/abort", post(abort_run))
         .route("/api/runs/{run_id}/resume", post(resume_run))
         .route(
@@ -280,6 +284,24 @@ async fn approve_run(
     state
         .runtime
         .approve_run(&run_id, request.approved, request.user_input)
+        .await?;
+    Ok(Json(json!({ "success": true })))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct InteractionResponseRequest {
+    response: String,
+}
+
+async fn respond_interaction(
+    State(state): State<AppState>,
+    Path(run_id): Path<String>,
+    Json(request): Json<InteractionResponseRequest>,
+) -> Result<Json<Value>, ApiError> {
+    state
+        .runtime
+        .respond_interaction(&run_id, request.response)
         .await?;
     Ok(Json(json!({ "success": true })))
 }

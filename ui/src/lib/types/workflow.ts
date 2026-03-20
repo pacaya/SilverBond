@@ -36,11 +36,24 @@ export interface AgentDefaults {
   toolToggles?: ToolToggles;
   maxTurns?: number;
   maxBudgetUsd?: number;
+  autoApprove?: boolean;
+  orchestrator?: OrchestratorConfig;
 }
 
 export interface AgentNodeConfig extends AgentDefaults {
   allowedTools?: string[];
   disallowedTools?: string[];
+}
+
+export type OrchestratorActivation = "stale_only" | "always_on";
+
+export interface OrchestratorConfig {
+  enabled: boolean;
+  model?: string;
+  activation?: OrchestratorActivation;
+  systemPrompt?: string;
+  staleTimeoutSecs?: number;
+  subagentTimeoutSecs?: number;
 }
 
 export interface WorkflowVariable {
