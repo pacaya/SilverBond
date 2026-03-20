@@ -34,7 +34,7 @@ CursorState {
   visit_counters    — per-node visit counts
   last_branch_*     — last branch decision metadata
   cancel_requested  — whether cancellation was requested
-  state             — Running | WaitingAtCollector | Done | Cancelled | Failed
+  state             — Running | WaitingAtCollector | WaitingInteraction | Done | Cancelled | Failed
 }
 ```
 
@@ -183,6 +183,8 @@ Events emitted during execution:
 | `approval_required` | Run paused waiting for user approval |
 | `cursor_cancelled` | Cursor cancelled (failure policy) |
 | `transition` | Cursor moving to next node |
+| `agent_interaction_required` | PTY prompt detected, waiting for human response |
+| `agent_interaction_resolved` | Human responded to PTY interaction prompt |
 | `workflow_error` | Runtime error occurred |
 | `done` | Run completed (success, failed, or aborted) |
 
@@ -197,13 +199,36 @@ Events emitted during execution:
 | `aborted` | User-initiated abort |
 | `restarted` | Run was restarted from a specific node |
 
+## Interactive PTY Prompts
+
+When task nodes execute via interactive PTY sessions (managed by `session.rs`), agent CLIs may emit interactive prompts — trust dialogs, permission requests, or destructive-action warnings. SilverBond handles these through a **4-tier escalation model**:
+
+### Tier 1: Auto-Respond (Warmup)
+
+Known low-risk patterns (e.g., "trust this folder?" prompts) are automatically answered during session warmup. Each driver declares these via `interaction_patterns()` with `InteractionKind::AutoRespond`. No user intervention is needed.
+
+### Tier 2: Auto-Approve with Destructive Blocklist
+
+When `autoApprove` is enabled in agent defaults, permission-request patterns (`InteractionKind::PermissionRequest`) are automatically approved — **unless** the prompt matches the driver's destructive blocklist. The shared blocklist catches patterns like `rm -rf`, `DROP TABLE`, `force push`, `chmod 777`, and similar dangerous operations.
+
+### Tier 3: Orchestrator Classification (Scaffolded)
+
+When the orchestrator is configured with `activation: "always_on"`, it can classify ambiguous prompts. This tier is scaffolded in the `OrchestratorConfig` type but not yet active — the infrastructure exists for future use.
+
+### Tier 4: Human-in-the-Loop
+
+Any prompt that is not auto-responded or auto-approved escalates to the user via the UI. The runtime emits an `agent_interaction_required` event, the frontend renders an interaction card in the RunPanel, and the session enters the `WaitingInteraction` state. The user can approve, reject, or type a free-form response. Once submitted, the runtime sends the response to the PTY session and emits `agent_interaction_resolved`.
+
+Destructive-blocklist matches (`InteractionKind::DestructiveWarning`) **always** escalate to Tier 4, regardless of auto-approve settings.
+
 ## Orchestrator
 
-When `useOrchestrator` is enabled, the runtime uses the orchestrator agent (Claude by default) for three decision types:
+When `useOrchestrator` is enabled, the runtime uses the orchestrator agent (Claude by default) for decision-making:
 
 1. **Prompt refinement** — enhances task prompts before execution
 2. **Branch choice** — selects which branch to follow at decision points
 3. **Loop verdict** — decides whether to continue or exit a loop
+4. **Interaction classification** — (scaffolded) classifies ambiguous PTY prompts when `activation` is `"always_on"`
 
 The orchestrator is only used when the selected agent supports the relevant capability.
 

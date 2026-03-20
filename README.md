@@ -93,7 +93,7 @@ Key frontend modules:
 - `ui/src/features/editor/GraphEditor.svelte` owns SvelteFlow integration
 - `ui/src/features/editor/InspectorPanel.svelte` edits workflow, node, and edge fields
 - `ui/src/features/history/HistoryPanel.svelte` renders interrupted runs and persisted logs
-- `ui/src/features/runtime/RunPanel.svelte` renders live run output and approvals
+- `ui/src/features/runtime/RunPanel.svelte` renders live run output, approvals, and interaction cards
 - `ui/src/lib/api/client.ts` is the browser contract to the Rust backend
 
 ## Current Constraints

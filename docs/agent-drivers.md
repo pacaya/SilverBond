@@ -25,6 +25,8 @@ trait AgentDriver: Send + Sync {
     fn capabilities(&self) -> AgentCapabilities;
     fn build_args(&self, prompt: &str, config: &AgentConfig) -> Result<CommandArgs>;
     fn parse_output(&self, stdout: &str, stderr: &str, exit_code: i32) -> Result<AgentOutput>;
+    fn interaction_patterns(&self) -> Vec<InteractionPattern> { vec![] }
+    fn destructive_blocklist(&self) -> &[&str] { shared_destructive_patterns() }
 }
 ```
 
@@ -32,6 +34,8 @@ trait AgentDriver: Send + Sync {
 - **`capabilities()`** — declares what the driver supports
 - **`build_args()`** — constructs CLI command and arguments from prompt + config
 - **`parse_output()`** — parses CLI stdout/stderr into structured `AgentOutput`
+- **`interaction_patterns()`** — returns regex patterns for detecting interactive PTY prompts
+- **`destructive_blocklist()`** — returns patterns that always require human approval
 
 ## Agent Config
 
@@ -110,6 +114,38 @@ Each driver declares 15 capability flags. The frontend uses these to show/hide c
 | `toolAllowlist` | Yes | No | No | Supports tool allow/deny lists |
 | `webSearch` | Yes | Yes | Yes | Supports web search toggle |
 
+## Interaction Patterns
+
+Each driver declares regex patterns for detecting interactive PTY prompts via `interaction_patterns()`. Patterns are classified by `InteractionKind`:
+
+| Kind | Behavior |
+|------|----------|
+| `AutoRespond { response }` | Automatically sends the configured response (e.g., "y" for trust prompts) |
+| `PermissionRequest` | Escalates to UI for user approval (or auto-approved if `autoApprove` is enabled) |
+| `SubagentActive` | Marks that a subagent is running — output silence is expected, not a stall |
+| `DestructiveWarning` | Always escalates to UI, even with `autoApprove` enabled |
+
+```rust
+pub struct InteractionPattern {
+    pub kind: InteractionKind,
+    pub pattern: String,        // Regex pattern
+    pub description: String,    // Human-readable description
+}
+```
+
+## Destructive Blocklist
+
+The shared destructive blocklist catches dangerous operations that should always require human confirmation:
+
+- `rm -rf`
+- `DROP TABLE` / `DROP DATABASE`
+- `force push` / `git push --force`
+- `delete N files`
+- `chmod 777`
+- `truncate`
+
+All drivers inherit this shared blocklist by default via `shared_destructive_patterns()`. Individual drivers can override `destructive_blocklist()` to customize.
+
 ## Claude Driver
 
 The most capable driver. Uses `claude` CLI.
@@ -137,6 +173,8 @@ claude -p "<prompt>" --output-format json \
 
 **Output parsing:** Single JSON blob with `result`, `session_id`, `usage`, `total_cost_usd`, `modelUsage`, `structured_output`. Maps `subtype` field to `NodeOutcome`.
 
+**Interaction patterns:** Trust folder prompts (auto-respond "y"), tool permission prompts (escalate to UI), subagent launch detection (2 patterns).
+
 ## Codex Driver
 
 Uses `codex` CLI. More limited capabilities than Claude.
@@ -159,6 +197,8 @@ codex exec [resume <session-id>] "<prompt>" --json \
 
 **Output parsing:** JSONL stream — accumulates events: `thread.started` (session_id), `turn.completed` (tokens), last text `item.completed` (response), `turn.failed` (error).
 
+**Interaction patterns:** Action approval prompts (escalate to UI).
+
 ## Gemini Driver
 
 Uses `gemini` CLI. Limited capability set.
@@ -180,6 +220,8 @@ gemini --prompt "<prompt>" --output-format json \
 **Special handling:** Reasoning and web search are configured via temporary settings file using `GEMINI_CLI_HOME` environment variable.
 
 **Output parsing:** Single JSON blob with `response`, `session_id`, `stats.models.*` (including `thoughts` token count). Error codes: 42 → input error, 53 → turn limit.
+
+**Interaction patterns:** Approval prompts (escalate to UI).
 
 ## Agent Discovery
 

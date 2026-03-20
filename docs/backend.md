@@ -17,6 +17,7 @@ The Rust backend is the system of record for SilverBond. It owns workflow valida
 | Utils | `anyhow` / `thiserror` | — / 2.0 | Error handling |
 | Frontend | `include_dir` | 0.7 | Embed built assets |
 | Frontend | `mime_guess` | 2.0 | Content-type detection |
+| PTY | `expectrl` | 0.7 | PTY session management and prompt detection |
 | Utils | `tempfile` | 3.20 | Temporary files for agent schemas |
 
 ## Module Overview
@@ -62,7 +63,7 @@ Defines the canonical workflow data model and validation logic:
 - `SplitFailurePolicy` — `BestEffortContinue`, `FailFastCancel`, `DrainThenFail`
 
 **Agent configuration types:**
-- `AgentDefaults` — model, reasoning level, system prompt, access mode, tool toggles, max turns, max budget
+- `AgentDefaults` — model, reasoning level, system prompt, access mode, tool toggles, max turns, max budget, `auto_approve`, `orchestrator` (OrchestratorConfig)
 - `AgentNodeConfig` — extends `AgentDefaults` with allowed/disallowed tool lists
 - `resolve_agent_config()` — merges node config → workflow defaults → driver defaults
 
@@ -76,11 +77,11 @@ Defines the canonical workflow data model and validation logic:
 
 ### `driver.rs` — Agent Abstraction Layer
 
-Defines the `AgentDriver` trait and concrete implementations. See [Agent Drivers](agent-drivers.md) for full details.
+Defines the `AgentDriver` trait and concrete implementations. The trait includes `interaction_patterns()` for PTY prompt detection and `destructive_blocklist()` for safety-critical pattern matching. See [Agent Drivers](agent-drivers.md) for full details.
 
 ### `runtime.rs` — Execution Engine
 
-The core execution engine. See [Execution Model](execution-model.md) for full details.
+The core execution engine. Includes interaction management methods (`respond_interaction()`) for handling PTY prompt escalation. See [Execution Model](execution-model.md) for full details.
 
 ### `storage.rs` — Persistence Layer
 
@@ -95,6 +96,22 @@ Manages all persistence:
 - `WorkflowStore` — reads/writes workflow JSON files from `workflows/` directory
 - `TemplateStore` — reads template JSON files from `templates/` directory
 - `seed_bundled_templates()` — copies bundled templates to the app root
+
+### `session.rs` — PTY Session Management
+
+Manages interactive PTY sessions for agent CLIs using `expectrl`. Responsibilities:
+
+- **Session lifecycle**: `create_session()` spawns PTY-backed agent processes, `close_session()` / `close_all()` clean up
+- **Interactive prompt handling**: `send_prompt_interactive()` watches for PTY prompts during execution using sentinel markers
+- **4-tier escalation**: Auto-responds to warmup patterns (Tier 1), auto-approves with destructive blocklist (Tier 2), scaffolds orchestrator classification (Tier 3), escalates to UI (Tier 4)
+- **Interaction resolution**: `respond_to_interaction()` sends human responses back to the PTY session
+- **Session state tracking**: `SessionState` enum tracks `Idle`, `Processing`, `WaitingInteraction`, `Completed`, `Error`
+- **Warmup**: `warmup_session()` runs initial auto-response phase for trust prompts
+- **History and inspection**: `get_history()` returns conversation log, `list_sessions()` provides session summaries
+
+### `pty_output.rs` — PTY Output Parsing
+
+Parses agent CLI output from PTY sessions. Uses `LazyLock<Regex>` for zero-allocation regex compilation (compiled once on first use). Patterns include cost parsing (`COST_RE`), token count extraction (`INPUT_RE`, `OUTPUT_RE`, `THINKING_RE`, `CACHE_READ_RE`, `CACHE_WRITE_RE`), and context window tracking (`CONTEXT_RE`).
 
 ### `frontend.rs` — Embedded Asset Serving
 

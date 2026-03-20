@@ -27,7 +27,11 @@ ui/src/
 ├── features/
 │   ├── editor/
 │   │   ├── GraphEditor.svelte        # SvelteFlow canvas and node interaction
-│   │   ├── InspectorPanel.svelte     # Node/edge/workflow property editor
+│   │   ├── InspectorPanel.svelte     # Node/edge/workflow property editor (composed)
+│   │   ├── NodeHeader.svelte         # Node header display and type badge
+│   │   ├── AddSectionMenu.svelte     # Menu for adding node config sections
+│   │   ├── ConditionBuilder.svelte   # Skip/loop condition editor
+│   │   ├── SchemaPresets.svelte      # Output schema preset selector
 │   │   ├── flowNodes.ts              # Workflow → SvelteFlow node/edge conversion
 │   │   └── flowNodes.test.ts         # Unit tests for flow node conversion
 │   ├── runtime/
@@ -55,6 +59,7 @@ ui/src/
 │   └── utils/
 │       ├── caretPosition.ts          # Textarea caret position measurement
 │       ├── format.ts                 # Token count formatting (5.4k, 1.0M)
+│       ├── sectionUtils.ts           # Inspector section helpers
 │       └── templateSuggestions.ts    # Autocomplete suggestion generation
 └── test/
     └── setup.ts                      # Vitest setup (jsdom)
@@ -69,7 +74,11 @@ App.svelte
         ├── Sidebar.svelte          (left panel: workflow list)
         ├── GraphEditor.svelte      (center: visual graph editor)
         ├── InspectorPanel.svelte   (right panel: property editor)
-        ├── RunPanel.svelte         (bottom: execution output)
+        │   ├── NodeHeader.svelte       (node type badge and name)
+        │   ├── AddSectionMenu.svelte   (add config sections)
+        │   ├── ConditionBuilder.svelte (skip/loop conditions)
+        │   └── SchemaPresets.svelte    (output schema presets)
+        ├── RunPanel.svelte         (bottom: execution output + interaction cards)
         ├── HistoryPanel.svelte     (tab: past runs and logs)
         ├── ReferencePanel.svelte   (tab: schema reference)
         └── ConfirmDialog.svelte    (modal: delete confirmation)
@@ -101,11 +110,17 @@ The SvelteFlow-powered graph canvas. Key patterns:
 
 ### InspectorPanel.svelte
 
-Context-sensitive property editor with three modes:
+Context-sensitive property editor composed of sub-components. Three modes:
 
 1. **Workflow selected**: Edit name, goal, cwd, orchestrator toggle, variables, limits, and per-agent defaults
 2. **Node selected**: Edit all node properties including agent config, output schema, skip conditions, loop settings
 3. **Edge selected**: Edit outcome type and label
+
+Sub-components:
+- **NodeHeader.svelte** — displays node type badge and editable name
+- **AddSectionMenu.svelte** — dropdown menu for adding optional config sections to a node
+- **ConditionBuilder.svelte** — visual editor for skip conditions and loop conditions
+- **SchemaPresets.svelte** — preset selector for common output schema patterns
 
 Features:
 - Capability-gated fields — only shows config options the selected agent supports
@@ -118,8 +133,14 @@ Features:
 Displays real-time execution output:
 - Scrollable log of runtime event lines
 - Approval card showing prompt, last output, and user input textarea
+- Interaction cards for PTY prompt escalation (permission requests, destructive warnings, agent questions)
 - Run/Abort action buttons
 - Auto-scrolls to bottom on new lines
+
+Interaction cards render differently based on `interactionType`:
+- **`destructive_warning`**: Warning-styled card with Reject/Confirm buttons
+- **`permission`**: Standard card with Reject/Approve buttons
+- **`question`**: Free-form textarea with Submit button
 
 ### HistoryPanel.svelte
 
@@ -155,6 +176,7 @@ class WorkflowStore {
   lines = $state<string[]>([]);
   nodeStates = $state<Record<string, string>>({});
   approval = $state<ApprovalState | null>(null);
+  interaction = $state<InteractionState | null>(null);
 
   // Undo/redo (max 50 entries)
   undo(): void;
@@ -192,6 +214,7 @@ export const api = {
   abortRun(runId): Promise<void>,
   resumeRun(runId): Promise<void>,
   restartFromNode(runId, nodeId): Promise<void>,
+  respondToInteraction(runId, response): Promise<{ success: boolean }>,
   dismissRun(runId): Promise<void>,
   interruptedRuns(): Promise<InterruptedRun[]>,
   logs(): Promise<LogListItem[]>,

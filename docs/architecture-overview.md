@@ -65,6 +65,8 @@ SilverBond/
 │   ├── model.rs            # Workflow schema + validation
 │   ├── runtime.rs          # Execution engine
 │   ├── driver.rs           # Agent CLI abstraction
+│   ├── session.rs          # PTY session management + interaction escalation
+│   ├── pty_output.rs       # PTY output parsing (LazyLock regexes)
 │   ├── storage.rs          # SQLite + file persistence
 │   ├── frontend.rs         # Embedded asset serving
 │   └── util.rs             # Helpers

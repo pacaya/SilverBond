@@ -191,13 +191,25 @@ Responsibilities:
 - manage approvals, aborts, resume, and restart-from
 - emit and persist runtime events and execution logs
 
+### `/src/session.rs`
+
+PTY session management.
+
+Responsibilities:
+
+- manage interactive PTY sessions for agent CLIs using `expectrl`
+- implement 4-tier escalation for PTY prompts (auto-respond, auto-approve, orchestrator, human-in-the-loop)
+- track session state (`Idle`, `Processing`, `WaitingInteraction`, `Completed`, `Error`)
+- resolve interactions by sending human responses to PTY sessions
+- warmup sessions with auto-response to known prompts
+
 ### `/src/driver.rs`
 
 Agent abstraction layer.
 
 Responsibilities:
 
-- define the `AgentDriver` trait (`name`, `capabilities`, `build_args`, `parse_output`)
+- define the `AgentDriver` trait (`name`, `capabilities`, `build_args`, `parse_output`, `interaction_patterns`, `destructive_blocklist`)
 - implement `ClaudeDriver`, `CodexDriver`, and `GeminiDriver`
 - normalize agent output into `AgentOutput` with token counts, cost, outcome classification
 - map access modes to agent-specific CLI permission flags
@@ -268,7 +280,7 @@ Top-level fields:
 - `ui.canvas`
 
 Nodes support per-node `agentConfig` overrides (model, reasoning level, system prompt, access mode,
-tool toggles, budget/turn limits, allowed/disallowed tools), a `cwd` override, and `continueSessionFrom`
+tool toggles, budget/turn limits, allowed/disallowed tools, `auto_approve`, `orchestrator`), a `cwd` override, and `continueSessionFrom`
 for session continuity across nodes. Configuration resolves as: node `agentConfig` → workflow
 `agentDefaults[agent]` → driver defaults.
 
@@ -353,6 +365,8 @@ Important runtime events today include:
 - `collector_waiting`
 - `aggregate_merged`
 - `collector_released`
+- `agent_interaction_required`
+- `agent_interaction_resolved`
 - `approval_queued`
 - `approval_required`
 - `cursor_cancelled`
@@ -410,6 +424,7 @@ Important routes today:
 - `POST /api/runs`
 - `GET /api/runs/{runId}/stream`
 - `GET /api/runs/{runId}/events`
+- `POST /api/runs/{runId}/respond-interaction`
 - `POST /api/runs/{runId}/approve`
 - `POST /api/runs/{runId}/abort`
 - `POST /api/runs/{runId}/resume`

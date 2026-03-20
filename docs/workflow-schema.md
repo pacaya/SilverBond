@@ -255,7 +255,16 @@ Workflow-level default configuration per agent:
       "accessMode": "execute",
       "toolToggles": { "webSearch": false },
       "maxTurns": 20,
-      "maxBudgetUsd": 10.0
+      "maxBudgetUsd": 10.0,
+      "autoApprove": true,
+      "orchestrator": {
+        "enabled": true,
+        "model": "claude-sonnet-4",
+        "activation": "stale_only",
+        "systemPrompt": "You classify prompts.",
+        "staleTimeoutSecs": 30,
+        "subagentTimeoutSecs": 120
+      }
     },
     "codex": {
       "model": "o4-mini",
@@ -266,6 +275,30 @@ Workflow-level default configuration per agent:
 ```
 
 Resolution order: node-level `agentConfig` overrides → workflow-level `agentDefaults` → driver defaults.
+
+### Auto-Approve
+
+When `autoApprove` is `true`, permission-request prompts detected during PTY execution are automatically approved — unless the prompt matches the destructive blocklist. Destructive patterns always require human confirmation.
+
+### OrchestratorConfig
+
+Optional orchestrator configuration for interaction classification and prompt refinement:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | `boolean` | `false` | Enable the orchestrator |
+| `model` | `string` | — | Model to use for orchestrator calls |
+| `activation` | `OrchestratorActivation` | `"stale_only"` | When to activate |
+| `systemPrompt` | `string` | — | System prompt for orchestrator |
+| `staleTimeoutSecs` | `number` | — | Seconds before considering output stale |
+| `subagentTimeoutSecs` | `number` | — | Timeout for subagent detection |
+
+### OrchestratorActivation
+
+| Value | Description |
+|-------|-------------|
+| `"stale_only"` | Activate only when output goes stale |
+| `"always_on"` | Classify all ambiguous prompts |
 
 ### Access Modes
 
@@ -289,6 +322,8 @@ Resolution order: node-level `agentConfig` overrides → workflow-level `agentDe
 | `maxBudgetUsd` | `number` | Maximum cost in USD |
 | `allowedTools` | `string[]` | Whitelist of allowed tools (node-level only) |
 | `disallowedTools` | `string[]` | Blacklist of disallowed tools (node-level only) |
+| `autoApprove` | `boolean` | Auto-approve PTY permission prompts (blocked by destructive blocklist) |
+| `orchestrator` | `OrchestratorConfig` | Orchestrator configuration for interaction classification |
 
 Not all agents support all fields. The frontend shows only capability-supported fields per agent. See [Agent Drivers](agent-drivers.md) for capability details.
 

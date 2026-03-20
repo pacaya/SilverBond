@@ -176,10 +176,21 @@ data: {"type": "node_start", "nodeId": "n1", "nodeName": "Research", ...}
 
 data: {"type": "node_done", "nodeId": "n1", "success": true, "output": "...", ...}
 
+data: {"type": "agent_interaction_required", "sessionId": "...", "description": "...", "interactionType": "permission"}
+
+data: {"type": "agent_interaction_resolved", "sessionId": "..."}
+
 data: {"type": "done", "status": "completed"}
 ```
 
 The connection stays open until the run completes, fails, or is aborted.
+
+**Additional SSE event types:**
+
+| Event | Description |
+|-------|-------------|
+| `agent_interaction_required` | A PTY prompt needs human response. Includes `sessionId`, `description`, `outputSoFar`, and `interactionType` (`permission`, `question`, or `destructive_warning`) |
+| `agent_interaction_resolved` | The interaction was resolved and execution continues |
 
 ### `GET /api/runs/{runId}/events`
 
@@ -207,6 +218,24 @@ Approve or reject a pending approval.
   "userInput": "Looks good, proceed."
 }
 ```
+
+### `POST /api/runs/{runId}/respond-interaction`
+
+Send a human response to a pending PTY interaction prompt.
+
+**Request body:**
+```json
+{
+  "response": "y"
+}
+```
+
+**Response:**
+```json
+{ "success": true }
+```
+
+The `response` field is sent directly to the agent's PTY session. For permission prompts, typically `"y"` or `"n"`. For question-type interactions, any free-form text.
 
 ### `POST /api/runs/{runId}/abort`
 
