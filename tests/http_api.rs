@@ -320,11 +320,18 @@ async fn exposes_capabilities() {
     assert_eq!(claude_caps["toolAllowlist"], true);
     assert_eq!(claude_caps["webSearch"], true);
 
-    // Verify Gemini is listed
-    assert!(capabilities["agents"]["gemini"].is_object());
-    let gemini_caps = &capabilities["agents"]["gemini"]["capabilities"];
-    assert_eq!(gemini_caps["nativeJsonSchema"], false);
-    assert_eq!(gemini_caps["reasoningConfig"], true);
+    // Gemini was removed (replaced by the Antigravity CLI) — it must not appear.
+    assert!(capabilities["agents"].get("gemini").is_none());
+
+    // Verify Cursor is listed (registry-driven worker agent).
+    assert!(capabilities["agents"]["cursor"].is_object());
+    let cursor_caps = &capabilities["agents"]["cursor"]["capabilities"];
+    assert_eq!(cursor_caps["workerExecution"], true);
+
+    // Verify Antigravity (agy) is listed.
+    assert!(capabilities["agents"]["agy"].is_object());
+    let agy_caps = &capabilities["agents"]["agy"]["capabilities"];
+    assert_eq!(agy_caps["workerExecution"], true);
 }
 
 #[tokio::test]

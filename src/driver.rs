@@ -121,7 +121,7 @@ pub fn agent_binary(name: &str) -> Option<String> {
         .ok()
         .and_then(|registry| registry.get(name).map(|spec| spec.binary.clone()))
         .or_else(|| match name {
-            "claude" | "codex" | "gemini" => Some(name.to_string()),
+            "claude" | "codex" => Some(name.to_string()),
             _ => None,
         })
 }
@@ -672,76 +672,8 @@ impl AgentDriver for CodexDriver {
 }
 
 // ===========================================================================
-// Gemini driver
+// Structured-output helpers
 // ===========================================================================
-
-/// Driver for the Google **Gemini CLI**.
-pub struct GeminiDriver;
-
-impl GeminiDriver {
-    /// Thinking budget for each reasoning level.
-    fn thinking_budget(level: &ReasoningLevel) -> u32 {
-        match level {
-            ReasoningLevel::Low => 2048,
-            ReasoningLevel::Medium => 8192,
-            ReasoningLevel::High => 32768,
-        }
-    }
-
-    /// Build a Gemini settings JSON object for overrides that require a settings file
-    /// (reasoning budget and/or web search toggle). Returns `None` if no settings needed.
-    fn build_settings(config: &AgentConfig) -> Option<Value> {
-        let needs_reasoning = config.reasoning_level.is_some();
-        let needs_web_toggle = config.tool_toggles.web_search.is_some();
-
-        if !needs_reasoning && !needs_web_toggle {
-            return None;
-        }
-
-        let mut settings = serde_json::Map::new();
-
-        // Web search toggle
-        if let Some(enabled) = config.tool_toggles.web_search {
-            settings.insert(
-                "web_search".to_string(),
-                Value::String(if enabled { "live" } else { "disabled" }.to_string()),
-            );
-        }
-
-        // Reasoning / thinking budget via modelConfigs overrides
-        if let Some(level) = &config.reasoning_level {
-            let budget = Self::thinking_budget(level);
-            settings.insert(
-                "modelConfigs".to_string(),
-                serde_json::json!({
-                    "overrides": [{
-                        "generateContentConfig": {
-                            "thinkingConfig": {
-                                "thinkingBudget": budget
-                            }
-                        }
-                    }]
-                }),
-            );
-        }
-
-        Some(Value::Object(settings))
-    }
-
-    /// Create a temporary directory with a `settings.json` file for Gemini CLI overrides.
-    /// Returns the temp directory path to set as `GEMINI_CLI_HOME`.
-    fn write_temp_settings(settings: &Value) -> anyhow::Result<PathBuf> {
-        let temp_dir = tempfile::Builder::new()
-            .prefix("silverbond-gemini-")
-            .tempdir()
-            .context("Failed to create temp directory for Gemini settings")?;
-        let settings_path = temp_dir.path().join("settings.json");
-        std::fs::write(&settings_path, serde_json::to_string_pretty(settings)?)
-            .context("Failed to write Gemini temp settings")?;
-        // keep() prevents automatic cleanup — caller is responsible for removal
-        Ok(temp_dir.keep())
-    }
-}
 
 /// Generate a human-readable schema description for prompt injection (structured output fallback).
 pub fn schema_to_prompt_hint(schema: &Value) -> String {
@@ -774,106 +706,6 @@ pub fn schema_to_prompt_hint(schema: &Value) -> String {
         "\nThe JSON object should have these fields:\n{}",
         parts.join("\n")
     )
-}
-
-impl AgentDriver for GeminiDriver {
-    fn name(&self) -> &str {
-        "gemini"
-    }
-
-    fn capabilities(&self) -> AgentCapabilities {
-        registry_capabilities_or(
-            self.name(),
-            AgentCapabilities {
-                worker_execution: true,
-                prompt_refinement: true,
-                branch_choice: true,
-                loop_verdict: true,
-                structured_output: true,
-                native_json_schema: false,
-                session_reuse: true,
-                model_selection: true,
-                reasoning_config: true,
-                system_prompt: false,
-                budget_limit: false,
-                turn_limit: false,
-                cost_reporting: false,
-                tool_allowlist: false,
-                web_search: true,
-            },
-        )
-    }
-
-    fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
-        let mut args = Vec::new();
-        let mut env = Vec::new();
-        let mut temp_dir = None;
-
-        // Model selection
-        if let Some(model) = &config.model {
-            args.push("--model".to_string());
-            args.push(model.clone());
-        }
-
-        // Session resume (no ephemeral flag available for Gemini)
-        if let Some(session_id) = &config.resume_session_id {
-            args.push("--resume".to_string());
-            args.push(session_id.clone());
-        }
-
-        // Access mode → approval mode
-        match config.access_mode {
-            AccessMode::ReadOnly => {
-                args.push("--approval-mode".to_string());
-                args.push("plan".to_string());
-            }
-            AccessMode::Edit => {
-                args.push("--approval-mode".to_string());
-                args.push("auto_edit".to_string());
-            }
-            AccessMode::Execute | AccessMode::Unrestricted => {
-                args.push("--approval-mode".to_string());
-                args.push("yolo".to_string());
-            }
-        }
-
-        // Temp settings for reasoning level and/or web search
-        if let Some(settings) = Self::build_settings(config) {
-            let dir = Self::write_temp_settings(&settings)?;
-            env.push(("GEMINI_CLI_HOME".to_string(), dir.display().to_string()));
-            temp_dir = Some(dir);
-        }
-
-        Ok(CommandArgs {
-            args,
-            env,
-            temp_dir,
-        })
-    }
-
-    fn cost_command(&self) -> Option<&str> {
-        None
-    }
-    fn context_command(&self) -> Option<&str> {
-        None
-    }
-    fn exit_command(&self) -> &str {
-        "/exit"
-    }
-    fn parse_cost_response(&self, _output: &str) -> Option<CostInfo> {
-        None
-    }
-    fn parse_context_response(&self, _output: &str) -> Option<ContextInfo> {
-        None
-    }
-
-    fn interaction_patterns(&self) -> Vec<InteractionPattern> {
-        vec![InteractionPattern {
-            kind: InteractionKind::PermissionRequest,
-            pattern: r"(?i)approve.*\?\s*\(y/n\)".to_string(),
-            description: "Approval prompt".to_string(),
-        }]
-    }
 }
 
 // ===========================================================================
@@ -953,7 +785,6 @@ pub fn get_driver(name: &str) -> Option<Box<dyn AgentDriver>> {
     match name {
         "claude" => Some(Box::new(ClaudeDriver)),
         "codex" => Some(Box::new(CodexDriver)),
-        "gemini" => Some(Box::new(GeminiDriver)),
         _ => agents::Registry::load().ok().and_then(|registry| {
             registry
                 .get(name)
@@ -965,11 +796,7 @@ pub fn get_driver(name: &str) -> Option<Box<dyn AgentDriver>> {
 /// Return every registered driver.
 pub fn all_drivers() -> Vec<Box<dyn AgentDriver>> {
     let Ok(registry) = agents::Registry::load() else {
-        return vec![
-            Box::new(ClaudeDriver),
-            Box::new(CodexDriver),
-            Box::new(GeminiDriver),
-        ];
+        return vec![Box::new(ClaudeDriver), Box::new(CodexDriver)];
     };
 
     registry
@@ -1344,19 +1171,13 @@ mod tests {
     }
 
     #[test]
-    fn registry_get_gemini() {
-        let driver = get_driver("gemini").expect("gemini driver should exist");
-        assert_eq!(driver.name(), "gemini");
-    }
-
-    #[test]
     fn registry_all_drivers() {
         let drivers = all_drivers();
-        assert_eq!(drivers.len(), 3);
         let names: Vec<&str> = drivers.iter().map(|d| d.name()).collect();
         assert!(names.contains(&"claude"));
         assert!(names.contains(&"codex"));
-        assert!(names.contains(&"gemini"));
+        // The Gemini driver was removed; ensure it no longer appears.
+        assert!(!names.contains(&"gemini"));
     }
 
     // -----------------------------------------------------------------------
@@ -1436,225 +1257,11 @@ mod tests {
         assert!(json.contains("webSearch"));
     }
 
-    // -----------------------------------------------------------------------
-    // GeminiDriver::build_session_args
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn gemini_default_args() {
-        let driver = GeminiDriver;
-        let cmd = driver.build_session_args(&default_config()).unwrap();
-        // Interactive mode: no --prompt, no --output-format json
-        assert!(!args_contain(&cmd.args, "--prompt"));
-        assert!(!args_contain(&cmd.args, "--output-format"));
-        assert_eq!(arg_after(&cmd.args, "--approval-mode"), Some("yolo"));
-        assert!(cmd.temp_dir.is_none());
-    }
-
-    #[test]
-    fn gemini_model_selection() {
-        let driver = GeminiDriver;
-        let config = AgentConfig {
-            model: Some("gemini-2.5-pro".into()),
-            ..default_config()
-        };
-        let cmd = driver.build_session_args(&config).unwrap();
-        assert_eq!(arg_after(&cmd.args, "--model"), Some("gemini-2.5-pro"));
-    }
-
-    #[test]
-    fn gemini_session_resume() {
-        let driver = GeminiDriver;
-        let config = AgentConfig {
-            resume_session_id: Some("gem-sess-1".into()),
-            ephemeral_session: false,
-            ..default_config()
-        };
-        let cmd = driver.build_session_args(&config).unwrap();
-        assert_eq!(arg_after(&cmd.args, "--resume"), Some("gem-sess-1"));
-    }
-
-    #[test]
-    fn gemini_access_mode_read_only() {
-        let driver = GeminiDriver;
-        let config = AgentConfig {
-            access_mode: AccessMode::ReadOnly,
-            ..default_config()
-        };
-        let cmd = driver.build_session_args(&config).unwrap();
-        assert_eq!(arg_after(&cmd.args, "--approval-mode"), Some("plan"));
-    }
-
-    #[test]
-    fn gemini_access_mode_edit() {
-        let driver = GeminiDriver;
-        let config = AgentConfig {
-            access_mode: AccessMode::Edit,
-            ..default_config()
-        };
-        let cmd = driver.build_session_args(&config).unwrap();
-        assert_eq!(arg_after(&cmd.args, "--approval-mode"), Some("auto_edit"));
-    }
-
-    #[test]
-    fn gemini_access_mode_execute() {
-        let driver = GeminiDriver;
-        let config = AgentConfig {
-            access_mode: AccessMode::Execute,
-            ..default_config()
-        };
-        let cmd = driver.build_session_args(&config).unwrap();
-        assert_eq!(arg_after(&cmd.args, "--approval-mode"), Some("yolo"));
-    }
-
-    #[test]
-    fn gemini_access_mode_unrestricted() {
-        let driver = GeminiDriver;
-        let config = AgentConfig {
-            access_mode: AccessMode::Unrestricted,
-            ..default_config()
-        };
-        let cmd = driver.build_session_args(&config).unwrap();
-        assert_eq!(arg_after(&cmd.args, "--approval-mode"), Some("yolo"));
-    }
-
-    #[test]
-    fn gemini_reasoning_level_creates_temp_settings() {
-        let driver = GeminiDriver;
-        let config = AgentConfig {
-            reasoning_level: Some(ReasoningLevel::High),
-            ..default_config()
-        };
-        let cmd = driver.build_session_args(&config).unwrap();
-
-        // Should have GEMINI_CLI_HOME env var pointing to a temp dir
-        let home = cmd
-            .env
-            .iter()
-            .find(|(k, _)| k == "GEMINI_CLI_HOME")
-            .map(|(_, v)| v.clone());
-        assert!(home.is_some(), "GEMINI_CLI_HOME should be set");
-
-        // Verify settings file exists with thinking budget
-        let settings_path = PathBuf::from(home.unwrap()).join("settings.json");
-        assert!(settings_path.exists());
-        let content: Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        let budget = content
-            .get("modelConfigs")
-            .and_then(|mc| mc.get("overrides"))
-            .and_then(|o| o.as_array())
-            .and_then(|arr| arr.first())
-            .and_then(|o| o.get("generateContentConfig"))
-            .and_then(|gc| gc.get("thinkingConfig"))
-            .and_then(|tc| tc.get("thinkingBudget"))
-            .and_then(|v| v.as_u64());
-        assert_eq!(budget, Some(32768));
-
-        // Cleanup
-        if let Some(dir) = cmd.temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-
-    #[test]
-    fn gemini_reasoning_level_budgets() {
-        assert_eq!(GeminiDriver::thinking_budget(&ReasoningLevel::Low), 2048);
-        assert_eq!(GeminiDriver::thinking_budget(&ReasoningLevel::Medium), 8192);
-        assert_eq!(GeminiDriver::thinking_budget(&ReasoningLevel::High), 32768);
-    }
-
-    #[test]
-    fn gemini_web_search_creates_temp_settings() {
-        let driver = GeminiDriver;
-        let config = AgentConfig {
-            tool_toggles: ToolToggles {
-                web_search: Some(false),
-            },
-            ..default_config()
-        };
-        let cmd = driver.build_session_args(&config).unwrap();
-
-        let home = cmd
-            .env
-            .iter()
-            .find(|(k, _)| k == "GEMINI_CLI_HOME")
-            .map(|(_, v)| v.clone());
-        assert!(home.is_some());
-
-        let settings_path = PathBuf::from(home.unwrap()).join("settings.json");
-        let content: Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert_eq!(
-            content.get("web_search").and_then(|v| v.as_str()),
-            Some("disabled")
-        );
-
-        if let Some(dir) = cmd.temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-
-    #[test]
-    fn gemini_web_search_enabled_settings() {
-        let driver = GeminiDriver;
-        let config = AgentConfig {
-            tool_toggles: ToolToggles {
-                web_search: Some(true),
-            },
-            ..default_config()
-        };
-        let cmd = driver.build_session_args(&config).unwrap();
-
-        let home = cmd
-            .env
-            .iter()
-            .find(|(k, _)| k == "GEMINI_CLI_HOME")
-            .map(|(_, v)| v.clone());
-        assert!(home.is_some());
-
-        let settings_path = PathBuf::from(home.unwrap()).join("settings.json");
-        let content: Value =
-            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert_eq!(
-            content.get("web_search").and_then(|v| v.as_str()),
-            Some("live")
-        );
-
-        if let Some(dir) = cmd.temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-
-    #[test]
-    fn gemini_no_temp_settings_when_not_needed() {
-        let driver = GeminiDriver;
-        let cmd = driver.build_session_args(&default_config()).unwrap();
-        assert!(cmd.temp_dir.is_none());
-        assert!(cmd.env.is_empty());
-    }
-
-    #[test]
-    fn gemini_schema_to_prompt_hint_empty() {
+    fn schema_to_prompt_hint_empty() {
         let schema = json!({"type": "object"});
         let hint = schema_to_prompt_hint(&schema);
         assert!(hint.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // GeminiDriver PTY methods
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn gemini_cost_command() {
-        let driver = GeminiDriver;
-        assert_eq!(driver.cost_command(), None);
-    }
-
-    #[test]
-    fn gemini_exit_command() {
-        let driver = GeminiDriver;
-        assert_eq!(driver.exit_command(), "/exit");
     }
 
     // -----------------------------------------------------------------------
@@ -1702,44 +1309,6 @@ mod tests {
         let driver = CodexDriver;
         let config = AgentConfig {
             allowed_tools: Some(vec!["Read".into(), "Edit".into()]),
-            disallowed_tools: Some(vec!["Bash".into()]),
-            ..default_config()
-        };
-        let cmd = driver.build_session_args(&config).unwrap();
-        assert!(!args_contain(&cmd.args, "--allowedTools"));
-        assert!(!args_contain(&cmd.args, "--disallowedTools"));
-    }
-
-    #[test]
-    fn gemini_ignores_system_prompt() {
-        let driver = GeminiDriver;
-        let config = AgentConfig {
-            system_prompt: Some("Be concise.".into()),
-            ..default_config()
-        };
-        let cmd = driver.build_session_args(&config).unwrap();
-        assert!(!args_contain(&cmd.args, "--append-system-prompt"));
-        assert!(!cmd.args.iter().any(|a| a.contains("Be concise")));
-    }
-
-    #[test]
-    fn gemini_ignores_budget_and_turn_limits() {
-        let driver = GeminiDriver;
-        let config = AgentConfig {
-            max_budget_usd: Some(5.0),
-            max_turns: Some(10),
-            ..default_config()
-        };
-        let cmd = driver.build_session_args(&config).unwrap();
-        assert!(!args_contain(&cmd.args, "--max-budget-usd"));
-        assert!(!args_contain(&cmd.args, "--max-turns"));
-    }
-
-    #[test]
-    fn gemini_ignores_tool_allowlist() {
-        let driver = GeminiDriver;
-        let config = AgentConfig {
-            allowed_tools: Some(vec!["Read".into()]),
             disallowed_tools: Some(vec!["Bash".into()]),
             ..default_config()
         };
@@ -1807,29 +1376,6 @@ mod tests {
         assert!(args_contain(&cmd.args, "--ephemeral"));
     }
 
-    #[test]
-    fn gemini_full_config_combination() {
-        let driver = GeminiDriver;
-        let config = AgentConfig {
-            model: Some("gemini-2.5-flash".into()),
-            reasoning_level: Some(ReasoningLevel::Low),
-            access_mode: AccessMode::ReadOnly,
-            tool_toggles: ToolToggles {
-                web_search: Some(true),
-            },
-            ..default_config()
-        };
-        let cmd = driver.build_session_args(&config).unwrap();
-        assert_eq!(arg_after(&cmd.args, "--model"), Some("gemini-2.5-flash"));
-        assert_eq!(arg_after(&cmd.args, "--approval-mode"), Some("plan"));
-        // Reasoning + web search → temp settings with GEMINI_CLI_HOME
-        assert!(cmd.env.iter().any(|(k, _)| k == "GEMINI_CLI_HOME"));
-        // Cleanup
-        if let Some(dir) = cmd.temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-
     // -----------------------------------------------------------------------
     // Capabilities
     // -----------------------------------------------------------------------
@@ -1871,23 +1417,14 @@ mod tests {
     }
 
     #[test]
-    fn gemini_capabilities() {
-        let driver = GeminiDriver;
+    fn registry_profile_driver_capabilities_default_when_absent() {
+        // A registry profile that isn't in the registry falls back to the
+        // worker-execution-only capability set.
+        let driver = RegistryProfileDriver::new("definitely-not-a-real-agent");
         let caps = driver.capabilities();
         assert!(caps.worker_execution);
-        assert!(caps.prompt_refinement);
-        assert!(caps.branch_choice);
-        assert!(caps.loop_verdict);
-        assert!(caps.structured_output);
-        assert!(!caps.native_json_schema);
-        assert!(caps.session_reuse);
-        assert!(caps.model_selection);
-        assert!(caps.reasoning_config);
-        assert!(!caps.system_prompt);
-        assert!(!caps.budget_limit);
-        assert!(!caps.turn_limit);
-        assert!(!caps.cost_reporting);
-        assert!(!caps.tool_allowlist);
-        assert!(caps.web_search);
+        assert!(!caps.structured_output);
+        assert!(!caps.session_reuse);
+        assert!(!caps.reasoning_config);
     }
 }

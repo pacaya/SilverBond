@@ -2539,8 +2539,7 @@ mod tests {
 
         assert!(
             result.issues.iter().any(|issue| {
-                issue.severity == "error"
-                    && issue.message.contains("references unknown subflow")
+                issue.severity == "error" && issue.message.contains("references unknown subflow")
             }),
             "expected unknown subflow error, got {:?}",
             result.issues
@@ -2573,8 +2572,7 @@ mod tests {
 
         assert!(
             result.issues.iter().any(|issue| {
-                issue.severity == "error"
-                    && issue.message.contains("exactly one exit node")
+                issue.severity == "error" && issue.message.contains("exactly one exit node")
             }),
             "expected single-exit validation error, got {:?}",
             result.issues
@@ -2611,7 +2609,9 @@ mod tests {
         assert!(
             result.issues.iter().any(|issue| {
                 issue.severity == "error"
-                    && issue.message.contains("does not match an outgoing branch edge label")
+                    && issue
+                        .message
+                        .contains("does not match an outgoing branch edge label")
             }),
             "expected outcome→edge mismatch error, got {:?}",
             result.issues
@@ -2621,15 +2621,15 @@ mod tests {
     #[test]
     fn epic_dev_template_parses_and_validates_clean() {
         // Load and validate the bundled epic-dev.json template at the schema level.
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("templates/epic-dev.json");
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("templates/epic-dev.json");
         let raw = std::fs::read_to_string(&path)
             .unwrap_or_else(|_| panic!("templates/epic-dev.json not found at {:?}", path));
         let value: serde_json::Value =
             serde_json::from_str(&raw).expect("epic-dev.json must be valid JSON");
 
-        let normalized = normalize_workflow_value(value)
-            .expect("epic-dev.json must parse as a v3 workflow");
+        let normalized =
+            normalize_workflow_value(value).expect("epic-dev.json must parse as a v3 workflow");
 
         let result = validate_workflow(normalized.workflow);
         let errors: Vec<_> = result
@@ -2649,10 +2649,14 @@ mod tests {
         // Load and validate the bundled multi-agent-plan-implementation.json template.
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("templates/multi-agent-plan-implementation.json");
-        let raw = std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| panic!("multi-agent-plan-implementation.json not found at {:?}", path));
-        let value: serde_json::Value =
-            serde_json::from_str(&raw).expect("multi-agent-plan-implementation.json must be valid JSON");
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|_| {
+            panic!(
+                "multi-agent-plan-implementation.json not found at {:?}",
+                path
+            )
+        });
+        let value: serde_json::Value = serde_json::from_str(&raw)
+            .expect("multi-agent-plan-implementation.json must be valid JSON");
 
         let normalized = normalize_workflow_value(value)
             .expect("multi-agent-plan-implementation.json must parse as a v3 workflow");

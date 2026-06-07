@@ -6623,7 +6623,7 @@ mod tests {
             "required": ["name"]
         });
         let hint = super::schema_to_prompt_hint(&schema);
-        // Uses GeminiDriver's bulleted list format
+        // Bulleted list format used for the structured-output prompt fallback
         assert!(hint.contains("name (string, required) — The person's name"));
         assert!(hint.contains("age (integer)"));
         assert!(!hint.contains("age (integer, required)"));
@@ -6787,17 +6787,6 @@ mod tests {
             .unwrap();
         assert!(!codex_cmd.args.iter().any(|a| a == "--json"));
         assert!(!codex_cmd.args.iter().any(|a| a == "--output-schema"));
-
-        let gemini_driver = get_driver("gemini").unwrap();
-        let gemini_cmd = gemini_driver
-            .build_session_args(&Default::default())
-            .unwrap();
-        assert!(!gemini_cmd.args.iter().any(|a| a == "--output-format"));
-        assert!(!gemini_cmd.args.iter().any(|a| a == "--prompt"));
-
-        if let Some(dir) = gemini_cmd.temp_dir {
-            let _ = std::fs::remove_dir_all(dir);
-        }
     }
 
     #[test]
@@ -6839,8 +6828,8 @@ mod tests {
                 ..Default::default()
             };
 
-            // All three agents should handle all access modes without error
-            for agent_name in &["claude", "codex", "gemini"] {
+            // Both built-in agents should handle all access modes without error
+            for agent_name in &["claude", "codex"] {
                 let driver = get_driver(agent_name).unwrap();
                 let result = driver.build_session_args(&config);
                 assert!(result.is_ok(), "{} failed with {:?}", agent_name, mode);
@@ -6853,9 +6842,6 @@ mod tests {
                     }
                     (&"codex", AccessMode::ReadOnly) => {
                         assert!(cmd.args.iter().any(|a| a == "read-only"));
-                    }
-                    (&"gemini", AccessMode::ReadOnly) => {
-                        assert!(cmd.args.iter().any(|a| a == "plan"));
                     }
                     _ => {} // Other combos already tested individually
                 }
@@ -7120,7 +7106,11 @@ mod tests {
 
     #[test]
     fn decide_routing_trims_quotes_and_whitespace() {
-        let outcomes = vec!["NEXT_STORY".to_string(), "DONE".to_string(), "BLOCKED".to_string()];
+        let outcomes = vec![
+            "NEXT_STORY".to_string(),
+            "DONE".to_string(),
+            "BLOCKED".to_string(),
+        ];
         assert_eq!(
             select_decide_outcome(&outcomes, "  \"NEXT_STORY\"  "),
             Some("NEXT_STORY".to_string())
@@ -7148,9 +7138,15 @@ mod tests {
             db.clone(),
             Arc::new(ScriptedRunner::new([
                 // input = "alpha"
-                ("compute alpha".to_string(), vec![ScriptedStep::success("result-alpha")]),
+                (
+                    "compute alpha".to_string(),
+                    vec![ScriptedStep::success("result-alpha")],
+                ),
                 // input = "beta"
-                ("compute beta".to_string(),  vec![ScriptedStep::success("result-beta")]),
+                (
+                    "compute beta".to_string(),
+                    vec![ScriptedStep::success("result-beta")],
+                ),
             ])),
         );
 
@@ -7217,22 +7213,14 @@ mod tests {
 
         // The subflow body is just a call node back to itself (depth = 1 allows
         // one level of nesting; a second attempt exceeds it).
-        let mut recurse_call = call_node(
-            "recurse",
-            "self_ref",
-            "recurse",
-            vec![],
-        );
+        let mut recurse_call = call_node("recurse", "self_ref", "recurse", vec![]);
         // Override max_depth to 1 so the second call is caught.
         if let Some(ref mut cfg) = recurse_call.subflow_config {
             cfg.max_depth = 1;
         }
 
-        let recurse_body = workflow_from_parts("recurse", vec![recurse_call], vec![], );
-        let runtime = RuntimeContext::with_runner(
-            db.clone(),
-            Arc::new(ScriptedRunner::new([])),
-        );
+        let recurse_body = workflow_from_parts("recurse", vec![recurse_call], vec![]);
+        let runtime = RuntimeContext::with_runner(db.clone(), Arc::new(ScriptedRunner::new([])));
         let mut wf = workflow_from_parts(
             "call",
             vec![{
@@ -7244,7 +7232,8 @@ mod tests {
             }],
             vec![],
         );
-        wf.subflows.insert("self_ref".to_string(), Box::new(recurse_body));
+        wf.subflows
+            .insert("self_ref".to_string(), Box::new(recurse_body));
 
         let run_id = runtime.start_run(wf, BTreeMap::new(), None).await.unwrap();
         let persisted = wait_for_terminal_run(&db, &run_id).await;
@@ -7271,8 +7260,14 @@ mod tests {
         let runtime = RuntimeContext::with_runner(
             db.clone(),
             Arc::new(ScriptedRunner::new([
-                ("pre work".to_string(), vec![ScriptedStep::success("pre done")]),
-                ("post work".to_string(), vec![ScriptedStep::success("post done")]),
+                (
+                    "pre work".to_string(),
+                    vec![ScriptedStep::success("pre done")],
+                ),
+                (
+                    "post work".to_string(),
+                    vec![ScriptedStep::success("post done")],
+                ),
             ])),
         );
 
@@ -7298,16 +7293,10 @@ mod tests {
         );
         wf.subflows.insert("sub".to_string(), Box::new(subflow));
 
-        let run_id = runtime
-            .start_run(wf, BTreeMap::new(), None)
-            .await
-            .unwrap();
+        let run_id = runtime.start_run(wf, BTreeMap::new(), None).await.unwrap();
 
         // Wait for the approval inside the subflow to be raised
-        let pending = wait_for_run(&db, &run_id, |p| {
-            p.checkpoint.pending_approval.is_some()
-        })
-        .await;
+        let pending = wait_for_run(&db, &run_id, |p| p.checkpoint.pending_approval.is_some()).await;
         assert!(
             pending.checkpoint.pending_approval.is_some(),
             "expected approval pending inside subflow"
@@ -7344,9 +7333,18 @@ mod tests {
         db.init().await.unwrap();
 
         let runner = Arc::new(ScriptedRunner::new([
-            ("read sprint status".to_string(),   vec![ScriptedStep::success("sprint: 1 story remaining")]),
-            ("implement story".to_string(),       vec![ScriptedStep::success("story done")]),
-            ("generate report".to_string(),       vec![ScriptedStep::success("epic complete")]),
+            (
+                "read sprint status".to_string(),
+                vec![ScriptedStep::success("sprint: 1 story remaining")],
+            ),
+            (
+                "implement story".to_string(),
+                vec![ScriptedStep::success("story done")],
+            ),
+            (
+                "generate report".to_string(),
+                vec![ScriptedStep::success("epic complete")],
+            ),
         ]));
         let runtime = RuntimeContext::with_runner(db.clone(), runner);
 
@@ -7371,9 +7369,18 @@ mod tests {
         let persisted = wait_for_terminal_run(&db, &run_id).await;
 
         assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
-        assert_eq!(persisted.checkpoint.all_results["read"].output, "sprint: 1 story remaining");
-        assert_eq!(persisted.checkpoint.all_results["impl"].output, "story done");
-        assert_eq!(persisted.checkpoint.all_results["report"].output, "epic complete");
+        assert_eq!(
+            persisted.checkpoint.all_results["read"].output,
+            "sprint: 1 story remaining"
+        );
+        assert_eq!(
+            persisted.checkpoint.all_results["impl"].output,
+            "story done"
+        );
+        assert_eq!(
+            persisted.checkpoint.all_results["report"].output,
+            "epic complete"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -7393,14 +7400,29 @@ mod tests {
 
         let runner = Arc::new(ScriptedRunner::new([
             // plan
-            ("plan tasks".to_string(), vec![ScriptedStep::success("tasks: a,b")]),
+            (
+                "plan tasks".to_string(),
+                vec![ScriptedStep::success("tasks: a,b")],
+            ),
             // batch items — ScriptedRunner matches the resolved prompt after var substitution
-            ("implement a".to_string(), vec![ScriptedStep::success("impl-a done")]),
-            ("implement b".to_string(), vec![ScriptedStep::success("impl-b done")]),
+            (
+                "implement a".to_string(),
+                vec![ScriptedStep::success("impl-a done")],
+            ),
+            (
+                "implement b".to_string(),
+                vec![ScriptedStep::success("impl-b done")],
+            ),
             // dual-review subflow body
-            ("review tasks: a,b".to_string(), vec![ScriptedStep::success("review ok")]),
+            (
+                "review tasks: a,b".to_string(),
+                vec![ScriptedStep::success("review ok")],
+            ),
             // consolidate
-            ("consolidate".to_string(), vec![ScriptedStep::success("consolidated")]),
+            (
+                "consolidate".to_string(),
+                vec![ScriptedStep::success("consolidated")],
+            ),
         ]));
         let runtime = RuntimeContext::with_runner(db.clone(), runner);
 
@@ -7415,7 +7437,14 @@ mod tests {
             "plan",
             vec![
                 run_agent_node("plan", "Plan", "mock", "plan tasks"),
-                parallel_batch_node("batch", "tasks", 2, "task", "impl_body", Some("impl_results")),
+                parallel_batch_node(
+                    "batch",
+                    "tasks",
+                    2,
+                    "task",
+                    "impl_body",
+                    Some("impl_results"),
+                ),
                 task_node("impl_body", "Impl", "implement {{var:task}}"),
                 approval_node("merge_gate", "Merge Gate", "approve merge?"),
                 call_node(

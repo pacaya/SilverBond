@@ -2,7 +2,7 @@
 
 ## What SilverBond Is
 
-SilverBond is a local-first graph workflow runner. It lets users visually author directed graphs of tasks, then executes them by shelling out to local agent CLIs (Claude, Codex, Gemini). The system is designed around a few core ideas:
+SilverBond is a local-first graph workflow runner. It lets users visually author directed graphs of tasks, then executes them by shelling out to local agent CLIs (Claude, Codex, Cursor, Antigravity). The system is designed around a few core ideas:
 
 - **Local-first**: No cloud coordinator, remote queue, or managed database required
 - **Runtime-authoritative**: The Rust backend owns all business logic — validation, traversal, execution, checkpoints
@@ -37,9 +37,9 @@ SilverBond is a local-first graph workflow runner. It lets users visually author
 │                    └────┬────┘ └──────────────┘ │
 └─────────────────────────┼───────────────────────┘
                           │ subprocess
-              ┌───────────┼───────────┐
-              │           │           │
-          claude CLI  codex CLI  gemini CLI
+          ┌───────────┬───┴───┬───────────┐
+          │           │       │           │
+      claude CLI  codex CLI  cursor-agent  agy
 ```
 
 ## Deployment Modes

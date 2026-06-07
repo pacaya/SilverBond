@@ -10,10 +10,16 @@ Runtime
   ├── resolve_agent_config()   # Merge node → workflow → driver defaults
   │
   └── AgentDriver trait
-        ├── ClaudeDriver       # claude CLI
-        ├── CodexDriver        # codex CLI
-        └── GeminiDriver       # gemini CLI
+        ├── ClaudeDriver           # claude CLI
+        ├── CodexDriver            # codex CLI
+        └── RegistryProfileDriver  # registry-defined CLIs (cursor-agent, agy, …)
 ```
+
+Beyond the two built-in drivers (Claude, Codex), additional agents are defined as
+**tmux-tools registry profiles** and driven generically by `RegistryProfileDriver`. The
+built-in registry ships **Cursor** (`cursor-agent`) and **Antigravity** (`agy`, Google's
+successor to the now-removed Gemini CLI); users can add more via
+`~/.config/tmux-tools/agents.toml`.
 
 ## AgentDriver Trait
 
@@ -95,24 +101,27 @@ Structured result from every agent execution:
 ## Capability Flags
 
 Each driver declares 15 capability flags. The frontend uses these to show/hide config options.
+Built-in `claude` / `codex` capabilities come from the tmux-tools registry; the registry-driven
+agents (Cursor, Antigravity) declare only `workerExecution` by default and can be enriched per
+agent in `agents.toml` (`[<agent>.capabilities]`).
 
-| Capability | Claude | Codex | Gemini | Description |
-|-----------|--------|-------|--------|-------------|
-| `workerExecution` | Yes | Yes | Yes | Can execute task prompts |
-| `promptRefinement` | Yes | No | No | Can refine prompts (orchestrator) |
-| `branchChoice` | Yes | No | No | Can choose branches (orchestrator) |
-| `loopVerdict` | Yes | No | No | Can decide loop exit (orchestrator) |
-| `structuredOutput` | Yes | Yes | Yes | Supports JSON output |
-| `sessionReuse` | Yes | Yes | Yes | Can resume sessions |
-| `nativeJsonSchema` | Yes | Yes | No | Accepts JSON Schema natively |
-| `modelSelection` | Yes | Yes | Yes | Supports model override |
-| `reasoningConfig` | Yes | Yes | No | Supports reasoning level |
-| `systemPrompt` | Yes | No | No | Supports system prompt |
-| `budgetLimit` | Yes | No | No | Supports cost limit |
-| `turnLimit` | Yes | No | No | Supports turn limit |
-| `costReporting` | Yes | No | No | Reports execution cost |
-| `toolAllowlist` | Yes | No | No | Supports tool allow/deny lists |
-| `webSearch` | Yes | Yes | Yes | Supports web search toggle |
+| Capability | Claude | Codex | Cursor | Antigravity | Description |
+|-----------|--------|-------|--------|-------------|-------------|
+| `workerExecution` | Yes | Yes | Yes | Yes | Can execute task prompts |
+| `promptRefinement` | Yes | No | No | No | Can refine prompts (orchestrator) |
+| `branchChoice` | Yes | No | No | No | Can choose branches (orchestrator) |
+| `loopVerdict` | Yes | No | No | No | Can decide loop exit (orchestrator) |
+| `structuredOutput` | Yes | Yes | No | No | Supports JSON output |
+| `sessionReuse` | Yes | Yes | No | No | Can resume sessions |
+| `nativeJsonSchema` | Yes | Yes | No | No | Accepts JSON Schema natively |
+| `modelSelection` | Yes | Yes | No | No | Supports model override |
+| `reasoningConfig` | Yes | Yes | No | No | Supports reasoning level |
+| `systemPrompt` | Yes | No | No | No | Supports system prompt |
+| `budgetLimit` | Yes | No | No | No | Supports cost limit |
+| `turnLimit` | Yes | No | No | No | Supports turn limit |
+| `costReporting` | Yes | No | No | No | Reports execution cost |
+| `toolAllowlist` | Yes | No | No | No | Supports tool allow/deny lists |
+| `webSearch` | Yes | Yes | No | No | Supports web search toggle |
 
 ## Interaction Patterns
 
@@ -199,29 +208,42 @@ codex exec [resume <session-id>] "<prompt>" --json \
 
 **Interaction patterns:** Action approval prompts (escalate to UI).
 
-## Gemini Driver
+## Registry Profile Driver (Cursor, Antigravity, …)
 
-Uses `gemini` CLI. Limited capability set.
+Agents that aren't one of the two built-in drivers are served by `RegistryProfileDriver`, a
+generic driver that resolves the executable and access-profile arguments from the tmux-tools
+registry (built-in profiles plus `~/.config/tmux-tools/agents.toml`). This is how **Cursor**
+(`cursor-agent`) and **Antigravity** (`agy`) are driven.
 
-**CLI construction:**
-```
-gemini --prompt "<prompt>" --output-format json \
-  [--model <model>] \
-  [--resume <session-id>] \
-  [--approval-mode <mode>]
-```
+> Google replaced the standalone Gemini CLI with the Antigravity CLI (`agy`); the dedicated
+> `GeminiDriver` was removed and `agy` is now a built-in registry profile.
 
-**Access mode mapping:**
-- `read_only` → `--approval-mode full`
-- `edit` → `--approval-mode patch`
-- `execute` → `--approval-mode auto-patch`
-- `unrestricted` → `--approval-mode full-auto`
+**CLI construction:** the binary and args come straight from the matched registry profile —
+`build_session_args` looks up the access profile (mapped from `access_mode`) via
+`Registry::launch_argv` and passes its args through verbatim. No model / session / schema flags
+are injected (those capabilities are off by default for registry profiles).
 
-**Special handling:** Reasoning and web search are configured via temporary settings file using `GEMINI_CLI_HOME` environment variable.
+**Access mode mapping** (registry access-profile names; the shared `read-only` /
+`workspace-write` / `full-access` vocabulary):
+- `read_only` → `read-only` profile
+- `edit` / `execute` → `workspace-write` profile
+- `unrestricted` → `full-access` profile
 
-**Output parsing:** Single JSON blob with `response`, `session_id`, `stats.models.*` (including `thoughts` token count). Error codes: 42 → input error, 53 → turn limit.
+### Cursor (`cursor-agent`)
 
-**Interaction patterns:** Approval prompts (escalate to UI).
+- `read-only` → `--mode ask` (also the `default`; `plan` tier → `--mode plan`)
+- `workspace-write` → `--sandbox enabled`
+- `full-access` → `--force --sandbox disabled` (dangerous; requires explicit permission)
+
+### Antigravity (`agy`)
+
+- `workspace-write` → no extra args (the `default`; approval-gated)
+- `full-access` → `--dangerously-skip-permissions` (dangerous; requires explicit permission)
+- No interactive read-only mode — for a guaranteed no-write run use `agy -p "<prompt>"` headless.
+
+**Output parsing:** registry-profile drivers report no cost/context (PTY-driven interactive
+sessions). Readiness and interaction detection come from the registry profile's `ready_regex`
+and the shared destructive blocklist.
 
 ## Agent Discovery
 

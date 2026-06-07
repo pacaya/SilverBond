@@ -14,7 +14,7 @@ Today it is built as:
 - SQLite-backed checkpoints, event history, interrupted runs, and execution logs
 - per-node agent configuration: model selection, reasoning level, system prompt, access mode, tool control, budget/turn limits, session continuity
 
-The runtime shells out to locally installed agent CLIs (`claude`, `codex`, and `gemini`).
+The runtime shells out to locally installed agent CLIs (`claude`, `codex`, `cursor-agent`, and `agy`).
 Tauri is packaging and windowing, not a second runtime model.
 
 ## Key Documents
@@ -26,7 +26,7 @@ Tauri is packaging and windowing, not a second runtime model.
 ## Development Commands
 
 Prerequisites: Rust toolchain, Node.js/npm, and optionally [`just`](https://github.com/casey/just).
-For real agent execution you also need at least one local agent CLI: `claude`, `codex`, or `gemini`.
+For real agent execution you also need at least one local agent CLI: `claude`, `codex`, `cursor-agent`, or `agy`.
 
 Run `just` (or `just --list`) to see all available recipes. The raw `npm`/`cargo` commands still
 work; `just` is a convenience layer.

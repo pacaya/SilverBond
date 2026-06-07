@@ -1,7 +1,7 @@
 //! PTY session manager — spawns and manages interactive agent CLI sessions.
 //!
 //! Each [`ManagedSession`] wraps a pseudo-terminal running an agent CLI (claude,
-//! codex, gemini) in interactive mode using `expectrl`. Prompts are sent via
+//! codex, cursor-agent, agy) in interactive mode using `expectrl`. Prompts are sent via
 //! PTY stdin, and responses are captured using sentinel-based completion detection.
 
 use std::{collections::HashMap, path::PathBuf, process::Command, sync::Arc, time::Duration};

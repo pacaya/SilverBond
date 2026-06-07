@@ -1,6 +1,6 @@
 # SilverBond Documentation
 
-SilverBond is a local-first graph workflow runner that executes multi-step workflows using local agent CLIs (Claude, Codex, Gemini). It consists of a Rust backend, a Svelte 5 frontend, SQLite persistence, and an optional Tauri desktop shell.
+SilverBond is a local-first graph workflow runner that executes multi-step workflows using local agent CLIs (Claude, Codex, Cursor, Antigravity). It consists of a Rust backend, a Svelte 5 frontend, SQLite persistence, and an optional Tauri desktop shell.
 
 ## Documentation Index
 
@@ -13,7 +13,7 @@ SilverBond is a local-first graph workflow runner that executes multi-step workf
 | [Frontend](frontend.md) | Svelte 5 UI architecture, components, and patterns |
 | [API Reference](api-reference.md) | HTTP and SSE endpoint documentation |
 | [Execution Model](execution-model.md) | Runtime engine, checkpoints, cursors, and events |
-| [Agent Drivers](agent-drivers.md) | Agent CLI integration layer (Claude, Codex, Gemini) |
+| [Agent Drivers](agent-drivers.md) | Agent CLI integration layer (Claude, Codex, Cursor, Antigravity) |
 | [Tauri Desktop](tauri-desktop.md) | Optional desktop packaging with Tauri |
 | [Testing](testing.md) | Test infrastructure and how to run tests |
 | [Svelte Specifics](svelte-specifics.md) | Critical Svelte 5 / SvelteFlow patterns and pitfalls |

@@ -8,7 +8,8 @@
 - At least one supported agent CLI installed and on PATH:
   - `claude` (Claude Code CLI)
   - `codex` (OpenAI Codex CLI)
-  - `gemini` (Gemini CLI)
+  - `cursor-agent` (Cursor CLI)
+  - `agy` (Antigravity CLI)
 
 ## Installation
 

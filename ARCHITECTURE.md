@@ -210,7 +210,7 @@ Agent abstraction layer.
 Responsibilities:
 
 - define the `AgentDriver` trait (`name`, `capabilities`, `build_args`, `parse_output`, `interaction_patterns`, `destructive_blocklist`)
-- implement `ClaudeDriver`, `CodexDriver`, and `GeminiDriver`
+- implement `ClaudeDriver` and `CodexDriver` built-ins, plus `RegistryProfileDriver` for registry-defined agents (Cursor, Antigravity, …)
 - normalize agent output into `AgentOutput` with token counts, cost, outcome classification
 - map access modes to agent-specific CLI permission flags
 - provide agent discovery and capability reporting
@@ -446,7 +446,8 @@ Current provider adapters:
 
 - `claude` (most capable — supports all 15 capability flags)
 - `codex`
-- `gemini`
+- `cursor` (`cursor-agent`, via the registry)
+- `agy` (Antigravity, via the registry)
 
 Each adapter implements the `AgentDriver` trait (`driver.rs`) which declares capabilities, builds
 CLI arguments, and parses agent output into a normalized `AgentOutput` struct with token counts,

@@ -116,7 +116,7 @@ Executes a prompt using a local agent CLI.
 | `id` | `string` | Yes | Unique node identifier |
 | `name` | `string` | Yes | Display name |
 | `type` | `"task"` | Yes | Node type |
-| `agent` | `string` | No | Agent to use (`claude`, `codex`, `gemini`). Defaults to `claude` |
+| `agent` | `string` | No | Agent to use (`claude`, `codex`, `cursor`, `agy`, or any registry profile). Defaults to `claude` |
 | `prompt` | `string` | Yes | Prompt text with template substitution support |
 | `contextSources` | `ContextSource[]` | No | Additional context from other nodes |
 | `responseFormat` | `"text" \| "json"` | No | Expected response format |
