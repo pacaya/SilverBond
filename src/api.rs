@@ -1,10 +1,16 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 
 use anyhow::Context;
 use async_stream::stream;
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    extract::{
+        Path, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::StatusCode,
     response::{
         IntoResponse,
@@ -12,15 +18,26 @@ use axum::{
     },
     routing::{get, post},
 };
-use futures::Stream;
-use serde::Deserialize;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use futures::{SinkExt, Stream, StreamExt, stream::SplitSink};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tmux_tools_core::stream::{CaptureAnsiOpts, capture_ansi, stream_pane};
+use tokio::{io::AsyncReadExt, time::Instant};
 
 use crate::{
     app::AppState,
-    model::{WorkflowNode, WorkflowNodeType, normalize_workflow_value, validate_workflow},
-    runtime::{NodeTestContext, available_agents, check_cli, run_node_preview},
+    model::{
+        WorkflowNode, WorkflowNodeType, WorkflowV3, normalize_workflow_value, validate_workflow,
+    },
+    runtime::{
+        NodeTestContext, RuntimeCheckpoint, RuntimeStatus, available_agents, check_cli,
+        run_node_preview,
+    },
 };
+
+const PANE_STREAM_HEARTBEAT: Duration = Duration::from_secs(5);
+const PANE_STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -36,6 +53,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/test-node", post(test_node))
         .route("/api/runs", post(create_run))
         .route("/api/runs/{run_id}/stream", get(stream_run))
+        .route(
+            "/api/runs/{run_id}/panes/{pane}/stream",
+            get(pane_stream_ws),
+        )
         .route("/api/runs/{run_id}/events", get(run_events))
         .route("/api/runs/{run_id}/approve", post(approve_run))
         .route(
@@ -64,24 +85,26 @@ async fn health() -> Json<Value> {
 async fn capabilities() -> Result<Json<Value>, ApiError> {
     let mut agents = serde_json::Map::new();
     for spec in available_agents() {
-        let (available, path) = check_cli(spec.name).await?;
+        let (available, path) = check_cli(&spec.binary).await?;
         agents.insert(
-            spec.name.to_string(),
+            spec.name.clone(),
             json!({
                 "available": available,
                 "path": path,
+                "binary": spec.binary,
                 "capabilities": spec.capabilities,
             }),
         );
     }
     Ok(Json(json!({
         "workflowVersion": 3,
-        "supportedNodeTypes": ["task", "approval", "split", "collector"],
+        "supportedNodeTypes": ["task", "approval", "split", "collector", "decide", "parallel_batch", "subflow", "call", "spawn", "send", "wait", "capture", "kill", "run_agent"],
         "supportedEdgeOutcomes": ["success", "reject", "branch", "loop_continue", "loop_exit"],
         "agents": agents,
         "features": {
             "split": true,
             "collector": true,
+            "subflow": true,
         }
     })))
 }
@@ -133,13 +156,66 @@ struct WorkflowPayloadRequest {
 }
 
 async fn validate_workflow_route(
+    State(state): State<AppState>,
     Json(request): Json<WorkflowPayloadRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let normalized = normalize_workflow_value(request.workflow)
+    let mut normalized = normalize_workflow_value(request.workflow)
         .map_err(|error| ApiError::status(StatusCode::BAD_REQUEST, error.to_string()))?;
+    hydrate_saved_subflows(&state, &mut normalized.workflow).await?;
     let mut result = validate_workflow(normalized.workflow);
     result.notices = normalized.notices;
     Ok(Json(serde_json::to_value(result)?))
+}
+
+async fn hydrate_saved_subflows(
+    state: &AppState,
+    workflow: &mut WorkflowV3,
+) -> Result<(), ApiError> {
+    let mut loaded = workflow.subflows.keys().cloned().collect::<BTreeSet<_>>();
+    loop {
+        let needed = collect_referenced_subflows(workflow)
+            .into_iter()
+            .filter(|name| !loaded.contains(name))
+            .collect::<Vec<_>>();
+        if needed.is_empty() {
+            return Ok(());
+        }
+
+        for name in needed {
+            loaded.insert(name.clone());
+            if let Some(stored) = state.workflows.get(&name).await? {
+                workflow.subflows.insert(name, Box::new(stored.workflow));
+            }
+        }
+    }
+}
+
+fn collect_referenced_subflows(workflow: &WorkflowV3) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_referenced_subflows_in_workflow(workflow, &mut names);
+    for subflow in workflow.subflows.values() {
+        collect_referenced_subflows_in_workflow(subflow, &mut names);
+    }
+    names
+}
+
+fn collect_referenced_subflows_in_workflow(workflow: &WorkflowV3, names: &mut BTreeSet<String>) {
+    for node in &workflow.nodes {
+        if !matches!(
+            node.node_type,
+            WorkflowNodeType::Subflow | WorkflowNodeType::Call
+        ) {
+            continue;
+        }
+        if let Some(name) = node
+            .subflow_config
+            .as_ref()
+            .map(|config| config.workflow_name.trim())
+            .filter(|name| !name.is_empty())
+        {
+            names.insert(name.to_string());
+        }
+    }
 }
 
 async fn list_templates(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -192,8 +268,9 @@ async fn create_run(
     State(state): State<AppState>,
     Json(request): Json<CreateRunRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let normalized = normalize_workflow_value(request.workflow)
+    let mut normalized = normalize_workflow_value(request.workflow)
         .map_err(|error| ApiError::status(StatusCode::BAD_REQUEST, error.to_string()))?;
+    hydrate_saved_subflows(&state, &mut normalized.workflow).await?;
     let validation = validate_workflow(normalized.workflow.clone());
     let errors = validation
         .issues
@@ -257,6 +334,432 @@ async fn stream_run(
         }
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+pub async fn pane_stream_ws(
+    State(state): State<AppState>,
+    Path((run_id, pane)): Path<(String, String)>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| async move {
+        let log_run_id = run_id.clone();
+        let log_pane = pane.clone();
+        let task = tokio::spawn(async move {
+            if let Err(error) = pane_stream_socket(socket, state, run_id, pane).await {
+                tracing::warn!(
+                    run_id = %log_run_id,
+                    pane = %log_pane,
+                    error = %error,
+                    "pane websocket stream ended with error"
+                );
+            }
+        });
+        let _ = task.await;
+    })
+}
+
+async fn pane_stream_socket(
+    mut socket: WebSocket,
+    state: AppState,
+    run_id: String,
+    pane: String,
+) -> anyhow::Result<()> {
+    let pane_target = match resolve_run_pane_target(&state, &run_id, &pane).await {
+        Ok(target) => target,
+        Err(error) => {
+            send_socket_error_and_close(&mut socket, 0, &error.to_string()).await;
+            return Ok(());
+        }
+    };
+
+    let (mut sender, mut receiver) = socket.split();
+    let mut next_seq = 0_u64;
+    send_snapshot(&mut sender, &pane_target, &mut next_seq).await?;
+
+    let mut pane_reader = match stream_pane(&pane_target).await {
+        Ok(reader) => reader,
+        Err(error) => {
+            let message = format!("pane stream unavailable: {error}");
+            let _ = send_error_frame(&mut sender, &mut next_seq, &message).await;
+            tracing::warn!(
+                run_id = %run_id,
+                pane = %pane,
+                pane_target = %pane_target,
+                error = %error,
+                "failed to start pane stream"
+            );
+            return Ok(());
+        }
+    };
+
+    let mut heartbeat = Box::pin(tokio::time::sleep(PANE_STREAM_HEARTBEAT));
+    let mut buffer = [0_u8; 8192];
+    loop {
+        tokio::select! {
+            client_message = receiver.next() => {
+                match client_message {
+                    Some(Ok(message)) if is_resync_request(&message) => {
+                        send_snapshot(&mut sender, &pane_target, &mut next_seq).await?;
+                        heartbeat.as_mut().reset(Instant::now() + PANE_STREAM_HEARTBEAT);
+                    }
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(_)) => {}
+                    Some(Err(error)) => {
+                        tracing::debug!(
+                            run_id = %run_id,
+                            pane = %pane,
+                            pane_target = %pane_target,
+                            error = %error,
+                            "pane websocket receive failed"
+                        );
+                        break;
+                    }
+                }
+            }
+            read_result = pane_reader.read(&mut buffer) => {
+                match read_result {
+                    Ok(0) => {
+                        tracing::debug!(
+                            run_id = %run_id,
+                            pane = %pane,
+                            pane_target = %pane_target,
+                            "pane stream reached EOF"
+                        );
+                        break;
+                    }
+                    Ok(bytes_read) => {
+                        match send_data_frame(&mut sender, &buffer[..bytes_read], &mut next_seq).await {
+                            Ok(()) => {
+                                heartbeat.as_mut().reset(Instant::now() + PANE_STREAM_HEARTBEAT);
+                            }
+                            Err(PaneWsSendError::Backpressure) => {
+                                tracing::warn!(
+                                    run_id = %run_id,
+                                    pane = %pane,
+                                    pane_target = %pane_target,
+                                    "pane websocket send stalled; sending snapshot resync"
+                                );
+                                send_snapshot(&mut sender, &pane_target, &mut next_seq).await?;
+                                heartbeat.as_mut().reset(Instant::now() + PANE_STREAM_HEARTBEAT);
+                            }
+                            Err(error) => {
+                                tracing::debug!(
+                                    run_id = %run_id,
+                                    pane = %pane,
+                                    pane_target = %pane_target,
+                                    error = %error,
+                                    "pane websocket send failed"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            pane = %pane,
+                            pane_target = %pane_target,
+                            error = %error,
+                            "pane stream read failed"
+                        );
+                        break;
+                    }
+                }
+            }
+            _ = &mut heartbeat => {
+                match send_heartbeat(&mut sender, current_seq(next_seq)).await {
+                    Ok(()) => heartbeat.as_mut().reset(Instant::now() + PANE_STREAM_HEARTBEAT),
+                    Err(error) => {
+                        tracing::debug!(
+                            run_id = %run_id,
+                            pane = %pane,
+                            pane_target = %pane_target,
+                            error = %error,
+                            "pane websocket heartbeat failed"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn resolve_run_pane_target(
+    state: &AppState,
+    run_id: &str,
+    pane: &str,
+) -> anyhow::Result<String> {
+    if let Some(target) = state
+        .runtime
+        .registry
+        .resolve_active_pane(run_id, pane)
+        .await
+    {
+        return Ok(target);
+    }
+
+    let persisted = state
+        .runtime
+        .db
+        .get_run(run_id)
+        .await?
+        .context("run not found")?;
+    let candidates = pane_candidates(&persisted.checkpoint);
+    if let Some(target) = match_pane_candidate(
+        pane,
+        &candidates,
+        persisted.checkpoint.current_node_id.as_deref(),
+    ) {
+        return Ok(target);
+    }
+
+    if matches!(
+        persisted.checkpoint.status,
+        RuntimeStatus::Running | RuntimeStatus::Paused
+    ) {
+        anyhow::bail!("run has no active pane matching {pane}");
+    }
+    anyhow::bail!("run has no pane matching {pane}");
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneCandidate {
+    key: String,
+    target: String,
+}
+
+fn pane_candidates(checkpoint: &RuntimeCheckpoint) -> Vec<PaneCandidate> {
+    let mut candidates = Vec::new();
+    for (node_id, result) in &checkpoint.all_results {
+        push_pane_candidate(
+            &mut candidates,
+            node_id,
+            result.metadata.agent_session_id.as_deref(),
+        );
+        if let Some(value) = &result.parsed_output {
+            push_pane_candidate(&mut candidates, node_id, pane_target_from_value(value));
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&result.output) {
+            push_pane_candidate(&mut candidates, node_id, pane_target_from_value(&value));
+        }
+    }
+
+    for execution in &checkpoint.execution_log.node_executions {
+        push_pane_candidate(
+            &mut candidates,
+            &execution.node_id,
+            execution.metadata.agent_session_id.as_deref(),
+        );
+    }
+
+    candidates
+}
+
+fn push_pane_candidate(candidates: &mut Vec<PaneCandidate>, key: &str, target: Option<&str>) {
+    let Some(target) = target.map(str::trim).filter(|target| !target.is_empty()) else {
+        return;
+    };
+    if candidates
+        .iter()
+        .any(|candidate| candidate.key == key && candidate.target == target)
+    {
+        return;
+    }
+    candidates.push(PaneCandidate {
+        key: key.to_string(),
+        target: target.to_string(),
+    });
+}
+
+fn pane_target_from_value(value: &Value) -> Option<&str> {
+    ["paneId", "pane_id", "target"]
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_str))
+}
+
+fn match_pane_candidate(
+    pane: &str,
+    candidates: &[PaneCandidate],
+    current_node_id: Option<&str>,
+) -> Option<String> {
+    if matches!(pane, "active" | "current") {
+        if let Some(current_node_id) = current_node_id {
+            if let Some(candidate) = candidates
+                .iter()
+                .rev()
+                .find(|candidate| candidate.key == current_node_id)
+            {
+                return Some(candidate.target.clone());
+            }
+        }
+        return match candidates {
+            [candidate] => Some(candidate.target.clone()),
+            candidates => candidates.last().map(|candidate| candidate.target.clone()),
+        };
+    }
+
+    candidates
+        .iter()
+        .rev()
+        .find(|candidate| candidate.key == pane || candidate.target == pane)
+        .map(|candidate| candidate.target.clone())
+}
+
+#[derive(Debug, Serialize)]
+struct PaneWsFrame<'a> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum PaneWsSendError {
+    #[error("websocket send timed out")]
+    Backpressure,
+    #[error("websocket send failed: {0}")]
+    Send(#[from] axum::Error),
+    #[error("websocket frame serialization failed: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+async fn send_snapshot(
+    sender: &mut SplitSink<WebSocket, Message>,
+    pane_target: &str,
+    next_seq: &mut u64,
+) -> anyhow::Result<()> {
+    let target = pane_target.to_string();
+    let snapshot = tokio::task::spawn_blocking(move || {
+        capture_ansi(&target, CaptureAnsiOpts::default()).map(|snapshot| snapshot.into_bytes())
+    })
+    .await
+    .context("capture_ansi task panicked")??;
+    let seq = *next_seq;
+    let frame = PaneWsFrame {
+        kind: "snapshot",
+        seq,
+        data: Some(BASE64_STANDARD.encode(snapshot)),
+        error: None,
+    };
+    send_frame(sender, &frame)
+        .await
+        .map_err(|error| anyhow::anyhow!(error))?;
+    *next_seq = (*next_seq).saturating_add(1);
+    Ok(())
+}
+
+async fn send_data_frame(
+    sender: &mut SplitSink<WebSocket, Message>,
+    bytes: &[u8],
+    next_seq: &mut u64,
+) -> Result<(), PaneWsSendError> {
+    let seq = *next_seq;
+    let frame = PaneWsFrame {
+        kind: "data",
+        seq,
+        data: Some(BASE64_STANDARD.encode(bytes)),
+        error: None,
+    };
+    send_frame(sender, &frame).await?;
+    *next_seq = (*next_seq).saturating_add(1);
+    Ok(())
+}
+
+async fn send_heartbeat(
+    sender: &mut SplitSink<WebSocket, Message>,
+    seq: u64,
+) -> Result<(), PaneWsSendError> {
+    let frame = PaneWsFrame {
+        kind: "heartbeat",
+        seq,
+        data: None,
+        error: None,
+    };
+    send_frame(sender, &frame).await
+}
+
+async fn send_error_frame(
+    sender: &mut SplitSink<WebSocket, Message>,
+    next_seq: &mut u64,
+    error: &str,
+) -> Result<(), PaneWsSendError> {
+    let seq = *next_seq;
+    let frame = PaneWsFrame {
+        kind: "error",
+        seq,
+        data: None,
+        error: Some(error),
+    };
+    send_frame(sender, &frame).await?;
+    *next_seq = (*next_seq).saturating_add(1);
+    Ok(())
+}
+
+async fn send_frame(
+    sender: &mut SplitSink<WebSocket, Message>,
+    frame: &PaneWsFrame<'_>,
+) -> Result<(), PaneWsSendError> {
+    let payload = serde_json::to_string(frame)?;
+    match tokio::time::timeout(
+        PANE_STREAM_SEND_TIMEOUT,
+        sender.send(Message::Text(payload.into())),
+    )
+    .await
+    {
+        Ok(result) => result.map_err(PaneWsSendError::Send),
+        Err(_) => Err(PaneWsSendError::Backpressure),
+    }
+}
+
+async fn send_socket_error_and_close(socket: &mut WebSocket, seq: u64, error: &str) {
+    let frame = PaneWsFrame {
+        kind: "error",
+        seq,
+        data: None,
+        error: Some(error),
+    };
+    if let Ok(payload) = serde_json::to_string(&frame) {
+        let _ = socket.send(Message::Text(payload.into())).await;
+    }
+    let _ = socket.send(Message::Close(None)).await;
+}
+
+fn is_resync_request(message: &Message) -> bool {
+    match message {
+        Message::Text(text) => {
+            let text = text.as_str().trim();
+            text.eq_ignore_ascii_case("resync")
+                || serde_json::from_str::<Value>(text)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .map(|kind| matches!(kind, "resync" | "snapshot"))
+                    })
+                    .unwrap_or(false)
+        }
+        Message::Binary(bytes) => serde_json::from_slice::<Value>(bytes)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(|kind| matches!(kind, "resync" | "snapshot"))
+            })
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
+fn current_seq(next_seq: u64) -> u64 {
+    next_seq.saturating_sub(1)
 }
 
 async fn run_events(

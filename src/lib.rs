@@ -8,4 +8,5 @@ pub mod pty_output;
 pub mod runtime;
 pub mod session;
 pub mod storage;
+pub mod tmux_exec;
 pub mod util;

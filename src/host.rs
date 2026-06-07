@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, time::{Duration, Instant}};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use anyhow::Context;
 use tokio::{
@@ -108,9 +111,7 @@ async fn check_health(local_addr: SocketAddr) -> anyhow::Result<bool> {
         }
     };
     stream
-        .write_all(
-            b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-        )
+        .write_all(b"GET /api/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
         .await?;
     let mut buffer = Vec::new();
     stream.read_to_end(&mut buffer).await?;

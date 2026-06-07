@@ -40,6 +40,8 @@ export interface ApprovalState {
   lastOutput: string;
 }
 
+export type PaneStatus = "idle" | "connecting" | "open" | "closed";
+
 export interface InteractionState {
   sessionId: string;
   description: string;
@@ -55,9 +57,60 @@ function defaultNodeName(type: WorkflowNodeType, count: number): string {
       return `Split ${count}`;
     case "collector":
       return `Collector ${count}`;
+    case "decide":
+      return `Decide ${count}`;
+    case "parallel_batch":
+      return `Batch ${count}`;
+    case "subflow":
+      return `Subflow ${count}`;
+    case "call":
+      return `Call ${count}`;
+    case "spawn":
+      return `Spawn ${count}`;
+    case "send":
+      return `Send ${count}`;
+    case "wait":
+      return `Wait ${count}`;
+    case "capture":
+      return `Capture ${count}`;
+    case "kill":
+      return `Kill ${count}`;
+    case "run_agent":
+      return `Run Agent ${count}`;
     case "task":
     default:
       return `Task ${count}`;
+  }
+}
+
+/** Minimal valid per-type config so a freshly-dropped node round-trips through backend serde. */
+function defaultNodeConfig(type: WorkflowNodeType): Partial<WorkflowNode> {
+  switch (type) {
+    case "decide":
+      return { decideConfig: { prompt: "", inputs: [], outcomes: [] } };
+    case "parallel_batch":
+      return {
+        batchConfig: { itemsBinding: "", maxConcurrent: 4, itemVar: "item", bodyEntry: "" },
+      };
+    case "run_agent":
+      // agent lives on node.agent (set in addNode); prompt stays unset so it
+      // does not shadow node.prompt on the backend (Some("") would win).
+      return { runAgentConfig: { killAfter: true } };
+    case "spawn":
+      return { spawnConfig: { agent: "claude" } };
+    case "send":
+      return { sendConfig: { text: "", enter: true } };
+    case "wait":
+      return { waitConfig: { mode: "idle" } };
+    case "capture":
+      return { captureConfig: { all: false, ansi: false } };
+    case "kill":
+      return { killConfig: {} };
+    case "subflow":
+    case "call":
+      return { subflowConfig: { workflowName: "", inputs: [], maxDepth: 10 } };
+    default:
+      return {};
   }
 }
 
@@ -77,7 +130,7 @@ class WorkflowStore {
   workflow = $state<WorkflowDocument | null>(null);
   validation = $state<ValidationResponse | null>(null);
   selection = $state<Selection>({ kind: "workflow", id: null });
-  panelTab = $state<"output" | "history" | "reference">("output");
+  panelTab = $state<"output" | "history" | "reference" | "terminal">("output");
   dirty = $state(false);
   runId = $state<string | null>(null);
   running = $state(false);
@@ -86,6 +139,16 @@ class WorkflowStore {
   approval = $state<ApprovalState | null>(null);
   interaction = $state<InteractionState | null>(null);
   errorMessage = $state<string>("");
+
+  /* ── live pane terminal ───────────────────────────────────────────── */
+  selectedPane = $state<string>("active");
+  paneStatus = $state<PaneStatus>("idle");
+  paneError = $state<string>("");
+
+  /* ── compound-node drill-in (breadcrumb path of subflow names) ─────── */
+  drillStack = $state<string[]>([]);
+  /** Node ids in the current marquee/multi-selection (for "save as compound"). */
+  multiSelectedNodeIds = $state<string[]>([]);
 
   /* ── undo/redo ────────────────────────────────────────────────────── */
   private undoStack: UndoEntry[] = [];
@@ -132,6 +195,8 @@ class WorkflowStore {
     this.nodeStates = {};
     this.undoStack = [];
     this.redoStack = [];
+    this.drillStack = [];
+    this.multiSelectedNodeIds = [];
   }
 
   createWorkflow() {
@@ -142,12 +207,78 @@ class WorkflowStore {
     this.nodeStates = {};
     this.undoStack = [];
     this.redoStack = [];
+    this.drillStack = [];
+    this.multiSelectedNodeIds = [];
+  }
+
+  /* ── compound-node drill-in ───────────────────────────────────────── */
+
+  /**
+   * Resolve the document currently shown on the canvas by walking the root
+   * workflow's `subflows` catalog along the breadcrumb path. Returns the root
+   * when not drilled in. Guarantees the returned doc has a `ui.canvas`.
+   */
+  private resolveActive(root: WorkflowDocument): WorkflowDocument {
+    let doc = root;
+    for (const name of this.drillStack) {
+      const next = doc.subflows?.[name];
+      if (!next) break;
+      doc = next;
+    }
+    if (!doc.ui?.canvas) {
+      doc.ui = {
+        ...doc.ui,
+        canvas: { viewport: { x: 0, y: 0, zoom: 1 }, nodes: {} },
+      };
+    }
+    return doc;
+  }
+
+  /** The document currently shown on the canvas (root or a nested subflow). */
+  get activeWorkflow(): WorkflowDocument | null {
+    if (!this.workflow) return null;
+    return this.resolveActive(this.workflow);
+  }
+
+  /** Whether the editor is currently drilled into a subflow. */
+  get isDrilledIn(): boolean {
+    return this.drillStack.length > 0;
+  }
+
+  /** Breadcrumb trail: ["root", ...subflow names]. */
+  get breadcrumb(): string[] {
+    return ["root", ...this.drillStack];
+  }
+
+  /** Double-click a subflow/call node to open its referenced subgraph. */
+  drillIntoSubflow(nodeId: string): boolean {
+    if (!this.workflow) return false;
+    const active = this.resolveActive(this.workflow);
+    const node = active.nodes.find((n) => n.id === nodeId);
+    const name = node?.subflowConfig?.workflowName;
+    if (!name || !this.workflow.subflows?.[name]) return false;
+    this.drillStack = [...this.drillStack, name];
+    this.selection = { kind: "workflow", id: null };
+    this.multiSelectedNodeIds = [];
+    return true;
+  }
+
+  /** Jump to a breadcrumb level. index 0 = root. */
+  drillToLevel(index: number) {
+    this.drillStack = this.drillStack.slice(0, Math.max(0, index));
+    this.selection = { kind: "workflow", id: null };
+    this.multiSelectedNodeIds = [];
+  }
+
+  setMultiSelection(ids: string[]) {
+    this.multiSelectedNodeIds = ids;
   }
 
   updateWorkflow(updater: (workflow: WorkflowDocument) => void) {
     if (!this.workflow) return;
     this.pushUndo();
-    updater(this.workflow);
+    // Mutations target the document currently on the canvas (root or subflow).
+    updater(this.resolveActive(this.workflow));
     this.dirty = true;
   }
 
@@ -169,8 +300,24 @@ class WorkflowStore {
     this.selection = { kind: "edge", id: edgeId };
   }
 
-  setPanelTab(tab: "output" | "history" | "reference") {
+  setPanelTab(tab: "output" | "history" | "reference" | "terminal") {
     this.panelTab = tab;
+  }
+
+  /* ── live pane terminal ───────────────────────────────────────────── */
+
+  selectPane(pane: string) {
+    this.selectedPane = pane;
+  }
+
+  setPaneStatus(status: PaneStatus) {
+    this.paneStatus = status;
+    // A healthy (re)connection clears any prior transient error.
+    if (status === "open" || status === "idle") this.paneError = "";
+  }
+
+  setPaneError(message: string) {
+    this.paneError = message;
   }
 
   /* ── node/edge mutations ──────────────────────────────────────────── */
@@ -180,18 +327,19 @@ class WorkflowStore {
       this.createWorkflow();
     }
     this.pushUndo();
-    const wf = this.workflow!;
+    const wf = this.resolveActive(this.workflow!);
     const id = createNodeId();
     const nodeCount = wf.nodes.filter((n) => n.type === type).length + 1;
     const node: WorkflowNode = {
       id,
       name: defaultNodeName(type, nodeCount),
       type,
-      agent: type === "task" ? "claude" : null,
+      agent: type === "task" || type === "run_agent" ? "claude" : null,
       prompt: "",
       contextSources: [],
       responseFormat: type === "task" ? "text" : null,
       splitFailurePolicy: type === "split" ? defaultSplitFailurePolicy() : undefined,
+      ...defaultNodeConfig(type),
     };
     wf.nodes.push(node);
     const canvas = ensureCanvas(wf).ui!.canvas!;
@@ -207,7 +355,7 @@ class WorkflowStore {
   removeNode(nodeId: string) {
     if (!this.workflow) return;
     this.pushUndo();
-    const wf = this.workflow;
+    const wf = this.resolveActive(this.workflow);
     wf.nodes = wf.nodes.filter((n) => n.id !== nodeId);
     wf.edges = wf.edges.filter((e) => e.from !== nodeId && e.to !== nodeId);
     delete wf.ui?.canvas?.nodes[nodeId];
@@ -223,7 +371,7 @@ class WorkflowStore {
     if (!this.workflow) return;
     this.pushUndo();
     const nextEdge: WorkflowEdge = { ...edge, id: createEdgeId() };
-    this.workflow.edges.push(nextEdge);
+    this.resolveActive(this.workflow).edges.push(nextEdge);
     this.dirty = true;
     this.selection = { kind: "edge", id: nextEdge.id };
   }
@@ -231,16 +379,129 @@ class WorkflowStore {
   removeEdge(edgeId: string) {
     if (!this.workflow) return;
     this.pushUndo();
-    this.workflow.edges = this.workflow.edges.filter((e) => e.id !== edgeId);
+    const wf = this.resolveActive(this.workflow);
+    wf.edges = wf.edges.filter((e) => e.id !== edgeId);
     this.dirty = true;
     this.selection = { kind: "workflow", id: null };
   }
 
   setNodePosition(nodeId: string, position: { x: number; y: number }) {
     if (!this.workflow) return;
-    const canvas = ensureCanvas(this.workflow).ui!.canvas!;
+    const canvas = this.resolveActive(this.workflow).ui!.canvas!;
     canvas.nodes[nodeId] = position;
     this.dirty = true;
+  }
+
+  /* ── save selection as compound node ──────────────────────────────── */
+
+  /**
+   * Collapse the selected nodes into a reusable saved subflow stored on the
+   * (active) document's `subflows` catalog, replacing the region with a single
+   * `subflow` node. Entry is the selected node with no internal inbound edge;
+   * exit is the selected node with no internal outbound edge. External edges
+   * are rewired to/from the new compound node.
+   *
+   * Returns the new compound node id, or null when the selection is invalid.
+   */
+  saveSelectionAsCompound(nodeIds: string[], rawName: string): string | null {
+    if (!this.workflow || nodeIds.length === 0) return null;
+    const name = rawName.trim();
+    if (!name) return null;
+
+    const wf = this.resolveActive(this.workflow);
+    if (wf.subflows?.[name]) return null; // name collision
+
+    const selected = new Set(nodeIds);
+    const selNodes = wf.nodes.filter((n) => selected.has(n.id));
+    if (selNodes.length === 0) return null;
+
+    const internalEdges = wf.edges.filter((e) => selected.has(e.from) && selected.has(e.to));
+    const inboundEdges = wf.edges.filter((e) => !selected.has(e.from) && selected.has(e.to));
+    const outboundEdges = wf.edges.filter((e) => selected.has(e.from) && !selected.has(e.to));
+
+    // Entry: targeted from outside, else a node with no internal inbound edge.
+    const hasInternalInbound = new Set(internalEdges.map((e) => e.to));
+    const inboundTargets = new Set(inboundEdges.map((e) => e.to));
+    const entry =
+      selNodes.find((n) => inboundTargets.has(n.id)) ??
+      selNodes.find((n) => !hasInternalInbound.has(n.id)) ??
+      selNodes[0];
+
+    // Exit: a node with no internal outbound edge (terminal within the region).
+    const hasInternalOutbound = new Set(internalEdges.map((e) => e.from));
+    const exit =
+      selNodes.find((n) => !hasInternalOutbound.has(n.id)) ?? selNodes[selNodes.length - 1];
+
+    this.pushUndo();
+
+    // Build the subflow document (deep clone so it is decoupled from the parent).
+    const positions = wf.ui?.canvas?.nodes ?? {};
+    const subflowDoc: WorkflowDocument = {
+      version: 3,
+      name,
+      goal: "",
+      cwd: wf.cwd,
+      useOrchestrator: false,
+      entryNodeId: entry.id,
+      variables: [],
+      limits: { maxTotalSteps: 50, maxVisitsPerNode: 10 },
+      nodes: structuredClone($state.snapshot(selNodes)) as WorkflowNode[],
+      edges: structuredClone($state.snapshot(internalEdges)) as WorkflowEdge[],
+      ui: {
+        canvas: {
+          viewport: { x: 0, y: 0, zoom: 1 },
+          nodes: Object.fromEntries(
+            selNodes.map((n) => [n.id, positions[n.id] ?? { x: 160, y: 160 }]),
+          ),
+        },
+      },
+    };
+
+    if (!wf.subflows) wf.subflows = {};
+    wf.subflows[name] = subflowDoc;
+
+    // Place the compound node at the centroid of the selected region.
+    const pts = selNodes.map((n) => positions[n.id]).filter(Boolean) as { x: number; y: number }[];
+    const centroid = pts.length
+      ? { x: pts.reduce((s, p) => s + p.x, 0) / pts.length, y: pts.reduce((s, p) => s + p.y, 0) / pts.length }
+      : { x: 200, y: 200 };
+
+    const compoundId = createNodeId();
+    const compoundNode: WorkflowNode = {
+      id: compoundId,
+      name,
+      type: "subflow",
+      agent: null,
+      prompt: "",
+      contextSources: [],
+      responseFormat: null,
+      subflowConfig: { workflowName: name, exitNodeId: exit.id, inputs: [], maxDepth: 10 },
+    };
+
+    // Remove selected nodes + their internal edges; keep boundary edges to rewire.
+    wf.nodes = wf.nodes.filter((n) => !selected.has(n.id));
+    wf.edges = wf.edges.filter((e) => !(selected.has(e.from) && selected.has(e.to)));
+    wf.nodes.push(compoundNode);
+
+    // Rewire boundary edges onto the compound node.
+    for (const edge of wf.edges) {
+      if (inboundEdges.includes(edge)) edge.to = compoundId;
+      if (outboundEdges.includes(edge)) edge.from = compoundId;
+    }
+
+    // Canvas bookkeeping.
+    const canvas = this.resolveActive(this.workflow).ui!.canvas!;
+    for (const n of selNodes) delete canvas.nodes[n.id];
+    canvas.nodes[compoundId] = centroid;
+
+    if (wf.entryNodeId && selected.has(wf.entryNodeId)) {
+      wf.entryNodeId = compoundId;
+    }
+
+    this.dirty = true;
+    this.multiSelectedNodeIds = [];
+    this.selection = { kind: "node", id: compoundId };
+    return compoundId;
   }
 
   /* ── runtime ──────────────────────────────────────────────────────── */

@@ -7,7 +7,7 @@ export default defineConfig({
     trace: "on-first-retry",
   },
   webServer: {
-    command: "/bin/zsh -lc 'export SILVERBOND_ROOT=$(mktemp -d /tmp/silverbond-e2e.XXXXXX); cargo run'",
+    command: "/bin/zsh -lc 'export SILVERBOND_ROOT=$(mktemp -d /tmp/silverbond-e2e.XXXXXX); export SILVERBOND_RUNNER=tmux; cargo run'",
     url: "http://127.0.0.1:3333/api/health",
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

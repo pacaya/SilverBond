@@ -12,8 +12,7 @@ use tokio::task::spawn_blocking;
 use crate::{
     model::{NormalizedWorkflow, WorkflowV3, normalize_workflow_value},
     runtime::{
-        ExecutionLog, InterruptedRunSummary, LogListItem, PersistedRun,
-        RuntimeEvent, RuntimeStatus,
+        ExecutionLog, InterruptedRunSummary, LogListItem, PersistedRun, RuntimeEvent, RuntimeStatus,
     },
     util::{ensure_dir, now_iso, safe_name},
 };
@@ -284,8 +283,17 @@ impl Database {
             })?;
             let mut runs = Vec::new();
             for row in rows {
-                let (run_id, status, workflow_name, current_node_id, current_node_name,
-                     total_executed, started_at, updated_at, pending_approval_json) = row?;
+                let (
+                    run_id,
+                    status,
+                    workflow_name,
+                    current_node_id,
+                    current_node_name,
+                    total_executed,
+                    started_at,
+                    updated_at,
+                    pending_approval_json,
+                ) = row?;
                 let pending_approval = pending_approval_json
                     .map(|json| serde_json::from_str(&json))
                     .transpose()?;
@@ -696,6 +704,15 @@ mod tests {
                 agent_config: None,
                 cwd: None,
                 continue_session_from: None,
+                decide_config: None,
+                batch_config: None,
+                spawn_config: None,
+                send_config: None,
+                wait_config: None,
+                capture_config: None,
+                kill_config: None,
+                run_agent_config: None,
+                subflow_config: None,
             }],
             edges: vec![WorkflowEdge {
                 id: "e1".to_string(),
@@ -707,6 +724,7 @@ mod tests {
                 condition: None,
             }],
             agent_defaults: std::collections::BTreeMap::new(),
+            subflows: std::collections::BTreeMap::new(),
             ui: None,
         }
     }

@@ -72,12 +72,18 @@ impl ParsedResponse {
 /// Cache write tokens: 512
 /// ```
 pub fn parse_claude_cost(output: &str) -> Option<CostInfo> {
-    static COST_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)total\s+cost:\s*\$?([\d.]+)").unwrap());
-    static INPUT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)input\s+tokens:\s*([\d,]+)").unwrap());
-    static OUTPUT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)output\s+tokens:\s*([\d,]+)").unwrap());
-    static THINKING_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)thinking\s+tokens:\s*([\d,]+)").unwrap());
-    static CACHE_READ_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)cache\s+read\s+tokens:\s*([\d,]+)").unwrap());
-    static CACHE_WRITE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)cache\s+write\s+tokens:\s*([\d,]+)").unwrap());
+    static COST_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)total\s+cost:\s*\$?([\d.]+)").unwrap());
+    static INPUT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)input\s+tokens:\s*([\d,]+)").unwrap());
+    static OUTPUT_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)output\s+tokens:\s*([\d,]+)").unwrap());
+    static THINKING_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)thinking\s+tokens:\s*([\d,]+)").unwrap());
+    static CACHE_READ_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)cache\s+read\s+tokens:\s*([\d,]+)").unwrap());
+    static CACHE_WRITE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)cache\s+write\s+tokens:\s*([\d,]+)").unwrap());
 
     let parse_u64 = |caps: regex::Captures| -> Option<u64> {
         caps.get(1)
@@ -118,7 +124,8 @@ pub fn parse_claude_cost(output: &str) -> Option<CostInfo> {
 /// ```
 pub fn parse_claude_context(output: &str) -> Option<ContextInfo> {
     static CONTEXT_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)context:\s*([\d,]+)\s*/\s*([\d,]+)\s*tokens\s*\(\s*([\d.]+)%\s*\)").unwrap()
+        Regex::new(r"(?i)context:\s*([\d,]+)\s*/\s*([\d,]+)\s*tokens\s*\(\s*([\d.]+)%\s*\)")
+            .unwrap()
     });
 
     let caps = CONTEXT_RE.captures(output)?;

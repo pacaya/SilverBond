@@ -24,9 +24,9 @@ use uuid::Uuid;
 use crate::{
     driver::{self, AgentConfig, NodeOutcome},
     model::{
-        self, ContextSource, ResponseFormat, SplitFailurePolicy, WorkflowEdge,
-        WorkflowEdgeOutcome, WorkflowGraph, WorkflowNode, WorkflowNodeType, WorkflowV3,
-        evaluate_condition, get_nested_field,
+        self, ContextSource, ResponseFormat, SplitFailurePolicy, WorkflowEdge, WorkflowEdgeOutcome,
+        WorkflowGraph, WorkflowNode, WorkflowNodeType, WorkflowV3, evaluate_condition,
+        get_nested_field,
     },
     session::SessionManager,
     storage::Database,
@@ -151,7 +151,30 @@ pub enum CursorTerminalStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CallFrameState {
+    pub call_node_id: String,
+    pub call_node_name: String,
+    pub subflow_name: String,
+    pub exit_node_id: String,
+    #[serde(default)]
+    pub parent_last_output: String,
+    #[serde(default)]
+    pub parent_loop_counters: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub parent_visit_counters: BTreeMap<String, u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_last_branch_origin_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_last_branch_choice: Option<String>,
+    #[serde(default)]
+    pub parent_var_map: BTreeMap<String, String>,
+    #[serde(default)]
+    pub subflow_results: BTreeMap<String, NodeResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct CursorState {
     pub cursor_id: String,
@@ -172,6 +195,10 @@ pub struct CursorState {
     pub loop_counters: BTreeMap<String, u32>,
     #[serde(default)]
     pub visit_counters: BTreeMap<String, u32>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub var_map: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_stack: Vec<CallFrameState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_branch_origin_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -440,11 +467,12 @@ pub use crate::driver::AgentCapabilities;
 
 #[derive(Debug, Clone)]
 pub struct AgentSpec {
-    pub name: &'static str,
+    pub name: String,
+    pub binary: String,
     pub capabilities: AgentCapabilities,
 }
 
-trait NodeRunner: Send + Sync {
+pub(crate) trait NodeRunner: Send + Sync {
     fn run(
         &self,
         agent: String,
@@ -467,6 +495,23 @@ trait NodeRunner: Send + Sync {
     ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
         // Default: fall back to basic run (ignoring interaction context)
         self.run(agent, prompt, cwd, timeout_secs, config)
+    }
+
+    fn run_node_with_interaction(
+        &self,
+        node: WorkflowNode,
+        agent: String,
+        prompt: String,
+        cwd: String,
+        timeout_secs: Option<u64>,
+        config: Option<AgentConfig>,
+        previous_output: String,
+        ctx: RuntimeContext,
+        run_id: String,
+    ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+        let _ = node;
+        let _ = previous_output;
+        self.run_with_interaction(agent, prompt, cwd, timeout_secs, config, ctx, run_id)
     }
 }
 
@@ -528,6 +573,7 @@ struct ActiveRun {
     abort_flag: Arc<AtomicBool>,
     approval_sender: Arc<Mutex<Option<oneshot::Sender<ApprovalDecision>>>>,
     interaction_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    active_panes: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -545,6 +591,7 @@ impl RunRegistry {
                 abort_flag: Arc::new(AtomicBool::new(false)),
                 approval_sender: Arc::new(Mutex::new(None)),
                 interaction_sender: Arc::new(Mutex::new(None)),
+                active_panes: Arc::new(Mutex::new(BTreeMap::new())),
             }
         });
     }
@@ -664,6 +711,47 @@ impl RunRegistry {
     async fn clear(&self, run_id: &str) {
         self.inner.lock().await.remove(run_id);
     }
+
+    pub(crate) async fn set_active_pane(&self, run_id: &str, key: &str, target: &str) {
+        if let Some(active) = self.inner.lock().await.get(run_id).cloned() {
+            active
+                .active_panes
+                .lock()
+                .await
+                .insert(key.to_string(), target.to_string());
+        }
+    }
+
+    pub(crate) async fn clear_active_pane(&self, run_id: &str, key: &str) {
+        if let Some(active) = self.inner.lock().await.get(run_id).cloned() {
+            active.active_panes.lock().await.remove(key);
+        }
+    }
+
+    pub(crate) async fn clear_active_pane_target(&self, run_id: &str, target: &str) {
+        if let Some(active) = self.inner.lock().await.get(run_id).cloned() {
+            active
+                .active_panes
+                .lock()
+                .await
+                .retain(|_, pane_target| pane_target != target);
+        }
+    }
+
+    pub(crate) async fn resolve_active_pane(&self, run_id: &str, pane: &str) -> Option<String> {
+        let active = self.inner.lock().await.get(run_id).cloned()?;
+        let panes = active.active_panes.lock().await;
+        if let Some(target) = panes.get(pane) {
+            return Some(target.clone());
+        }
+        if panes.values().any(|target| target == pane) {
+            return Some(pane.to_string());
+        }
+        if matches!(pane, "active" | "current") && panes.len() == 1 {
+            return panes.values().next().cloned();
+        }
+        None
+    }
 }
 
 #[derive(Clone)]
@@ -680,12 +768,18 @@ impl RuntimeContext {
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("artifacts");
         let session_manager = Arc::new(SessionManager::new(artifact_dir));
+        let runner: Arc<dyn NodeRunner> =
+            if std::env::var("SILVERBOND_RUNNER").as_deref() == Ok("tmux") {
+                Arc::new(crate::tmux_exec::TmuxNodeRunner::new())
+            } else {
+                Arc::new(PtyNodeRunner {
+                    session_manager: session_manager.clone(),
+                })
+            };
         Self {
             db,
             registry: RunRegistry::default(),
-            runner: Arc::new(PtyNodeRunner {
-                session_manager: session_manager.clone(),
-            }),
+            runner,
             session_manager,
         }
     }
@@ -786,6 +880,8 @@ impl RuntimeContext {
             last_output: String::new(),
             loop_counters: BTreeMap::new(),
             visit_counters: BTreeMap::new(),
+            var_map: checkpoint.var_map.clone(),
+            call_stack: Vec::new(),
             last_branch_origin_id: None,
             last_branch_choice: None,
             cancel_requested: false,
@@ -866,14 +962,8 @@ impl RuntimeContext {
         Ok(())
     }
 
-    pub async fn respond_interaction(
-        &self,
-        run_id: &str,
-        response: String,
-    ) -> anyhow::Result<()> {
-        self.registry
-            .resolve_interaction(run_id, response)
-            .await
+    pub async fn respond_interaction(&self, run_id: &str, response: String) -> anyhow::Result<()> {
+        self.registry.resolve_interaction(run_id, response).await
     }
 }
 
@@ -881,16 +971,8 @@ pub fn available_agents() -> Vec<AgentSpec> {
     driver::all_drivers()
         .into_iter()
         .map(|d| AgentSpec {
-            // SAFETY: driver names are static strings from driver implementations
-            name: match d.name() {
-                "claude" => "claude",
-                "codex" => "codex",
-                "gemini" => "gemini",
-                other => {
-                    // Leak the string to get a &'static str — only called once at startup
-                    Box::leak(other.to_string().into_boxed_str())
-                }
-            },
+            name: d.name().to_string(),
+            binary: driver::agent_binary(d.name()).unwrap_or_else(|| d.name().to_string()),
             capabilities: d.capabilities(),
         })
         .collect()
@@ -899,12 +981,8 @@ pub fn available_agents() -> Vec<AgentSpec> {
 pub fn find_agent(name: &str) -> Option<AgentSpec> {
     let drv = driver::get_driver(name)?;
     Some(AgentSpec {
-        name: match name {
-            "claude" => "claude",
-            "codex" => "codex",
-            "gemini" => "gemini",
-            other => Box::leak(other.to_string().into_boxed_str()),
-        },
+        name: name.to_string(),
+        binary: driver::agent_binary(name).unwrap_or_else(|| name.to_string()),
         capabilities: drv.capabilities(),
     })
 }
@@ -970,10 +1048,7 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 /// Resolve executable path for an agent command, searching the given paths.
-fn resolve_agent_executable(
-    agent_name: &str,
-    search_paths: &[PathBuf],
-) -> anyhow::Result<PathBuf> {
+fn resolve_agent_executable(agent_name: &str, search_paths: &[PathBuf]) -> anyhow::Result<PathBuf> {
     resolve_executable(agent_name, search_paths).with_context(|| {
         format!(
             "Could not find '{}' on PATH. Install the CLI and ensure it is available to SilverBond.",
@@ -1016,19 +1091,25 @@ pub async fn run_node_preview(
         },
     );
 
-    let agent = node.agent.clone().unwrap_or_else(|| DEFAULT_AGENT.to_string());
-    let config = crate::model::resolve_agent_config(
-        &BTreeMap::new(),
-        cwd,
-        &agent,
-        node,
-        None,
-        false,
-        None,
-    );
+    let agent = node
+        .agent
+        .clone()
+        .unwrap_or_else(|| DEFAULT_AGENT.to_string());
+    let config =
+        crate::model::resolve_agent_config(&BTreeMap::new(), cwd, &agent, node, None, false, None);
     let resolved_prompt = wrap_prompt_for_json(node, resolved_prompt, &None);
-    let sm = Arc::new(SessionManager::new(PathBuf::from("/tmp/silverbond-preview")));
-    let mut result = run_pty_command(sm, &agent, &resolved_prompt, cwd, node.timeout, Some(&config)).await?;
+    let sm = Arc::new(SessionManager::new(PathBuf::from(
+        "/tmp/silverbond-preview",
+    )));
+    let mut result = run_pty_command(
+        sm,
+        &agent,
+        &resolved_prompt,
+        cwd,
+        node.timeout,
+        Some(&config),
+    )
+    .await?;
     parse_structured_output(node, &mut result);
 
     let routing_preview = preview_routing(node, &result.parsed_output);
@@ -1079,7 +1160,6 @@ pub struct NodePreviewResult {
     pub result: NodeResult,
 }
 
-
 struct ActiveApprovalWait {
     cursor_id: String,
     receiver: oneshot::Receiver<ApprovalDecision>,
@@ -1093,6 +1173,12 @@ struct CursorTaskResult {
     refined_prompt: Option<String>,
     iteration: u32,
     attempts: u32,
+}
+
+struct BatchItemTaskResult {
+    item_index: usize,
+    item_value: Value,
+    task_result: CursorTaskResult,
 }
 
 struct NextDecision {
@@ -1150,6 +1236,83 @@ fn build_session_persistence_set(workflow: &WorkflowV3) -> HashSet<String> {
         .collect()
 }
 
+fn is_runner_node_type(node_type: &WorkflowNodeType) -> bool {
+    matches!(
+        node_type,
+        WorkflowNodeType::Task
+            | WorkflowNodeType::Decide
+            | WorkflowNodeType::Spawn
+            | WorkflowNodeType::Send
+            | WorkflowNodeType::Wait
+            | WorkflowNodeType::Capture
+            | WorkflowNodeType::Kill
+            | WorkflowNodeType::RunAgent
+    )
+}
+
+fn prompt_template_for_node(node: &WorkflowNode) -> &str {
+    if let Some(prompt) = match node.node_type {
+        WorkflowNodeType::RunAgent => node
+            .run_agent_config
+            .as_ref()
+            .and_then(|config| config.prompt.as_deref()),
+        WorkflowNodeType::Send => node
+            .send_config
+            .as_ref()
+            .map(|config| config.text.as_str())
+            .filter(|text| !text.is_empty()),
+        WorkflowNodeType::Decide => node
+            .decide_config
+            .as_ref()
+            .map(|config| config.prompt.as_str()),
+        _ => None,
+    } {
+        return prompt;
+    }
+    &node.prompt
+}
+
+fn agent_name_for_node(node: &WorkflowNode) -> String {
+    match &node.node_type {
+        WorkflowNodeType::RunAgent => node
+            .run_agent_config
+            .as_ref()
+            .and_then(|config| config.agent.clone())
+            .or_else(|| node.agent.clone())
+            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
+        WorkflowNodeType::Spawn => node
+            .spawn_config
+            .as_ref()
+            .and_then(|config| config.agent.clone())
+            .or_else(|| node.agent.clone())
+            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
+        WorkflowNodeType::Send
+        | WorkflowNodeType::Wait
+        | WorkflowNodeType::Capture
+        | WorkflowNodeType::Kill => "tmux".to_string(),
+        _ => node
+            .agent
+            .clone()
+            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
+    }
+}
+
+fn timeout_for_node(node: &WorkflowNode) -> Option<u64> {
+    match &node.node_type {
+        WorkflowNodeType::RunAgent => node
+            .run_agent_config
+            .as_ref()
+            .and_then(|config| config.timeout)
+            .or(node.timeout),
+        WorkflowNodeType::Wait => node
+            .wait_config
+            .as_ref()
+            .and_then(|config| config.timeout)
+            .or(node.timeout),
+        _ => node.timeout,
+    }
+}
+
 fn build_inbound_source_map(graph: &WorkflowGraph) -> HashMap<String, Vec<String>> {
     graph
         .inbound
@@ -1157,7 +1320,10 @@ fn build_inbound_source_map(graph: &WorkflowGraph) -> HashMap<String, Vec<String
         .map(|(node_id, edges)| {
             (
                 (*node_id).to_string(),
-                edges.iter().map(|edge| edge.from.clone()).collect::<Vec<_>>(),
+                edges
+                    .iter()
+                    .map(|edge| edge.from.clone())
+                    .collect::<Vec<_>>(),
             )
         })
         .collect()
@@ -1214,6 +1380,8 @@ fn build_initial_checkpoint(
             last_output: String::new(),
             loop_counters: BTreeMap::new(),
             visit_counters: BTreeMap::new(),
+            var_map: var_map.clone(),
+            call_stack: Vec::new(),
             last_branch_origin_id: None,
             last_branch_choice: None,
             cancel_requested: false,
@@ -1272,6 +1440,8 @@ fn rehydrate_checkpoint_for_execution(workflow: &WorkflowV3, checkpoint: &mut Ru
                 last_output: checkpoint.last_output.clone(),
                 loop_counters: checkpoint.loop_counters.clone(),
                 visit_counters: checkpoint.visit_counters.clone(),
+                var_map: checkpoint.var_map.clone(),
+                call_stack: Vec::new(),
                 last_branch_origin_id: checkpoint.last_branch_origin_id.clone(),
                 last_branch_choice: checkpoint.last_branch_choice.clone(),
                 cancel_requested: false,
@@ -1283,8 +1453,13 @@ fn rehydrate_checkpoint_for_execution(workflow: &WorkflowV3, checkpoint: &mut Ru
             });
         }
     }
-    checkpoint.active_cursors.retain(|cursor| !cursor.cancel_requested);
+    checkpoint
+        .active_cursors
+        .retain(|cursor| !cursor.cancel_requested);
     for cursor in &mut checkpoint.active_cursors {
+        if cursor.var_map.is_empty() && cursor.call_stack.is_empty() {
+            cursor.var_map = checkpoint.var_map.clone();
+        }
         if cursor.state == CursorRuntimeState::Running {
             cursor.state = CursorRuntimeState::Runnable;
         }
@@ -1316,11 +1491,16 @@ fn update_checkpoint_summary(workflow: &WorkflowV3, checkpoint: &mut RuntimeChec
         return;
     };
     checkpoint.current_node_id = Some(cursor.node_id.clone());
-    checkpoint.current_node_name = workflow
-        .nodes
-        .iter()
-        .find(|node| node.id == cursor.node_id)
-        .map(|node| node.name.clone());
+    checkpoint.current_node_name =
+        workflow_for_cursor(workflow, cursor)
+            .ok()
+            .and_then(|active_workflow| {
+                active_workflow
+                    .nodes
+                    .iter()
+                    .find(|node| node.id == cursor.node_id)
+                    .map(|node| node.name.clone())
+            });
 }
 
 fn find_cursor_index(checkpoint: &RuntimeCheckpoint, cursor_id: &str) -> Option<usize> {
@@ -1336,6 +1516,85 @@ fn cursor_snapshot(checkpoint: &RuntimeCheckpoint, cursor_id: &str) -> Option<Cu
         .iter()
         .find(|cursor| cursor.cursor_id == cursor_id)
         .cloned()
+}
+
+fn workflow_for_cursor<'a>(
+    root_workflow: &'a WorkflowV3,
+    cursor: &CursorState,
+) -> anyhow::Result<&'a WorkflowV3> {
+    let Some(frame) = cursor.call_stack.last() else {
+        return Ok(root_workflow);
+    };
+    root_workflow
+        .subflows
+        .get(&frame.subflow_name)
+        .map(|workflow| workflow.as_ref())
+        .with_context(|| {
+            format!(
+                "Subflow \"{}\" is missing from the run-local workflow catalog",
+                frame.subflow_name
+            )
+        })
+}
+
+fn graph_for_cursor<'a>(
+    root_workflow: &'a WorkflowV3,
+    cursor: &CursorState,
+) -> anyhow::Result<WorkflowGraph<'a>> {
+    Ok(workflow_for_cursor(root_workflow, cursor)?.graph())
+}
+
+fn all_results_for_cursor(
+    checkpoint: &RuntimeCheckpoint,
+    cursor: &CursorState,
+) -> BTreeMap<String, NodeResult> {
+    cursor
+        .call_stack
+        .last()
+        .map(|frame| frame.subflow_results.clone())
+        .unwrap_or_else(|| checkpoint.all_results.clone())
+}
+
+fn var_map_for_cursor(
+    checkpoint: &RuntimeCheckpoint,
+    cursor: &CursorState,
+) -> BTreeMap<String, String> {
+    if cursor.var_map.is_empty() {
+        checkpoint.var_map.clone()
+    } else {
+        cursor.var_map.clone()
+    }
+}
+
+fn insert_result_for_cursor_index(
+    checkpoint: &mut RuntimeCheckpoint,
+    cursor_index: usize,
+    node_id: String,
+    result: NodeResult,
+) -> bool {
+    if let Some(frame) = checkpoint.active_cursors[cursor_index]
+        .call_stack
+        .last_mut()
+    {
+        frame.subflow_results.insert(node_id, result);
+        false
+    } else {
+        checkpoint.all_results.insert(node_id, result);
+        true
+    }
+}
+
+fn scoped_output_hash_key(cursor: &CursorState, node_id: &str) -> String {
+    if cursor.call_stack.is_empty() {
+        return node_id.to_string();
+    }
+    let mut parts = cursor
+        .call_stack
+        .iter()
+        .map(|frame| frame.call_node_id.as_str())
+        .collect::<Vec<_>>();
+    parts.push(node_id);
+    parts.join("::")
 }
 
 fn select_success_edge(graph: &WorkflowGraph, node_id: &str) -> Option<WorkflowEdge> {
@@ -1357,8 +1616,7 @@ fn should_skip_cursor_node(
     let source_text = if skip.source == "previous_output" {
         cursor.last_output.clone()
     } else {
-        checkpoint
-            .all_results
+        all_results_for_cursor(checkpoint, cursor)
             .get(&skip.source)
             .map(|result| result.output.clone())
             .unwrap_or_default()
@@ -1422,12 +1680,7 @@ async fn execute_workflow(
     rehydrate_checkpoint_for_execution(&workflow, &mut checkpoint);
     let start_instant = std::time::Instant::now();
     let run_id = checkpoint.run_id.clone();
-    let graph = workflow.graph();
-    let run_shared = Arc::new(RunConstantData {
-        inbound_map: build_inbound_source_map(&graph),
-        agent_defaults: workflow.agent_defaults.clone(),
-        session_persistence_nodes: build_session_persistence_set(&workflow),
-    });
+    let session_persistence_nodes = build_session_persistence_set(&workflow);
     let mut running_tasks = JoinSet::new();
     let mut active_approval: Option<ActiveApprovalWait> = None;
 
@@ -1470,14 +1723,8 @@ async fn execute_workflow(
         }
 
         let mut changed = false;
-        while process_immediate_cursors(
-            &ctx,
-            &workflow,
-            &graph,
-            &mut checkpoint,
-            &mut active_approval,
-        )
-        .await?
+        while process_immediate_cursors(&ctx, &workflow, &mut checkpoint, &mut active_approval)
+            .await?
         {
             changed = true;
             if checkpoint.execution_log.terminal_reason.is_some() {
@@ -1497,7 +1744,9 @@ async fn execute_workflow(
         let dispatchable = checkpoint
             .active_cursors
             .iter()
-            .filter(|cursor| cursor.state == CursorRuntimeState::Runnable && !cursor.cancel_requested)
+            .filter(|cursor| {
+                cursor.state == CursorRuntimeState::Runnable && !cursor.cancel_requested
+            })
             .map(|cursor| cursor.cursor_id.clone())
             .collect::<Vec<_>>();
 
@@ -1505,7 +1754,8 @@ async fn execute_workflow(
             let Some(cursor) = cursor_snapshot(&checkpoint, &cursor_id) else {
                 continue;
             };
-            let Some(node) = graph
+            let active_graph = graph_for_cursor(&workflow, &cursor)?;
+            let Some(node) = active_graph
                 .node_map
                 .get(cursor.node_id.as_str())
                 .map(|node| (*node).clone())
@@ -1525,7 +1775,7 @@ async fn execute_workflow(
                 checkpoint.execution_log.terminal_reason = Some("aborted".to_string());
                 break;
             };
-            if node.node_type != WorkflowNodeType::Task {
+            if !is_runner_node_type(&node.node_type) {
                 continue;
             }
             let Some(iteration) =
@@ -1539,14 +1789,22 @@ async fn execute_workflow(
             let dispatch_cursor = cursor_snapshot(&checkpoint, &cursor_id).unwrap_or(cursor);
             let run_ctx = CursorTaskExecutionContext {
                 run_id: run_id.clone(),
-                workflow_goal: workflow.goal.clone(),
-                workflow_nodes_len: workflow.nodes.len(),
+                workflow_goal: workflow_for_cursor(&workflow, &dispatch_cursor)?
+                    .goal
+                    .clone(),
+                workflow_nodes_len: workflow_for_cursor(&workflow, &dispatch_cursor)?
+                    .nodes
+                    .len(),
                 cwd: checkpoint.cwd.clone(),
                 use_orchestrator: checkpoint.use_orchestrator,
                 total_executed: checkpoint.total_executed,
-                all_results: checkpoint.all_results.clone(),
-                var_map: checkpoint.var_map.clone(),
-                shared: run_shared.clone(),
+                all_results: all_results_for_cursor(&checkpoint, &dispatch_cursor),
+                var_map: var_map_for_cursor(&checkpoint, &dispatch_cursor),
+                shared: Arc::new(RunConstantData {
+                    inbound_map: build_inbound_source_map(&active_graph),
+                    agent_defaults: workflow.agent_defaults.clone(),
+                    session_persistence_nodes: session_persistence_nodes.clone(),
+                }),
             };
             running_tasks.spawn(run_cursor_task(
                 ctx.clone(),
@@ -1565,13 +1823,7 @@ async fn execute_workflow(
 
         if running_tasks.is_empty() {
             if active_approval.is_some() {
-                wait_for_approval(
-                    &ctx,
-                    &graph,
-                    &mut checkpoint,
-                    &mut active_approval,
-                )
-                .await?;
+                wait_for_approval(&ctx, &workflow, &mut checkpoint, &mut active_approval).await?;
                 update_checkpoint_summary(&workflow, &mut checkpoint);
                 persist_checkpoint(&ctx, &workflow, &mut checkpoint).await?;
                 continue;
@@ -1603,22 +1855,24 @@ async fn execute_workflow(
         }
 
         if active_approval.is_some() {
-            let wait = active_approval.as_mut().expect("approval state should exist");
+            let wait = active_approval
+                .as_mut()
+                .expect("approval state should exist");
             tokio::select! {
                 task = running_tasks.join_next() => {
                     if let Some(task) = task {
-                        apply_join_result(&ctx, &workflow, &graph, &mut checkpoint, task).await?;
+                        apply_join_result(&ctx, &workflow, &mut checkpoint, task).await?;
                     }
                 }
                 decision = &mut wait.receiver => {
                     let decision = decision.ok();
                     if let Some(wait) = active_approval.take() {
-                        handle_approval_resolution(&ctx, &graph, &mut checkpoint, wait.cursor_id, decision).await?;
+                        handle_approval_resolution(&ctx, &workflow, &mut checkpoint, wait.cursor_id, decision).await?;
                     }
                 }
             }
         } else if let Some(task) = running_tasks.join_next().await {
-            apply_join_result(&ctx, &workflow, &graph, &mut checkpoint, task).await?;
+            apply_join_result(&ctx, &workflow, &mut checkpoint, task).await?;
         }
 
         update_checkpoint_summary(&workflow, &mut checkpoint);
@@ -1631,7 +1885,6 @@ async fn execute_workflow(
 async fn process_immediate_cursors(
     ctx: &RuntimeContext,
     workflow: &WorkflowV3,
-    graph: &WorkflowGraph<'_>,
     checkpoint: &mut RuntimeCheckpoint,
     active_approval: &mut Option<ActiveApprovalWait>,
 ) -> anyhow::Result<bool> {
@@ -1651,7 +1904,9 @@ async fn process_immediate_cursors(
         let Some(cursor) = cursor_snapshot(checkpoint, &cursor_id) else {
             continue;
         };
-        let Some(node) = graph
+        let active_workflow = workflow_for_cursor(workflow, &cursor)?;
+        let active_graph = active_workflow.graph();
+        let Some(node) = active_graph
             .node_map
             .get(cursor.node_id.as_str())
             .map(|node| (*node).clone())
@@ -1672,15 +1927,30 @@ async fn process_immediate_cursors(
             return Ok(true);
         };
 
-        match node.node_type {
-            WorkflowNodeType::Task => {
+        match &node.node_type {
+            WorkflowNodeType::Task
+            | WorkflowNodeType::Decide
+            | WorkflowNodeType::Spawn
+            | WorkflowNodeType::Send
+            | WorkflowNodeType::Wait
+            | WorkflowNodeType::Capture
+            | WorkflowNodeType::Kill
+            | WorkflowNodeType::RunAgent => {
                 if should_skip_cursor_node(&node, &cursor, checkpoint) {
                     let Some(_) =
                         prepare_cursor_visit(ctx, workflow, checkpoint, &cursor_id, &node).await?
                     else {
                         return Ok(true);
                     };
-                    handle_skipped_task(ctx, workflow, graph, checkpoint, cursor_id, node).await?;
+                    handle_skipped_task(
+                        ctx,
+                        active_workflow,
+                        &active_graph,
+                        checkpoint,
+                        cursor_id,
+                        node,
+                    )
+                    .await?;
                     return Ok(true);
                 }
             }
@@ -1699,7 +1969,7 @@ async fn process_immediate_cursors(
                 else {
                     return Ok(true);
                 };
-                handle_split_node(ctx, graph, checkpoint, cursor_id, node).await?;
+                handle_split_node(ctx, &active_graph, checkpoint, cursor_id, node).await?;
                 return Ok(true);
             }
             WorkflowNodeType::Collector => {
@@ -1708,7 +1978,35 @@ async fn process_immediate_cursors(
                 else {
                     return Ok(true);
                 };
-                handle_collector_entry(ctx, graph, checkpoint, cursor_id, node).await?;
+                handle_collector_entry(ctx, &active_graph, checkpoint, cursor_id, node).await?;
+                return Ok(true);
+            }
+            WorkflowNodeType::ParallelBatch => {
+                let Some(_) =
+                    prepare_cursor_visit(ctx, workflow, checkpoint, &cursor_id, &node).await?
+                else {
+                    return Ok(true);
+                };
+                handle_parallel_batch_node(
+                    ctx,
+                    active_workflow,
+                    &active_graph,
+                    checkpoint,
+                    cursor_id,
+                    node,
+                )
+                .await?;
+                return Ok(true);
+            }
+            WorkflowNodeType::Subflow | WorkflowNodeType::Call => {
+                let Some(_) =
+                    prepare_cursor_visit(ctx, active_workflow, checkpoint, &cursor_id, &node)
+                        .await?
+                else {
+                    return Ok(true);
+                };
+                handle_subflow_node(ctx, workflow, &active_graph, checkpoint, cursor_id, node)
+                    .await?;
                 return Ok(true);
             }
         }
@@ -1788,8 +2086,9 @@ async fn prepare_cursor_visit(
         *loop_counter += 1;
         *loop_counter
     };
-    checkpoint.last_branch_origin_id =
-        checkpoint.active_cursors[index].last_branch_origin_id.clone();
+    checkpoint.last_branch_origin_id = checkpoint.active_cursors[index]
+        .last_branch_origin_id
+        .clone();
     checkpoint.last_branch_choice = checkpoint.active_cursors[index].last_branch_choice.clone();
     Ok(Some(iteration))
 }
@@ -1838,6 +2137,161 @@ async fn handle_skipped_task(
     }
     update_checkpoint_summary(workflow, checkpoint);
     Ok(())
+}
+
+async fn handle_subflow_node(
+    ctx: &RuntimeContext,
+    root_workflow: &WorkflowV3,
+    parent_graph: &WorkflowGraph<'_>,
+    checkpoint: &mut RuntimeCheckpoint,
+    cursor_id: String,
+    node: WorkflowNode,
+) -> anyhow::Result<()> {
+    let Some(index) = find_cursor_index(checkpoint, &cursor_id) else {
+        return Ok(());
+    };
+    let parent_cursor = checkpoint.active_cursors[index].clone();
+    let config = node
+        .subflow_config
+        .clone()
+        .context("subflow node is missing subflowConfig")?;
+    let subflow_name = config.workflow_name.trim().to_string();
+    let subflow = root_workflow
+        .subflows
+        .get(&subflow_name)
+        .map(|workflow| workflow.as_ref())
+        .with_context(|| format!("subflow \"{}\" not found", subflow_name))?;
+    let max_depth = config.max_depth.max(1) as usize;
+    if parent_cursor.call_stack.len() + 1 > max_depth {
+        emit_event(
+            ctx,
+            &checkpoint.run_id,
+            RuntimeEvent::new("workflow_error")
+                .with("cursorId", cursor_id.clone())
+                .with("nodeId", node.id.clone())
+                .with(
+                    "message",
+                    format!(
+                        "Subflow \"{}\" exceeded maxDepth {} at call node \"{}\".",
+                        subflow_name, max_depth, node.name
+                    ),
+                ),
+        )
+        .await?;
+        checkpoint.status = RuntimeStatus::Failed;
+        checkpoint.execution_log.terminal_reason = Some("failed".to_string());
+        checkpoint.active_cursors.remove(index);
+        return Ok(());
+    }
+
+    let exit_node_id = resolve_subflow_exit_node(&config, subflow)?;
+    let parent_results = all_results_for_cursor(checkpoint, &parent_cursor);
+    let parent_vars = var_map_for_cursor(checkpoint, &parent_cursor);
+    let parent_inbound = build_inbound_source_map(parent_graph);
+    let binding_context = TemplateRuntimeContext {
+        current_node_id: &node.id,
+        current_node: &node,
+        all_results: &parent_results,
+        last_output: &parent_cursor.last_output,
+        var_map: &parent_vars,
+        inbound_map: &parent_inbound,
+        last_branch_origin_id: parent_cursor.last_branch_origin_id.as_deref(),
+        last_branch_choice: parent_cursor.last_branch_choice.as_deref(),
+    };
+
+    let mut subflow_vars = BTreeMap::new();
+    for variable in &subflow.variables {
+        subflow_vars.insert(variable.name.clone(), variable.default.clone());
+    }
+    for input in &config.inputs {
+        let value =
+            resolve_input_binding_source(&input.source, &binding_context).with_context(|| {
+                format!(
+                    "subflow input \"{}\" references missing source \"{}\"",
+                    input.name, input.source
+                )
+            })?;
+        subflow_vars.insert(input.name.clone(), value);
+    }
+
+    let frame = CallFrameState {
+        call_node_id: node.id.clone(),
+        call_node_name: node.name.clone(),
+        subflow_name: subflow_name.clone(),
+        exit_node_id: exit_node_id.clone(),
+        parent_last_output: parent_cursor.last_output.clone(),
+        parent_loop_counters: parent_cursor.loop_counters.clone(),
+        parent_visit_counters: parent_cursor.visit_counters.clone(),
+        parent_last_branch_origin_id: parent_cursor.last_branch_origin_id.clone(),
+        parent_last_branch_choice: parent_cursor.last_branch_choice.clone(),
+        parent_var_map: parent_vars,
+        subflow_results: BTreeMap::new(),
+    };
+
+    let cursor = &mut checkpoint.active_cursors[index];
+    cursor.call_stack.push(frame);
+    cursor.node_id = subflow.entry_node_id.clone();
+    cursor.incoming_edge_id = None;
+    cursor.incoming_node_id = Some(node.id.clone());
+    cursor.last_output.clear();
+    cursor.loop_counters = BTreeMap::new();
+    cursor.visit_counters = BTreeMap::new();
+    cursor.var_map = subflow_vars;
+    cursor.last_branch_origin_id = None;
+    cursor.last_branch_choice = None;
+    cursor.state = CursorRuntimeState::Runnable;
+
+    record_transition_for_cursor(
+        ctx,
+        checkpoint,
+        Some(cursor_id.clone()),
+        node.id.clone(),
+        Some(subflow.entry_node_id.clone()),
+        "subflow",
+        &subflow_name,
+    )
+    .await?;
+    emit_event(
+        ctx,
+        &checkpoint.run_id,
+        RuntimeEvent::new("subflow_start")
+            .with("cursorId", cursor_id)
+            .with("nodeId", node.id)
+            .with("subflowName", subflow_name)
+            .with("entryNodeId", subflow.entry_node_id.clone())
+            .with("exitNodeId", exit_node_id),
+    )
+    .await?;
+    Ok(())
+}
+
+fn resolve_subflow_exit_node(
+    config: &model::SubflowConfig,
+    subflow: &WorkflowV3,
+) -> anyhow::Result<String> {
+    if let Some(exit_node_id) = config
+        .exit_node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(exit_node_id.to_string());
+    }
+
+    let graph = subflow.graph();
+    let terminal_nodes = subflow
+        .nodes
+        .iter()
+        .filter(|node| graph.outgoing_for(&node.id).is_empty())
+        .map(|node| node.id.clone())
+        .collect::<Vec<_>>();
+    match terminal_nodes.as_slice() {
+        [exit_node_id] => Ok(exit_node_id.clone()),
+        _ => anyhow::bail!(
+            "subflow \"{}\" must have exactly one terminal node when exitNodeId is omitted",
+            config.workflow_name
+        ),
+    }
 }
 
 async fn queue_approval(
@@ -1948,13 +2402,16 @@ async fn restore_pending_approval(
             .with("lastOutput", pending.last_output.clone()),
     )
     .await?;
-    *active_approval = Some(ActiveApprovalWait { cursor_id, receiver });
+    *active_approval = Some(ActiveApprovalWait {
+        cursor_id,
+        receiver,
+    });
     Ok(())
 }
 
 async fn wait_for_approval(
     ctx: &RuntimeContext,
-    graph: &WorkflowGraph<'_>,
+    workflow: &WorkflowV3,
     checkpoint: &mut RuntimeCheckpoint,
     active_approval: &mut Option<ActiveApprovalWait>,
 ) -> anyhow::Result<()> {
@@ -1963,7 +2420,7 @@ async fn wait_for_approval(
             decision = &mut wait.receiver => {
                 let cursor_id = wait.cursor_id.clone();
                 *active_approval = None;
-                handle_approval_resolution(ctx, graph, checkpoint, cursor_id, decision.ok()).await?;
+                handle_approval_resolution(ctx, workflow, checkpoint, cursor_id, decision.ok()).await?;
             }
             _ = tokio::time::sleep(Duration::from_millis(250)) => {}
         }
@@ -1978,8 +2435,13 @@ async fn run_cursor_task(
     node: WorkflowNode,
     iteration: u32,
 ) -> anyhow::Result<CursorTaskResult> {
+    if node.node_type == WorkflowNodeType::Decide {
+        return run_decide_node(ctx, run_ctx, cursor, node, iteration).await;
+    }
+
+    let prompt_template = prompt_template_for_node(&node);
     let mut resolved_prompt = resolve_template_vars(
-        &node.prompt,
+        prompt_template,
         &TemplateRuntimeContext {
             current_node_id: &node.id,
             current_node: &node,
@@ -2069,18 +2531,16 @@ async fn run_cursor_task(
         }
     }
 
-    let agent_name = node.agent.clone().unwrap_or_else(|| DEFAULT_AGENT.to_string());
+    let agent_name = agent_name_for_node(&node);
+    let node_timeout = timeout_for_node(&node);
 
     // Session reuse: resolve resume_session_id from referenced node's result
-    let resume_session_id = node
-        .continue_session_from
-        .as_ref()
-        .and_then(|source_id| {
-            run_ctx
-                .all_results
-                .get(source_id)
-                .and_then(|r| r.metadata.agent_session_id.clone())
-        });
+    let resume_session_id = node.continue_session_from.as_ref().and_then(|source_id| {
+        run_ctx
+            .all_results
+            .get(source_id)
+            .and_then(|r| r.metadata.agent_session_id.clone())
+    });
     let needs_session_persistence = run_ctx.shared.session_persistence_nodes.contains(&node.id);
 
     // Artifact-based JSON output: no native schema passing, all agents use artifact files
@@ -2115,12 +2575,14 @@ async fn run_cursor_task(
         attempts += 1;
         let step_result = ctx
             .runner
-            .run_with_interaction(
+            .run_node_with_interaction(
+                node.clone(),
                 agent_name.clone(),
                 resolved_prompt.clone(),
                 run_ctx.cwd.clone(),
-                node.timeout,
+                node_timeout,
                 Some(agent_config.clone()),
+                cursor.last_output.clone(),
                 ctx.clone(),
                 run_ctx.run_id.clone(),
             )
@@ -2157,10 +2619,206 @@ async fn run_cursor_task(
     })
 }
 
+async fn run_decide_node(
+    ctx: RuntimeContext,
+    run_ctx: CursorTaskExecutionContext,
+    cursor: CursorState,
+    node: WorkflowNode,
+    iteration: u32,
+) -> anyhow::Result<CursorTaskResult> {
+    let config = node
+        .decide_config
+        .as_ref()
+        .context("decide node is missing decideConfig")?;
+    let template_context = TemplateRuntimeContext {
+        current_node_id: &node.id,
+        current_node: &node,
+        all_results: &run_ctx.all_results,
+        last_output: &cursor.last_output,
+        var_map: &run_ctx.var_map,
+        inbound_map: &run_ctx.shared.inbound_map,
+        last_branch_origin_id: cursor.last_branch_origin_id.as_deref(),
+        last_branch_choice: cursor.last_branch_choice.as_deref(),
+    };
+    let bindings = resolve_decide_input_bindings(config, &template_context)?;
+    let resolved_prompt = render_decide_prompt(&config.prompt, &template_context, &bindings);
+    let model = config
+        .model
+        .clone()
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(model::default_decide_model);
+
+    emit_event(
+        &ctx,
+        &run_ctx.run_id,
+        RuntimeEvent::new("node_start")
+            .with("cursorId", cursor.cursor_id.clone())
+            .with("nodeId", node.id.clone())
+            .with("nodeName", node.name.clone())
+            .with("agent", "llm")
+            .with("resolvedPrompt", resolved_prompt.clone())
+            .with("iteration", iteration),
+    )
+    .await?;
+
+    let start = std::time::Instant::now();
+    let response = driver::call_llm(&model, &resolved_prompt).await?;
+    let duration = format!("{:.1}", start.elapsed().as_secs_f64());
+    let selected = select_decide_outcome(&config.outcomes, &response);
+    let (success, output, stderr) = if let Some(selected) = selected {
+        (true, selected, String::new())
+    } else {
+        (
+            false,
+            response.clone(),
+            format!(
+                "LLM response did not match any decide outcome: {}",
+                config.outcomes.join(", ")
+            ),
+        )
+    };
+
+    let result = NodeResult {
+        success,
+        output: output.clone(),
+        stderr,
+        exit_code: if success { 0 } else { 1 },
+        duration,
+        agent: "llm".to_string(),
+        prompt: config.prompt.clone(),
+        raw_output: Some(response.clone()),
+        parsed_output: Some(json!({
+            "outcome": if success { Some(output.clone()) } else { None },
+            "response": response,
+            "inputs": bindings,
+            "model": model,
+        })),
+        resolved_prompt: Some(resolved_prompt.clone()),
+        ..Default::default()
+    };
+
+    Ok(CursorTaskResult {
+        cursor_id: cursor.cursor_id,
+        node,
+        result,
+        resolved_prompt,
+        refined_prompt: None,
+        iteration,
+        attempts: 1,
+    })
+}
+
+fn resolve_decide_input_bindings(
+    config: &model::DecideConfig,
+    context: &TemplateRuntimeContext<'_>,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut bindings = BTreeMap::new();
+    for input in &config.inputs {
+        let value = resolve_input_binding_source(&input.source, context).with_context(|| {
+            format!(
+                "decide input \"{}\" references missing source \"{}\"",
+                input.name, input.source
+            )
+        })?;
+        bindings.insert(input.name.clone(), value);
+    }
+    Ok(bindings)
+}
+
+fn resolve_input_binding_source(
+    source: &str,
+    context: &TemplateRuntimeContext<'_>,
+) -> Option<String> {
+    let source = source.trim();
+    match source {
+        "previous_output" => return Some(context.last_output.to_string()),
+        "branch_origin" => {
+            return Some(
+                context
+                    .last_branch_origin_id
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        "branch_choice" => {
+            return Some(context.last_branch_choice.unwrap_or_default().to_string());
+        }
+        _ => {}
+    }
+
+    if let Some(var_name) = source.strip_prefix("var:") {
+        return context.var_map.get(var_name).cloned();
+    }
+
+    if let Some(rest) = source.strip_prefix("node:") {
+        if let Some((node_id, field_path)) = rest.split_once(".parsedOutput.") {
+            return context
+                .all_results
+                .get(node_id)
+                .and_then(|result| result.parsed_output.as_ref())
+                .and_then(|parsed| get_nested_field(parsed, field_path))
+                .map(value_to_template_string);
+        }
+        let node_id = rest.strip_suffix(".output").unwrap_or(rest);
+        return context
+            .all_results
+            .get(node_id)
+            .map(|result| result.output.clone());
+    }
+
+    context.var_map.get(source).cloned().or_else(|| {
+        context
+            .all_results
+            .get(source)
+            .map(|result| result.output.clone())
+    })
+}
+
+fn render_decide_prompt(
+    prompt: &str,
+    context: &TemplateRuntimeContext<'_>,
+    bindings: &BTreeMap<String, String>,
+) -> String {
+    let mut var_map = context.var_map.clone();
+    for (name, value) in bindings {
+        var_map.insert(name.clone(), value.clone());
+    }
+    let binding_context = TemplateRuntimeContext {
+        current_node_id: context.current_node_id,
+        current_node: context.current_node,
+        all_results: context.all_results,
+        last_output: context.last_output,
+        var_map: &var_map,
+        inbound_map: context.inbound_map,
+        last_branch_origin_id: context.last_branch_origin_id,
+        last_branch_choice: context.last_branch_choice,
+    };
+    let mut rendered = resolve_template_vars(prompt, &binding_context);
+    for (name, value) in bindings {
+        rendered = rendered.replace(&format!("{{{{{}}}}}", name), value);
+    }
+    rendered
+}
+
+fn select_decide_outcome(outcomes: &[String], response: &str) -> Option<String> {
+    let trimmed = response
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('`')
+        .trim();
+    if let Some(outcome) = outcomes.iter().find(|outcome| outcome.as_str() == trimmed) {
+        return Some(outcome.clone());
+    }
+    outcomes
+        .iter()
+        .find(|outcome| response.contains(outcome.as_str()))
+        .cloned()
+}
+
 async fn apply_join_result(
     ctx: &RuntimeContext,
     workflow: &WorkflowV3,
-    graph: &WorkflowGraph<'_>,
     checkpoint: &mut RuntimeCheckpoint,
     task: Result<anyhow::Result<CursorTaskResult>, tokio::task::JoinError>,
 ) -> anyhow::Result<()> {
@@ -2196,12 +2854,21 @@ async fn apply_join_result(
     let Some(index) = find_cursor_index(checkpoint, &task_result.cursor_id) else {
         return Ok(());
     };
+    let active_workflow = workflow_for_cursor(workflow, &checkpoint.active_cursors[index])?;
+    let graph = active_workflow.graph();
+    let output_hash_key =
+        scoped_output_hash_key(&checkpoint.active_cursors[index], &task_result.node.id);
     checkpoint.active_cursors[index].state = CursorRuntimeState::Runnable;
     checkpoint.active_cursors[index].last_output = task_result.result.output.clone();
-    checkpoint.last_output = task_result.result.output.clone();
-    checkpoint
-        .all_results
-        .insert(task_result.node.id.clone(), task_result.result.clone());
+    if checkpoint.active_cursors[index].call_stack.is_empty() {
+        checkpoint.last_output = task_result.result.output.clone();
+    }
+    insert_result_for_cursor_index(
+        checkpoint,
+        index,
+        task_result.node.id.clone(),
+        task_result.result.clone(),
+    );
 
     emit_event(
         ctx,
@@ -2223,7 +2890,9 @@ async fn apply_join_result(
                 });
                 // Merge agent metadata fields into the event result
                 if let Ok(meta_val) = serde_json::to_value(&task_result.result.metadata) {
-                    if let (Some(base), Some(meta)) = (event_result.as_object_mut(), meta_val.as_object()) {
+                    if let (Some(base), Some(meta)) =
+                        (event_result.as_object_mut(), meta_val.as_object())
+                    {
                         base.extend(meta.iter().map(|(k, v)| (k.clone(), v.clone())));
                     }
                 }
@@ -2232,29 +2901,41 @@ async fn apply_join_result(
     )
     .await?;
 
-    checkpoint.execution_log.node_executions.push(NodeExecutionLog {
-        cursor_id: Some(task_result.cursor_id.clone()),
-        node_id: task_result.node.id.clone(),
-        node_name: task_result.node.name.clone(),
-        node_type: "task".to_string(),
-        agent: task_result
-            .node
-            .agent
-            .clone()
-            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
-        original_prompt: task_result.node.prompt.clone(),
-        resolved_prompt: task_result.resolved_prompt.clone(),
-        refined_prompt: task_result.refined_prompt.clone(),
-        output: task_result.result.output.clone(),
-        stderr: task_result.result.stderr.clone(),
-        exit_code: task_result.result.exit_code,
-        success: task_result.result.success,
-        duration: task_result.result.duration.clone(),
-        iteration: task_result.iteration,
-        attempts: task_result.attempts,
-        timestamp: now_iso(),
-        metadata: task_result.result.metadata.clone(),
-    });
+    checkpoint
+        .execution_log
+        .node_executions
+        .push(NodeExecutionLog {
+            cursor_id: Some(task_result.cursor_id.clone()),
+            node_id: task_result.node.id.clone(),
+            node_name: task_result.node.name.clone(),
+            node_type: task_result.node.node_type.as_str().to_string(),
+            agent: agent_name_for_node(&task_result.node),
+            original_prompt: prompt_template_for_node(&task_result.node).to_string(),
+            resolved_prompt: task_result.resolved_prompt.clone(),
+            refined_prompt: task_result.refined_prompt.clone(),
+            output: task_result.result.output.clone(),
+            stderr: task_result.result.stderr.clone(),
+            exit_code: task_result.result.exit_code,
+            success: task_result.result.success,
+            duration: task_result.result.duration.clone(),
+            iteration: task_result.iteration,
+            attempts: task_result.attempts,
+            timestamp: now_iso(),
+            metadata: task_result.result.metadata.clone(),
+        });
+
+    if complete_subflow_if_at_exit(
+        ctx,
+        workflow,
+        checkpoint,
+        &task_result.cursor_id,
+        &task_result.node,
+        &task_result.result,
+    )
+    .await?
+    {
+        return Ok(());
+    }
 
     if !task_result.result.success {
         let status = if task_result.result.exit_code == -2 {
@@ -2264,7 +2945,7 @@ async fn apply_join_result(
         };
         handle_terminal_cursor_status(
             ctx,
-            graph,
+            &graph,
             checkpoint,
             task_result.cursor_id,
             task_result.node,
@@ -2275,10 +2956,7 @@ async fn apply_join_result(
         return Ok(());
     }
 
-    let output_hashes = checkpoint
-        .output_hashes
-        .entry(task_result.node.id.clone())
-        .or_default();
+    let output_hashes = checkpoint.output_hashes.entry(output_hash_key).or_default();
     output_hashes.push(djb2(&task_result.result.output));
     if output_hashes.len() >= 3
         && output_hashes[output_hashes.len() - 1] == output_hashes[output_hashes.len() - 2]
@@ -2307,8 +2985,8 @@ async fn apply_join_result(
 
     let decision = select_next_decision(
         ctx,
-        workflow,
-        graph,
+        active_workflow,
+        &graph,
         checkpoint,
         &task_result.cursor_id,
         &task_result.node,
@@ -2348,9 +3026,211 @@ async fn apply_join_result(
     Ok(())
 }
 
+async fn complete_subflow_if_at_exit(
+    ctx: &RuntimeContext,
+    root_workflow: &WorkflowV3,
+    checkpoint: &mut RuntimeCheckpoint,
+    cursor_id: &str,
+    node: &WorkflowNode,
+    exit_result: &NodeResult,
+) -> anyhow::Result<bool> {
+    let Some(index) = find_cursor_index(checkpoint, cursor_id) else {
+        return Ok(false);
+    };
+    let should_complete = checkpoint.active_cursors[index]
+        .call_stack
+        .last()
+        .is_some_and(|frame| frame.exit_node_id == node.id);
+    if !should_complete {
+        return Ok(false);
+    }
+
+    let mut frame = checkpoint.active_cursors[index]
+        .call_stack
+        .pop()
+        .expect("checked call frame exists");
+    frame
+        .subflow_results
+        .entry(node.id.clone())
+        .or_insert_with(|| exit_result.clone());
+
+    let call_result = NodeResult {
+        success: exit_result.success,
+        output: exit_result.output.clone(),
+        stderr: exit_result.stderr.clone(),
+        exit_code: exit_result.exit_code,
+        duration: exit_result.duration.clone(),
+        agent: "subflow".to_string(),
+        prompt: frame.subflow_name.clone(),
+        raw_output: exit_result.raw_output.clone(),
+        parsed_output: exit_result.parsed_output.clone(),
+        parse_error: exit_result.parse_error.clone(),
+        resolved_prompt: Some(format!("subflow:{}", frame.subflow_name)),
+        stale: exit_result.stale,
+        preserved_from_run_id: exit_result.preserved_from_run_id.clone(),
+        metadata: exit_result.metadata.clone(),
+    };
+
+    {
+        let cursor = &mut checkpoint.active_cursors[index];
+        cursor.last_output = call_result.output.clone();
+        cursor.loop_counters = frame.parent_loop_counters.clone();
+        cursor.visit_counters = frame.parent_visit_counters.clone();
+        cursor.var_map = frame.parent_var_map.clone();
+        cursor.last_branch_origin_id = frame.parent_last_branch_origin_id.clone();
+        cursor.last_branch_choice = frame.parent_last_branch_choice.clone();
+        cursor.state = CursorRuntimeState::Runnable;
+    }
+
+    let parent_workflow = workflow_for_cursor(root_workflow, &checkpoint.active_cursors[index])?;
+    let parent_graph = parent_workflow.graph();
+    let call_node = parent_graph
+        .node_map
+        .get(frame.call_node_id.as_str())
+        .map(|node| (*node).clone())
+        .with_context(|| {
+            format!(
+                "call node \"{}\" missing while completing subflow \"{}\"",
+                frame.call_node_id, frame.subflow_name
+            )
+        })?;
+
+    insert_result_for_cursor_index(
+        checkpoint,
+        index,
+        frame.call_node_id.clone(),
+        call_result.clone(),
+    );
+    if checkpoint.active_cursors[index].call_stack.is_empty() {
+        checkpoint.last_output = call_result.output.clone();
+    }
+
+    emit_event(
+        ctx,
+        &checkpoint.run_id,
+        RuntimeEvent::new("subflow_done")
+            .with("cursorId", cursor_id.to_string())
+            .with("nodeId", frame.call_node_id.clone())
+            .with("subflowName", frame.subflow_name.clone())
+            .with("exitNodeId", node.id.clone())
+            .with("output", call_result.output.clone()),
+    )
+    .await?;
+    emit_event(
+        ctx,
+        &checkpoint.run_id,
+        RuntimeEvent::new("node_done")
+            .with("cursorId", cursor_id.to_string())
+            .with("nodeId", frame.call_node_id.clone())
+            .with(
+                "result",
+                json!({
+                    "success": call_result.success,
+                    "output": call_result.output.clone(),
+                    "stderr": call_result.stderr.clone(),
+                    "exitCode": call_result.exit_code,
+                    "duration": call_result.duration.clone(),
+                    "nodeName": frame.call_node_name.clone(),
+                    "resolvedPrompt": format!("subflow:{}", frame.subflow_name),
+                    "parsedOutput": call_result.parsed_output.clone(),
+                    "parseError": call_result.parse_error.clone(),
+                }),
+            ),
+    )
+    .await?;
+
+    let iteration = frame
+        .parent_loop_counters
+        .get(&frame.call_node_id)
+        .copied()
+        .unwrap_or(1);
+    checkpoint
+        .execution_log
+        .node_executions
+        .push(NodeExecutionLog {
+            cursor_id: Some(cursor_id.to_string()),
+            node_id: frame.call_node_id.clone(),
+            node_name: frame.call_node_name.clone(),
+            node_type: call_node.node_type.as_str().to_string(),
+            agent: "subflow".to_string(),
+            original_prompt: call_node.prompt.clone(),
+            resolved_prompt: format!("subflow:{}", frame.subflow_name),
+            refined_prompt: None,
+            output: call_result.output.clone(),
+            stderr: call_result.stderr.clone(),
+            exit_code: call_result.exit_code,
+            success: call_result.success,
+            duration: call_result.duration.clone(),
+            iteration,
+            attempts: 1,
+            timestamp: now_iso(),
+            metadata: call_result.metadata.clone(),
+        });
+
+    if !call_result.success {
+        let status = if call_result.exit_code == -2 {
+            CursorTerminalStatus::Timeout
+        } else {
+            CursorTerminalStatus::Failure
+        };
+        handle_terminal_cursor_status(
+            ctx,
+            &parent_graph,
+            checkpoint,
+            cursor_id.to_string(),
+            call_node,
+            call_result,
+            status,
+        )
+        .await?;
+        return Ok(true);
+    }
+
+    let decision = select_next_decision(
+        ctx,
+        parent_workflow,
+        &parent_graph,
+        checkpoint,
+        cursor_id,
+        &call_node,
+        &call_result,
+        iteration,
+    )
+    .await?;
+    let next_node_id = decision.next_edge.as_ref().map(|edge| edge.to.clone());
+    record_transition_for_cursor(
+        ctx,
+        checkpoint,
+        Some(cursor_id.to_string()),
+        frame.call_node_id.clone(),
+        next_node_id,
+        &decision.control_type,
+        &decision.reason,
+    )
+    .await?;
+
+    if let Some(index) = find_cursor_index(checkpoint, cursor_id) {
+        if let Some(edge) = decision.next_edge {
+            let cursor = &mut checkpoint.active_cursors[index];
+            cursor.node_id = edge.to.clone();
+            cursor.incoming_edge_id = Some(edge.id.clone());
+            cursor.incoming_node_id = Some(frame.call_node_id.clone());
+            if decision.control_type == "branch" {
+                cursor.last_branch_origin_id = Some(frame.call_node_id);
+                cursor.last_branch_choice = edge.label.clone();
+            }
+            cursor.state = CursorRuntimeState::Runnable;
+        } else {
+            checkpoint.active_cursors.remove(index);
+        }
+    }
+
+    Ok(true)
+}
+
 async fn handle_approval_resolution(
     ctx: &RuntimeContext,
-    graph: &WorkflowGraph<'_>,
+    workflow: &WorkflowV3,
     checkpoint: &mut RuntimeCheckpoint,
     cursor_id: String,
     decision: Option<ApprovalDecision>,
@@ -2359,14 +3239,16 @@ async fn handle_approval_resolution(
     let Some(index) = find_cursor_index(checkpoint, &cursor_id) else {
         return Ok(());
     };
+    let graph = graph_for_cursor(workflow, &checkpoint.active_cursors[index])?;
     let node_id = checkpoint.active_cursors[index].node_id.clone();
     let Some(node) = graph.node_map.get(node_id.as_str()).map(|n| (*n).clone()) else {
         return Ok(());
     };
-    let approved = decision.as_ref().map(|value| value.approved).unwrap_or(false);
-    let user_input = decision
-        .map(|value| value.user_input)
-        .unwrap_or_default();
+    let approved = decision
+        .as_ref()
+        .map(|value| value.approved)
+        .unwrap_or(false);
+    let user_input = decision.map(|value| value.user_input).unwrap_or_default();
     let output = if approved {
         if user_input.trim().is_empty() {
             "[Approved by user]".to_string()
@@ -2396,29 +3278,32 @@ async fn handle_approval_resolution(
         preserved_from_run_id: None,
         ..Default::default()
     };
-    checkpoint.all_results.insert(node.id.clone(), result.clone());
-    checkpoint.execution_log.node_executions.push(NodeExecutionLog {
-        cursor_id: Some(cursor_id.clone()),
-        node_id: node.id.clone(),
-        node_name: node.name.clone(),
-        node_type: "approval".to_string(),
-        agent: "user".to_string(),
-        original_prompt: node.prompt.clone(),
-        resolved_prompt: node.prompt.clone(),
-        refined_prompt: None,
-        output: output.clone(),
-        stderr: result.stderr.clone(),
-        exit_code: result.exit_code,
-        success: result.success,
-        duration: "0".to_string(),
-        iteration: *checkpoint.active_cursors[index]
-            .loop_counters
-            .get(&node.id)
-            .unwrap_or(&1),
-        attempts: 1,
-        timestamp: now_iso(),
-        ..Default::default()
-    });
+    insert_result_for_cursor_index(checkpoint, index, node.id.clone(), result.clone());
+    checkpoint
+        .execution_log
+        .node_executions
+        .push(NodeExecutionLog {
+            cursor_id: Some(cursor_id.clone()),
+            node_id: node.id.clone(),
+            node_name: node.name.clone(),
+            node_type: "approval".to_string(),
+            agent: "user".to_string(),
+            original_prompt: node.prompt.clone(),
+            resolved_prompt: node.prompt.clone(),
+            refined_prompt: None,
+            output: output.clone(),
+            stderr: result.stderr.clone(),
+            exit_code: result.exit_code,
+            success: result.success,
+            duration: "0".to_string(),
+            iteration: *checkpoint.active_cursors[index]
+                .loop_counters
+                .get(&node.id)
+                .unwrap_or(&1),
+            attempts: 1,
+            timestamp: now_iso(),
+            ..Default::default()
+        });
     emit_event(
         ctx,
         &checkpoint.run_id,
@@ -2440,8 +3325,12 @@ async fn handle_approval_resolution(
     )
     .await?;
 
+    if complete_subflow_if_at_exit(ctx, workflow, checkpoint, &cursor_id, &node, &result).await? {
+        return Ok(());
+    }
+
     if approved {
-        let next_edge = select_success_edge(graph, &node.id);
+        let next_edge = select_success_edge(&graph, &node.id);
         let next_node_id = next_edge.as_ref().map(|edge| edge.to.clone());
         record_transition_for_cursor(
             ctx,
@@ -2488,7 +3377,7 @@ async fn handle_approval_resolution(
     } else {
         handle_terminal_cursor_status(
             ctx,
-            graph,
+            &graph,
             checkpoint,
             cursor_id,
             node,
@@ -2498,6 +3387,413 @@ async fn handle_approval_resolution(
         .await?;
     }
     Ok(())
+}
+
+async fn handle_parallel_batch_node(
+    ctx: &RuntimeContext,
+    workflow: &WorkflowV3,
+    graph: &WorkflowGraph<'_>,
+    checkpoint: &mut RuntimeCheckpoint,
+    cursor_id: String,
+    node: WorkflowNode,
+) -> anyhow::Result<()> {
+    let config = node
+        .batch_config
+        .clone()
+        .context("parallel_batch node is missing batchConfig")?;
+    let Some(parent_index) = find_cursor_index(checkpoint, &cursor_id) else {
+        return Ok(());
+    };
+    let parent_cursor = checkpoint.active_cursors[parent_index].clone();
+    let base_all_results = all_results_for_cursor(checkpoint, &parent_cursor);
+    let base_var_map = var_map_for_cursor(checkpoint, &parent_cursor);
+    let items = read_batch_items(&base_all_results, &base_var_map, &config.items_binding)?;
+    let max_concurrent = config.max_concurrent.max(1) as usize;
+    let body_node = graph
+        .node_map
+        .get(config.body_entry.as_str())
+        .map(|node| (*node).clone())
+        .with_context(|| {
+            format!(
+                "parallel_batch bodyEntry \"{}\" does not reference a known node",
+                config.body_entry
+            )
+        })?;
+    anyhow::ensure!(
+        is_runner_node_type(&body_node.node_type),
+        "parallel_batch bodyEntry \"{}\" is not an executable node",
+        config.body_entry
+    );
+    let iteration = *parent_cursor.loop_counters.get(&node.id).unwrap_or(&1);
+    let shared = Arc::new(RunConstantData {
+        inbound_map: build_inbound_source_map(graph),
+        agent_defaults: workflow.agent_defaults.clone(),
+        session_persistence_nodes: build_session_persistence_set(workflow),
+    });
+    let mut pending_items = items.into_iter().enumerate();
+    let total_items = pending_items.len();
+    let mut running = JoinSet::new();
+    let mut item_results = Vec::new();
+
+    while running.len() < max_concurrent {
+        let Some((item_index, item_value)) = pending_items.next() else {
+            break;
+        };
+        spawn_batch_item_task(
+            ctx,
+            &mut running,
+            workflow,
+            checkpoint,
+            shared.clone(),
+            base_all_results.clone(),
+            base_var_map.clone(),
+            parent_cursor.clone(),
+            node.clone(),
+            body_node.clone(),
+            config.item_var.clone(),
+            item_index,
+            item_value,
+        )
+        .await?;
+    }
+
+    while let Some(joined) = running.join_next().await {
+        let item_result = match joined {
+            Ok(Ok(item_result)) => item_result,
+            Ok(Err(error)) => return Err(error),
+            Err(error) if error.is_cancelled() => continue,
+            Err(error) => return Err(error.into()),
+        };
+        item_results.push(record_batch_item_result(ctx, checkpoint, item_result).await?);
+
+        if let Some((item_index, item_value)) = pending_items.next() {
+            spawn_batch_item_task(
+                ctx,
+                &mut running,
+                workflow,
+                checkpoint,
+                shared.clone(),
+                base_all_results.clone(),
+                base_var_map.clone(),
+                parent_cursor.clone(),
+                node.clone(),
+                body_node.clone(),
+                config.item_var.clone(),
+                item_index,
+                item_value,
+            )
+            .await?;
+        }
+    }
+
+    item_results.sort_by_key(|result| {
+        result
+            .get("index")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX)
+    });
+    let succeeded = item_results
+        .iter()
+        .filter(|result| result.get("success").and_then(Value::as_bool) == Some(true))
+        .count();
+    let parsed_output = json!({
+        "items": item_results,
+        "summary": {
+            "total": total_items,
+            "succeeded": succeeded,
+            "failed": total_items.saturating_sub(succeeded),
+            "maxConcurrent": max_concurrent,
+        }
+    });
+    if let Some(collector_var) = config
+        .collector_var
+        .as_deref()
+        .filter(|collector_var| !collector_var.trim().is_empty())
+    {
+        checkpoint.var_map.insert(
+            collector_var.to_string(),
+            serde_json::to_string(&parsed_output["items"])?,
+        );
+    }
+    let output =
+        serde_json::to_string_pretty(&parsed_output).unwrap_or_else(|_| parsed_output.to_string());
+    let success = succeeded == total_items;
+    let result = NodeResult {
+        success,
+        output: output.clone(),
+        stderr: if success {
+            String::new()
+        } else {
+            format!(
+                "{} of {} batch items failed",
+                total_items - succeeded,
+                total_items
+            )
+        },
+        exit_code: if success { 0 } else { 1 },
+        duration: "0".to_string(),
+        agent: "system".to_string(),
+        prompt: node.prompt.clone(),
+        parsed_output: Some(parsed_output.clone()),
+        resolved_prompt: Some(node.prompt.clone()),
+        ..Default::default()
+    };
+    insert_result_for_cursor_index(checkpoint, parent_index, node.id.clone(), result.clone());
+    if checkpoint.active_cursors[parent_index]
+        .call_stack
+        .is_empty()
+    {
+        checkpoint.last_output = output.clone();
+    }
+    checkpoint
+        .execution_log
+        .node_executions
+        .push(NodeExecutionLog {
+            cursor_id: Some(cursor_id.clone()),
+            node_id: node.id.clone(),
+            node_name: node.name.clone(),
+            node_type: node.node_type.as_str().to_string(),
+            agent: "system".to_string(),
+            original_prompt: node.prompt.clone(),
+            resolved_prompt: node.prompt.clone(),
+            refined_prompt: None,
+            output: output.clone(),
+            stderr: result.stderr.clone(),
+            exit_code: result.exit_code,
+            success: result.success,
+            duration: result.duration.clone(),
+            iteration,
+            attempts: 1,
+            timestamp: now_iso(),
+            ..Default::default()
+        });
+    emit_event(
+        ctx,
+        &checkpoint.run_id,
+        RuntimeEvent::new("node_done")
+            .with("cursorId", cursor_id.clone())
+            .with("nodeId", node.id.clone())
+            .with(
+                "result",
+                json!({
+                    "success": result.success,
+                    "output": result.output.clone(),
+                    "stderr": result.stderr.clone(),
+                    "exitCode": result.exit_code,
+                    "duration": result.duration.clone(),
+                    "nodeName": node.name.clone(),
+                    "resolvedPrompt": node.prompt.clone(),
+                    "parsedOutput": parsed_output,
+                }),
+            ),
+    )
+    .await?;
+
+    if !success {
+        handle_terminal_cursor_status(
+            ctx,
+            graph,
+            checkpoint,
+            cursor_id,
+            node,
+            result,
+            CursorTerminalStatus::Failure,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let next_edge = select_success_edge(graph, &node.id);
+    let next_node_id = next_edge.as_ref().map(|edge| edge.to.clone());
+    record_transition_for_cursor(
+        ctx,
+        checkpoint,
+        Some(cursor_id.clone()),
+        node.id.clone(),
+        next_node_id.clone(),
+        "success",
+        "parallel_batch complete",
+    )
+    .await?;
+    if let Some(index) = find_cursor_index(checkpoint, &cursor_id) {
+        if let Some(edge) = next_edge {
+            checkpoint.active_cursors[index].node_id = edge.to.clone();
+            checkpoint.active_cursors[index].incoming_edge_id = Some(edge.id.clone());
+            checkpoint.active_cursors[index].incoming_node_id = Some(node.id);
+            checkpoint.active_cursors[index].last_output = output;
+            checkpoint.active_cursors[index].state = CursorRuntimeState::Runnable;
+        } else {
+            checkpoint.active_cursors.remove(index);
+        }
+    }
+    Ok(())
+}
+
+async fn spawn_batch_item_task(
+    ctx: &RuntimeContext,
+    running: &mut JoinSet<anyhow::Result<BatchItemTaskResult>>,
+    workflow: &WorkflowV3,
+    checkpoint: &RuntimeCheckpoint,
+    shared: Arc<RunConstantData>,
+    base_all_results: BTreeMap<String, NodeResult>,
+    mut base_var_map: BTreeMap<String, String>,
+    parent_cursor: CursorState,
+    batch_node: WorkflowNode,
+    body_node: WorkflowNode,
+    item_var: String,
+    item_index: usize,
+    item_value: Value,
+) -> anyhow::Result<()> {
+    let child_cursor_id = new_cursor_id();
+    emit_event(
+        ctx,
+        &checkpoint.run_id,
+        RuntimeEvent::new("cursor_spawned")
+            .with("cursorId", child_cursor_id.clone())
+            .with("parentCursorId", parent_cursor.cursor_id.clone())
+            .with("fromNodeId", batch_node.id.clone())
+            .with("toNodeId", body_node.id.clone())
+            .with("itemIndex", item_index)
+            .with("item", item_value.clone()),
+    )
+    .await?;
+    base_var_map.insert(item_var, value_to_template_string(&item_value));
+    let run_ctx = CursorTaskExecutionContext {
+        run_id: checkpoint.run_id.clone(),
+        workflow_goal: workflow.goal.clone(),
+        workflow_nodes_len: workflow.nodes.len(),
+        cwd: checkpoint.cwd.clone(),
+        use_orchestrator: checkpoint.use_orchestrator,
+        total_executed: checkpoint.total_executed,
+        all_results: base_all_results,
+        var_map: base_var_map.clone(),
+        shared,
+    };
+    let child_cursor = CursorState {
+        cursor_id: child_cursor_id,
+        node_id: body_node.id.clone(),
+        execution_epoch: checkpoint.execution_epoch,
+        parent_cursor_id: Some(parent_cursor.cursor_id.clone()),
+        incoming_edge_id: None,
+        incoming_node_id: Some(batch_node.id),
+        split_family_ids: parent_cursor.split_family_ids.clone(),
+        last_output: parent_cursor.last_output,
+        loop_counters: parent_cursor.loop_counters,
+        visit_counters: parent_cursor.visit_counters,
+        var_map: base_var_map,
+        call_stack: parent_cursor.call_stack,
+        last_branch_origin_id: parent_cursor.last_branch_origin_id,
+        last_branch_choice: parent_cursor.last_branch_choice,
+        cancel_requested: false,
+        state: CursorRuntimeState::Running,
+    };
+    let task_ctx: RuntimeContext = (*ctx).clone();
+    running.spawn(async move {
+        let task_result = run_cursor_task(task_ctx, run_ctx, child_cursor, body_node, 1).await?;
+        Ok(BatchItemTaskResult {
+            item_index,
+            item_value,
+            task_result,
+        })
+    });
+    Ok(())
+}
+
+async fn record_batch_item_result(
+    ctx: &RuntimeContext,
+    checkpoint: &mut RuntimeCheckpoint,
+    item_result: BatchItemTaskResult,
+) -> anyhow::Result<Value> {
+    let task_result = item_result.task_result;
+    emit_event(
+        ctx,
+        &checkpoint.run_id,
+        RuntimeEvent::new("node_done")
+            .with("cursorId", task_result.cursor_id.clone())
+            .with("nodeId", task_result.node.id.clone())
+            .with("itemIndex", item_result.item_index)
+            .with(
+                "result",
+                json!({
+                    "success": task_result.result.success,
+                    "output": task_result.result.output.clone(),
+                    "stderr": task_result.result.stderr.clone(),
+                    "exitCode": task_result.result.exit_code,
+                    "duration": task_result.result.duration.clone(),
+                    "nodeName": task_result.node.name.clone(),
+                    "resolvedPrompt": task_result.resolved_prompt.clone(),
+                    "parsedOutput": task_result.result.parsed_output.clone(),
+                    "parseError": task_result.result.parse_error.clone(),
+                }),
+            ),
+    )
+    .await?;
+    checkpoint
+        .execution_log
+        .node_executions
+        .push(NodeExecutionLog {
+            cursor_id: Some(task_result.cursor_id.clone()),
+            node_id: task_result.node.id.clone(),
+            node_name: task_result.node.name.clone(),
+            node_type: task_result.node.node_type.as_str().to_string(),
+            agent: agent_name_for_node(&task_result.node),
+            original_prompt: prompt_template_for_node(&task_result.node).to_string(),
+            resolved_prompt: task_result.resolved_prompt.clone(),
+            refined_prompt: task_result.refined_prompt.clone(),
+            output: task_result.result.output.clone(),
+            stderr: task_result.result.stderr.clone(),
+            exit_code: task_result.result.exit_code,
+            success: task_result.result.success,
+            duration: task_result.result.duration.clone(),
+            iteration: task_result.iteration,
+            attempts: task_result.attempts,
+            timestamp: now_iso(),
+            metadata: task_result.result.metadata.clone(),
+        });
+    Ok(json!({
+        "index": item_result.item_index,
+        "item": item_result.item_value,
+        "cursorId": task_result.cursor_id,
+        "nodeId": task_result.node.id,
+        "success": task_result.result.success,
+        "output": task_result.result.output,
+        "stderr": task_result.result.stderr,
+        "exitCode": task_result.result.exit_code,
+        "parsedOutput": task_result.result.parsed_output,
+    }))
+}
+
+fn read_batch_items(
+    all_results: &BTreeMap<String, NodeResult>,
+    var_map: &BTreeMap<String, String>,
+    items_binding: &str,
+) -> anyhow::Result<Vec<Value>> {
+    let binding = items_binding.trim();
+    if let Some(items) = all_results
+        .get(binding)
+        .and_then(|result| result.parsed_output.as_ref())
+        .and_then(Value::as_array)
+    {
+        return Ok(items.clone());
+    }
+    let raw = var_map
+        .get(binding)
+        .cloned()
+        .or_else(|| all_results.get(binding).map(|result| result.output.clone()))
+        .with_context(|| format!("parallel_batch itemsBinding \"{}\" is not set", binding))?;
+    let parsed = serde_json::from_str::<Value>(&raw).with_context(|| {
+        format!(
+            "parallel_batch itemsBinding \"{}\" must contain a JSON array",
+            binding
+        )
+    })?;
+    let Value::Array(items) = parsed else {
+        anyhow::bail!(
+            "parallel_batch itemsBinding \"{}\" must contain a JSON array",
+            binding
+        );
+    };
+    Ok(items)
 }
 
 async fn handle_split_node(
@@ -2510,7 +3806,7 @@ async fn handle_split_node(
     let Some(index) = find_cursor_index(checkpoint, &cursor_id) else {
         return Ok(());
     };
-    let cursor = checkpoint.active_cursors.remove(index);
+    let mut cursor = checkpoint.active_cursors.remove(index);
     let edges = graph
         .outgoing_for(&node.id)
         .iter()
@@ -2530,47 +3826,52 @@ async fn handle_split_node(
             force_failed: false,
         },
     );
-    checkpoint.all_results.insert(
-        node.id.clone(),
-        NodeResult {
-            success: true,
-            output: format!("Spawned {} branches.", edges.len()),
-            stderr: String::new(),
-            exit_code: 0,
-            duration: "0".to_string(),
-            agent: "system".to_string(),
-            prompt: node.prompt.clone(),
-            raw_output: None,
-            parsed_output: Some(json!({
-                "branchCount": edges.len(),
-                "failurePolicy": format!("{:?}", node.split_failure_policy).to_lowercase(),
-            })),
-            parse_error: None,
-            resolved_prompt: Some(node.prompt.clone()),
-            stale: false,
-            preserved_from_run_id: None,
-            ..Default::default()
-        },
-    );
-    checkpoint.execution_log.node_executions.push(NodeExecutionLog {
-        cursor_id: Some(cursor_id.clone()),
-        node_id: node.id.clone(),
-        node_name: node.name.clone(),
-        node_type: "split".to_string(),
-        agent: "system".to_string(),
-        original_prompt: node.prompt.clone(),
-        resolved_prompt: node.prompt.clone(),
-        refined_prompt: None,
+    let split_result = NodeResult {
+        success: true,
         output: format!("Spawned {} branches.", edges.len()),
         stderr: String::new(),
         exit_code: 0,
-        success: true,
         duration: "0".to_string(),
-        iteration: *cursor.loop_counters.get(&node.id).unwrap_or(&1),
-        attempts: 1,
-        timestamp: now_iso(),
+        agent: "system".to_string(),
+        prompt: node.prompt.clone(),
+        raw_output: None,
+        parsed_output: Some(json!({
+            "branchCount": edges.len(),
+            "failurePolicy": format!("{:?}", node.split_failure_policy).to_lowercase(),
+        })),
+        parse_error: None,
+        resolved_prompt: Some(node.prompt.clone()),
+        stale: false,
+        preserved_from_run_id: None,
         ..Default::default()
-    });
+    };
+    if cursor.call_stack.is_empty() {
+        checkpoint.all_results.insert(node.id.clone(), split_result);
+    } else if let Some(frame) = cursor.call_stack.last_mut() {
+        frame.subflow_results.insert(node.id.clone(), split_result);
+    }
+    checkpoint
+        .execution_log
+        .node_executions
+        .push(NodeExecutionLog {
+            cursor_id: Some(cursor_id.clone()),
+            node_id: node.id.clone(),
+            node_name: node.name.clone(),
+            node_type: "split".to_string(),
+            agent: "system".to_string(),
+            original_prompt: node.prompt.clone(),
+            resolved_prompt: node.prompt.clone(),
+            refined_prompt: None,
+            output: format!("Spawned {} branches.", edges.len()),
+            stderr: String::new(),
+            exit_code: 0,
+            success: true,
+            duration: "0".to_string(),
+            iteration: *cursor.loop_counters.get(&node.id).unwrap_or(&1),
+            attempts: 1,
+            timestamp: now_iso(),
+            ..Default::default()
+        });
     emit_event(
         ctx,
         &checkpoint.run_id,
@@ -2611,7 +3912,10 @@ async fn handle_split_node(
             node.id.clone(),
             Some(edge.to.clone()),
             "split",
-            edge.label.clone().unwrap_or_else(|| edge.id.clone()).as_str(),
+            edge.label
+                .clone()
+                .unwrap_or_else(|| edge.id.clone())
+                .as_str(),
         )
         .await?;
         let mut split_family_ids = cursor.split_family_ids.clone();
@@ -2627,6 +3931,8 @@ async fn handle_split_node(
             last_output: cursor.last_output.clone(),
             loop_counters: cursor.loop_counters.clone(),
             visit_counters: cursor.visit_counters.clone(),
+            var_map: cursor.var_map.clone(),
+            call_stack: cursor.call_stack.clone(),
             last_branch_origin_id: cursor.last_branch_origin_id.clone(),
             last_branch_choice: cursor.last_branch_choice.clone(),
             cancel_requested: false,
@@ -2669,24 +3975,9 @@ async fn handle_collector_entry(
     };
 
     checkpoint.active_cursors[index].state = CursorRuntimeState::WaitingCollector;
-    let barrier_key = format!("{}:{}", node.id, checkpoint.execution_epoch);
-    let barrier = checkpoint
-        .collector_barriers
-        .entry(barrier_key)
-        .or_insert_with(|| CollectorBarrierState {
-            execution_epoch: checkpoint.execution_epoch,
-            required_inputs: graph
-                .inbound_for(&node.id)
-                .iter()
-                .map(|edge| merge_key_for_edge(edge))
-                .collect(),
-            arrivals: BTreeMap::new(),
-            waiting_cursor_ids: Vec::new(),
-            released: false,
-        });
     let merge_key = merge_key_for_edge(&incoming_edge);
-    let source_result = checkpoint
-        .all_results
+    let cursor_results = all_results_for_cursor(checkpoint, &checkpoint.active_cursors[index]);
+    let source_result = cursor_results
         .get(&incoming_edge.from)
         .cloned()
         .unwrap_or(NodeResult {
@@ -2705,13 +3996,29 @@ async fn handle_collector_entry(
             preserved_from_run_id: None,
             ..Default::default()
         });
+    let split_family_ids = checkpoint.active_cursors[index].split_family_ids.clone();
+    let barrier_key = format!("{}:{}", node.id, checkpoint.execution_epoch);
+    let barrier = checkpoint
+        .collector_barriers
+        .entry(barrier_key)
+        .or_insert_with(|| CollectorBarrierState {
+            execution_epoch: checkpoint.execution_epoch,
+            required_inputs: graph
+                .inbound_for(&node.id)
+                .iter()
+                .map(|edge| merge_key_for_edge(edge))
+                .collect(),
+            arrivals: BTreeMap::new(),
+            waiting_cursor_ids: Vec::new(),
+            released: false,
+        });
     barrier.arrivals.insert(
         merge_key.clone(),
         CollectorInputStatus {
             source_node_id: incoming_edge.from.clone(),
             edge_id: incoming_edge.id.clone(),
             edge_label: incoming_edge.label.clone(),
-            split_family_ids: checkpoint.active_cursors[index].split_family_ids.clone(),
+            split_family_ids,
             status: CursorTerminalStatus::Success,
             success: true,
             output: source_result.output,
@@ -2768,7 +4075,11 @@ async fn release_collectors_if_ready(
             .next()
             .unwrap_or_default()
             .to_string();
-        let Some(node) = graph.node_map.get(collector_id.as_str()).map(|n| (*n).clone()) else {
+        let Some(node) = graph
+            .node_map
+            .get(collector_id.as_str())
+            .map(|n| (*n).clone())
+        else {
             continue;
         };
         let parsed_output = json!({
@@ -2783,19 +4094,31 @@ async fn release_collectors_if_ready(
         });
         let output = serde_json::to_string_pretty(&parsed_output)
             .unwrap_or_else(|_| parsed_output.to_string());
-        checkpoint.all_results.insert(
-            collector_id.clone(),
-            NodeResult {
-                success: true,
-                output: output.clone(),
-                duration: "0".to_string(),
-                agent: "system".to_string(),
-                prompt: node.prompt.clone(),
-                parsed_output: Some(parsed_output.clone()),
-                resolved_prompt: Some(node.prompt.clone()),
-                ..Default::default()
-            },
-        );
+        let collector_result = NodeResult {
+            success: true,
+            output: output.clone(),
+            duration: "0".to_string(),
+            agent: "system".to_string(),
+            prompt: node.prompt.clone(),
+            parsed_output: Some(parsed_output.clone()),
+            resolved_prompt: Some(node.prompt.clone()),
+            ..Default::default()
+        };
+        if let Some(representative_index) = waiting_cursor_ids
+            .iter()
+            .find_map(|waiting_cursor_id| find_cursor_index(checkpoint, waiting_cursor_id))
+        {
+            insert_result_for_cursor_index(
+                checkpoint,
+                representative_index,
+                collector_id.clone(),
+                collector_result,
+            );
+        } else {
+            checkpoint
+                .all_results
+                .insert(collector_id.clone(), collector_result);
+        }
         emit_event(
             ctx,
             &checkpoint.run_id,
@@ -2817,31 +4140,41 @@ async fn release_collectors_if_ready(
             .first()
             .cloned()
             .unwrap_or_else(new_cursor_id);
+        let representative_state = waiting_cursor_ids.iter().find_map(|waiting_cursor_id| {
+            checkpoint
+                .active_cursors
+                .iter()
+                .find(|cursor| cursor.cursor_id == *waiting_cursor_id)
+                .cloned()
+        });
         for waiting_cursor_id in &waiting_cursor_ids {
             if let Some(index) = find_cursor_index(checkpoint, waiting_cursor_id) {
                 checkpoint.active_cursors.remove(index);
             }
         }
 
-        checkpoint.execution_log.node_executions.push(NodeExecutionLog {
-            cursor_id: Some(representative_cursor_id.clone()),
-            node_id: collector_id.clone(),
-            node_name: node.name.clone(),
-            node_type: "collector".to_string(),
-            agent: "system".to_string(),
-            original_prompt: node.prompt.clone(),
-            resolved_prompt: node.prompt.clone(),
-            refined_prompt: None,
-            output: output.clone(),
-            stderr: String::new(),
-            exit_code: 0,
-            success: true,
-            duration: "0".to_string(),
-            iteration: 1,
-            attempts: 1,
-            timestamp: now_iso(),
-            ..Default::default()
-        });
+        checkpoint
+            .execution_log
+            .node_executions
+            .push(NodeExecutionLog {
+                cursor_id: Some(representative_cursor_id.clone()),
+                node_id: collector_id.clone(),
+                node_name: node.name.clone(),
+                node_type: "collector".to_string(),
+                agent: "system".to_string(),
+                original_prompt: node.prompt.clone(),
+                resolved_prompt: node.prompt.clone(),
+                refined_prompt: None,
+                output: output.clone(),
+                stderr: String::new(),
+                exit_code: 0,
+                success: true,
+                duration: "0".to_string(),
+                iteration: 1,
+                attempts: 1,
+                timestamp: now_iso(),
+                ..Default::default()
+            });
 
         let next_edge = select_success_edge(graph, &collector_id);
         let next_node_id = next_edge.as_ref().map(|edge| edge.to.clone());
@@ -2878,19 +4211,39 @@ async fn release_collectors_if_ready(
         .await?;
 
         if let Some(edge) = next_edge {
+            let representative_state = representative_state.unwrap_or_else(|| CursorState {
+                cursor_id: representative_cursor_id.clone(),
+                node_id: collector_id.clone(),
+                execution_epoch: checkpoint.execution_epoch,
+                parent_cursor_id: None,
+                incoming_edge_id: None,
+                incoming_node_id: None,
+                split_family_ids: Vec::new(),
+                last_output: String::new(),
+                loop_counters: BTreeMap::new(),
+                visit_counters: BTreeMap::new(),
+                var_map: checkpoint.var_map.clone(),
+                call_stack: Vec::new(),
+                last_branch_origin_id: None,
+                last_branch_choice: None,
+                cancel_requested: false,
+                state: CursorRuntimeState::Runnable,
+            });
             checkpoint.active_cursors.push(CursorState {
                 cursor_id: representative_cursor_id,
                 node_id: edge.to.clone(),
                 execution_epoch: checkpoint.execution_epoch,
-                parent_cursor_id: None,
+                parent_cursor_id: representative_state.parent_cursor_id,
                 incoming_edge_id: Some(edge.id.clone()),
                 incoming_node_id: Some(collector_id),
-                split_family_ids: Vec::new(),
+                split_family_ids: representative_state.split_family_ids,
                 last_output: output,
-                loop_counters: BTreeMap::new(),
-                visit_counters: BTreeMap::new(),
-                last_branch_origin_id: None,
-                last_branch_choice: None,
+                loop_counters: representative_state.loop_counters,
+                visit_counters: representative_state.visit_counters,
+                var_map: representative_state.var_map,
+                call_stack: representative_state.call_stack,
+                last_branch_origin_id: representative_state.last_branch_origin_id,
+                last_branch_choice: representative_state.last_branch_choice,
                 cancel_requested: false,
                 state: CursorRuntimeState::Runnable,
             });
@@ -3034,6 +4387,51 @@ async fn select_next_decision(
         .find(|edge| edge.outcome == WorkflowEdgeOutcome::LoopExit)
         .map(|edge| (*edge).clone());
 
+    if node.node_type == WorkflowNodeType::Decide {
+        let chosen_label = result.output.trim();
+        let chosen = branch_edges
+            .iter()
+            .find(|edge| edge.label.as_deref() == Some(chosen_label))
+            .map(|edge| (*edge).clone());
+        if let Some(edge) = chosen {
+            emit_event(
+                ctx,
+                &checkpoint.run_id,
+                RuntimeEvent::new("branch_decision")
+                    .with("cursorId", cursor_id.to_string())
+                    .with("nodeId", node.id.clone())
+                    .with(
+                        "chosenBranch",
+                        edge.branch_id.clone().unwrap_or_else(|| edge.id.clone()),
+                    )
+                    .with("chosenLabel", chosen_label.to_string()),
+            )
+            .await?;
+            checkpoint.execution_log.decisions.push(DecisionLog {
+                kind: "decide".to_string(),
+                node_id: node.id.clone(),
+                chosen_branch: Some(edge.branch_id.clone().unwrap_or_else(|| edge.id.clone())),
+                chosen_label: Some(chosen_label.to_string()),
+                verdict: None,
+                duration: Some(result.duration.clone()),
+                deterministic: false,
+                raw_request: result.resolved_prompt.clone(),
+                raw_response: result.raw_output.clone(),
+                timestamp: now_iso(),
+            });
+            return Ok(NextDecision {
+                next_edge: Some(edge.clone()),
+                control_type: "branch".to_string(),
+                reason: chosen_label.to_string(),
+            });
+        }
+        anyhow::bail!(
+            "decide node \"{}\" selected outcome \"{}\" with no matching branch edge",
+            node.name,
+            chosen_label
+        );
+    }
+
     if let Some(loop_continue) = loop_continue {
         let max_iterations = node.loop_max_iterations.unwrap_or(5);
         if iteration >= max_iterations {
@@ -3081,7 +4479,11 @@ async fn select_next_decision(
                 timestamp: now_iso(),
             });
             return Ok(NextDecision {
-                next_edge: if matched { Some(loop_continue) } else { loop_exit },
+                next_edge: if matched {
+                    Some(loop_continue)
+                } else {
+                    loop_exit
+                },
                 control_type: if matched {
                     "loop_continue".to_string()
                 } else {
@@ -3107,10 +4509,20 @@ async fn select_next_decision(
                 .or(chosen);
         }
         if chosen.is_none() && checkpoint.use_orchestrator {
-            let orchestration =
-                run_orchestrator_branch(ctx.session_manager.clone(), &workflow.goal, node, &result.output, &branch_edges, &checkpoint.cwd)
-                    .await?;
-            let chosen_id = orchestration.output.trim().trim_matches('"').trim_matches('\'');
+            let orchestration = run_orchestrator_branch(
+                ctx.session_manager.clone(),
+                &workflow.goal,
+                node,
+                &result.output,
+                &branch_edges,
+                &checkpoint.cwd,
+            )
+            .await?;
+            let chosen_id = orchestration
+                .output
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'');
             chosen = branch_edges
                 .iter()
                 .find(|edge| edge.branch_id.as_deref() == Some(chosen_id) || edge.id == chosen_id)
@@ -3249,9 +4661,8 @@ fn resolve_template_vars(prompt: &str, context: &TemplateRuntimeContext<'_>) -> 
     }
 
     static PARSED_OUTPUT_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let parsed_re = PARSED_OUTPUT_RE.get_or_init(|| {
-        Regex::new(r"\{\{node:([^.}]+)\.parsedOutput\.([^}]+)\}\}").unwrap()
-    });
+    let parsed_re = PARSED_OUTPUT_RE
+        .get_or_init(|| Regex::new(r"\{\{node:([^.}]+)\.parsedOutput\.([^}]+)\}\}").unwrap());
     resolved = parsed_re
         .replace_all(&resolved, |captures: &regex::Captures<'_>| {
             let node_id = captures
@@ -3450,8 +4861,16 @@ async fn run_pty_command(
     timeout_secs: Option<u64>,
     config: Option<&AgentConfig>,
 ) -> anyhow::Result<NodeResult> {
-    run_pty_command_with_context(session_manager, agent, prompt, cwd, timeout_secs, config, None)
-        .await
+    run_pty_command_with_context(
+        session_manager,
+        agent,
+        prompt,
+        cwd,
+        timeout_secs,
+        config,
+        None,
+    )
+    .await
 }
 
 /// Inner implementation that optionally accepts interaction context for event emission.
@@ -3476,9 +4895,9 @@ async fn run_pty_command_with_context(
         std::env::var("HOME").unwrap_or_else(|_| ".".to_string())
     };
     let search_paths = executable_search_paths(std::env::var_os("PATH").as_deref());
-    let executable = resolve_agent_executable(agent_spec.name, &search_paths)?;
+    let executable = resolve_agent_executable(&agent_spec.binary, &search_paths)?;
 
-    let drv = driver::get_driver(agent_spec.name)
+    let drv = driver::get_driver(&agent_spec.name)
         .with_context(|| format!("No driver for agent: {}", agent_spec.name))?;
 
     let default_config = AgentConfig::default();
@@ -3491,7 +4910,7 @@ async fn run_pty_command_with_context(
     // Create a PTY session
     let session_id = session_manager
         .create_session(
-            agent_spec.name,
+            &agent_spec.name,
             &executable.display().to_string(),
             cmd.args,
             cmd.env,
@@ -3604,11 +5023,17 @@ async fn run_pty_command_with_context(
                 break resp;
             }
 
-            crate::session::PromptEvent::InteractionRequired { kind, description, output_so_far } => {
+            crate::session::PromptEvent::InteractionRequired {
+                kind,
+                description,
+                output_so_far,
+            } => {
                 match kind {
                     // Tier 1: Auto-respond (shouldn't reach here since handled in warmup, but safety net)
                     driver::InteractionKind::AutoRespond { response } => {
-                        session_manager.respond_to_interaction(&session_id, &response).await?;
+                        session_manager
+                            .respond_to_interaction(&session_id, &response)
+                            .await?;
                         continue;
                     }
 
@@ -3626,36 +5051,56 @@ async fn run_pty_command_with_context(
 
                         if is_destructive {
                             let reply = escalate_or_fallback(
-                                interaction_ctx, &session_id,
+                                interaction_ctx,
+                                &session_id,
                                 driver::InteractionKind::DestructiveWarning.event_type(),
-                                &description, &output_so_far, "n",
-                            ).await?;
-                            session_manager.respond_to_interaction(&session_id, &reply).await?;
+                                &description,
+                                &output_so_far,
+                                "n",
+                            )
+                            .await?;
+                            session_manager
+                                .respond_to_interaction(&session_id, &reply)
+                                .await?;
                             continue;
                         }
 
                         if cfg.auto_approve {
-                            session_manager.respond_to_interaction(&session_id, "y").await?;
+                            session_manager
+                                .respond_to_interaction(&session_id, "y")
+                                .await?;
                             continue;
                         }
 
                         let reply = escalate_or_fallback(
-                            interaction_ctx, &session_id,
+                            interaction_ctx,
+                            &session_id,
                             driver::InteractionKind::PermissionRequest.event_type(),
-                            &description, &output_so_far, "y",
-                        ).await?;
-                        session_manager.respond_to_interaction(&session_id, &reply).await?;
+                            &description,
+                            &output_so_far,
+                            "y",
+                        )
+                        .await?;
+                        session_manager
+                            .respond_to_interaction(&session_id, &reply)
+                            .await?;
                         continue;
                     }
 
                     // Destructive warning (from pattern matching directly)
                     driver::InteractionKind::DestructiveWarning => {
                         let reply = escalate_or_fallback(
-                            interaction_ctx, &session_id,
+                            interaction_ctx,
+                            &session_id,
                             kind.event_type(),
-                            &description, &output_so_far, "n",
-                        ).await?;
-                        session_manager.respond_to_interaction(&session_id, &reply).await?;
+                            &description,
+                            &output_so_far,
+                            "n",
+                        )
+                        .await?;
+                        session_manager
+                            .respond_to_interaction(&session_id, &reply)
+                            .await?;
                         continue;
                     }
                 }
@@ -3696,12 +5141,18 @@ async fn run_pty_command_with_context(
                 // Tier 4: Escalate to human after repeated stale detections
                 if interaction_ctx.is_some() {
                     let reply = escalate_or_fallback(
-                        interaction_ctx, &session_id, "question",
+                        interaction_ctx,
+                        &session_id,
+                        "question",
                         "Agent output appears stale — it may be waiting for input",
-                        &output_so_far, "",
-                    ).await?;
+                        &output_so_far,
+                        "",
+                    )
+                    .await?;
                     if !reply.is_empty() {
-                        session_manager.respond_to_interaction(&session_id, &reply).await?;
+                        session_manager
+                            .respond_to_interaction(&session_id, &reply)
+                            .await?;
                     }
                     stale_count = 0;
                 }
@@ -3798,7 +5249,14 @@ async fn escalate_or_fallback(
     fallback: &str,
 ) -> anyhow::Result<String> {
     if let Some(ictx) = interaction_ctx {
-        escalate_to_human(ictx, session_id, interaction_type, description, output_so_far).await
+        escalate_to_human(
+            ictx,
+            session_id,
+            interaction_type,
+            description,
+            output_so_far,
+        )
+        .await
     } else {
         Ok(fallback.to_string())
     }
@@ -3912,11 +5370,12 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::{
-        driver::{get_driver, AccessMode, AgentConfig, ReasoningLevel},
+        driver::{AccessMode, AgentConfig, ReasoningLevel, get_driver},
         model::{
-            normalize_workflow_value, resolve_agent_config, AgentDefaults, AgentNodeConfig,
-            SplitFailurePolicy, WorkflowEdge, WorkflowEdgeOutcome, WorkflowLimits, WorkflowNode,
-            WorkflowNodeType, WorkflowV3,
+            AgentDefaults, AgentNodeConfig, BatchConfig, InputBinding, SplitFailurePolicy,
+            SubflowConfig, WorkflowEdge, WorkflowEdgeOutcome, WorkflowLimits, WorkflowNode,
+            WorkflowNodeType, WorkflowV3, WorkflowVariable, normalize_workflow_value,
+            resolve_agent_config,
         },
         storage::Database,
     };
@@ -3994,7 +5453,10 @@ mod tests {
                 let step = {
                     let mut guard = steps.lock().await;
                     let Some(queue) = guard.get_mut(&prompt) else {
-                        return Err(anyhow::anyhow!("No scripted step for prompt \"{}\"", prompt));
+                        return Err(anyhow::anyhow!(
+                            "No scripted step for prompt \"{}\"",
+                            prompt
+                        ));
                     };
                     let Some(step) = queue.pop_front() else {
                         return Err(anyhow::anyhow!(
@@ -4043,6 +5505,15 @@ mod tests {
             agent_config: None,
             cwd: None,
             continue_session_from: None,
+            decide_config: None,
+            batch_config: None,
+            spawn_config: None,
+            send_config: None,
+            wait_config: None,
+            capture_config: None,
+            kill_config: None,
+            run_agent_config: None,
+            subflow_config: None,
         }
     }
 
@@ -4066,6 +5537,15 @@ mod tests {
             agent_config: None,
             cwd: None,
             continue_session_from: None,
+            decide_config: None,
+            batch_config: None,
+            spawn_config: None,
+            send_config: None,
+            wait_config: None,
+            capture_config: None,
+            kill_config: None,
+            run_agent_config: None,
+            subflow_config: None,
         }
     }
 
@@ -4089,6 +5569,15 @@ mod tests {
             agent_config: None,
             cwd: None,
             continue_session_from: None,
+            decide_config: None,
+            batch_config: None,
+            spawn_config: None,
+            send_config: None,
+            wait_config: None,
+            capture_config: None,
+            kill_config: None,
+            run_agent_config: None,
+            subflow_config: None,
         }
     }
 
@@ -4112,6 +5601,102 @@ mod tests {
             agent_config: None,
             cwd: None,
             continue_session_from: None,
+            decide_config: None,
+            batch_config: None,
+            spawn_config: None,
+            send_config: None,
+            wait_config: None,
+            capture_config: None,
+            kill_config: None,
+            run_agent_config: None,
+            subflow_config: None,
+        }
+    }
+
+    fn parallel_batch_node(
+        id: &str,
+        items_binding: &str,
+        max_concurrent: u32,
+        item_var: &str,
+        body_entry: &str,
+        collector_var: Option<&str>,
+    ) -> WorkflowNode {
+        WorkflowNode {
+            id: id.to_string(),
+            name: format!("Batch {}", id),
+            node_type: WorkflowNodeType::ParallelBatch,
+            agent: None,
+            prompt: String::new(),
+            context_sources: Vec::new(),
+            response_format: None,
+            output_schema: None,
+            retry_count: None,
+            retry_delay: None,
+            timeout: None,
+            skip_condition: None,
+            loop_max_iterations: None,
+            loop_condition: None,
+            split_failure_policy: SplitFailurePolicy::BestEffortContinue,
+            agent_config: None,
+            cwd: None,
+            continue_session_from: None,
+            decide_config: None,
+            batch_config: Some(BatchConfig {
+                items_binding: items_binding.to_string(),
+                max_concurrent,
+                item_var: item_var.to_string(),
+                body_entry: body_entry.to_string(),
+                collector_var: collector_var.map(str::to_string),
+            }),
+            spawn_config: None,
+            send_config: None,
+            wait_config: None,
+            capture_config: None,
+            kill_config: None,
+            run_agent_config: None,
+            subflow_config: None,
+        }
+    }
+
+    fn call_node(
+        id: &str,
+        workflow_name: &str,
+        exit_node_id: &str,
+        inputs: Vec<InputBinding>,
+    ) -> WorkflowNode {
+        WorkflowNode {
+            id: id.to_string(),
+            name: format!("Call {}", workflow_name),
+            node_type: WorkflowNodeType::Call,
+            agent: None,
+            prompt: String::new(),
+            context_sources: Vec::new(),
+            response_format: None,
+            output_schema: None,
+            retry_count: None,
+            retry_delay: None,
+            timeout: None,
+            skip_condition: None,
+            loop_max_iterations: None,
+            loop_condition: None,
+            split_failure_policy: SplitFailurePolicy::BestEffortContinue,
+            agent_config: None,
+            cwd: None,
+            continue_session_from: None,
+            decide_config: None,
+            batch_config: None,
+            spawn_config: None,
+            send_config: None,
+            wait_config: None,
+            capture_config: None,
+            kill_config: None,
+            run_agent_config: None,
+            subflow_config: Some(SubflowConfig {
+                workflow_name: workflow_name.to_string(),
+                exit_node_id: Some(exit_node_id.to_string()),
+                inputs,
+                max_depth: 5,
+            }),
         }
     }
 
@@ -4147,6 +5732,7 @@ mod tests {
             nodes,
             edges,
             agent_defaults: BTreeMap::new(),
+            subflows: BTreeMap::new(),
             ui: None,
         }
     }
@@ -4214,6 +5800,15 @@ mod tests {
                     agent_config: None,
                     cwd: None,
                     continue_session_from: None,
+                    decide_config: None,
+                    batch_config: None,
+                    spawn_config: None,
+                    send_config: None,
+                    wait_config: None,
+                    capture_config: None,
+                    kill_config: None,
+                    run_agent_config: None,
+                    subflow_config: None,
                 },
                 WorkflowNode {
                     id: "n2".to_string(),
@@ -4234,6 +5829,15 @@ mod tests {
                     agent_config: None,
                     cwd: None,
                     continue_session_from: None,
+                    decide_config: None,
+                    batch_config: None,
+                    spawn_config: None,
+                    send_config: None,
+                    wait_config: None,
+                    capture_config: None,
+                    kill_config: None,
+                    run_agent_config: None,
+                    subflow_config: None,
                 },
             ],
             edges: vec![WorkflowEdge {
@@ -4246,6 +5850,7 @@ mod tests {
                 condition: None,
             }],
             agent_defaults: BTreeMap::new(),
+            subflows: BTreeMap::new(),
             ui: None,
         }
     }
@@ -4320,6 +5925,15 @@ mod tests {
             agent_config: None,
             cwd: None,
             continue_session_from: None,
+            decide_config: None,
+            batch_config: None,
+            spawn_config: None,
+            send_config: None,
+            wait_config: None,
+            capture_config: None,
+            kill_config: None,
+            run_agent_config: None,
+            subflow_config: None,
         };
         let mut results = BTreeMap::new();
         results.insert(
@@ -4352,6 +5966,21 @@ mod tests {
         assert!(value.contains("done"));
     }
 
+    #[test]
+    fn decide_outcome_selection_prefers_exact_then_substring() {
+        let outcomes = vec!["approve".to_string(), "revise".to_string()];
+
+        assert_eq!(
+            select_decide_outcome(&outcomes, "revise"),
+            Some("revise".to_string())
+        );
+        assert_eq!(
+            select_decide_outcome(&outcomes, "I would approve this path."),
+            Some("approve".to_string())
+        );
+        assert_eq!(select_decide_outcome(&outcomes, "unknown"), None);
+    }
+
     #[tokio::test]
     async fn split_spawns_collects_and_continues() {
         let temp = TempDir::new().unwrap();
@@ -4360,8 +5989,14 @@ mod tests {
         let runtime = RuntimeContext::with_runner(
             db.clone(),
             Arc::new(ScriptedRunner::new([
-                ("branch-a".to_string(), vec![ScriptedStep::success("alpha output").with_delay(60)]),
-                ("branch-b".to_string(), vec![ScriptedStep::success("beta output").with_delay(5)]),
+                (
+                    "branch-a".to_string(),
+                    vec![ScriptedStep::success("alpha output").with_delay(60)],
+                ),
+                (
+                    "branch-b".to_string(),
+                    vec![ScriptedStep::success("beta output").with_delay(5)],
+                ),
                 ("after".to_string(), vec![ScriptedStep::success("done")]),
             ])),
         );
@@ -4401,15 +6036,178 @@ mod tests {
 
         let events = db.list_events(&run_id).await.unwrap();
         assert_eq!(
-            events.iter().filter(|event| event.kind == "cursor_spawned").count(),
+            events
+                .iter()
+                .filter(|event| event.kind == "cursor_spawned")
+                .count(),
             2
         );
         assert!(events.iter().any(|event| event.kind == "aggregate_merged"));
-        assert!(events.iter().any(|event| event.kind == "collector_released"));
-        assert!(events
-            .iter()
-            .filter(|event| event.kind == "transition")
-            .all(|event| event.data.contains_key("cursorId")));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == "collector_released")
+        );
+        assert!(
+            events
+                .iter()
+                .filter(|event| event.kind == "transition")
+                .all(|event| event.data.contains_key("cursorId"))
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_fans_out_three_items_with_cap_two() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                (
+                    "work a".to_string(),
+                    vec![ScriptedStep::success("done a").with_delay(20)],
+                ),
+                (
+                    "work b".to_string(),
+                    vec![ScriptedStep::success("done b").with_delay(20)],
+                ),
+                (
+                    "work c".to_string(),
+                    vec![ScriptedStep::success("done c").with_delay(20)],
+                ),
+                (
+                    "after".to_string(),
+                    vec![ScriptedStep::success("after done")],
+                ),
+            ])),
+        );
+        let mut workflow = workflow_from_parts(
+            "batch",
+            vec![
+                parallel_batch_node("batch", "items", 2, "item", "body", Some("batch_results")),
+                task_node("body", "Body", "work {{var:item}}"),
+                task_node("after", "After", "after"),
+            ],
+            vec![success_edge("batch_after", "batch", "after", None)],
+        );
+        workflow.variables = vec![WorkflowVariable {
+            name: "items".to_string(),
+            default: "[]".to_string(),
+        }];
+        let mut vars = BTreeMap::new();
+        vars.insert("items".to_string(), json!(["a", "b", "c"]).to_string());
+
+        let run_id = runtime.start_run(workflow, vars, None).await.unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        assert!(persisted.checkpoint.all_results.contains_key("after"));
+        let batch = persisted.checkpoint.all_results.get("batch").unwrap();
+        let parsed = batch.parsed_output.as_ref().unwrap();
+        assert_eq!(parsed["summary"]["total"], json!(3));
+        assert_eq!(parsed["summary"]["succeeded"], json!(3));
+        assert_eq!(parsed["summary"]["maxConcurrent"], json!(2));
+
+        let collected = persisted
+            .checkpoint
+            .var_map
+            .get("batch_results")
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .unwrap();
+        assert_eq!(collected.as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn subflow_call_returns_exit_output_with_isolated_scope() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                (
+                    "first one".to_string(),
+                    vec![ScriptedStep::success("internal one")],
+                ),
+                (
+                    "exit one internal one".to_string(),
+                    vec![ScriptedStep::success("returned one")],
+                ),
+                (
+                    "after {{entry}} returned one".to_string(),
+                    vec![ScriptedStep::success("done one")],
+                ),
+                (
+                    "first two".to_string(),
+                    vec![ScriptedStep::success("internal two")],
+                ),
+                (
+                    "exit two internal two".to_string(),
+                    vec![ScriptedStep::success("returned two")],
+                ),
+                (
+                    "after {{entry}} returned two".to_string(),
+                    vec![ScriptedStep::success("done two")],
+                ),
+            ])),
+        );
+        let subflow = workflow_from_parts(
+            "entry",
+            vec![
+                task_node("entry", "Entry", "first {{var:message}}"),
+                task_node("exit", "Exit", "exit {{var:message}} {{previous_output}}"),
+            ],
+            vec![success_edge("entry_exit", "entry", "exit", None)],
+        );
+
+        async fn run_parent(
+            runtime: &RuntimeContext,
+            db: &Database,
+            subflow: WorkflowV3,
+            input: &str,
+        ) -> PersistedRun {
+            let mut workflow = workflow_from_parts(
+                "call",
+                vec![
+                    call_node(
+                        "call",
+                        "echo_subflow",
+                        "exit",
+                        vec![InputBinding {
+                            name: "message".to_string(),
+                            source: "var:input".to_string(),
+                        }],
+                    ),
+                    task_node("after", "After", "after {{entry}} {{call}}"),
+                ],
+                vec![success_edge("call_after", "call", "after", None)],
+            );
+            workflow.variables = vec![WorkflowVariable {
+                name: "input".to_string(),
+                default: String::new(),
+            }];
+            workflow
+                .subflows
+                .insert("echo_subflow".to_string(), Box::new(subflow));
+
+            let mut vars = BTreeMap::new();
+            vars.insert("input".to_string(), input.to_string());
+            let run_id = runtime.start_run(workflow, vars, None).await.unwrap();
+            wait_for_terminal_run(db, &run_id).await
+        }
+
+        let first = run_parent(&runtime, &db, subflow.clone(), "one").await;
+        let second = run_parent(&runtime, &db, subflow, "two").await;
+
+        assert_eq!(first.checkpoint.status, RuntimeStatus::Completed);
+        assert_eq!(second.checkpoint.status, RuntimeStatus::Completed);
+        assert_eq!(first.checkpoint.all_results["call"].output, "returned one");
+        assert_eq!(second.checkpoint.all_results["call"].output, "returned two");
+        assert!(!first.checkpoint.all_results.contains_key("entry"));
+        assert!(!second.checkpoint.all_results.contains_key("entry"));
+        assert_eq!(first.checkpoint.all_results["after"].output, "done one");
+        assert_eq!(second.checkpoint.all_results["after"].output, "done two");
     }
 
     #[tokio::test]
@@ -4420,7 +6218,10 @@ mod tests {
         let runtime = RuntimeContext::with_runner(
             db.clone(),
             Arc::new(ScriptedRunner::new([
-                ("branch-a".to_string(), vec![ScriptedStep::success("alpha ok")]),
+                (
+                    "branch-a".to_string(),
+                    vec![ScriptedStep::success("alpha ok")],
+                ),
                 (
                     "branch-b".to_string(),
                     vec![ScriptedStep::failure("beta failed", "boom").with_delay(5)],
@@ -4471,7 +6272,10 @@ mod tests {
         let runtime = RuntimeContext::with_runner(
             db.clone(),
             Arc::new(ScriptedRunner::new([
-                ("branch-a".to_string(), vec![ScriptedStep::success("alpha ok").with_delay(30)]),
+                (
+                    "branch-a".to_string(),
+                    vec![ScriptedStep::success("alpha ok").with_delay(30)],
+                ),
                 (
                     "branch-b".to_string(),
                     vec![ScriptedStep::failure("beta failed", "boom").with_delay(5)],
@@ -4506,11 +6310,13 @@ mod tests {
         assert_eq!(persisted.checkpoint.status, RuntimeStatus::Failed);
         assert!(persisted.checkpoint.all_results.contains_key("collector"));
         assert!(persisted.checkpoint.all_results.contains_key("after"));
-        assert!(persisted
-            .checkpoint
-            .split_families
-            .values()
-            .all(|family| family.force_failed));
+        assert!(
+            persisted
+                .checkpoint
+                .split_families
+                .values()
+                .all(|family| family.force_failed)
+        );
     }
 
     #[tokio::test]
@@ -4598,7 +6404,10 @@ mod tests {
                 && persisted.checkpoint.queued_approvals.len() == 1
         })
         .await;
-        assert_eq!(pending_a.checkpoint.queued_approvals[0].approval.node_id, "approve_b");
+        assert_eq!(
+            pending_a.checkpoint.queued_approvals[0].approval.node_id,
+            "approve_b"
+        );
 
         runtime
             .approve_run(&run_id, true, "approved alpha".to_string())
@@ -4632,7 +6441,10 @@ mod tests {
         assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
         let events = db.list_events(&run_id).await.unwrap();
         assert_eq!(
-            events.iter().filter(|event| event.kind == "approval_queued").count(),
+            events
+                .iter()
+                .filter(|event| event.kind == "approval_queued")
+                .count(),
             2
         );
         assert_eq!(
@@ -4692,7 +6504,10 @@ mod tests {
         .await;
         let original_epoch = original.checkpoint.execution_epoch;
 
-        let restarted_run_id = runtime.restart_from(&run_id, "approve_branch").await.unwrap();
+        let restarted_run_id = runtime
+            .restart_from(&run_id, "approve_branch")
+            .await
+            .unwrap();
         let restarted = wait_for_run(&db, &restarted_run_id, |persisted| {
             persisted
                 .checkpoint
@@ -4713,12 +6528,7 @@ mod tests {
 
         assert_eq!(finished.checkpoint.status, RuntimeStatus::Failed);
         assert!(!finished.checkpoint.all_results.contains_key("after"));
-        assert!(
-            !finished
-                .checkpoint
-                .all_results
-                .contains_key("collector")
-        );
+        assert!(!finished.checkpoint.all_results.contains_key("collector"));
     }
 
     // -----------------------------------------------------------------------
@@ -4869,10 +6679,14 @@ mod tests {
             use_orchestrator: false,
             entry_node_id: "n1".to_string(),
             variables: Vec::new(),
-            limits: WorkflowLimits { max_total_steps: 10, max_visits_per_node: 5 },
+            limits: WorkflowLimits {
+                max_total_steps: 10,
+                max_visits_per_node: 5,
+            },
             nodes: vec![n1, n2, n3],
             edges: vec![],
             agent_defaults: BTreeMap::new(),
+            subflows: BTreeMap::new(),
             ui: None,
         };
 
@@ -4890,16 +6704,22 @@ mod tests {
     fn integration_mixed_agents_config_resolution() {
         // Workflow with Claude and Codex nodes using different configs
         let mut defaults = BTreeMap::new();
-        defaults.insert("claude".to_string(), AgentDefaults {
-            model: Some("sonnet".to_string()),
-            max_turns: Some(5),
-            ..Default::default()
-        });
-        defaults.insert("codex".to_string(), AgentDefaults {
-            model: Some("o3-mini".to_string()),
-            reasoning_level: Some(ReasoningLevel::Medium),
-            ..Default::default()
-        });
+        defaults.insert(
+            "claude".to_string(),
+            AgentDefaults {
+                model: Some("sonnet".to_string()),
+                max_turns: Some(5),
+                ..Default::default()
+            },
+        );
+        defaults.insert(
+            "codex".to_string(),
+            AgentDefaults {
+                model: Some("o3-mini".to_string()),
+                reasoning_level: Some(ReasoningLevel::Medium),
+                ..Default::default()
+            },
+        );
 
         // Claude node with node-level override
         let mut claude_node = task_node("n1", "Claude Step", "prompt1");
@@ -4912,7 +6732,15 @@ mod tests {
             ..Default::default()
         });
 
-        let claude_config = resolve_agent_config(&defaults, "/work", "claude", &claude_node, None, false, None);
+        let claude_config = resolve_agent_config(
+            &defaults,
+            "/work",
+            "claude",
+            &claude_node,
+            None,
+            false,
+            None,
+        );
         assert_eq!(claude_config.model.as_deref(), Some("sonnet")); // from defaults
         assert_eq!(claude_config.max_turns, Some(5)); // from defaults
         assert_eq!(claude_config.max_budget_usd, Some(1.5)); // from node override
@@ -4926,32 +6754,44 @@ mod tests {
         let mut codex_node = task_node("n2", "Codex Step", "prompt2");
         codex_node.agent = Some("codex".to_string());
 
-        let codex_config = resolve_agent_config(&defaults, "/work", "codex", &codex_node, None, false, None);
+        let codex_config =
+            resolve_agent_config(&defaults, "/work", "codex", &codex_node, None, false, None);
         assert_eq!(codex_config.model.as_deref(), Some("o3-mini"));
         assert_eq!(codex_config.reasoning_level, Some(ReasoningLevel::Medium));
 
         let codex_driver = get_driver("codex").unwrap();
         let codex_cmd = codex_driver.build_session_args(&codex_config).unwrap();
         assert!(codex_cmd.args.iter().any(|a| a == "--model"));
-        assert!(codex_cmd.args.iter().any(|a| a.contains("model_reasoning_effort=medium")));
+        assert!(
+            codex_cmd
+                .args
+                .iter()
+                .any(|a| a.contains("model_reasoning_effort=medium"))
+        );
     }
 
     #[test]
     fn integration_session_args_no_json_mode_flags() {
         // With PTY mode, no agent should have --json-schema, --print, --json, etc.
         let claude_driver = get_driver("claude").unwrap();
-        let claude_cmd = claude_driver.build_session_args(&Default::default()).unwrap();
+        let claude_cmd = claude_driver
+            .build_session_args(&Default::default())
+            .unwrap();
         assert!(!claude_cmd.args.iter().any(|a| a == "--json-schema"));
         assert!(!claude_cmd.args.iter().any(|a| a == "--print"));
         assert!(!claude_cmd.args.iter().any(|a| a == "--output-format"));
 
         let codex_driver = get_driver("codex").unwrap();
-        let codex_cmd = codex_driver.build_session_args(&Default::default()).unwrap();
+        let codex_cmd = codex_driver
+            .build_session_args(&Default::default())
+            .unwrap();
         assert!(!codex_cmd.args.iter().any(|a| a == "--json"));
         assert!(!codex_cmd.args.iter().any(|a| a == "--output-schema"));
 
         let gemini_driver = get_driver("gemini").unwrap();
-        let gemini_cmd = gemini_driver.build_session_args(&Default::default()).unwrap();
+        let gemini_cmd = gemini_driver
+            .build_session_args(&Default::default())
+            .unwrap();
         assert!(!gemini_cmd.args.iter().any(|a| a == "--output-format"));
         assert!(!gemini_cmd.args.iter().any(|a| a == "--prompt"));
 
@@ -4967,8 +6807,13 @@ mod tests {
 
         // With session ID and persistence needed
         let config = resolve_agent_config(
-            &defaults, "/work", "claude", &node,
-            Some("sess-abc".to_string()), true, None,
+            &defaults,
+            "/work",
+            "claude",
+            &node,
+            Some("sess-abc".to_string()),
+            true,
+            None,
         );
         assert_eq!(config.resume_session_id.as_deref(), Some("sess-abc"));
         assert!(!config.ephemeral_session);
@@ -5028,12 +6873,14 @@ mod tests {
         let mut node = task_node("n1", "Step", "prompt");
 
         // Without node cwd → uses workflow cwd
-        let config = resolve_agent_config(&defaults, "/workspace", "claude", &node, None, false, None);
+        let config =
+            resolve_agent_config(&defaults, "/workspace", "claude", &node, None, false, None);
         assert_eq!(config.cwd, "/workspace");
 
         // With node cwd → uses node cwd
         node.cwd = Some("/other/project".to_string());
-        let config = resolve_agent_config(&defaults, "/workspace", "claude", &node, None, false, None);
+        let config =
+            resolve_agent_config(&defaults, "/workspace", "claude", &node, None, false, None);
         assert_eq!(config.cwd, "/other/project");
     }
 
@@ -5073,19 +6920,29 @@ mod tests {
             "edges": [{ "id": "e1", "from": "n1", "to": "n2", "outcome": "success" }]
         });
         let result = normalize_workflow_value(json);
-        assert!(result.is_ok(), "Workflow with agent config should parse: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Workflow with agent config should parse: {:?}",
+            result.err()
+        );
         let w = result.unwrap().workflow;
 
         // Agent defaults parsed
         assert_eq!(w.agent_defaults.len(), 2);
         assert_eq!(w.agent_defaults["claude"].model.as_deref(), Some("sonnet"));
         assert_eq!(w.agent_defaults["claude"].max_turns, Some(5));
-        assert_eq!(w.agent_defaults["codex"].reasoning_level, Some(ReasoningLevel::High));
+        assert_eq!(
+            w.agent_defaults["codex"].reasoning_level,
+            Some(ReasoningLevel::High)
+        );
 
         // Node config parsed
         let n1 = &w.nodes[0];
         assert!(n1.agent_config.is_some());
-        assert_eq!(n1.agent_config.as_ref().unwrap().base.max_budget_usd, Some(1.5));
+        assert_eq!(
+            n1.agent_config.as_ref().unwrap().base.max_budget_usd,
+            Some(1.5)
+        );
         assert_eq!(n1.cwd.as_deref(), Some("/custom"));
     }
 
@@ -5099,14 +6956,517 @@ mod tests {
             use_orchestrator: false,
             entry_node_id: "n1".to_string(),
             variables: Vec::new(),
-            limits: WorkflowLimits { max_total_steps: 10, max_visits_per_node: 5 },
+            limits: WorkflowLimits {
+                max_total_steps: 10,
+                max_visits_per_node: 5,
+            },
             nodes: vec![task_node("n1", "Step 1", "prompt1")],
             edges: vec![],
             agent_defaults: BTreeMap::new(),
+            subflows: BTreeMap::new(),
             ui: None,
         };
 
         let set = super::build_session_persistence_set(&wf);
         assert!(set.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // T15: RunAgent node integration — routes through ScriptedRunner seam
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a RunAgent node. The ScriptedRunner sees the resolved prompt,
+    /// so we match on the `run_agent_config.prompt` value.
+    fn run_agent_node(id: &str, name: &str, agent: &str, prompt: &str) -> WorkflowNode {
+        WorkflowNode {
+            id: id.to_string(),
+            name: name.to_string(),
+            node_type: WorkflowNodeType::RunAgent,
+            agent: Some(agent.to_string()),
+            prompt: String::new(),
+            context_sources: Vec::new(),
+            response_format: None,
+            output_schema: None,
+            retry_count: None,
+            retry_delay: None,
+            timeout: None,
+            skip_condition: None,
+            loop_max_iterations: None,
+            loop_condition: None,
+            split_failure_policy: SplitFailurePolicy::BestEffortContinue,
+            agent_config: None,
+            cwd: None,
+            continue_session_from: None,
+            decide_config: None,
+            batch_config: None,
+            spawn_config: None,
+            send_config: None,
+            wait_config: None,
+            capture_config: None,
+            kill_config: None,
+            run_agent_config: Some(model::RunAgentConfig {
+                agent: Some(agent.to_string()),
+                prompt: Some(prompt.to_string()),
+                ..Default::default()
+            }),
+            subflow_config: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn minimal_run_agent_node_completes() {
+        // Phase 1 gate: a minimal workflow with a single RunAgent node runs via the
+        // engine and produces a completed checkpoint with the scripted output.
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([(
+                "echo hello".to_string(),
+                vec![ScriptedStep::success("agent output")],
+            )])),
+        );
+
+        let workflow = workflow_from_parts(
+            "agent",
+            vec![run_agent_node("agent", "Run Echo", "mock", "echo hello")],
+            vec![],
+        );
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        assert_eq!(
+            persisted.checkpoint.all_results["agent"].output,
+            "agent output"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_agent_node_followed_by_task_uses_previous_output() {
+        // RunAgent output is available to a downstream Task via {{previous_output}}.
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                (
+                    "run agent prompt".to_string(),
+                    vec![ScriptedStep::success("agent result")],
+                ),
+                (
+                    "after agent result".to_string(),
+                    vec![ScriptedStep::success("downstream done")],
+                ),
+            ])),
+        );
+
+        let workflow = workflow_from_parts(
+            "agent",
+            vec![
+                run_agent_node("agent", "Run Agent", "mock", "run agent prompt"),
+                task_node("after", "After", "after {{previous_output}}"),
+            ],
+            vec![success_edge("agent_after", "agent", "after", None)],
+        );
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        assert_eq!(
+            persisted.checkpoint.all_results["after"].output,
+            "downstream done"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T15: Decide routing — branch-edge selection by output label
+    // (Note: the Decide node calls driver::call_llm directly, bypassing the
+    //  ScriptedRunner seam. These tests verify the label-matching logic via the
+    //  `select_decide_outcome` function. Full engine-level Decide tests would
+    //  require a real API key; we test routing mechanics via the unit-level fn.)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn decide_routing_exact_match_takes_priority_over_substring() {
+        let outcomes = vec![
+            "approve".to_string(),
+            "revise".to_string(),
+            "reject".to_string(),
+        ];
+        // Exact match
+        assert_eq!(
+            select_decide_outcome(&outcomes, "revise"),
+            Some("revise".to_string())
+        );
+        // Substring match when no exact match
+        assert_eq!(
+            select_decide_outcome(&outcomes, "I would approve this."),
+            Some("approve".to_string())
+        );
+        // No match
+        assert_eq!(select_decide_outcome(&outcomes, "unknown"), None);
+    }
+
+    #[test]
+    fn decide_routing_trims_quotes_and_whitespace() {
+        let outcomes = vec!["NEXT_STORY".to_string(), "DONE".to_string(), "BLOCKED".to_string()];
+        assert_eq!(
+            select_decide_outcome(&outcomes, "  \"NEXT_STORY\"  "),
+            Some("NEXT_STORY".to_string())
+        );
+        assert_eq!(
+            select_decide_outcome(&outcomes, "`DONE`"),
+            Some("DONE".to_string())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T15: Compound subflow — two parents call the same subflow with different
+    //      inputs and receive isolated, correct outputs (extends the existing test).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn subflow_called_from_two_parents_with_different_inputs_isolated() {
+        // This test complements the existing `subflow_call_returns_exit_output_with_isolated_scope`.
+        // We run BOTH parents through the same RuntimeContext (shared ScriptedRunner)
+        // and verify each gets the correct, independently-scoped output.
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                // input = "alpha"
+                ("compute alpha".to_string(), vec![ScriptedStep::success("result-alpha")]),
+                // input = "beta"
+                ("compute beta".to_string(),  vec![ScriptedStep::success("result-beta")]),
+            ])),
+        );
+
+        // Subflow: single task node named "compute" that receives `{{var:input}}`.
+        let subflow = workflow_from_parts(
+            "compute",
+            vec![task_node("compute", "Compute", "compute {{var:input}}")],
+            vec![],
+        );
+
+        async fn run_with_input(
+            runtime: &RuntimeContext,
+            db: &Database,
+            subflow: WorkflowV3,
+            input: &str,
+        ) -> PersistedRun {
+            let mut wf = workflow_from_parts(
+                "call",
+                vec![call_node(
+                    "call",
+                    "compute_sub",
+                    "compute",
+                    vec![InputBinding {
+                        name: "input".to_string(),
+                        source: "var:input".to_string(),
+                    }],
+                )],
+                vec![],
+            );
+            wf.variables = vec![WorkflowVariable {
+                name: "input".to_string(),
+                default: String::new(),
+            }];
+            wf.subflows
+                .insert("compute_sub".to_string(), Box::new(subflow));
+            let mut vars = BTreeMap::new();
+            vars.insert("input".to_string(), input.to_string());
+            let run_id = runtime.start_run(wf, vars, None).await.unwrap();
+            wait_for_terminal_run(db, &run_id).await
+        }
+
+        let alpha = run_with_input(&runtime, &db, subflow.clone(), "alpha").await;
+        let beta = run_with_input(&runtime, &db, subflow, "beta").await;
+
+        assert_eq!(alpha.checkpoint.status, RuntimeStatus::Completed);
+        assert_eq!(beta.checkpoint.status, RuntimeStatus::Completed);
+        assert_eq!(alpha.checkpoint.all_results["call"].output, "result-alpha");
+        assert_eq!(beta.checkpoint.all_results["call"].output, "result-beta");
+        // The subflow's internal node must NOT appear in the parent's results
+        assert!(!alpha.checkpoint.all_results.contains_key("compute"));
+        assert!(!beta.checkpoint.all_results.contains_key("compute"));
+    }
+
+    // -----------------------------------------------------------------------
+    // T15: Subflow — recursion depth bound enforced at runtime
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn subflow_exceeding_max_depth_fails_run() {
+        // A subflow with max_depth=1 that tries to call itself again must fail.
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+
+        // The subflow body is just a call node back to itself (depth = 1 allows
+        // one level of nesting; a second attempt exceeds it).
+        let mut recurse_call = call_node(
+            "recurse",
+            "self_ref",
+            "recurse",
+            vec![],
+        );
+        // Override max_depth to 1 so the second call is caught.
+        if let Some(ref mut cfg) = recurse_call.subflow_config {
+            cfg.max_depth = 1;
+        }
+
+        let recurse_body = workflow_from_parts("recurse", vec![recurse_call], vec![], );
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([])),
+        );
+        let mut wf = workflow_from_parts(
+            "call",
+            vec![{
+                let mut n = call_node("call", "self_ref", "recurse", vec![]);
+                if let Some(ref mut cfg) = n.subflow_config {
+                    cfg.max_depth = 1;
+                }
+                n
+            }],
+            vec![],
+        );
+        wf.subflows.insert("self_ref".to_string(), Box::new(recurse_body));
+
+        let run_id = runtime.start_run(wf, BTreeMap::new(), None).await.unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        // The run must fail (not hang) when the depth bound is exceeded.
+        assert_eq!(
+            persisted.checkpoint.status,
+            RuntimeStatus::Failed,
+            "expected Failed when maxDepth exceeded"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T15: Compound subflow — resume a run paused *inside* a subflow
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn subflow_with_approval_inside_can_be_resumed() {
+        // Verify that a run paused inside a subflow (waiting for human approval)
+        // can be resumed and completes correctly — nested checkpointing works.
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                ("pre work".to_string(), vec![ScriptedStep::success("pre done")]),
+                ("post work".to_string(), vec![ScriptedStep::success("post done")]),
+            ])),
+        );
+
+        // Subflow: pre-task → approval → post-task
+        // The approval acts as the pause point inside the subflow.
+        let subflow = workflow_from_parts(
+            "pre",
+            vec![
+                task_node("pre", "Pre", "pre work"),
+                approval_node("gate", "Gate", "approve?"),
+                task_node("post", "Post", "post work"),
+            ],
+            vec![
+                success_edge("pre_gate", "pre", "gate", None),
+                success_edge("gate_post", "gate", "post", None),
+            ],
+        );
+
+        let mut wf = workflow_from_parts(
+            "call",
+            vec![call_node("call", "sub", "post", vec![])],
+            vec![],
+        );
+        wf.subflows.insert("sub".to_string(), Box::new(subflow));
+
+        let run_id = runtime
+            .start_run(wf, BTreeMap::new(), None)
+            .await
+            .unwrap();
+
+        // Wait for the approval inside the subflow to be raised
+        let pending = wait_for_run(&db, &run_id, |p| {
+            p.checkpoint.pending_approval.is_some()
+        })
+        .await;
+        assert!(
+            pending.checkpoint.pending_approval.is_some(),
+            "expected approval pending inside subflow"
+        );
+
+        // Approve → run should resume and complete
+        runtime
+            .approve_run(&run_id, true, "approved".to_string())
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(
+            persisted.checkpoint.status,
+            RuntimeStatus::Completed,
+            "run should complete after approving inside subflow"
+        );
+        // The call node's output = the subflow exit node's (post) output
+        assert_eq!(persisted.checkpoint.all_results["call"].output, "post done");
+    }
+
+    // -----------------------------------------------------------------------
+    // T15: Engine-level — stubbed serial loop that mirrors the epic-dev template
+    //      (Decide nodes replaced with Task nodes to stay hermetic)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stubbed_epic_dev_serial_loop_completes() {
+        // Models the epic-dev pattern: read-status → pick-story → run-story → loop.
+        // Decide routing is replaced by deterministic Task→success edges so the
+        // run is fully hermetic (no LLM calls).
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+
+        let runner = Arc::new(ScriptedRunner::new([
+            ("read sprint status".to_string(),   vec![ScriptedStep::success("sprint: 1 story remaining")]),
+            ("implement story".to_string(),       vec![ScriptedStep::success("story done")]),
+            ("generate report".to_string(),       vec![ScriptedStep::success("epic complete")]),
+        ]));
+        let runtime = RuntimeContext::with_runner(db.clone(), runner);
+
+        // Simplified epic-dev: read → implement → report (no Decide/loop in stubbed version)
+        let workflow = workflow_from_parts(
+            "read",
+            vec![
+                run_agent_node("read", "Read Sprint Status", "mock", "read sprint status"),
+                run_agent_node("impl", "Implement Story", "mock", "implement story"),
+                run_agent_node("report", "Generate Report", "mock", "generate report"),
+            ],
+            vec![
+                success_edge("read_impl", "read", "impl", None),
+                success_edge("impl_report", "impl", "report", None),
+            ],
+        );
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        assert_eq!(persisted.checkpoint.all_results["read"].output, "sprint: 1 story remaining");
+        assert_eq!(persisted.checkpoint.all_results["impl"].output, "story done");
+        assert_eq!(persisted.checkpoint.all_results["report"].output, "epic complete");
+    }
+
+    // -----------------------------------------------------------------------
+    // T15: Engine-level — stubbed multi-agent-plan through consolidation
+    //      (ParallelBatch + call node + approval merge gate, all scripted)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn stubbed_multi_agent_plan_through_consolidation() {
+        // Models the multi-agent-plan-implementation template:
+        // plan → ParallelBatch(impl, cap 2) → approval merge gate →
+        // call dual-review subflow → consolidate.
+        // All agent work is scripted; the merge gate is approved programmatically.
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+
+        let runner = Arc::new(ScriptedRunner::new([
+            // plan
+            ("plan tasks".to_string(), vec![ScriptedStep::success("tasks: a,b")]),
+            // batch items — ScriptedRunner matches the resolved prompt after var substitution
+            ("implement a".to_string(), vec![ScriptedStep::success("impl-a done")]),
+            ("implement b".to_string(), vec![ScriptedStep::success("impl-b done")]),
+            // dual-review subflow body
+            ("review tasks: a,b".to_string(), vec![ScriptedStep::success("review ok")]),
+            // consolidate
+            ("consolidate".to_string(), vec![ScriptedStep::success("consolidated")]),
+        ]));
+        let runtime = RuntimeContext::with_runner(db.clone(), runner);
+
+        // Dual-review subflow: single task node (acts as exit).
+        let review_sub = workflow_from_parts(
+            "review",
+            vec![task_node("review", "Review", "review {{var:scope}}")],
+            vec![],
+        );
+
+        let mut wf = workflow_from_parts(
+            "plan",
+            vec![
+                run_agent_node("plan", "Plan", "mock", "plan tasks"),
+                parallel_batch_node("batch", "tasks", 2, "task", "impl_body", Some("impl_results")),
+                task_node("impl_body", "Impl", "implement {{var:task}}"),
+                approval_node("merge_gate", "Merge Gate", "approve merge?"),
+                call_node(
+                    "review_call",
+                    "dual_review",
+                    "review",
+                    vec![InputBinding {
+                        name: "scope".to_string(),
+                        source: "node:plan.output".to_string(),
+                    }],
+                ),
+                task_node("consolidate", "Consolidate", "consolidate"),
+            ],
+            vec![
+                success_edge("plan_batch", "plan", "batch", None),
+                success_edge("batch_gate", "batch", "merge_gate", None),
+                success_edge("gate_review", "merge_gate", "review_call", None),
+                success_edge("review_cons", "review_call", "consolidate", None),
+            ],
+        );
+        wf.variables = vec![WorkflowVariable {
+            name: "tasks".to_string(),
+            default: "[]".to_string(),
+        }];
+        wf.subflows
+            .insert("dual_review".to_string(), Box::new(review_sub));
+
+        let mut vars = BTreeMap::new();
+        vars.insert("tasks".to_string(), json!(["a", "b"]).to_string());
+        let run_id = runtime.start_run(wf, vars, None).await.unwrap();
+
+        // Wait for the merge gate approval
+        wait_for_run(&db, &run_id, |p| p.checkpoint.pending_approval.is_some()).await;
+        runtime
+            .approve_run(&run_id, true, "merged".to_string())
+            .await
+            .unwrap();
+
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(
+            persisted.checkpoint.status,
+            RuntimeStatus::Completed,
+            "multi-agent plan should complete through consolidation"
+        );
+        assert!(persisted.checkpoint.all_results.contains_key("plan"));
+        assert!(persisted.checkpoint.all_results.contains_key("batch"));
+        assert!(persisted.checkpoint.all_results.contains_key("review_call"));
+        assert_eq!(
+            persisted.checkpoint.all_results["consolidate"].output,
+            "consolidated"
+        );
     }
 }

@@ -7,6 +7,7 @@
     AgentDefaults,
     AgentNodeConfig,
     ContextSource,
+    InputBinding,
     ReasoningLevel,
     RuntimeCapabilities,
     SplitFailurePolicy,
@@ -32,6 +33,10 @@
     validation: ValidationResponse | null;
     capabilities: RuntimeCapabilities | undefined;
   } = $props();
+
+  // Operate on the document currently shown on the canvas (root, or a subflow
+  // we drilled into). The `workflow` prop stays bound to the root.
+  let activeWorkflow = $derived(store.activeWorkflow ?? workflow);
 
   let previousOutput = $state("");
   let testResult = $state("");
@@ -113,24 +118,24 @@
   let selectedNode = $derived.by(() => {
     const selection = store.selection;
     if (selection.kind !== "node") return null;
-    return workflow.nodes.find((node) => node.id === selection.id) ?? null;
+    return activeWorkflow.nodes.find((node) => node.id === selection.id) ?? null;
   });
   let selectedEdge = $derived.by(() => {
     const selection = store.selection;
     if (selection.kind !== "edge") return null;
-    return workflow.edges.find((edge) => edge.id === selection.id) ?? null;
+    return activeWorkflow.edges.find((edge) => edge.id === selection.id) ?? null;
   });
   let edgeDisplayName = $derived.by(() => {
     if (!selectedEdge) return "";
-    const fromNode = workflow.nodes.find((n) => n.id === selectedEdge.from);
-    const toNode = workflow.nodes.find((n) => n.id === selectedEdge.to);
+    const fromNode = activeWorkflow.nodes.find((n) => n.id === selectedEdge.from);
+    const toNode = activeWorkflow.nodes.find((n) => n.id === selectedEdge.to);
     const fromName = fromNode?.name || selectedEdge.from.slice(0, 8);
     const toName = toNode?.name || selectedEdge.to.slice(0, 8);
     return `${fromName} → ${toName}`;
   });
   let issues = $derived(validation?.issues ?? []);
   let promptSuggestions = $derived(
-    selectedNode ? buildSuggestions(workflow, selectedNode.id) : [],
+    selectedNode ? buildSuggestions(activeWorkflow, selectedNode.id) : [],
   );
 
   /** Get the capabilities object for the currently selected node's agent */
@@ -158,9 +163,53 @@
     });
   }
 
+  function numOrUndef(v: string): number | undefined {
+    return v !== "" ? Number(v) : undefined;
+  }
+
+  /* ── Typed config object updaters (decide / batch / primitives / subflow) ── */
+  const CONFIG_DEFAULTS: Record<string, () => Record<string, unknown>> = {
+    runAgentConfig: () => ({ killAfter: true }),
+    decideConfig: () => ({ prompt: "", inputs: [], outcomes: [] }),
+    batchConfig: () => ({ itemsBinding: "", maxConcurrent: 4, itemVar: "item", bodyEntry: "" }),
+    spawnConfig: () => ({}),
+    sendConfig: () => ({ text: "", enter: true }),
+    waitConfig: () => ({ mode: "idle" }),
+    captureConfig: () => ({ all: false, ansi: false }),
+    killConfig: () => ({}),
+    subflowConfig: () => ({ workflowName: "", inputs: [], maxDepth: 10 }),
+  };
+
+  /** Merge a field into a node's typed config object; pass undefined to clear it. */
+  function updateConfig(configKey: string, field: string, value: unknown) {
+    store.updateWorkflow((wf) => {
+      const n = wf.nodes.find((x) => x.id === selectedNode!.id);
+      if (!n) return;
+      const rec = n as unknown as Record<string, unknown>;
+      const base = rec[configKey] as Record<string, unknown> | null | undefined;
+      const next: Record<string, unknown> = { ...(CONFIG_DEFAULTS[configKey]?.() ?? {}), ...(base ?? {}) };
+      if (value === undefined) delete next[field];
+      else next[field] = value;
+      rec[configKey] = next;
+    });
+  }
+
+  const updateRunAgent = (f: string, v: unknown) => updateConfig("runAgentConfig", f, v);
+  const updateDecide = (f: string, v: unknown) => updateConfig("decideConfig", f, v);
+  const updateBatch = (f: string, v: unknown) => updateConfig("batchConfig", f, v);
+  const updateSpawn = (f: string, v: unknown) => updateConfig("spawnConfig", f, v);
+  const updateSend = (f: string, v: unknown) => updateConfig("sendConfig", f, v);
+  const updateWait = (f: string, v: unknown) => updateConfig("waitConfig", f, v);
+  const updateCapture = (f: string, v: unknown) => updateConfig("captureConfig", f, v);
+  const updateKill = (f: string, v: unknown) => updateConfig("killConfig", f, v);
+  const updateSubflow = (f: string, v: unknown) => updateConfig("subflowConfig", f, v);
+
+  /** Available subflow names from the workflow's embedded catalog. */
+  let subflowNames = $derived(Object.keys(activeWorkflow.subflows ?? {}));
+
   /** Get workflow-level agent defaults for a given agent */
   function getAgentDefaults(agentName: string): AgentDefaults {
-    return workflow.agentDefaults?.[agentName] ?? {};
+    return activeWorkflow.agentDefaults?.[agentName] ?? {};
   }
 
   /** Update a workflow-level agent default. Pass undefined to clear. */
@@ -313,11 +362,52 @@
   {/if}
 {/snippet}
 
+<!-- Reusable input-binding editor (decide / subflow / call). `update` writes the whole list. -->
+{#snippet inputBindings(list: InputBinding[], update: (field: string, value: unknown) => void)}
+  <section class="inspectorSection">
+    <div class="inspectorSection__title">Inputs</div>
+    <small class="helperText">Bind named inputs from context / variables / templates.</small>
+    {#if list.length > 0}
+      <div class="contextRow contextRow--header">
+        <span class="columnLabel">Name</span>
+        <span class="columnLabel">Source</span>
+        <span></span>
+      </div>
+    {/if}
+    {#each list as binding, index (index)}
+      <div class="contextRow">
+        <input
+          value={binding.name}
+          placeholder="name"
+          oninput={(e) => update("inputs", list.map((b, i) => i === index ? { ...b, name: (e.target as HTMLInputElement).value } : b))}
+        />
+        <input
+          value={binding.source}
+          placeholder={"{{previous_output}} / alias"}
+          oninput={(e) => update("inputs", list.map((b, i) => i === index ? { ...b, source: (e.target as HTMLInputElement).value } : b))}
+        />
+        <button
+          class="button button--ghost"
+          onclick={() => update("inputs", list.filter((_, i) => i !== index))}
+        >
+          Remove
+        </button>
+      </div>
+    {/each}
+    <button
+      class="button button--ghost"
+      onclick={() => update("inputs", [...list, { name: "", source: "" } satisfies InputBinding])}
+    >
+      + Add input
+    </button>
+  </section>
+{/snippet}
+
 {#if selectedNode}
   {@const nodeIssues = issues.filter((i) => i.nodeId === selectedNode.id)}
   <div class="inspector inspector--withFooter">
     <!-- Compact Header -->
-    <NodeHeader node={selectedNode} {workflow} />
+    <NodeHeader node={selectedNode} workflow={activeWorkflow} />
 
     {#if nodeIssues.length > 0}
       <div class="issueList">
@@ -329,10 +419,10 @@
 
     <!-- Scrollable content area -->
     <div class="inspector__body">
-      {#if selectedNode.type === "task"}
+      {#if selectedNode.type === "task" || selectedNode.type === "run_agent"}
         <!-- PROMPT SECTION (always visible, primary) -->
         <section class="inspectorSection">
-          <div class="inspectorSection__title">Prompt</div>
+          <div class="inspectorSection__title">{selectedNode.type === "run_agent" ? "Agent" : "Prompt"}</div>
           <label class="field">
             <span>Agent</span>
             <select
@@ -365,20 +455,113 @@
               })}
             />
           </div>
-          <label class="field">
-            <span>Response format</span>
-            <select
-              value={selectedNode.responseFormat ?? "text"}
-              onchange={(e) => store.updateWorkflow((wf) => {
-                const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-                if (n) n.responseFormat = (e.target as HTMLSelectElement).value as WorkflowNode["responseFormat"];
-              })}
-            >
-              <option value="text">text</option>
-              <option value="json">json</option>
-            </select>
-          </label>
+          {#if selectedNode.type === "task"}
+            <label class="field">
+              <span>Response format</span>
+              <select
+                value={selectedNode.responseFormat ?? "text"}
+                onchange={(e) => store.updateWorkflow((wf) => {
+                  const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                  if (n) n.responseFormat = (e.target as HTMLSelectElement).value as WorkflowNode["responseFormat"];
+                })}
+              >
+                <option value="text">text</option>
+                <option value="json">json</option>
+              </select>
+            </label>
+          {/if}
         </section>
+
+        <!-- RUN_AGENT PTY CONFIG (one-shot agent in a managed pane) -->
+        {#if selectedNode.type === "run_agent"}
+          {@const rc = selectedNode.runAgentConfig ?? { killAfter: true }}
+          <section class="inspectorSection">
+            <div class="inspectorSection__title">Agent run</div>
+            <small class="helperText">Spawns the agent in a PTY pane, waits for completion, then captures output.</small>
+            <label class="field">
+              <span>Pane name</span>
+              <input
+                value={rc.name ?? ""}
+                placeholder="auto"
+                onblur={(e) => updateRunAgent("name", (e.target as HTMLInputElement).value || undefined)}
+              />
+            </label>
+            <label class="field">
+              <span>Access</span>
+              <input
+                value={rc.access ?? ""}
+                placeholder="inherit (e.g. read_only / execute)"
+                onblur={(e) => updateRunAgent("access", (e.target as HTMLInputElement).value || undefined)}
+              />
+            </label>
+            <label class="field">
+              <span>Working directory</span>
+              <input
+                value={rc.cwd ?? ""}
+                placeholder={activeWorkflow.cwd || "inherit workflow cwd"}
+                onblur={(e) => updateRunAgent("cwd", (e.target as HTMLInputElement).value || undefined)}
+              />
+            </label>
+            <label class="field field--split">
+              <span>Timeout (s)</span>
+              <input
+                type="number"
+                value={rc.timeout ?? ""}
+                placeholder="none"
+                oninput={(e) => updateRunAgent("timeout", numOrUndef((e.target as HTMLInputElement).value))}
+              />
+            </label>
+            <label class="field field--split">
+              <span>Idle seconds</span>
+              <input
+                type="number"
+                step="0.5"
+                value={rc.idleSeconds ?? ""}
+                placeholder="default"
+                oninput={(e) => updateRunAgent("idleSeconds", numOrUndef((e.target as HTMLInputElement).value))}
+              />
+            </label>
+            <label class="field field--split">
+              <span>Ready-stable (s)</span>
+              <input
+                type="number"
+                step="0.5"
+                value={rc.readyStableSeconds ?? ""}
+                placeholder="default"
+                oninput={(e) => updateRunAgent("readyStableSeconds", numOrUndef((e.target as HTMLInputElement).value))}
+              />
+            </label>
+            <label class="field">
+              <span>Until marker</span>
+              <input
+                value={rc.until ?? ""}
+                placeholder="text marking completion"
+                onblur={(e) => updateRunAgent("until", (e.target as HTMLInputElement).value || undefined)}
+              />
+            </label>
+            <label class="field">
+              <span>Extra args</span>
+              <textarea
+                value={(rc.extraArgs ?? []).join("\n")}
+                placeholder={"--flag\nvalue"}
+                onblur={(e) => {
+                  const args = (e.target as HTMLTextAreaElement).value.split("\n").map((s) => s.trim()).filter(Boolean);
+                  updateRunAgent("extraArgs", args.length ? args : undefined);
+                }}
+                class="field--shortTextarea"
+              ></textarea>
+            </label>
+            <label class="field toggle-field">
+              <span>Kill pane after</span>
+              <input
+                type="checkbox"
+                class="toggle"
+                checked={rc.killAfter ?? true}
+                onchange={(e) => updateRunAgent("killAfter", (e.target as HTMLInputElement).checked)}
+              />
+            </label>
+          </section>
+        {/if}
 
         <!-- CONTEXT SOURCES (promoted, always visible) -->
         <section class="inspectorSection">
@@ -405,7 +588,7 @@
                 })}
               >
                 <option value="">Select node</option>
-                {#each workflow.nodes.filter((n) => n.id !== selectedNode!.id) as n (n.id)}
+                {#each activeWorkflow.nodes.filter((n) => n.id !== selectedNode!.id) as n (n.id)}
                   <option value={n.id}>{n.name}</option>
                 {/each}
               </select>
@@ -454,7 +637,7 @@
               <span>Working directory</span>
               <input
                 value={selectedNode.cwd ?? ""}
-                placeholder={workflow.cwd || "inherit workflow cwd"}
+                placeholder={activeWorkflow.cwd || "inherit workflow cwd"}
                 onblur={(e) => store.updateWorkflow((wf) => {
                   const n = wf.nodes.find((n) => n.id === selectedNode!.id);
                   if (n) n.cwd = (e.target as HTMLInputElement).value || null;
@@ -465,7 +648,7 @@
             <!-- Continue session from (session reuse) -->
             {#if agentCaps?.sessionReuse}
               {@const currentAgent = selectedNode.agent ?? "claude"}
-              {@const eligibleNodes = workflow.nodes.filter(
+              {@const eligibleNodes = activeWorkflow.nodes.filter(
                 (n) => n.type === "task" && n.id !== selectedNode!.id && (n.agent ?? "claude") === currentAgent
               )}
               {#if eligibleNodes.length > 0}
@@ -682,6 +865,396 @@
             Collectors wait for all inbound success paths in the current execution epoch, merge their inputs, and continue through a single success edge.
           </p>
         </section>
+
+      {:else if selectedNode.type === "decide"}
+        {@const dc = selectedNode.decideConfig ?? { prompt: "", inputs: [], outcomes: [] }}
+        <section class="inspectorSection">
+          <div class="inspectorSection__title">Decide</div>
+          <small class="helperText">An LLM reads the inputs and picks one outcome; each outcome maps to a branch edge.</small>
+          <div class="field field--prompt">
+            <span>Decision prompt</span>
+            <PromptTextarea
+              value={dc.prompt}
+              suggestions={promptSuggestions}
+              oninput={(e) => updateDecide("prompt", (e.target as HTMLTextAreaElement).value)}
+            />
+          </div>
+          <label class="field">
+            <span>Model</span>
+            <input
+              value={dc.model ?? ""}
+              placeholder="claude-haiku-4-5"
+              onblur={(e) => updateDecide("model", (e.target as HTMLInputElement).value || undefined)}
+            />
+          </label>
+          <label class="field">
+            <span>Outcomes (one per line)</span>
+            <textarea
+              value={(dc.outcomes ?? []).join("\n")}
+              placeholder={"approve\nreject\nescalate"}
+              onblur={(e) => {
+                const list = (e.target as HTMLTextAreaElement).value.split("\n").map((s) => s.trim()).filter(Boolean);
+                updateDecide("outcomes", list);
+              }}
+              class="field--shortTextarea"
+            ></textarea>
+            <small class="helperText">Use these as branch ids on the outgoing edges.</small>
+          </label>
+        </section>
+        {@render inputBindings(dc.inputs ?? [], updateDecide)}
+
+      {:else if selectedNode.type === "parallel_batch"}
+        {@const bc = selectedNode.batchConfig ?? { itemsBinding: "", maxConcurrent: 4, itemVar: "item", bodyEntry: "" }}
+        <section class="inspectorSection">
+          <div class="inspectorSection__title">Parallel batch</div>
+          <small class="helperText">Fans out over a collection, running the body subgraph once per item.</small>
+          <label class="field">
+            <span>Items binding</span>
+            <input
+              value={bc.itemsBinding}
+              placeholder={"e.g. {{previous_output}} or context alias"}
+              onblur={(e) => updateBatch("itemsBinding", (e.target as HTMLInputElement).value)}
+            />
+          </label>
+          <label class="field">
+            <span>Item variable</span>
+            <input
+              value={bc.itemVar}
+              placeholder="item"
+              onblur={(e) => updateBatch("itemVar", (e.target as HTMLInputElement).value)}
+            />
+          </label>
+          <label class="field">
+            <span>Body entry node</span>
+            <select
+              value={bc.bodyEntry}
+              onchange={(e) => updateBatch("bodyEntry", (e.target as HTMLSelectElement).value)}
+            >
+              <option value="">Select node</option>
+              {#each activeWorkflow.nodes.filter((n) => n.id !== selectedNode!.id) as n (n.id)}
+                <option value={n.id}>{n.name}</option>
+              {/each}
+            </select>
+          </label>
+          <label class="field field--split">
+            <span>Max concurrent</span>
+            <input
+              type="number"
+              min="1"
+              value={bc.maxConcurrent}
+              oninput={(e) => updateBatch("maxConcurrent", numOrUndef((e.target as HTMLInputElement).value) ?? 1)}
+            />
+          </label>
+          <label class="field">
+            <span>Collector variable</span>
+            <input
+              value={bc.collectorVar ?? ""}
+              placeholder="optional — name to gather results"
+              onblur={(e) => updateBatch("collectorVar", (e.target as HTMLInputElement).value || undefined)}
+            />
+          </label>
+        </section>
+
+      {:else if selectedNode.type === "spawn"}
+        {@const sc = selectedNode.spawnConfig ?? {}}
+        <section class="inspectorSection">
+          <div class="inspectorSection__title">Spawn</div>
+          <small class="helperText">Launches a long-lived agent/command into a managed PTY pane.</small>
+          <label class="field">
+            <span>Agent</span>
+            <select
+              value={sc.agent ?? ""}
+              onchange={(e) => updateSpawn("agent", (e.target as HTMLSelectElement).value || undefined)}
+            >
+              <option value="">(use command)</option>
+              {#each Object.entries(capabilities?.agents ?? {}) as [agent, info] (agent)}
+                <option value={agent} disabled={!info.available}>{agent}{!info.available ? " (not installed)" : ""}</option>
+              {/each}
+            </select>
+          </label>
+          <label class="field">
+            <span>Command</span>
+            <input
+              value={sc.command ?? ""}
+              placeholder="overrides agent, e.g. npm run dev"
+              onblur={(e) => updateSpawn("command", (e.target as HTMLInputElement).value || undefined)}
+            />
+          </label>
+          <label class="field">
+            <span>Pane name</span>
+            <input
+              value={sc.name ?? ""}
+              placeholder="auto"
+              onblur={(e) => updateSpawn("name", (e.target as HTMLInputElement).value || undefined)}
+            />
+          </label>
+          <label class="field">
+            <span>Session name</span>
+            <input
+              value={sc.sessionName ?? ""}
+              placeholder="optional tmux session"
+              onblur={(e) => updateSpawn("sessionName", (e.target as HTMLInputElement).value || undefined)}
+            />
+          </label>
+          <label class="field">
+            <span>Access</span>
+            <input
+              value={sc.access ?? ""}
+              placeholder="inherit"
+              onblur={(e) => updateSpawn("access", (e.target as HTMLInputElement).value || undefined)}
+            />
+          </label>
+          <label class="field">
+            <span>Working directory</span>
+            <input
+              value={sc.cwd ?? ""}
+              placeholder={activeWorkflow.cwd || "inherit workflow cwd"}
+              onblur={(e) => updateSpawn("cwd", (e.target as HTMLInputElement).value || undefined)}
+            />
+          </label>
+          <label class="field">
+            <span>Extra args</span>
+            <textarea
+              value={(sc.extraArgs ?? []).join("\n")}
+              placeholder={"--flag\nvalue"}
+              onblur={(e) => {
+                const args = (e.target as HTMLTextAreaElement).value.split("\n").map((s) => s.trim()).filter(Boolean);
+                updateSpawn("extraArgs", args.length ? args : undefined);
+              }}
+              class="field--shortTextarea"
+            ></textarea>
+          </label>
+        </section>
+
+      {:else if selectedNode.type === "send"}
+        {@const sd = selectedNode.sendConfig ?? { text: "", enter: true }}
+        <section class="inspectorSection">
+          <div class="inspectorSection__title">Send</div>
+          <small class="helperText">Sends text / keystrokes to a running pane.</small>
+          <label class="field">
+            <span>Target pane</span>
+            <input
+              value={sd.target ?? ""}
+              placeholder="active pane"
+              onblur={(e) => updateSend("target", (e.target as HTMLInputElement).value || undefined)}
+            />
+          </label>
+          <div class="field field--prompt">
+            <span>Text</span>
+            <PromptTextarea
+              value={sd.text}
+              suggestions={promptSuggestions}
+              oninput={(e) => updateSend("text", (e.target as HTMLTextAreaElement).value)}
+            />
+          </div>
+          <label class="field toggle-field">
+            <span>Press Enter after</span>
+            <input
+              type="checkbox"
+              class="toggle"
+              checked={sd.enter ?? true}
+              onchange={(e) => updateSend("enter", (e.target as HTMLInputElement).checked)}
+            />
+          </label>
+        </section>
+
+      {:else if selectedNode.type === "wait"}
+        {@const wc = selectedNode.waitConfig ?? { mode: "idle" }}
+        <section class="inspectorSection">
+          <div class="inspectorSection__title">Wait</div>
+          <small class="helperText">Blocks until the target pane is idle, ready, or prints a marker.</small>
+          <label class="field">
+            <span>Target pane</span>
+            <input
+              value={wc.target ?? ""}
+              placeholder="active pane"
+              onblur={(e) => updateWait("target", (e.target as HTMLInputElement).value || undefined)}
+            />
+          </label>
+          <label class="field">
+            <span>Mode</span>
+            <select value={wc.mode} onchange={(e) => updateWait("mode", (e.target as HTMLSelectElement).value)}>
+              <option value="idle">idle</option>
+              <option value="ready">ready</option>
+              <option value="until">until (marker)</option>
+            </select>
+          </label>
+          {#if wc.mode === "until"}
+            <label class="field">
+              <span>Marker</span>
+              <input
+                value={wc.marker ?? ""}
+                placeholder="text to wait for"
+                onblur={(e) => updateWait("marker", (e.target as HTMLInputElement).value || undefined)}
+              />
+            </label>
+          {/if}
+          {#if wc.mode === "idle"}
+            <label class="field field--split">
+              <span>Idle seconds</span>
+              <input
+                type="number"
+                step="0.5"
+                value={wc.idleSeconds ?? ""}
+                placeholder="default"
+                oninput={(e) => updateWait("idleSeconds", numOrUndef((e.target as HTMLInputElement).value))}
+              />
+            </label>
+          {/if}
+          {#if wc.mode === "ready"}
+            <label class="field field--split">
+              <span>Ready-stable (s)</span>
+              <input
+                type="number"
+                step="0.5"
+                value={wc.readyStableSeconds ?? ""}
+                placeholder="default"
+                oninput={(e) => updateWait("readyStableSeconds", numOrUndef((e.target as HTMLInputElement).value))}
+              />
+            </label>
+          {/if}
+          <label class="field field--split">
+            <span>Timeout (s)</span>
+            <input
+              type="number"
+              value={wc.timeout ?? ""}
+              placeholder="none"
+              oninput={(e) => updateWait("timeout", numOrUndef((e.target as HTMLInputElement).value))}
+            />
+          </label>
+        </section>
+
+      {:else if selectedNode.type === "capture"}
+        {@const cc = selectedNode.captureConfig ?? { all: false, ansi: false }}
+        <section class="inspectorSection">
+          <div class="inspectorSection__title">Capture</div>
+          <small class="helperText">Captures pane output into the run context for downstream nodes.</small>
+          <label class="field">
+            <span>Target pane</span>
+            <input
+              value={cc.target ?? ""}
+              placeholder="active pane"
+              onblur={(e) => updateCapture("target", (e.target as HTMLInputElement).value || undefined)}
+            />
+          </label>
+          <label class="field field--split">
+            <span>Lines</span>
+            <input
+              type="number"
+              value={cc.lines ?? ""}
+              placeholder="visible"
+              disabled={cc.all}
+              oninput={(e) => updateCapture("lines", numOrUndef((e.target as HTMLInputElement).value))}
+            />
+          </label>
+          <label class="field toggle-field">
+            <span>Capture all scrollback</span>
+            <input
+              type="checkbox"
+              class="toggle"
+              checked={cc.all ?? false}
+              onchange={(e) => updateCapture("all", (e.target as HTMLInputElement).checked)}
+            />
+          </label>
+          <label class="field toggle-field">
+            <span>Include ANSI</span>
+            <input
+              type="checkbox"
+              class="toggle"
+              checked={cc.ansi ?? false}
+              onchange={(e) => updateCapture("ansi", (e.target as HTMLInputElement).checked)}
+            />
+          </label>
+        </section>
+
+      {:else if selectedNode.type === "kill"}
+        {@const kc = selectedNode.killConfig ?? {}}
+        <section class="inspectorSection">
+          <div class="inspectorSection__title">Kill</div>
+          <small class="helperText">Terminates a running pane or tmux session.</small>
+          <label class="field">
+            <span>Target pane</span>
+            <input
+              value={kc.target ?? ""}
+              placeholder="active pane"
+              onblur={(e) => updateKill("target", (e.target as HTMLInputElement).value || undefined)}
+            />
+          </label>
+          <label class="field">
+            <span>Session name</span>
+            <input
+              value={kc.sessionName ?? ""}
+              placeholder="optional tmux session"
+              onblur={(e) => updateKill("sessionName", (e.target as HTMLInputElement).value || undefined)}
+            />
+          </label>
+        </section>
+
+      {:else if selectedNode.type === "subflow" || selectedNode.type === "call"}
+        {@const fc = selectedNode.subflowConfig ?? { workflowName: "", inputs: [], maxDepth: 10 }}
+        {@const referenced = activeWorkflow.subflows?.[fc.workflowName]}
+        <section class="inspectorSection">
+          <div class="inspectorSection__title">Compound ({selectedNode.type})</div>
+          <small class="helperText">References a reusable saved subgraph. Double-click the node on the canvas to drill in.</small>
+          <label class="field">
+            <span>Subflow</span>
+            <select
+              value={fc.workflowName}
+              onchange={(e) => updateSubflow("workflowName", (e.target as HTMLSelectElement).value)}
+            >
+              <option value="">Select subflow</option>
+              {#each subflowNames as name (name)}
+                <option value={name}>{name}</option>
+              {/each}
+              {#if fc.workflowName && !subflowNames.includes(fc.workflowName)}
+                <option value={fc.workflowName}>{fc.workflowName} (unresolved)</option>
+              {/if}
+            </select>
+          </label>
+          {#if referenced}
+            <div class="contractBox">
+              <div class="contractBox__row">
+                <span class="contractBox__label">entry</span>
+                <span class="contractBox__value">{referenced.nodes.find((n) => n.id === referenced.entryNodeId)?.name ?? "—"}</span>
+              </div>
+              <div class="contractBox__row">
+                <span class="contractBox__label">exit</span>
+                <span class="contractBox__value">{referenced.nodes.find((n) => n.id === fc.exitNodeId)?.name ?? "(single terminal)"}</span>
+              </div>
+              <div class="contractBox__row">
+                <span class="contractBox__label">nodes</span>
+                <span class="contractBox__value">{referenced.nodes.length}</span>
+              </div>
+            </div>
+            <label class="field">
+              <span>Exit node</span>
+              <select
+                value={fc.exitNodeId ?? ""}
+                onchange={(e) => updateSubflow("exitNodeId", (e.target as HTMLSelectElement).value || undefined)}
+              >
+                <option value="">Infer single terminal</option>
+                {#each referenced.nodes as n (n.id)}
+                  <option value={n.id}>{n.name}</option>
+                {/each}
+              </select>
+            </label>
+            <button class="button button--ghost" onclick={() => store.drillIntoSubflow(selectedNode!.id)}>
+              Open subgraph →
+            </button>
+          {:else if fc.workflowName}
+            <div class="issue issue--warning">Subflow "{fc.workflowName}" is not defined in this activeWorkflow.</div>
+          {/if}
+          <label class="field field--split">
+            <span>Max depth</span>
+            <input
+              type="number"
+              min="1"
+              value={fc.maxDepth ?? 10}
+              oninput={(e) => updateSubflow("maxDepth", numOrUndef((e.target as HTMLInputElement).value) ?? 10)}
+            />
+          </label>
+        </section>
+        {@render inputBindings(fc.inputs ?? [], updateSubflow)}
       {/if}
     </div>
 
@@ -710,7 +1283,7 @@
               onclick={async () => {
                 testLoading = true;
                 try {
-                  const preview = await api.testNode(selectedNode!, workflow.cwd, { previousOutput });
+                  const preview = await api.testNode(selectedNode!, activeWorkflow.cwd, { previousOutput });
                   testResult = JSON.stringify(preview, null, 2);
                 } finally {
                   testLoading = false;
@@ -797,7 +1370,7 @@
     <div class="inspector__header">
       <div>
         <small>Workflow</small>
-        <h3>{workflow.name || "Untitled workflow"}</h3>
+        <h3>{activeWorkflow.name || "Untitled workflow"}</h3>
       </div>
     </div>
 
@@ -806,7 +1379,7 @@
       <label class="field">
         <span>Name</span>
         <input
-          value={workflow.name ?? ""}
+          value={activeWorkflow.name ?? ""}
           oninput={(e) => store.updateWorkflow((wf) => {
             wf.name = (e.target as HTMLInputElement).value;
           })}
@@ -815,7 +1388,7 @@
       <label class="field">
         <span>Goal</span>
         <textarea
-          value={workflow.goal}
+          value={activeWorkflow.goal}
           oninput={(e) => store.updateWorkflow((wf) => {
             wf.goal = (e.target as HTMLTextAreaElement).value;
           })}
@@ -824,7 +1397,7 @@
       <label class="field">
         <span>Working directory</span>
         <input
-          value={workflow.cwd}
+          value={activeWorkflow.cwd}
           oninput={(e) => store.updateWorkflow((wf) => {
             wf.cwd = (e.target as HTMLInputElement).value;
           })}
@@ -833,13 +1406,13 @@
       <label class="field">
         <span>Entry node</span>
         <select
-          value={workflow.entryNodeId}
+          value={activeWorkflow.entryNodeId}
           onchange={(e) => store.updateWorkflow((wf) => {
             wf.entryNodeId = (e.target as HTMLSelectElement).value;
           })}
         >
           <option value="">Select node</option>
-          {#each workflow.nodes as node (node.id)}
+          {#each activeWorkflow.nodes as node (node.id)}
             <option value={node.id}>{node.name}</option>
           {/each}
         </select>
@@ -849,7 +1422,7 @@
         <input
           type="checkbox"
           class="toggle"
-          checked={workflow.useOrchestrator}
+          checked={activeWorkflow.useOrchestrator}
           onchange={(e) => store.updateWorkflow((wf) => {
             wf.useOrchestrator = (e.target as HTMLInputElement).checked;
           })}
@@ -863,7 +1436,7 @@
         <span>Max total steps</span>
         <input
           type="number"
-          value={workflow.limits.maxTotalSteps}
+          value={activeWorkflow.limits.maxTotalSteps}
           oninput={(e) => store.updateWorkflow((wf) => {
             wf.limits.maxTotalSteps = Number((e.target as HTMLInputElement).value);
           })}
@@ -873,7 +1446,7 @@
         <span>Max visits per node</span>
         <input
           type="number"
-          value={workflow.limits.maxVisitsPerNode}
+          value={activeWorkflow.limits.maxVisitsPerNode}
           oninput={(e) => store.updateWorkflow((wf) => {
             wf.limits.maxVisitsPerNode = Number((e.target as HTMLInputElement).value);
           })}
@@ -913,14 +1486,14 @@
 
     <section class="inspectorSection">
       <div class="inspectorSection__title">Variables</div>
-      {#if workflow.variables.length > 0}
+      {#if activeWorkflow.variables.length > 0}
         <div class="contextRow contextRow--header">
           <span class="columnLabel">Name</span>
           <span class="columnLabel">Default value</span>
           <span></span>
         </div>
       {/if}
-      {#each workflow.variables as variable, index (`${variable.name}-${index}`)}
+      {#each activeWorkflow.variables as variable, index (`${variable.name}-${index}`)}
         <div class="contextRow">
           <input
             value={variable.name}
@@ -957,3 +1530,38 @@
     </section>
   </div>
 {/if}
+
+<style>
+  .contractBox {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 6px 0 4px;
+    padding: 8px 10px;
+    border: 1px solid rgba(56, 189, 248, 0.3);
+    border-radius: 10px;
+    background: rgba(56, 189, 248, 0.06);
+  }
+
+  .contractBox__row {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 12px;
+  }
+
+  .contractBox__label {
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 10px;
+  }
+
+  .contractBox__value {
+    color: var(--text-bright);
+    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+</style>

@@ -87,12 +87,43 @@ pub enum ResponseFormat {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum WorkflowNodeType {
     Task,
     Approval,
     Split,
     Collector,
+    Decide,
+    ParallelBatch,
+    Subflow,
+    Call,
+    Spawn,
+    Send,
+    Wait,
+    Capture,
+    Kill,
+    RunAgent,
+}
+
+impl WorkflowNodeType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            WorkflowNodeType::Task => "task",
+            WorkflowNodeType::Approval => "approval",
+            WorkflowNodeType::Split => "split",
+            WorkflowNodeType::Collector => "collector",
+            WorkflowNodeType::Decide => "decide",
+            WorkflowNodeType::ParallelBatch => "parallel_batch",
+            WorkflowNodeType::Subflow => "subflow",
+            WorkflowNodeType::Call => "call",
+            WorkflowNodeType::Spawn => "spawn",
+            WorkflowNodeType::Send => "send",
+            WorkflowNodeType::Wait => "wait",
+            WorkflowNodeType::Capture => "capture",
+            WorkflowNodeType::Kill => "kill",
+            WorkflowNodeType::RunAgent => "run_agent",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -128,6 +159,10 @@ pub fn default_max_total_steps() -> u32 {
 }
 
 pub fn default_max_visits_per_node() -> u32 {
+    10
+}
+
+pub fn default_max_call_depth() -> u32 {
     10
 }
 
@@ -198,10 +233,7 @@ pub fn resolve_agent_config(
     let tool_toggles = merge!(tool_toggles).unwrap_or_default();
     let access_mode = merge!(access_mode).unwrap_or_default();
 
-    let cwd = node
-        .cwd
-        .clone()
-        .unwrap_or_else(|| workflow_cwd.to_string());
+    let cwd = node.cwd.clone().unwrap_or_else(|| workflow_cwd.to_string());
 
     let overrides = node.agent_config.as_ref();
 
@@ -260,9 +292,8 @@ pub fn migrate_output_schema(value: Value) -> Value {
     };
     // Detect legacy format: all values are plain strings (not objects/arrays)
     // and the object has no "type" key (which would indicate it's already a JSON Schema).
-    let is_legacy = !obj.is_empty()
-        && !obj.contains_key("type")
-        && obj.values().all(|v| v.is_string());
+    let is_legacy =
+        !obj.is_empty() && !obj.contains_key("type") && obj.values().all(|v| v.is_string());
     if !is_legacy {
         return value;
     }
@@ -282,6 +313,204 @@ pub fn migrate_output_schema(value: Value) -> Value {
         "properties": properties,
         "required": required,
     })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct InputBinding {
+    pub name: String,
+    pub source: String,
+}
+
+pub fn default_decide_model() -> String {
+    "claude-haiku-4-5".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DecideConfig {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<InputBinding>,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outcomes: Vec<String>,
+}
+
+pub fn default_batch_max_concurrent() -> u32 {
+    4
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchConfig {
+    pub items_binding: String,
+    #[serde(default = "default_batch_max_concurrent")]
+    pub max_concurrent: u32,
+    pub item_var: String,
+    pub body_entry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collector_var: Option<String>,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            items_binding: String::new(),
+            max_concurrent: default_batch_max_concurrent(),
+            item_var: String::new(),
+            body_entry: String::new(),
+            collector_var: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SpawnConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SendConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub enter: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitMode {
+    #[default]
+    Idle,
+    Ready,
+    Until,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub mode: WaitMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marker: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_stable_seconds: Option<f64>,
+}
+
+impl Default for WaitConfig {
+    fn default() -> Self {
+        Self {
+            target: None,
+            mode: WaitMode::Idle,
+            marker: None,
+            timeout: None,
+            idle_seconds: None,
+            ready_stable_seconds: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<u32>,
+    #[serde(default)]
+    pub all: bool,
+    #[serde(default)]
+    pub ansi: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KillConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RunAgentConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_stable_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+    #[serde(default = "default_run_agent_kill_after")]
+    pub kill_after: bool,
+}
+
+fn default_run_agent_kill_after() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SubflowConfig {
+    #[serde(default, alias = "workflow", alias = "subflowName")]
+    pub workflow_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<InputBinding>,
+    #[serde(default = "default_max_call_depth")]
+    pub max_depth: u32,
+}
+
+impl Default for SubflowConfig {
+    fn default() -> Self {
+        Self {
+            workflow_name: String::new(),
+            exit_node_id: None,
+            inputs: Vec::new(),
+            max_depth: default_max_call_depth(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -370,6 +599,28 @@ pub struct WorkflowNode {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continue_session_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decide_config: Option<DecideConfig>,
+    #[serde(
+        default,
+        alias = "parallelBatchConfig",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub batch_config: Option<BatchConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn_config: Option<SpawnConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_config: Option<SendConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_config: Option<WaitConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_config: Option<CaptureConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kill_config: Option<KillConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_agent_config: Option<RunAgentConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subflow_config: Option<SubflowConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -410,6 +661,9 @@ pub struct WorkflowV3 {
     pub edges: Vec<WorkflowEdge>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agent_defaults: BTreeMap<String, AgentDefaults>,
+    /// Run-local catalog of saved workflows referenced by subflow/call nodes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub subflows: BTreeMap<String, Box<WorkflowV3>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui: Option<WorkflowUi>,
 }
@@ -553,6 +807,8 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
             });
         }
 
+        validate_tmux_node_config(node, &mut issues);
+
         if node.output_schema.is_some() && node.response_format != Some(ResponseFormat::Json) {
             issues.push(ValidationIssue {
                 severity: "warning".to_string(),
@@ -587,6 +843,16 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
             .iter()
             .filter(|edge| edge.outcome == WorkflowEdgeOutcome::Reject)
             .count();
+
+        if node.node_type == WorkflowNodeType::Decide {
+            validate_decide_node_config(node, outgoing, &mut issues);
+        }
+        if node.node_type == WorkflowNodeType::ParallelBatch {
+            validate_batch_node_config(node, &graph, &mut issues);
+        }
+        if is_subflow_node_type(&node.node_type) {
+            validate_subflow_node_config(node, &workflow.subflows, &mut issues);
+        }
 
         if success_edges > 1 {
             if node.node_type != WorkflowNodeType::Split {
@@ -752,13 +1018,16 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
         // Validate continue_session_from references
         if let Some(ref source_id) = node.continue_session_from {
             if let Some(source_node) = graph.node_map.get(source_id.as_str()) {
-                // Must be a task node
-                if source_node.node_type != WorkflowNodeType::Task {
+                // Must be a node type that can produce an agent session id.
+                if !matches!(
+                    source_node.node_type,
+                    WorkflowNodeType::Task | WorkflowNodeType::RunAgent
+                ) {
                     issues.push(ValidationIssue {
                         severity: "error".to_string(),
                         node_id: Some(node.id.clone()),
                         message: format!(
-                            "\"{}\" continues session from \"{}\" which is not a task node.",
+                            "\"{}\" continues session from \"{}\" which is not an agent-running node.",
                             node.name, source_node.name
                         ),
                     });
@@ -828,6 +1097,9 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
         }
     }
 
+    validate_subflow_catalog(&workflow, &mut issues);
+    validate_subflow_call_cycles(&workflow, &mut issues);
+
     let graph_meta = compute_graph_metadata(&workflow);
     for node_id in &graph_meta.unreachable_node_ids {
         let name = graph
@@ -850,6 +1122,590 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
     }
 }
 
+fn validate_tmux_node_config(node: &WorkflowNode, issues: &mut Vec<ValidationIssue>) {
+    match &node.node_type {
+        WorkflowNodeType::Spawn => {
+            let config = node.spawn_config.as_ref();
+            let has_agent = config
+                .and_then(|cfg| cfg.agent.as_deref())
+                .or(node.agent.as_deref())
+                .is_some_and(|agent| !agent.trim().is_empty());
+            let has_command = config
+                .and_then(|cfg| cfg.command.as_deref())
+                .is_some_and(|command| !command.trim().is_empty());
+            if !has_agent && !has_command {
+                issues.push(ValidationIssue {
+                    severity: "error".to_string(),
+                    node_id: Some(node.id.clone()),
+                    message: format!("\"{}\" spawn node requires an agent or command.", node.name),
+                });
+            }
+        }
+        WorkflowNodeType::Send => {
+            let text = node
+                .send_config
+                .as_ref()
+                .map(|cfg| cfg.text.as_str())
+                .unwrap_or(node.prompt.as_str());
+            if text.trim().is_empty() && node.prompt.trim().is_empty() {
+                issues.push(ValidationIssue {
+                    severity: "error".to_string(),
+                    node_id: Some(node.id.clone()),
+                    message: format!("\"{}\" send node requires text or prompt.", node.name),
+                });
+            }
+        }
+        WorkflowNodeType::Wait => {
+            let config = node.wait_config.as_ref();
+            if config.is_some_and(|cfg| cfg.mode == WaitMode::Until)
+                && config
+                    .and_then(|cfg| cfg.marker.as_deref())
+                    .is_none_or(|marker| marker.trim().is_empty())
+            {
+                issues.push(ValidationIssue {
+                    severity: "error".to_string(),
+                    node_id: Some(node.id.clone()),
+                    message: format!(
+                        "\"{}\" wait node with until mode requires a marker.",
+                        node.name
+                    ),
+                });
+            }
+        }
+        WorkflowNodeType::RunAgent => {
+            let has_agent = node
+                .run_agent_config
+                .as_ref()
+                .and_then(|cfg| cfg.agent.as_deref())
+                .or(node.agent.as_deref())
+                .is_some_and(|agent| !agent.trim().is_empty());
+            if !has_agent {
+                issues.push(ValidationIssue {
+                    severity: "error".to_string(),
+                    node_id: Some(node.id.clone()),
+                    message: format!("\"{}\" run_agent node requires an agent.", node.name),
+                });
+            }
+            let prompt = node
+                .run_agent_config
+                .as_ref()
+                .and_then(|cfg| cfg.prompt.as_deref())
+                .unwrap_or(node.prompt.as_str());
+            if prompt.trim().is_empty() {
+                issues.push(ValidationIssue {
+                    severity: "warning".to_string(),
+                    node_id: Some(node.id.clone()),
+                    message: format!("\"{}\" run_agent node has an empty prompt.", node.name),
+                });
+            }
+        }
+        WorkflowNodeType::Task
+        | WorkflowNodeType::Approval
+        | WorkflowNodeType::Split
+        | WorkflowNodeType::Collector
+        | WorkflowNodeType::Decide
+        | WorkflowNodeType::ParallelBatch
+        | WorkflowNodeType::Subflow
+        | WorkflowNodeType::Call
+        | WorkflowNodeType::Capture
+        | WorkflowNodeType::Kill => {}
+    }
+}
+
+fn is_subflow_node_type(node_type: &WorkflowNodeType) -> bool {
+    matches!(
+        node_type,
+        WorkflowNodeType::Subflow | WorkflowNodeType::Call
+    )
+}
+
+fn validate_subflow_catalog(workflow: &WorkflowV3, issues: &mut Vec<ValidationIssue>) {
+    for (subflow_name, subflow) in &workflow.subflows {
+        let subflow_graph = subflow.graph();
+        if subflow_graph
+            .node_map
+            .get(subflow.entry_node_id.as_str())
+            .is_none()
+        {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: None,
+                message: format!(
+                    "Subflow \"{}\" entryNodeId \"{}\" references a non-existent node.",
+                    subflow_name, subflow.entry_node_id
+                ),
+            });
+        }
+
+        for node in &subflow.nodes {
+            if is_subflow_node_type(&node.node_type) {
+                validate_subflow_node_config(node, &workflow.subflows, issues);
+            }
+        }
+    }
+}
+
+fn validate_subflow_node_config(
+    node: &WorkflowNode,
+    subflows: &BTreeMap<String, Box<WorkflowV3>>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(config) = node.subflow_config.as_ref() else {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "\"{}\" {} node requires subflowConfig.",
+                node.name,
+                node.node_type.as_str()
+            ),
+        });
+        return;
+    };
+
+    let workflow_name = config.workflow_name.trim();
+    if workflow_name.is_empty() {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "\"{}\" {} node requires subflowConfig.workflowName.",
+                node.name,
+                node.node_type.as_str()
+            ),
+        });
+        return;
+    }
+
+    let Some(subflow) = subflows
+        .get(workflow_name)
+        .map(|workflow| workflow.as_ref())
+    else {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "\"{}\" references unknown subflow \"{}\".",
+                node.name, workflow_name
+            ),
+        });
+        return;
+    };
+
+    let subflow_graph = subflow.graph();
+    if subflow_graph
+        .node_map
+        .get(subflow.entry_node_id.as_str())
+        .is_none()
+    {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "\"{}\" references subflow \"{}\" with missing entryNodeId \"{}\".",
+                node.name, workflow_name, subflow.entry_node_id
+            ),
+        });
+    }
+
+    let terminal_node_ids = subflow
+        .nodes
+        .iter()
+        .filter(|candidate| subflow_graph.outgoing_for(&candidate.id).is_empty())
+        .map(|candidate| candidate.id.as_str())
+        .collect::<Vec<_>>();
+    if terminal_node_ids.len() != 1 {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "\"{}\" references subflow \"{}\" which must expose exactly one exit node; found {}.",
+                node.name,
+                workflow_name,
+                terminal_node_ids.len()
+            ),
+        });
+    }
+
+    if let Some(exit_node_id) = config
+        .exit_node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match subflow_graph.node_map.get(exit_node_id) {
+            Some(_) if !subflow_graph.outgoing_for(exit_node_id).is_empty() => {
+                issues.push(ValidationIssue {
+                    severity: "error".to_string(),
+                    node_id: Some(node.id.clone()),
+                    message: format!(
+                        "\"{}\" subflow exitNodeId \"{}\" must be terminal.",
+                        node.name, exit_node_id
+                    ),
+                });
+            }
+            Some(_) => {}
+            None => issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node.id.clone()),
+                message: format!(
+                    "\"{}\" subflow exitNodeId \"{}\" references a non-existent node.",
+                    node.name, exit_node_id
+                ),
+            }),
+        }
+    } else if terminal_node_ids.len() != 1 {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "\"{}\" subflowConfig.exitNodeId is required unless the referenced subflow has exactly one terminal node.",
+                node.name
+            ),
+        });
+    }
+
+    if config.max_depth == 0 {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!("\"{}\" subflow maxDepth must be at least 1.", node.name),
+        });
+    }
+
+    let mut seen_inputs = BTreeSet::new();
+    let subflow_variables = subflow
+        .variables
+        .iter()
+        .map(|variable| variable.name.as_str())
+        .collect::<BTreeSet<_>>();
+    for input in &config.inputs {
+        if input.name.trim().is_empty() || input.source.trim().is_empty() {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node.id.clone()),
+                message: format!(
+                    "\"{}\" subflow node has an input binding with an empty name or source.",
+                    node.name
+                ),
+            });
+        }
+        if !input.name.trim().is_empty() && !seen_inputs.insert(input.name.clone()) {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node.id.clone()),
+                message: format!(
+                    "\"{}\" subflow node has duplicate input binding \"{}\".",
+                    node.name, input.name
+                ),
+            });
+        }
+        if !input.name.trim().is_empty() && !subflow_variables.contains(input.name.as_str()) {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node.id.clone()),
+                message: format!(
+                    "\"{}\" binds unknown subflow variable \"{}\".",
+                    node.name, input.name
+                ),
+            });
+        }
+    }
+
+    for variable in &subflow.variables {
+        if variable.default.is_empty() && !seen_inputs.contains(&variable.name) {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node.id.clone()),
+                message: format!(
+                    "\"{}\" does not bind required subflow input \"{}\".",
+                    node.name, variable.name
+                ),
+            });
+        }
+    }
+}
+
+fn validate_subflow_call_cycles(workflow: &WorkflowV3, issues: &mut Vec<ValidationIssue>) {
+    let root_name = workflow
+        .name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("__root__")
+        .to_string();
+    let mut graph: BTreeMap<String, Vec<(String, String, u32)>> = BTreeMap::new();
+    collect_subflow_calls(&root_name, workflow, &mut graph);
+    for (name, subflow) in &workflow.subflows {
+        collect_subflow_calls(name, subflow, &mut graph);
+    }
+
+    let mut emitted = BTreeSet::new();
+    for start in graph.keys() {
+        let mut stack = Vec::new();
+        detect_subflow_cycle(start, &graph, &mut stack, &mut emitted, issues);
+    }
+}
+
+fn collect_subflow_calls(
+    workflow_name: &str,
+    workflow: &WorkflowV3,
+    graph: &mut BTreeMap<String, Vec<(String, String, u32)>>,
+) {
+    for node in &workflow.nodes {
+        if !is_subflow_node_type(&node.node_type) {
+            continue;
+        }
+        let Some(config) = node.subflow_config.as_ref() else {
+            continue;
+        };
+        let callee = config.workflow_name.trim();
+        if callee.is_empty() {
+            continue;
+        }
+        graph.entry(workflow_name.to_string()).or_default().push((
+            callee.to_string(),
+            node.id.clone(),
+            config.max_depth,
+        ));
+    }
+}
+
+fn detect_subflow_cycle(
+    current: &str,
+    graph: &BTreeMap<String, Vec<(String, String, u32)>>,
+    stack: &mut Vec<String>,
+    emitted: &mut BTreeSet<String>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(edges) = graph.get(current) else {
+        return;
+    };
+    stack.push(current.to_string());
+    for (callee, node_id, max_depth) in edges {
+        if let Some(position) = stack.iter().position(|name| name == callee) {
+            let mut cycle = stack[position..].to_vec();
+            cycle.push(callee.clone());
+            let signature = cycle.join(" -> ");
+            if emitted.insert(signature.clone()) {
+                issues.push(ValidationIssue {
+                    severity: "warning".to_string(),
+                    node_id: Some(node_id.clone()),
+                    message: format!(
+                        "Subflow call cycle detected: {}. maxDepth ({}) bounds recursion at runtime.",
+                        signature, max_depth
+                    ),
+                });
+            }
+            continue;
+        }
+        detect_subflow_cycle(callee, graph, stack, emitted, issues);
+    }
+    stack.pop();
+}
+
+fn validate_decide_node_config(
+    node: &WorkflowNode,
+    outgoing: &[&WorkflowEdge],
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(config) = &node.decide_config else {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!("\"{}\" decide node requires decideConfig.", node.name),
+        });
+        return;
+    };
+
+    if config.prompt.trim().is_empty() {
+        issues.push(ValidationIssue {
+            severity: "warning".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!("\"{}\" decide node has an empty prompt.", node.name),
+        });
+    }
+
+    let mut seen_inputs = BTreeSet::new();
+    for input in &config.inputs {
+        if input.name.trim().is_empty() || input.source.trim().is_empty() {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node.id.clone()),
+                message: format!(
+                    "\"{}\" decide node has an input binding with an empty name or source.",
+                    node.name
+                ),
+            });
+        }
+        if !input.name.trim().is_empty() && !seen_inputs.insert(input.name.clone()) {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node.id.clone()),
+                message: format!(
+                    "\"{}\" decide node has duplicate input binding \"{}\".",
+                    node.name, input.name
+                ),
+            });
+        }
+    }
+
+    if config.outcomes.is_empty() {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "\"{}\" decide node requires at least one outcome.",
+                node.name
+            ),
+        });
+        return;
+    }
+
+    let branch_labels = outgoing
+        .iter()
+        .filter(|edge| edge.outcome == WorkflowEdgeOutcome::Branch)
+        .filter_map(|edge| edge.label.as_deref())
+        .collect::<BTreeSet<_>>();
+    let mut seen_outcomes = BTreeSet::new();
+    for outcome in &config.outcomes {
+        if outcome.trim().is_empty() {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node.id.clone()),
+                message: format!("\"{}\" decide node has an empty outcome label.", node.name),
+            });
+            continue;
+        }
+        if !seen_outcomes.insert(outcome.clone()) {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node.id.clone()),
+                message: format!(
+                    "\"{}\" decide node has duplicate outcome \"{}\".",
+                    node.name, outcome
+                ),
+            });
+        }
+        if !branch_labels.contains(outcome.as_str()) {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node.id.clone()),
+                message: format!(
+                    "\"{}\" decide outcome \"{}\" does not match an outgoing branch edge label.",
+                    node.name, outcome
+                ),
+            });
+        }
+    }
+
+    let branch_edges = outgoing
+        .iter()
+        .filter(|edge| edge.outcome == WorkflowEdgeOutcome::Branch)
+        .collect::<Vec<_>>();
+    if branch_edges.len() != config.outcomes.len() {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "\"{}\" decide node must have one outgoing branch edge per outcome.",
+                node.name
+            ),
+        });
+    }
+    for edge in branch_edges {
+        if edge
+            .label
+            .as_deref()
+            .is_none_or(|label| label.trim().is_empty())
+        {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node.id.clone()),
+                message: format!(
+                    "\"{}\" decide node branch edge \"{}\" requires a label matching an outcome.",
+                    node.name, edge.id
+                ),
+            });
+        }
+    }
+}
+
+fn validate_batch_node_config(
+    node: &WorkflowNode,
+    graph: &WorkflowGraph<'_>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some(config) = &node.batch_config else {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "\"{}\" parallel_batch node requires batchConfig.",
+                node.name
+            ),
+        });
+        return;
+    };
+
+    if config.items_binding.trim().is_empty() {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "\"{}\" parallel_batch node requires itemsBinding.",
+                node.name
+            ),
+        });
+    }
+    if config.item_var.trim().is_empty() {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!("\"{}\" parallel_batch node requires itemVar.", node.name),
+        });
+    }
+    if config.body_entry.trim().is_empty() {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!("\"{}\" parallel_batch node requires bodyEntry.", node.name),
+        });
+    } else if graph.node_map.get(config.body_entry.as_str()).is_none() {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "\"{}\" parallel_batch bodyEntry \"{}\" references a non-existent node.",
+                node.name, config.body_entry
+            ),
+        });
+    }
+    if config.max_concurrent == 0 {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "\"{}\" parallel_batch maxConcurrent must be at least 1.",
+                node.name
+            ),
+        });
+    }
+    if config
+        .collector_var
+        .as_ref()
+        .is_some_and(|collector_var| collector_var.trim().is_empty())
+    {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "\"{}\" parallel_batch collectorVar cannot be empty when set.",
+                node.name
+            ),
+        });
+    }
+}
+
 fn has_task_execution_config(node: &WorkflowNode) -> bool {
     node.agent.is_some()
         || !node.prompt.trim().is_empty()
@@ -864,6 +1720,9 @@ fn has_task_execution_config(node: &WorkflowNode) -> bool {
         || node.loop_condition.is_some()
         || node.agent_config.is_some()
         || node.cwd.is_some()
+        || node.decide_config.is_some()
+        || node.batch_config.is_some()
+        || node.subflow_config.is_some()
 }
 
 pub fn compute_graph_metadata(workflow: &WorkflowV3) -> GraphMetadata {
@@ -1000,6 +1859,15 @@ mod tests {
             agent_config: None,
             cwd: None,
             continue_session_from: None,
+            decide_config: None,
+            batch_config: None,
+            spawn_config: None,
+            send_config: None,
+            wait_config: None,
+            capture_config: None,
+            kill_config: None,
+            run_agent_config: None,
+            subflow_config: None,
         }
     }
 
@@ -1015,7 +1883,11 @@ mod tests {
         }
     }
 
-    fn workflow(nodes: Vec<WorkflowNode>, edges: Vec<WorkflowEdge>, entry_node_id: &str) -> WorkflowV3 {
+    fn workflow(
+        nodes: Vec<WorkflowNode>,
+        edges: Vec<WorkflowEdge>,
+        entry_node_id: &str,
+    ) -> WorkflowV3 {
         WorkflowV3 {
             version: 3,
             name: Some("test".to_string()),
@@ -1028,6 +1900,7 @@ mod tests {
             nodes,
             edges,
             agent_defaults: BTreeMap::new(),
+            subflows: BTreeMap::new(),
             ui: None,
         }
     }
@@ -1057,6 +1930,7 @@ mod tests {
             nodes: Vec::new(),
             edges: Vec::new(),
             agent_defaults: BTreeMap::new(),
+            subflows: BTreeMap::new(),
             ui: None,
         });
         assert!(
@@ -1105,12 +1979,15 @@ mod tests {
         ));
 
         assert!(result.issues.iter().any(|issue| {
-            issue.message.contains("can only use success edges for split fan-out")
+            issue
+                .message
+                .contains("can only use success edges for split fan-out")
         }));
-        assert!(result
-            .issues
-            .iter()
-            .any(|issue| issue.message.contains("fans out to fewer than two branches")));
+        assert!(result.issues.iter().any(|issue| {
+            issue
+                .message
+                .contains("fans out to fewer than two branches")
+        }));
     }
 
     #[test]
@@ -1138,16 +2015,20 @@ mod tests {
             "task_a",
         ));
 
-        assert!(result
-            .issues
-            .iter()
-            .any(|issue| issue.message.contains("duplicate collector input key \"dup\"")));
-        assert!(result
-            .issues
-            .iter()
-            .any(|issue| issue.message.contains("must have exactly one outbound success edge")));
         assert!(result.issues.iter().any(|issue| {
-            issue.message.contains("can only use a success edge after collecting inputs")
+            issue
+                .message
+                .contains("duplicate collector input key \"dup\"")
+        }));
+        assert!(result.issues.iter().any(|issue| {
+            issue
+                .message
+                .contains("must have exactly one outbound success edge")
+        }));
+        assert!(result.issues.iter().any(|issue| {
+            issue
+                .message
+                .contains("can only use a success edge after collecting inputs")
         }));
     }
 
@@ -1173,14 +2054,16 @@ mod tests {
             "split",
         ));
 
-        assert!(result
-            .issues
-            .iter()
-            .any(|issue| issue.message.contains("split node, so task execution fields are ignored")));
-        assert!(result
-            .issues
-            .iter()
-            .any(|issue| issue.message.contains("collector node, so task execution fields are ignored")));
+        assert!(result.issues.iter().any(|issue| {
+            issue
+                .message
+                .contains("split node, so task execution fields are ignored")
+        }));
+        assert!(result.issues.iter().any(|issue| {
+            issue
+                .message
+                .contains("collector node, so task execution fields are ignored")
+        }));
     }
 
     #[test]
@@ -1195,8 +2078,7 @@ mod tests {
             },
         );
         let n = node("n1", "N1", WorkflowNodeType::Task);
-        let config =
-            resolve_agent_config(&defaults, "/work", "claude", &n, None, false, None);
+        let config = resolve_agent_config(&defaults, "/work", "claude", &n, None, false, None);
         assert_eq!(config.model.as_deref(), Some("opus"));
         assert_eq!(config.max_turns, Some(5));
         assert_eq!(config.cwd, "/work");
@@ -1223,8 +2105,7 @@ mod tests {
             ..Default::default()
         });
         n.cwd = Some("/custom".to_string());
-        let config =
-            resolve_agent_config(&defaults, "/work", "claude", &n, None, false, None);
+        let config = resolve_agent_config(&defaults, "/work", "claude", &n, None, false, None);
         // Node override wins for model
         assert_eq!(config.model.as_deref(), Some("sonnet"));
         // Default still used for reasoning_level (no node override)
@@ -1388,13 +2269,11 @@ mod tests {
         n1.agent = Some("claude".to_string());
         n1.continue_session_from = Some("nonexistent".to_string());
 
-        let result = validate_workflow(workflow(
-            vec![n1],
-            vec![],
-            "n1",
-        ));
+        let result = validate_workflow(workflow(vec![n1], vec![], "n1"));
         assert!(result.issues.iter().any(|i| {
-            i.severity == "error" && i.message.contains("references unknown node \"nonexistent\"")
+            i.severity == "error"
+                && i.message
+                    .contains("references unknown node \"nonexistent\"")
         }));
     }
 
@@ -1411,9 +2290,12 @@ mod tests {
             vec![success_edge("e1", "n1", "n2", None)],
             "n1",
         ));
-        assert!(result.issues.iter().any(|i| {
-            i.severity == "error" && i.message.contains("different agents")
-        }));
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|i| { i.severity == "error" && i.message.contains("different agents") })
+        );
     }
 
     #[test]
@@ -1428,9 +2310,11 @@ mod tests {
             vec![success_edge("e1", "n1", "n2", None)],
             "n1",
         ));
-        assert!(result.issues.iter().any(|i| {
-            i.severity == "error" && i.message.contains("not a task node")
-        }));
+        assert!(
+            result.issues.iter().any(|i| {
+                i.severity == "error" && i.message.contains("not an agent-running node")
+            })
+        );
     }
 
     #[test]
@@ -1447,8 +2331,342 @@ mod tests {
             "n1",
         ));
         // No session-related errors
-        assert!(!result.issues.iter().any(|i| {
-            i.severity == "error" && i.message.contains("session")
+        assert!(
+            !result
+                .issues
+                .iter()
+                .any(|i| { i.severity == "error" && i.message.contains("session") })
+        );
+    }
+
+    #[test]
+    fn parses_minimal_run_agent_node() {
+        let value = json!({
+            "version": 3,
+            "goal": "Run one agent",
+            "entryNodeId": "run",
+            "nodes": [{
+                "id": "run",
+                "name": "Run Echo",
+                "type": "run_agent",
+                "agent": "echo",
+                "prompt": "hello"
+            }],
+            "edges": []
+        });
+
+        let normalized = normalize_workflow_value(value).unwrap();
+        assert_eq!(
+            normalized.workflow.nodes[0].node_type,
+            WorkflowNodeType::RunAgent
+        );
+        let result = validate_workflow(normalized.workflow);
+        assert!(
+            !result.issues.iter().any(|issue| issue.severity == "error"),
+            "expected no validation errors, got {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn validates_subflow_call_required_inputs() {
+        let mut call = node("call", "Call Double", WorkflowNodeType::Call);
+        call.subflow_config = Some(SubflowConfig {
+            workflow_name: "double".to_string(),
+            exit_node_id: Some("exit".to_string()),
+            inputs: Vec::new(),
+            max_depth: default_max_call_depth(),
+        });
+        let mut subflow = workflow(
+            vec![
+                node("entry", "Entry", WorkflowNodeType::Task),
+                node("exit", "Exit", WorkflowNodeType::Task),
+            ],
+            vec![success_edge("entry_exit", "entry", "exit", None)],
+            "entry",
+        );
+        subflow.variables = vec![WorkflowVariable {
+            name: "input".to_string(),
+            default: String::new(),
+        }];
+        let mut parent = workflow(vec![call], vec![], "call");
+        parent
+            .subflows
+            .insert("double".to_string(), Box::new(subflow));
+
+        let result = validate_workflow(parent);
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue
+                    .message
+                    .contains("does not bind required subflow input \"input\"")
         }));
+    }
+
+    #[test]
+    fn warns_on_subflow_call_cycles() {
+        let mut call = node("call", "Recursive Call", WorkflowNodeType::Call);
+        call.subflow_config = Some(SubflowConfig {
+            workflow_name: "recursive".to_string(),
+            exit_node_id: Some("call".to_string()),
+            inputs: Vec::new(),
+            max_depth: 3,
+        });
+        let recursive = workflow(vec![call], vec![], "call");
+        let mut parent = workflow(
+            vec![node("start", "Start", WorkflowNodeType::Task)],
+            vec![],
+            "start",
+        );
+        parent
+            .subflows
+            .insert("recursive".to_string(), Box::new(recursive));
+
+        let result = validate_workflow(parent);
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "warning" && issue.message.contains("Subflow call cycle detected")
+        }));
+    }
+
+    #[test]
+    fn validates_wait_until_requires_marker() {
+        let mut wait = node("wait", "Wait", WorkflowNodeType::Wait);
+        wait.wait_config = Some(WaitConfig {
+            mode: WaitMode::Until,
+            ..Default::default()
+        });
+        let result = validate_workflow(workflow(vec![wait], vec![], "wait"));
+
+        assert!(
+            result
+                .issues
+                .iter()
+                .any(|issue| issue.severity == "error" && issue.message.contains("marker")),
+            "expected marker validation error, got {:?}",
+            result.issues
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // T15: Subflow validation — recursion depth bound + call-cycle warning
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validates_subflow_max_depth_zero_is_error() {
+        // A call node with maxDepth=0 must be rejected at validation time.
+        let mut call = node("call", "Call Zero Depth", WorkflowNodeType::Call);
+        call.subflow_config = Some(SubflowConfig {
+            workflow_name: "sub".to_string(),
+            exit_node_id: Some("exit".to_string()),
+            inputs: Vec::new(),
+            max_depth: 0, // invalid
+        });
+        let sub = workflow(
+            vec![
+                node("entry", "Entry", WorkflowNodeType::Task),
+                node("exit", "Exit", WorkflowNodeType::Task),
+            ],
+            vec![success_edge("e", "entry", "exit", None)],
+            "entry",
+        );
+        let mut parent = workflow(vec![call], vec![], "call");
+        parent.subflows.insert("sub".to_string(), Box::new(sub));
+
+        let result = validate_workflow(parent);
+
+        assert!(
+            result.issues.iter().any(|issue| {
+                issue.severity == "error" && issue.message.contains("maxDepth must be at least 1")
+            }),
+            "expected maxDepth=0 error, got {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn recursion_cycle_warning_includes_depth_bound_in_message() {
+        // A subflow that directly calls itself should emit a cycle warning that
+        // mentions the maxDepth bound so the user knows runtime safety applies.
+        let mut self_call = node("call", "Self Call", WorkflowNodeType::Call);
+        self_call.subflow_config = Some(SubflowConfig {
+            workflow_name: "recurse".to_string(),
+            exit_node_id: Some("call".to_string()),
+            inputs: Vec::new(),
+            max_depth: 5,
+        });
+        // The "recurse" subflow body IS self_call — single terminal node
+        let recurse_body = workflow(vec![self_call], vec![], "call");
+        let mut parent = workflow(
+            vec![node("start", "Start", WorkflowNodeType::Task)],
+            vec![],
+            "start",
+        );
+        parent
+            .subflows
+            .insert("recurse".to_string(), Box::new(recurse_body));
+
+        let result = validate_workflow(parent);
+
+        let cycle_issue = result.issues.iter().find(|issue| {
+            issue.severity == "warning" && issue.message.contains("Subflow call cycle detected")
+        });
+        assert!(
+            cycle_issue.is_some(),
+            "expected cycle warning, got {:?}",
+            result.issues
+        );
+        // The warning should mention the maxDepth value (5) so users know recursion is bounded.
+        assert!(
+            cycle_issue.unwrap().message.contains("5"),
+            "cycle warning should mention maxDepth value"
+        );
+    }
+
+    #[test]
+    fn validates_subflow_unknown_workflow_name_is_error() {
+        // A call node referencing a workflow not in `subflows` must fail.
+        let mut call = node("call", "Call Missing", WorkflowNodeType::Call);
+        call.subflow_config = Some(SubflowConfig {
+            workflow_name: "no_such_workflow".to_string(),
+            exit_node_id: None,
+            inputs: Vec::new(),
+            max_depth: default_max_call_depth(),
+        });
+        let parent = workflow(vec![call], vec![], "call");
+        let result = validate_workflow(parent);
+
+        assert!(
+            result.issues.iter().any(|issue| {
+                issue.severity == "error"
+                    && issue.message.contains("references unknown subflow")
+            }),
+            "expected unknown subflow error, got {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn validates_subflow_with_multiple_terminal_nodes_is_error() {
+        // A subflow body with two terminal nodes violates single-exit contract.
+        let mut call = node("call", "Call Multi-Exit", WorkflowNodeType::Call);
+        call.subflow_config = Some(SubflowConfig {
+            workflow_name: "multi".to_string(),
+            exit_node_id: None, // no explicit exitNodeId → auto-detect
+            inputs: Vec::new(),
+            max_depth: default_max_call_depth(),
+        });
+        // Two terminal nodes (no outgoing edges)
+        let sub = workflow(
+            vec![
+                node("exit_a", "Exit A", WorkflowNodeType::Task),
+                node("exit_b", "Exit B", WorkflowNodeType::Task),
+            ],
+            vec![], // no edges → both are terminal
+            "exit_a",
+        );
+        let mut parent = workflow(vec![call], vec![], "call");
+        parent.subflows.insert("multi".to_string(), Box::new(sub));
+
+        let result = validate_workflow(parent);
+
+        assert!(
+            result.issues.iter().any(|issue| {
+                issue.severity == "error"
+                    && issue.message.contains("exactly one exit node")
+            }),
+            "expected single-exit validation error, got {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn validates_decide_node_outcomes_must_match_branch_edges() {
+        // A Decide node whose outcomes don't match branch edge labels should error.
+        let mut decide = node("decide", "Route", WorkflowNodeType::Decide);
+        decide.decide_config = Some(DecideConfig {
+            inputs: Vec::new(),
+            prompt: "Pick a path".to_string(),
+            model: None,
+            outcomes: vec!["yes".to_string(), "no".to_string()],
+        });
+        let yes_target = node("yes_node", "Yes", WorkflowNodeType::Task);
+        let parent = workflow(
+            vec![decide, yes_target],
+            vec![WorkflowEdge {
+                id: "branch_yes".to_string(),
+                from: "decide".to_string(),
+                to: "yes_node".to_string(),
+                outcome: WorkflowEdgeOutcome::Branch,
+                label: Some("yes".to_string()),
+                branch_id: None,
+                condition: None,
+            }],
+            "decide",
+        );
+        // "no" outcome has no matching branch edge → should error
+        let result = validate_workflow(parent);
+
+        assert!(
+            result.issues.iter().any(|issue| {
+                issue.severity == "error"
+                    && issue.message.contains("does not match an outgoing branch edge label")
+            }),
+            "expected outcome→edge mismatch error, got {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn epic_dev_template_parses_and_validates_clean() {
+        // Load and validate the bundled epic-dev.json template at the schema level.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("templates/epic-dev.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("templates/epic-dev.json not found at {:?}", path));
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).expect("epic-dev.json must be valid JSON");
+
+        let normalized = normalize_workflow_value(value)
+            .expect("epic-dev.json must parse as a v3 workflow");
+
+        let result = validate_workflow(normalized.workflow);
+        let errors: Vec<_> = result
+            .issues
+            .iter()
+            .filter(|issue| issue.severity == "error")
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "epic-dev.json has validation errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn multi_agent_plan_template_parses_and_validates_clean() {
+        // Load and validate the bundled multi-agent-plan-implementation.json template.
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("templates/multi-agent-plan-implementation.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| panic!("multi-agent-plan-implementation.json not found at {:?}", path));
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).expect("multi-agent-plan-implementation.json must be valid JSON");
+
+        let normalized = normalize_workflow_value(value)
+            .expect("multi-agent-plan-implementation.json must parse as a v3 workflow");
+
+        let result = validate_workflow(normalized.workflow);
+        let errors: Vec<_> = result
+            .issues
+            .iter()
+            .filter(|issue| issue.severity == "error")
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "multi-agent-plan-implementation.json has validation errors: {:?}",
+            errors
+        );
     }
 }

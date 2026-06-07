@@ -12,12 +12,14 @@
   } from "@xyflow/svelte";
   import clsx from "clsx";
   import { buildFlowNodes, buildValidationIndex } from "@/features/editor/flowNodes";
+  import SubflowNode from "@/features/editor/SubflowNode.svelte";
   import { store } from "@/lib/stores/workflowStore.svelte";
   import type {
     RuntimeCapabilities,
     ValidationResponse,
     WorkflowDocument,
     WorkflowEdgeOutcome,
+    WorkflowNodeType,
   } from "@/lib/types/workflow";
 
   let {
@@ -29,6 +31,28 @@
     validation: ValidationResponse | null;
     capabilities: RuntimeCapabilities | undefined;
   } = $props();
+
+  // The canvas always renders the *active* document — root, or a subflow we
+  // drilled into. `workflow` (the prop) stays bound to the root for saving.
+  let activeWorkflow = $derived(store.activeWorkflow ?? workflow);
+
+  const nodeTypes = { subflow: SubflowNode };
+
+  // Secondary node types live behind a "+ More" menu to keep the toolbar tidy.
+  let showMoreNodes = $state(false);
+
+  const PRIMITIVE_TYPES: { type: WorkflowNodeType; label: string }[] = [
+    { type: "run_agent", label: "Run Agent" },
+    { type: "decide", label: "Decide" },
+    { type: "parallel_batch", label: "Batch" },
+    { type: "subflow", label: "Subflow" },
+    { type: "call", label: "Call" },
+    { type: "spawn", label: "Spawn" },
+    { type: "send", label: "Send" },
+    { type: "wait", label: "Wait" },
+    { type: "capture", label: "Capture" },
+    { type: "kill", label: "Kill" },
+  ];
 
   function edgeColor(outcome: WorkflowEdgeOutcome): string {
     switch (outcome) {
@@ -55,7 +79,7 @@
   let validationIndex = $derived(buildValidationIndex(validation));
 
   function toFlowEdges(): Edge[] {
-    return workflow.edges.map((edge) => ({
+    return activeWorkflow.edges.map((edge) => ({
       id: edge.id,
       source: edge.from,
       target: edge.to,
@@ -107,16 +131,17 @@
   // Sync workflow store -> SvelteFlow when workflow data changes.
   // With $state.raw we must reassign the whole array (immutable pattern).
   $effect(() => {
-    // Reading workflow.nodes triggers this effect on any mutation
-    void workflow.nodes.length;
-    void workflow.entryNodeId;
+    // Reading active nodes triggers this effect on any mutation
+    void activeWorkflow.nodes.length;
+    void activeWorkflow.entryNodeId;
+    void store.drillStack;
     void validation;
     void store.nodeStates;
     void store.selection;
     nodes = mergeFlowNodes(
       lastNodes,
       buildFlowNodes(
-        workflow,
+        activeWorkflow,
         validation,
         validationIndex,
         store.nodeStates,
@@ -126,7 +151,8 @@
   });
 
   $effect(() => {
-    void workflow.edges.length;
+    void activeWorkflow.edges.length;
+    void store.drillStack;
     void store.selection;
     edges = mergeFlowEdges(lastEdges, toFlowEdges());
   });
@@ -139,8 +165,8 @@
 
   function handleConnect(connection: Connection) {
     if (!connection.source || !connection.target) return;
-    const outgoing = workflow.edges.filter((e) => e.from === connection.source);
-    const sourceNode = workflow.nodes.find((node) => node.id === connection.source);
+    const outgoing = activeWorkflow.edges.filter((e) => e.from === connection.source);
+    const sourceNode = activeWorkflow.nodes.find((node) => node.id === connection.source);
     let outcome: WorkflowEdgeOutcome = "success";
 
     if (sourceNode?.type === "collector" && outgoing.some((edge) => edge.outcome === "success")) {
@@ -150,7 +176,10 @@
 
     if (sourceNode?.type === "split" || sourceNode?.type === "collector") {
       outcome = "success";
-    } else if (sourceNode?.type === "task") {
+    } else if (sourceNode?.type === "decide") {
+      // Decide nodes route exclusively through branch edges.
+      outcome = "branch";
+    } else if (sourceNode?.type === "task" || sourceNode?.type === "run_agent") {
       outcome = outgoing.some((e) => e.outcome === "success") ? "branch" : "success";
     } else if (sourceNode?.type === "approval") {
       outcome = outgoing.some((e) => e.outcome === "success") ? "reject" : "success";
@@ -180,8 +209,34 @@
     store.selectEdge(edge.id);
   }
 
+  function handleSelectionChange({ nodes: selected }: { nodes: Node[]; edges: Edge[] }) {
+    store.setMultiSelection(selected.map((n) => n.id));
+  }
+
+  function saveAsCompound() {
+    const ids = store.multiSelectedNodeIds.length
+      ? store.multiSelectedNodeIds
+      : store.selection.kind === "node"
+        ? [store.selection.id]
+        : [];
+    if (ids.length === 0) {
+      store.setError("Select one or more nodes to save as a compound node.");
+      return;
+    }
+    const name = prompt("Name for the new compound node (saved subflow):");
+    if (!name) return;
+    const created = store.saveSelectionAsCompound(ids, name);
+    if (!created) {
+      store.setError(`Could not create compound "${name}" (empty selection or name in use).`);
+    }
+  }
+
   const supportedNodeTypes = $derived(
     capabilities?.supportedNodeTypes ?? ["task", "approval", "split", "collector"],
+  );
+
+  let canSaveCompound = $derived(
+    store.multiSelectedNodeIds.length > 0 || store.selection.kind === "node",
   );
 </script>
 
@@ -189,11 +244,13 @@
   <SvelteFlow
     bind:nodes
     bind:edges
+    {nodeTypes}
     fitView
     onnodedragstop={handleNodeDragStop}
     onpaneclick={handlePaneClick}
     onnodeclick={handleNodeClick}
     onedgeclick={handleEdgeClick}
+    onselectionchange={handleSelectionChange}
     onconnect={handleConnect}
   >
     <Background patternColor="rgba(148, 163, 184, 0.14)" gap={18} size={1} />
@@ -237,8 +294,141 @@
             + Collector
           </button>
         {/if}
-        <span class="canvasToolbar__meta">{workflow.nodes.length} nodes</span>
+
+        {#if PRIMITIVE_TYPES.some((t) => supportedNodeTypes.includes(t.type))}
+          <div class="canvasToolbar__more">
+            <button class="button button--ghost" onclick={(event) => {
+              event.stopPropagation();
+              showMoreNodes = !showMoreNodes;
+            }}>
+              + More ▾
+            </button>
+            {#if showMoreNodes}
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <div class="canvasToolbar__backdrop" onclick={() => showMoreNodes = false}></div>
+              <div class="canvasToolbar__menu">
+                {#each PRIMITIVE_TYPES.filter((t) => supportedNodeTypes.includes(t.type)) as item (item.type)}
+                  <button class="canvasToolbar__menuItem" onclick={(event) => {
+                    event.stopPropagation();
+                    store.addNode(item.type);
+                    showMoreNodes = false;
+                  }}>
+                    + {item.label}
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
+        {/if}
+
+        <button
+          class="button button--ghost"
+          disabled={!canSaveCompound}
+          title="Collapse the selected nodes into a reusable compound node"
+          onclick={(event) => { event.stopPropagation(); saveAsCompound(); }}
+        >
+          ⧉ Save as compound
+        </button>
+
+        <span class="canvasToolbar__meta">{activeWorkflow.nodes.length} nodes</span>
       </div>
     </Panel>
+
+    {#if store.isDrilledIn}
+      <Panel position="top-center">
+        <div class="drillBreadcrumb">
+          {#each store.breadcrumb as crumb, index (index)}
+            {#if index > 0}<span class="drillBreadcrumb__sep">›</span>{/if}
+            <button
+              class="drillBreadcrumb__crumb"
+              class:drillBreadcrumb__crumb--current={index === store.breadcrumb.length - 1}
+              onclick={(event) => { event.stopPropagation(); store.drillToLevel(index); }}
+            >
+              {index === 0 ? (workflow.name || "root") : crumb}
+            </button>
+          {/each}
+        </div>
+      </Panel>
+    {/if}
   </SvelteFlow>
 </div>
+
+<style>
+  .canvasToolbar__more {
+    position: relative;
+  }
+
+  .canvasToolbar__backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+  }
+
+  .canvasToolbar__menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    left: 0;
+    z-index: 21;
+    display: flex;
+    flex-direction: column;
+    min-width: 150px;
+    padding: 6px;
+    gap: 2px;
+    background: rgba(8, 15, 30, 0.97);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 18px 40px rgba(2, 8, 23, 0.5);
+  }
+
+  .canvasToolbar__menuItem {
+    text-align: left;
+    padding: 7px 10px;
+    border-radius: 8px;
+    background: transparent;
+    border: none;
+    color: var(--text-bright);
+    cursor: pointer;
+    font-size: 13px;
+  }
+
+  .canvasToolbar__menuItem:hover {
+    background: rgba(96, 165, 250, 0.16);
+  }
+
+  .drillBreadcrumb {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 14px;
+    background: rgba(8, 15, 30, 0.9);
+    border: 1px solid rgba(56, 189, 248, 0.4);
+    border-radius: 999px;
+    backdrop-filter: blur(10px);
+    font-size: 13px;
+  }
+
+  .drillBreadcrumb__crumb {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 6px;
+  }
+
+  .drillBreadcrumb__crumb:hover {
+    color: var(--text-bright);
+  }
+
+  .drillBreadcrumb__crumb--current {
+    color: rgba(125, 211, 252, 0.95);
+    font-weight: 600;
+    cursor: default;
+  }
+
+  .drillBreadcrumb__sep {
+    color: var(--text-dim);
+    opacity: 0.6;
+  }
+</style>

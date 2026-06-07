@@ -38,16 +38,33 @@ export function buildFlowNodes(
       ? { x: canvasPosition.x, y: canvasPosition.y }
       : { x: 180, y: 180 };
     const status = validationIndex[node.id];
+    const isCompound = node.type === "subflow" || node.type === "call";
+
+    const data: Record<string, unknown> = isCompound
+      ? (() => {
+          const subflowName = node.subflowConfig?.workflowName ?? "";
+          const inputs = (node.subflowConfig?.inputs ?? []).map((b) => b.name);
+          const missing = !subflowName || !workflow.subflows?.[subflowName];
+          return {
+            label: node.name,
+            nodeType: node.type,
+            subflowName,
+            inputs,
+            output: subflowName ? `${subflowName}.result` : "result",
+            missing,
+          };
+        })()
+      : { label: node.name };
 
     return {
       id: node.id,
       position,
-      data: { label: node.name },
+      data,
       draggable: true,
       selected: selectedNodeId === node.id,
-      type: "default",
+      type: isCompound ? "subflow" : "default",
       initialWidth: 220,
-      initialHeight: 72,
+      initialHeight: isCompound ? 120 : 72,
       class: clsx("graphNode", `graphNode--${node.type}`, {
         "graphNode--entry": workflow.entryNodeId === node.id,
         "graphNode--error": status?.error,
@@ -71,6 +88,16 @@ function nodeStyle(type: WorkflowNodeType): string {
     approval: "rgba(245, 158, 11, 0.72)",
     split: "rgba(249, 115, 22, 0.78)",
     collector: "rgba(45, 212, 191, 0.72)",
+    decide: "rgba(168, 85, 247, 0.78)",
+    parallel_batch: "rgba(234, 179, 8, 0.78)",
+    subflow: "rgba(56, 189, 248, 0.82)",
+    call: "rgba(14, 165, 233, 0.78)",
+    spawn: "rgba(34, 197, 94, 0.72)",
+    send: "rgba(132, 204, 22, 0.72)",
+    wait: "rgba(148, 163, 184, 0.72)",
+    capture: "rgba(20, 184, 166, 0.72)",
+    kill: "rgba(239, 68, 68, 0.78)",
+    run_agent: "rgba(129, 140, 248, 0.78)",
   };
 
   return [

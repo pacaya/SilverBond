@@ -13,6 +13,7 @@
   import GraphEditor from "@/features/editor/GraphEditor.svelte";
   import InspectorPanel from "@/features/editor/InspectorPanel.svelte";
   import RunPanel from "@/features/runtime/RunPanel.svelte";
+  import PaneTerminal from "@/features/runtime/PaneTerminal.svelte";
   import HistoryPanel from "@/features/history/HistoryPanel.svelte";
   import ConfirmDialog from "@/lib/components/ConfirmDialog.svelte";
   import ReferencePanel from "@/features/reference/ReferencePanel.svelte";
@@ -395,13 +396,20 @@
   </main>
 
   <aside class="sidepanel">
-    <div class="sidepanel__tabs">
+    <div class="sidepanel__tabs" style="grid-template-columns: repeat(4, minmax(0, 1fr));">
       <button
         class={store.panelTab === "output" ? "sidepanel__tab sidepanel__tab--active" : "sidepanel__tab"}
         onclick={() => store.setPanelTab("output")}
       >
         Output
         {#if store.approval}<span class="approvalBadge"></span>{/if}
+      </button>
+      <button
+        class={store.panelTab === "terminal" ? "sidepanel__tab sidepanel__tab--active" : "sidepanel__tab"}
+        data-testid="terminal-tab"
+        onclick={() => store.setPanelTab("terminal")}
+      >
+        Terminal
       </button>
       <button
         class={store.panelTab === "history" ? "sidepanel__tab sidepanel__tab--active" : "sidepanel__tab"}
@@ -432,6 +440,8 @@
           if (store.runId) api.respondToInteraction(store.runId, response);
         }}
       />
+    {:else if store.panelTab === "terminal"}
+      <PaneTerminal runId={store.runId} workflow={store.workflow} />
     {:else if store.panelTab === "history"}
       <HistoryPanel
         onResume={(runId) => resumeRun(runId)}

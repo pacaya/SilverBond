@@ -8,8 +8,10 @@ use std::path::PathBuf;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tmux_tools_core::agents;
+use tokio::process::Command;
 
-use crate::pty_output::{CostInfo, ContextInfo};
+use crate::pty_output::{ContextInfo, CostInfo};
 
 // ---------------------------------------------------------------------------
 // Interaction types (for interactive prompt handling)
@@ -86,6 +88,53 @@ pub struct AgentCapabilities {
     pub web_search: bool,
 }
 
+fn capabilities_from_registry(name: &str) -> Option<AgentCapabilities> {
+    let registry = agents::Registry::load().ok()?;
+    registry.get(name).map(|spec| {
+        let caps = &spec.capabilities;
+        AgentCapabilities {
+            worker_execution: caps.worker_execution,
+            prompt_refinement: caps.prompt_refinement,
+            branch_choice: caps.branch_choice,
+            loop_verdict: caps.loop_verdict,
+            structured_output: caps.structured_output,
+            session_reuse: caps.session_reuse,
+            native_json_schema: caps.native_json_schema,
+            model_selection: caps.model_selection,
+            reasoning_config: caps.reasoning_config,
+            system_prompt: caps.system_prompt,
+            budget_limit: caps.budget_limit,
+            turn_limit: caps.turn_limit,
+            cost_reporting: caps.cost_reporting,
+            tool_allowlist: caps.tool_allowlist,
+            web_search: caps.web_search,
+        }
+    })
+}
+
+fn registry_capabilities_or(name: &str, fallback: AgentCapabilities) -> AgentCapabilities {
+    capabilities_from_registry(name).unwrap_or(fallback)
+}
+
+pub fn agent_binary(name: &str) -> Option<String> {
+    agents::Registry::load()
+        .ok()
+        .and_then(|registry| registry.get(name).map(|spec| spec.binary.clone()))
+        .or_else(|| match name {
+            "claude" | "codex" | "gemini" => Some(name.to_string()),
+            _ => None,
+        })
+}
+
+fn registry_access_profile(config: &AgentConfig) -> String {
+    match config.access_mode {
+        AccessMode::ReadOnly => "read-only",
+        AccessMode::Edit | AccessMode::Execute => "workspace-write",
+        AccessMode::Unrestricted => "full-access",
+    }
+    .to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Configuration types
 // ---------------------------------------------------------------------------
@@ -158,6 +207,68 @@ impl Default for AgentConfig {
             orchestrator: None,
         }
     }
+}
+
+const DEFAULT_DECIDE_FALLBACK_MODEL: &str = "claude-sonnet-4-5";
+
+/// Invoke the default LLM backend for lightweight router/classifier calls.
+///
+/// This intentionally uses the existing CLI-backed driver path instead of adding
+/// a separate HTTP client. The caller passes the preferred model; on failure,
+/// non-fallback models are retried once with the configured fallback model.
+pub async fn call_llm(model: &str, prompt: &str) -> anyhow::Result<String> {
+    let model = model.trim();
+    let model = if model.is_empty() {
+        DEFAULT_DECIDE_FALLBACK_MODEL
+    } else {
+        model
+    };
+    match call_claude_print(model, prompt).await {
+        Ok(output) => Ok(output),
+        Err(error) if model != DEFAULT_DECIDE_FALLBACK_MODEL => {
+            call_claude_print(DEFAULT_DECIDE_FALLBACK_MODEL, prompt)
+                .await
+                .with_context(|| {
+                    format!(
+                        "LLM call failed for model {model}; fallback model {DEFAULT_DECIDE_FALLBACK_MODEL} also failed: {error}"
+                    )
+                })
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn call_claude_print(model: &str, prompt: &str) -> anyhow::Result<String> {
+    let config = AgentConfig {
+        model: Some(model.to_string()),
+        access_mode: AccessMode::ReadOnly,
+        ephemeral_session: true,
+        ..Default::default()
+    };
+    let args = ClaudeDriver.build_session_args(&config)?;
+    let mut command = Command::new(ClaudeDriver.name());
+    command.arg("--print");
+    command.args(args.args);
+    command.arg(prompt);
+    for (key, value) in args.env {
+        command.env(key, value);
+    }
+
+    let output = command
+        .output()
+        .await
+        .with_context(|| format!("failed to run {}", ClaudeDriver.name()))?;
+    if let Some(temp_dir) = args.temp_dir {
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+    anyhow::ensure!(
+        output.status.success(),
+        "{} exited with status {}: {}",
+        ClaudeDriver.name(),
+        output.status,
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -256,11 +367,15 @@ pub trait AgentDriver: Send + Sync {
     fn parse_context_response(&self, output: &str) -> Option<ContextInfo>;
 
     /// Return patterns that match interactive prompts for this agent backend.
-    fn interaction_patterns(&self) -> Vec<InteractionPattern> { vec![] }
+    fn interaction_patterns(&self) -> Vec<InteractionPattern> {
+        vec![]
+    }
 
     /// Return regex patterns for destructive commands that should always
     /// escalate to human approval, even when auto-approve is on.
-    fn destructive_blocklist(&self) -> &[&str] { shared_destructive_patterns() }
+    fn destructive_blocklist(&self) -> &[&str] {
+        shared_destructive_patterns()
+    }
 }
 
 // ===========================================================================
@@ -276,23 +391,26 @@ impl AgentDriver for ClaudeDriver {
     }
 
     fn capabilities(&self) -> AgentCapabilities {
-        AgentCapabilities {
-            worker_execution: true,
-            prompt_refinement: true,
-            branch_choice: true,
-            loop_verdict: true,
-            structured_output: true,
-            session_reuse: true,
-            native_json_schema: true,
-            model_selection: true,
-            reasoning_config: false,
-            system_prompt: true,
-            budget_limit: true,
-            turn_limit: true,
-            cost_reporting: true,
-            tool_allowlist: true,
-            web_search: true,
-        }
+        registry_capabilities_or(
+            self.name(),
+            AgentCapabilities {
+                worker_execution: true,
+                prompt_refinement: true,
+                branch_choice: true,
+                loop_verdict: true,
+                structured_output: true,
+                session_reuse: true,
+                native_json_schema: true,
+                model_selection: true,
+                reasoning_config: false,
+                system_prompt: true,
+                budget_limit: true,
+                turn_limit: true,
+                cost_reporting: true,
+                tool_allowlist: true,
+                web_search: true,
+            },
+        )
     }
 
     fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
@@ -350,14 +468,7 @@ impl AgentDriver for ClaudeDriver {
                     args.push("plan".to_string());
                 }
                 AccessMode::Edit => {
-                    for tool in &[
-                        "Read",
-                        "Edit",
-                        "Write",
-                        "Glob",
-                        "Grep",
-                        "Bash(git *)",
-                    ] {
+                    for tool in &["Read", "Edit", "Write", "Glob", "Grep", "Bash(git *)"] {
                         args.push("--allowedTools".to_string());
                         args.push(tool.to_string());
                     }
@@ -383,9 +494,15 @@ impl AgentDriver for ClaudeDriver {
         })
     }
 
-    fn cost_command(&self) -> Option<&str> { Some("/cost") }
-    fn context_command(&self) -> Option<&str> { Some("/context") }
-    fn exit_command(&self) -> &str { "/exit" }
+    fn cost_command(&self) -> Option<&str> {
+        Some("/cost")
+    }
+    fn context_command(&self) -> Option<&str> {
+        Some("/context")
+    }
+    fn exit_command(&self) -> &str {
+        "/exit"
+    }
 
     fn parse_cost_response(&self, output: &str) -> Option<CostInfo> {
         crate::pty_output::parse_claude_cost(output)
@@ -398,7 +515,9 @@ impl AgentDriver for ClaudeDriver {
     fn interaction_patterns(&self) -> Vec<InteractionPattern> {
         vec![
             InteractionPattern {
-                kind: InteractionKind::AutoRespond { response: "y".to_string() },
+                kind: InteractionKind::AutoRespond {
+                    response: "y".to_string(),
+                },
                 pattern: r"(?i)do you trust.*\?\s*$".to_string(),
                 description: "Trust folder prompt".to_string(),
             },
@@ -434,23 +553,26 @@ impl AgentDriver for CodexDriver {
     }
 
     fn capabilities(&self) -> AgentCapabilities {
-        AgentCapabilities {
-            worker_execution: true,
-            prompt_refinement: false,
-            branch_choice: false,
-            loop_verdict: false,
-            structured_output: true,
-            session_reuse: true,
-            native_json_schema: true,
-            model_selection: true,
-            reasoning_config: true,
-            system_prompt: false,
-            budget_limit: false,
-            turn_limit: false,
-            cost_reporting: false,
-            tool_allowlist: false,
-            web_search: true,
-        }
+        registry_capabilities_or(
+            self.name(),
+            AgentCapabilities {
+                worker_execution: true,
+                prompt_refinement: false,
+                branch_choice: false,
+                loop_verdict: false,
+                structured_output: true,
+                session_reuse: true,
+                native_json_schema: true,
+                model_selection: true,
+                reasoning_config: true,
+                system_prompt: false,
+                budget_limit: false,
+                turn_limit: false,
+                cost_reporting: false,
+                tool_allowlist: false,
+                web_search: true,
+            },
+        )
     }
 
     fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
@@ -524,20 +646,28 @@ impl AgentDriver for CodexDriver {
         })
     }
 
-    fn cost_command(&self) -> Option<&str> { None }
-    fn context_command(&self) -> Option<&str> { None }
-    fn exit_command(&self) -> &str { "/exit" }
-    fn parse_cost_response(&self, _output: &str) -> Option<CostInfo> { None }
-    fn parse_context_response(&self, _output: &str) -> Option<ContextInfo> { None }
+    fn cost_command(&self) -> Option<&str> {
+        None
+    }
+    fn context_command(&self) -> Option<&str> {
+        None
+    }
+    fn exit_command(&self) -> &str {
+        "/exit"
+    }
+    fn parse_cost_response(&self, _output: &str) -> Option<CostInfo> {
+        None
+    }
+    fn parse_context_response(&self, _output: &str) -> Option<ContextInfo> {
+        None
+    }
 
     fn interaction_patterns(&self) -> Vec<InteractionPattern> {
-        vec![
-            InteractionPattern {
-                kind: InteractionKind::PermissionRequest,
-                pattern: r"(?i)allow this action.*\[y/n\]".to_string(),
-                description: "Action approval prompt".to_string(),
-            },
-        ]
+        vec![InteractionPattern {
+            kind: InteractionKind::PermissionRequest,
+            pattern: r"(?i)allow this action.*\[y/n\]".to_string(),
+            description: "Action approval prompt".to_string(),
+        }]
     }
 }
 
@@ -606,15 +736,11 @@ impl GeminiDriver {
             .tempdir()
             .context("Failed to create temp directory for Gemini settings")?;
         let settings_path = temp_dir.path().join("settings.json");
-        std::fs::write(
-            &settings_path,
-            serde_json::to_string_pretty(settings)?,
-        )
-        .context("Failed to write Gemini temp settings")?;
+        std::fs::write(&settings_path, serde_json::to_string_pretty(settings)?)
+            .context("Failed to write Gemini temp settings")?;
         // keep() prevents automatic cleanup — caller is responsible for removal
         Ok(temp_dir.keep())
     }
-
 }
 
 /// Generate a human-readable schema description for prompt injection (structured output fallback).
@@ -627,10 +753,7 @@ pub fn schema_to_prompt_hint(schema: &Value) -> String {
             .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
             .unwrap_or_default();
         for (name, prop) in props {
-            let ty = prop
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("any");
+            let ty = prop.get("type").and_then(|v| v.as_str()).unwrap_or("any");
             let desc = prop
                 .get("description")
                 .and_then(|v| v.as_str())
@@ -659,23 +782,26 @@ impl AgentDriver for GeminiDriver {
     }
 
     fn capabilities(&self) -> AgentCapabilities {
-        AgentCapabilities {
-            worker_execution: true,
-            prompt_refinement: true,
-            branch_choice: true,
-            loop_verdict: true,
-            structured_output: true,
-            native_json_schema: false,
-            session_reuse: true,
-            model_selection: true,
-            reasoning_config: true,
-            system_prompt: false,
-            budget_limit: false,
-            turn_limit: false,
-            cost_reporting: false,
-            tool_allowlist: false,
-            web_search: true,
-        }
+        registry_capabilities_or(
+            self.name(),
+            AgentCapabilities {
+                worker_execution: true,
+                prompt_refinement: true,
+                branch_choice: true,
+                loop_verdict: true,
+                structured_output: true,
+                native_json_schema: false,
+                session_reuse: true,
+                model_selection: true,
+                reasoning_config: true,
+                system_prompt: false,
+                budget_limit: false,
+                turn_limit: false,
+                cost_reporting: false,
+                tool_allowlist: false,
+                web_search: true,
+            },
+        )
     }
 
     fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
@@ -725,20 +851,96 @@ impl AgentDriver for GeminiDriver {
         })
     }
 
-    fn cost_command(&self) -> Option<&str> { None }
-    fn context_command(&self) -> Option<&str> { None }
-    fn exit_command(&self) -> &str { "/exit" }
-    fn parse_cost_response(&self, _output: &str) -> Option<CostInfo> { None }
-    fn parse_context_response(&self, _output: &str) -> Option<ContextInfo> { None }
+    fn cost_command(&self) -> Option<&str> {
+        None
+    }
+    fn context_command(&self) -> Option<&str> {
+        None
+    }
+    fn exit_command(&self) -> &str {
+        "/exit"
+    }
+    fn parse_cost_response(&self, _output: &str) -> Option<CostInfo> {
+        None
+    }
+    fn parse_context_response(&self, _output: &str) -> Option<ContextInfo> {
+        None
+    }
 
     fn interaction_patterns(&self) -> Vec<InteractionPattern> {
-        vec![
-            InteractionPattern {
-                kind: InteractionKind::PermissionRequest,
-                pattern: r"(?i)approve.*\?\s*\(y/n\)".to_string(),
-                description: "Approval prompt".to_string(),
-            },
-        ]
+        vec![InteractionPattern {
+            kind: InteractionKind::PermissionRequest,
+            pattern: r"(?i)approve.*\?\s*\(y/n\)".to_string(),
+            description: "Approval prompt".to_string(),
+        }]
+    }
+}
+
+// ===========================================================================
+// Generic tmux-tools registry profile driver
+// ===========================================================================
+
+/// Driver for user-defined tmux-tools registry profiles.
+pub struct RegistryProfileDriver {
+    name: String,
+}
+
+impl RegistryProfileDriver {
+    fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl AgentDriver for RegistryProfileDriver {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn capabilities(&self) -> AgentCapabilities {
+        capabilities_from_registry(&self.name).unwrap_or(AgentCapabilities {
+            worker_execution: true,
+            prompt_refinement: false,
+            branch_choice: false,
+            loop_verdict: false,
+            structured_output: false,
+            session_reuse: false,
+            native_json_schema: false,
+            model_selection: false,
+            reasoning_config: false,
+            system_prompt: false,
+            budget_limit: false,
+            turn_limit: false,
+            cost_reporting: false,
+            tool_allowlist: false,
+            web_search: false,
+        })
+    }
+
+    fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
+        let registry = agents::Registry::load()?;
+        let profile = registry_access_profile(config);
+        let (_binary, args) = registry.launch_argv(&self.name, Some(&profile))?;
+        Ok(CommandArgs {
+            args,
+            env: Vec::new(),
+            temp_dir: None,
+        })
+    }
+
+    fn cost_command(&self) -> Option<&str> {
+        None
+    }
+    fn context_command(&self) -> Option<&str> {
+        None
+    }
+    fn exit_command(&self) -> &str {
+        "/exit"
+    }
+    fn parse_cost_response(&self, _output: &str) -> Option<CostInfo> {
+        None
+    }
+    fn parse_context_response(&self, _output: &str) -> Option<ContextInfo> {
+        None
     }
 }
 
@@ -752,17 +954,29 @@ pub fn get_driver(name: &str) -> Option<Box<dyn AgentDriver>> {
         "claude" => Some(Box::new(ClaudeDriver)),
         "codex" => Some(Box::new(CodexDriver)),
         "gemini" => Some(Box::new(GeminiDriver)),
-        _ => None,
+        _ => agents::Registry::load().ok().and_then(|registry| {
+            registry
+                .get(name)
+                .map(|_| Box::new(RegistryProfileDriver::new(name)) as Box<dyn AgentDriver>)
+        }),
     }
 }
 
 /// Return every registered driver.
 pub fn all_drivers() -> Vec<Box<dyn AgentDriver>> {
-    vec![
-        Box::new(ClaudeDriver),
-        Box::new(CodexDriver),
-        Box::new(GeminiDriver),
-    ]
+    let Ok(registry) = agents::Registry::load() else {
+        return vec![
+            Box::new(ClaudeDriver),
+            Box::new(CodexDriver),
+            Box::new(GeminiDriver),
+        ];
+    };
+
+    registry
+        .agents()
+        .keys()
+        .filter_map(|name| get_driver(name))
+        .collect()
 }
 
 // ===========================================================================
@@ -820,7 +1034,10 @@ mod tests {
             ..default_config()
         };
         let cmd = driver.build_session_args(&config).unwrap();
-        assert_eq!(arg_after(&cmd.args, "--model"), Some("claude-sonnet-4-20250514"));
+        assert_eq!(
+            arg_after(&cmd.args, "--model"),
+            Some("claude-sonnet-4-20250514")
+        );
     }
 
     #[test]
@@ -1017,7 +1234,10 @@ mod tests {
             ..default_config()
         };
         let cmd = driver.build_session_args(&config).unwrap();
-        assert_eq!(arg_after(&cmd.args, "-c"), Some("model_reasoning_effort=high"));
+        assert_eq!(
+            arg_after(&cmd.args, "-c"),
+            Some("model_reasoning_effort=high")
+        );
     }
 
     #[test]
@@ -1541,13 +1761,21 @@ mod tests {
             max_turns: Some(10),
             max_budget_usd: Some(2.0),
             access_mode: AccessMode::Edit,
-            tool_toggles: ToolToggles { web_search: Some(false) },
+            tool_toggles: ToolToggles {
+                web_search: Some(false),
+            },
             ephemeral_session: true,
             ..default_config()
         };
         let cmd = driver.build_session_args(&config).unwrap();
-        assert_eq!(arg_after(&cmd.args, "--model"), Some("claude-opus-4-20250514"));
-        assert_eq!(arg_after(&cmd.args, "--append-system-prompt"), Some("You are helpful."));
+        assert_eq!(
+            arg_after(&cmd.args, "--model"),
+            Some("claude-opus-4-20250514")
+        );
+        assert_eq!(
+            arg_after(&cmd.args, "--append-system-prompt"),
+            Some("You are helpful.")
+        );
         assert_eq!(arg_after(&cmd.args, "--max-turns"), Some("10"));
         assert_eq!(arg_after(&cmd.args, "--max-budget-usd"), Some("2"));
         assert!(!args_contain(&cmd.args, "--json-schema"));
@@ -1562,13 +1790,18 @@ mod tests {
             model: Some("o3-mini".into()),
             reasoning_level: Some(ReasoningLevel::Medium),
             access_mode: AccessMode::Edit,
-            tool_toggles: ToolToggles { web_search: Some(true) },
+            tool_toggles: ToolToggles {
+                web_search: Some(true),
+            },
             ephemeral_session: true,
             ..default_config()
         };
         let cmd = driver.build_session_args(&config).unwrap();
         assert_eq!(arg_after(&cmd.args, "--model"), Some("o3-mini"));
-        assert_eq!(arg_after(&cmd.args, "-c"), Some("model_reasoning_effort=medium"));
+        assert_eq!(
+            arg_after(&cmd.args, "-c"),
+            Some("model_reasoning_effort=medium")
+        );
         assert_eq!(arg_after(&cmd.args, "--sandbox"), Some("workspace-write"));
         assert!(args_contain(&cmd.args, "--search"));
         assert!(args_contain(&cmd.args, "--ephemeral"));
@@ -1581,7 +1814,9 @@ mod tests {
             model: Some("gemini-2.5-flash".into()),
             reasoning_level: Some(ReasoningLevel::Low),
             access_mode: AccessMode::ReadOnly,
-            tool_toggles: ToolToggles { web_search: Some(true) },
+            tool_toggles: ToolToggles {
+                web_search: Some(true),
+            },
             ..default_config()
         };
         let cmd = driver.build_session_args(&config).unwrap();

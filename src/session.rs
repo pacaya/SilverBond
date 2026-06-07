@@ -4,13 +4,7 @@
 //! codex, gemini) in interactive mode using `expectrl`. Prompts are sent via
 //! PTY stdin, and responses are captured using sentinel-based completion detection.
 
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    process::Command,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, path::PathBuf, process::Command, sync::Arc, time::Duration};
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
@@ -133,8 +127,8 @@ impl SessionManager {
         // Force color/interactive mode hints
         cmd.env("TERM", "xterm-256color");
 
-        let expectrl_session = expectrl::Session::spawn(cmd)
-            .context("Failed to spawn agent process via expectrl")?;
+        let expectrl_session =
+            expectrl::Session::spawn(cmd).context("Failed to spawn agent process via expectrl")?;
 
         let session = ManagedSession {
             id: session_id.clone(),
@@ -146,7 +140,10 @@ impl SessionManager {
             last_activity: now,
         };
 
-        self.sessions.lock().await.insert(session_id.clone(), session);
+        self.sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), session);
         Ok(session_id)
     }
 
@@ -164,9 +161,7 @@ impl SessionManager {
         // Write the prompt — must be done under the lock briefly.
         {
             let mut sessions = self.sessions.lock().await;
-            let session = sessions
-                .get_mut(session_id)
-                .context("Session not found")?;
+            let session = sessions.get_mut(session_id).context("Session not found")?;
             session.state = SessionState::Processing;
             session.last_activity = Utc::now();
             session.output_history.push(SessionEntry {
@@ -195,9 +190,8 @@ impl SessionManager {
             session.session.set_expect_timeout(Some(timeout_duration));
 
             // Use regex with whitespace tolerance for sentinel matching
-            let sentinel_pattern = expectrl::Regex(
-                format!(r"\s*{}\s*", regex::escape(&sentinel_owned))
-            );
+            let sentinel_pattern =
+                expectrl::Regex(format!(r"\s*{}\s*", regex::escape(&sentinel_owned)));
 
             let captures = session
                 .session
@@ -241,11 +235,7 @@ impl SessionManager {
     ///
     /// Slash commands produce short, immediate responses — uses a brief
     /// fixed timeout and reads whatever is available.
-    pub async fn send_command(
-        &self,
-        session_id: &str,
-        command: &str,
-    ) -> anyhow::Result<String> {
+    pub async fn send_command(&self, session_id: &str, command: &str) -> anyhow::Result<String> {
         let sessions_ref = self.sessions.clone();
         let sid = session_id.to_string();
         let cmd = command.to_string();
@@ -254,10 +244,10 @@ impl SessionManager {
             // Send the command under the lock
             {
                 let mut sessions_guard = sessions_ref.blocking_lock();
-                let session = sessions_guard
-                    .get_mut(&sid)
-                    .context("Session not found")?;
-                session.session.send_line(&cmd)
+                let session = sessions_guard.get_mut(&sid).context("Session not found")?;
+                session
+                    .session
+                    .send_line(&cmd)
                     .context("Failed to send command to PTY")?;
                 Ok::<(), anyhow::Error>(())
             }?;
@@ -368,13 +358,9 @@ pub enum PromptEvent {
         output_so_far: String,
     },
     /// No new output for the intermediate timeout while the process is alive.
-    StaleDetected {
-        output_so_far: String,
-    },
+    StaleDetected { output_so_far: String },
     /// The total timeout was exceeded.
-    Timeout {
-        output_so_far: String,
-    },
+    Timeout { output_so_far: String },
 }
 
 impl SessionManager {
@@ -465,9 +451,7 @@ impl SessionManager {
         // Send the prompt
         {
             let mut sessions = self.sessions.lock().await;
-            let session = sessions
-                .get_mut(session_id)
-                .context("Session not found")?;
+            let session = sessions.get_mut(session_id).context("Session not found")?;
             session.state = SessionState::Processing;
             session.last_activity = Utc::now();
             session.output_history.push(SessionEntry {
@@ -494,8 +478,8 @@ impl SessionManager {
 
             let total_deadline = std::time::Instant::now() + total_timeout;
             let sentinel_pat_str = format!(r"\s*{}\s*", regex::escape(&sentinel_owned));
-            let sentinel_regex = regex::Regex::new(&sentinel_pat_str)
-                .context("Failed to compile sentinel regex")?;
+            let sentinel_regex =
+                regex::Regex::new(&sentinel_pat_str).context("Failed to compile sentinel regex")?;
 
             let mut accumulated_output = Vec::new();
             let mut accumulated_text = String::new();
@@ -574,9 +558,8 @@ impl SessionManager {
 
                         // Check sentinel in accumulated text
                         if sentinel_regex.is_match(&accumulated_text) {
-                            let parts: Vec<&str> = accumulated_text
-                                .splitn(2, &sentinel_owned)
-                                .collect();
+                            let parts: Vec<&str> =
+                                accumulated_text.splitn(2, &sentinel_owned).collect();
                             let response_text = parts[0].trim().to_string();
 
                             session.state = SessionState::Idle;
@@ -624,9 +607,7 @@ impl SessionManager {
         response: &str,
     ) -> anyhow::Result<()> {
         let mut sessions = self.sessions.lock().await;
-        let session = sessions
-            .get_mut(session_id)
-            .context("Session not found")?;
+        let session = sessions.get_mut(session_id).context("Session not found")?;
         session
             .session
             .send_line(response)
@@ -702,13 +683,7 @@ mod tests {
 
         // Spawn a simple shell session to verify lifecycle
         let session_id = sm
-            .create_session(
-                "test",
-                "/bin/sh",
-                vec![],
-                vec![],
-                "/tmp",
-            )
+            .create_session("test", "/bin/sh", vec![], vec![], "/tmp")
             .await
             .unwrap();
 

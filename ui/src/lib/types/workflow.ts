@@ -1,4 +1,20 @@
-export type WorkflowNodeType = "task" | "approval" | "split" | "collector";
+export type WorkflowNodeType =
+  | "task"
+  | "approval"
+  | "split"
+  | "collector"
+  | "decide"
+  | "parallel_batch"
+  | "subflow"
+  | "call"
+  | "spawn"
+  | "send"
+  | "wait"
+  | "capture"
+  | "kill"
+  | "run_agent";
+
+export type WaitMode = "idle" | "ready" | "until";
 export type WorkflowEdgeOutcome =
   | "success"
   | "reject"
@@ -101,6 +117,94 @@ export interface WorkflowUiState {
   canvas?: WorkflowUiCanvas;
 }
 
+/** A single input binding for decide / subflow / call nodes. */
+export interface InputBinding {
+  name: string;
+  source: string;
+}
+
+/** LLM-routed branch decision node. */
+export interface DecideConfig {
+  inputs?: InputBinding[];
+  prompt: string;
+  model?: string | null;
+  outcomes?: string[];
+}
+
+/** Fan-out over a collection, running a subgraph body per item. */
+export interface BatchConfig {
+  itemsBinding: string;
+  maxConcurrent: number;
+  itemVar: string;
+  bodyEntry: string;
+  collectorVar?: string | null;
+}
+
+/** Spawn an agent/command into a managed PTY pane. */
+export interface SpawnConfig {
+  agent?: string | null;
+  command?: string | null;
+  access?: string | null;
+  extraArgs?: string[];
+  cwd?: string | null;
+  name?: string | null;
+  sessionName?: string | null;
+}
+
+/** Send text/keys to a running pane. */
+export interface SendConfig {
+  target?: string | null;
+  text: string;
+  enter: boolean;
+}
+
+/** Wait on a pane until idle / ready / a marker appears. */
+export interface WaitConfig {
+  target?: string | null;
+  mode: WaitMode;
+  marker?: string | null;
+  timeout?: number | null;
+  idleSeconds?: number | null;
+  readyStableSeconds?: number | null;
+}
+
+/** Capture pane output into the run context. */
+export interface CaptureConfig {
+  target?: string | null;
+  lines?: number | null;
+  all: boolean;
+  ansi: boolean;
+}
+
+/** Terminate a running pane/session. */
+export interface KillConfig {
+  target?: string | null;
+  sessionName?: string | null;
+}
+
+/** One-shot: spawn an agent, wait for completion, capture, optionally kill. */
+export interface RunAgentConfig {
+  agent?: string | null;
+  prompt?: string | null;
+  cwd?: string | null;
+  access?: string | null;
+  extraArgs?: string[];
+  name?: string | null;
+  timeout?: number | null;
+  idleSeconds?: number | null;
+  readyStableSeconds?: number | null;
+  until?: string | null;
+  killAfter: boolean;
+}
+
+/** Reference to a reusable saved subgraph (compound node). */
+export interface SubflowConfig {
+  workflowName: string;
+  exitNodeId?: string | null;
+  inputs?: InputBinding[];
+  maxDepth: number;
+}
+
 export interface WorkflowNode {
   id: string;
   name: string;
@@ -120,6 +224,15 @@ export interface WorkflowNode {
   agentConfig?: AgentNodeConfig | null;
   cwd?: string | null;
   continueSessionFrom?: string | null;
+  decideConfig?: DecideConfig | null;
+  batchConfig?: BatchConfig | null;
+  spawnConfig?: SpawnConfig | null;
+  sendConfig?: SendConfig | null;
+  waitConfig?: WaitConfig | null;
+  captureConfig?: CaptureConfig | null;
+  killConfig?: KillConfig | null;
+  runAgentConfig?: RunAgentConfig | null;
+  subflowConfig?: SubflowConfig | null;
 }
 
 export interface WorkflowEdge {
@@ -144,6 +257,8 @@ export interface WorkflowDocument {
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
   agentDefaults?: Record<string, AgentDefaults>;
+  /** Run-local catalog of saved subgraphs referenced by subflow/call nodes. */
+  subflows?: Record<string, WorkflowDocument>;
   ui?: WorkflowUiState;
 }
 

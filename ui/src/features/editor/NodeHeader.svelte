@@ -17,6 +17,16 @@
     approval: "var(--amber)",
     split: "var(--teal)",
     collector: "var(--purple)",
+    decide: "rgb(168, 85, 247)",
+    parallel_batch: "rgb(234, 179, 8)",
+    subflow: "rgb(56, 189, 248)",
+    call: "rgb(14, 165, 233)",
+    spawn: "rgb(34, 197, 94)",
+    send: "rgb(132, 204, 22)",
+    wait: "rgb(148, 163, 184)",
+    capture: "rgb(20, 184, 166)",
+    kill: "rgb(239, 68, 68)",
+    run_agent: "rgb(129, 140, 248)",
   };
 
   function toggleEntryNode() {

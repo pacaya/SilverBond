@@ -1,9 +1,3 @@
-use silverbond::{
-    api,
-    app::{AppPaths, AppState},
-    runtime::RuntimeContext,
-    storage::{Database, TemplateStore, WorkflowStore},
-};
 use axum::{
     Router,
     body::Body,
@@ -11,6 +5,12 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use silverbond::{
+    api,
+    app::{AppPaths, AppState},
+    runtime::RuntimeContext,
+    storage::{Database, TemplateStore, WorkflowStore},
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
@@ -282,9 +282,28 @@ async fn exposes_capabilities() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(capabilities["workflowVersion"], 3);
-    assert_eq!(capabilities["supportedNodeTypes"], json!(["task", "approval", "split", "collector"]));
+    assert_eq!(
+        capabilities["supportedNodeTypes"],
+        json!([
+            "task",
+            "approval",
+            "split",
+            "collector",
+            "decide",
+            "parallel_batch",
+            "subflow",
+            "call",
+            "spawn",
+            "send",
+            "wait",
+            "capture",
+            "kill",
+            "run_agent"
+        ])
+    );
     assert_eq!(capabilities["features"]["split"], true);
     assert_eq!(capabilities["features"]["collector"], true);
+    assert_eq!(capabilities["features"]["subflow"], true);
 
     // Verify capability flags match expected values for claude
     let claude_caps = &capabilities["agents"]["claude"]["capabilities"];
