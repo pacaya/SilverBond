@@ -56,7 +56,7 @@
       "name": "Batch Test",
       "type": "parallel_batch",
       "batchConfig": {
-        "itemsBinding": "node:batch-impl.output.impl_results",
+        "itemsBinding": "node:batch-impl.output.items",
         "maxConcurrent": 4,
         "itemVar": "impl",
         "bodyEntry": "test-item",
@@ -81,7 +81,7 @@
         "inputs": [
           {
             "name": "review_scope",
-            "source": "node:batch-test.output.test_results"
+            "source": "node:batch-test.output.items"
           }
         ]
       }
@@ -91,7 +91,7 @@
       "name": "Batch Fixes",
       "type": "parallel_batch",
       "batchConfig": {
-        "itemsBinding": "node:batch-test.output.test_results",
+        "itemsBinding": "node:batch-test.output.items",
         "maxConcurrent": 4,
         "itemVar": "fix",
         "bodyEntry": "fix-item",
@@ -113,7 +113,7 @@
       "type": "run_agent",
       "runAgentConfig": {
         "agent": "claude",
-        "prompt": "Consolidate the multi-agent implementation run into a final summary. Plan: {{var:plan_doc}}\n\nImplementation results:\n{{node:batch-impl.output.impl_results}}\n\nTest results:\n{{node:batch-test.output.test_results}}\n\nReview:\n{{node:dual-review-call.output}}\n\nFix results:\n{{node:batch-fixes.output.fix_results}}"
+        "prompt": "Consolidate the multi-agent implementation run into a final summary. Plan: {{var:plan_doc}}\n\nImplementation results:\n{{node:batch-impl.output.items}}\n\nTest results:\n{{node:batch-test.output.items}}\n\nReview:\n{{node:dual-review-call.output}}\n\nFix results:\n{{node:batch-fixes.output.items}}"
       }
     }
   ],

@@ -785,12 +785,62 @@ pub fn ensure_defaults(mut workflow: WorkflowV3) -> WorkflowV3 {
 
 pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
     let workflow = ensure_defaults(workflow);
-    let graph = workflow.graph();
     let mut issues = Vec::new();
-    let mut seen_nodes = BTreeSet::new();
-    let mut seen_edges = BTreeSet::new();
 
     validate_run_as_config(workflow.run_as.as_ref(), &mut issues);
+    validate_graph_body(&workflow, &workflow.subflows, "", &mut issues);
+
+    let graph = workflow.graph();
+    if graph
+        .node_map
+        .get(workflow.entry_node_id.as_str())
+        .is_none()
+    {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: None,
+            message: format!(
+                "entryNodeId \"{}\" references a non-existent node.",
+                workflow.entry_node_id
+            ),
+        });
+    }
+
+    validate_subflow_catalog(&workflow, &mut issues);
+    validate_subflow_call_cycles(&workflow, &mut issues);
+
+    let graph_meta = compute_graph_metadata(&workflow);
+    for node_id in &graph_meta.unreachable_node_ids {
+        let name = graph
+            .node_map
+            .get(node_id.as_str())
+            .map(|node| node.name.clone())
+            .unwrap_or_else(|| node_id.clone());
+        issues.push(ValidationIssue {
+            severity: "warning".to_string(),
+            node_id: Some(node_id.clone()),
+            message: format!("\"{}\" is unreachable from the entry node.", name),
+        });
+    }
+
+    ValidationResult {
+        workflow,
+        notices: Vec::new(),
+        issues,
+        graph: graph_meta,
+    }
+}
+
+fn validate_graph_body(
+    workflow: &WorkflowV3,
+    subflows: &BTreeMap<String, Box<WorkflowV3>>,
+    prefix: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let issue_start = issues.len();
+    let graph = workflow.graph();
+    let mut seen_nodes = BTreeSet::new();
+    let mut seen_edges = BTreeSet::new();
 
     for node in &workflow.nodes {
         if !seen_nodes.insert(node.id.clone()) {
@@ -819,7 +869,7 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
             });
         }
 
-        validate_tmux_node_config(node, &mut issues);
+        validate_tmux_node_config(node, issues);
 
         if node.output_schema.is_some() && node.response_format != Some(ResponseFormat::Json) {
             issues.push(ValidationIssue {
@@ -857,13 +907,13 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
             .count();
 
         if node.node_type == WorkflowNodeType::Decide {
-            validate_decide_node_config(node, outgoing, &mut issues);
+            validate_decide_node_config(node, outgoing, issues);
         }
         if node.node_type == WorkflowNodeType::ParallelBatch {
-            validate_batch_node_config(node, &graph, &mut issues);
+            validate_batch_node_config(node, &graph, issues);
         }
         if is_subflow_node_type(&node.node_type) {
-            validate_subflow_node_config(node, &workflow.subflows, &mut issues);
+            validate_subflow_node_config(node, subflows, issues);
         }
 
         if success_edges > 1 {
@@ -1070,21 +1120,6 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
         }
     }
 
-    if graph
-        .node_map
-        .get(workflow.entry_node_id.as_str())
-        .is_none()
-    {
-        issues.push(ValidationIssue {
-            severity: "error".to_string(),
-            node_id: None,
-            message: format!(
-                "entryNodeId \"{}\" references a non-existent node.",
-                workflow.entry_node_id
-            ),
-        });
-    }
-
     for edge in &workflow.edges {
         if !seen_edges.insert(edge.id.clone()) {
             issues.push(ValidationIssue {
@@ -1109,28 +1144,19 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
         }
     }
 
-    validate_subflow_catalog(&workflow, &mut issues);
-    validate_subflow_call_cycles(&workflow, &mut issues);
+    scope_graph_body_issues(prefix, &mut issues[issue_start..]);
+}
 
-    let graph_meta = compute_graph_metadata(&workflow);
-    for node_id in &graph_meta.unreachable_node_ids {
-        let name = graph
-            .node_map
-            .get(node_id.as_str())
-            .map(|node| node.name.clone())
-            .unwrap_or_else(|| node_id.clone());
-        issues.push(ValidationIssue {
-            severity: "warning".to_string(),
-            node_id: Some(node_id.clone()),
-            message: format!("\"{}\" is unreachable from the entry node.", name),
-        });
+fn scope_graph_body_issues(prefix: &str, issues: &mut [ValidationIssue]) {
+    if prefix.is_empty() {
+        return;
     }
 
-    ValidationResult {
-        workflow,
-        notices: Vec::new(),
-        issues,
-        graph: graph_meta,
+    for issue in issues {
+        if let Some(node_id) = issue.node_id.as_mut() {
+            *node_id = format!("{prefix}:{node_id}");
+        }
+        issue.message = format!("{prefix}: {}", issue.message);
     }
 }
 
@@ -1143,16 +1169,30 @@ fn validate_run_as_config(run_as: Option<&RunAsConfig>, issues: &mut Vec<Validat
         tracing::warn!("workflow runAs has both user and command set; command takes precedence");
     }
 
-    if run_as.command.as_ref().is_some_and(Vec::is_empty) {
-        issues.push(ValidationIssue {
-            severity: "error".to_string(),
-            node_id: None,
-            message: "runAs.command must not be empty.".to_string(),
-        });
+    if let Some(command) = run_as.command.as_ref() {
+        if command.is_empty() {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: None,
+                message: "runAs.command must not be empty.".to_string(),
+            });
+        } else if command.iter().any(|token| token.trim().is_empty()) {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: None,
+                message: "runAs.command must not contain blank tokens.".to_string(),
+            });
+        }
     }
 
     if let Some(user) = run_as.user.as_deref() {
-        if user.chars().any(is_run_as_user_shell_metachar) {
+        if user.trim().is_empty() {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: None,
+                message: "runAs.user must not be empty.".to_string(),
+            });
+        } else if user.chars().any(is_run_as_user_shell_metachar) {
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: None,
@@ -1187,6 +1227,58 @@ fn is_run_as_user_shell_metachar(ch: char) -> bool {
                 | '#'
                 | '~'
         )
+}
+
+fn validate_wait_timing_and_marker(
+    node_id: &str,
+    node_name: &str,
+    until_marker: Option<&str>,
+    require_marker: bool,
+    idle_seconds: Option<f64>,
+    ready_stable_seconds: Option<f64>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    if require_marker && until_marker.is_none_or(|marker| marker.trim().is_empty()) {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: Some(node_id.to_string()),
+            message: format!(
+                "\"{}\" wait node with until mode requires a marker.",
+                node_name
+            ),
+        });
+    }
+
+    if let Some(marker) = until_marker.filter(|marker| !marker.trim().is_empty()) {
+        if let Err(error) = regex_engine::Regex::new(marker) {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node_id.to_string()),
+                message: format!(
+                    "\"{}\" has invalid wait marker regex: {}",
+                    node_name, error
+                ),
+            });
+        }
+    }
+
+    for (field_name, value) in [
+        ("idle_seconds", idle_seconds),
+        ("ready_stable_seconds", ready_stable_seconds),
+    ] {
+        if let Some(value) = value
+            && (!value.is_finite() || value < 0.0)
+        {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node_id.to_string()),
+                message: format!(
+                    "\"{}\" {} must be a finite non-negative number.",
+                    node_name, field_name
+                ),
+            });
+        }
+    }
 }
 
 fn validate_tmux_node_config(node: &WorkflowNode, issues: &mut Vec<ValidationIssue>) {
@@ -1224,20 +1316,15 @@ fn validate_tmux_node_config(node: &WorkflowNode, issues: &mut Vec<ValidationIss
         }
         WorkflowNodeType::Wait => {
             let config = node.wait_config.as_ref();
-            if config.is_some_and(|cfg| cfg.mode == WaitMode::Until)
-                && config
-                    .and_then(|cfg| cfg.marker.as_deref())
-                    .is_none_or(|marker| marker.trim().is_empty())
-            {
-                issues.push(ValidationIssue {
-                    severity: "error".to_string(),
-                    node_id: Some(node.id.clone()),
-                    message: format!(
-                        "\"{}\" wait node with until mode requires a marker.",
-                        node.name
-                    ),
-                });
-            }
+            validate_wait_timing_and_marker(
+                &node.id,
+                &node.name,
+                config.and_then(|cfg| cfg.marker.as_deref()),
+                config.is_some_and(|cfg| cfg.mode == WaitMode::Until),
+                config.and_then(|cfg| cfg.idle_seconds),
+                config.and_then(|cfg| cfg.ready_stable_seconds),
+                issues,
+            );
         }
         WorkflowNodeType::RunAgent => {
             let has_agent = node
@@ -1265,6 +1352,16 @@ fn validate_tmux_node_config(node: &WorkflowNode, issues: &mut Vec<ValidationIss
                     message: format!("\"{}\" run_agent node has an empty prompt.", node.name),
                 });
             }
+            let config = node.run_agent_config.as_ref();
+            validate_wait_timing_and_marker(
+                &node.id,
+                &node.name,
+                config.and_then(|cfg| cfg.until.as_deref()),
+                false,
+                config.and_then(|cfg| cfg.idle_seconds),
+                config.and_then(|cfg| cfg.ready_stable_seconds),
+                issues,
+            );
         }
         WorkflowNodeType::Task
         | WorkflowNodeType::Approval
@@ -1304,11 +1401,8 @@ fn validate_subflow_catalog(workflow: &WorkflowV3, issues: &mut Vec<ValidationIs
             });
         }
 
-        for node in &subflow.nodes {
-            if is_subflow_node_type(&node.node_type) {
-                validate_subflow_node_config(node, &workflow.subflows, issues);
-            }
-        }
+        let prefix = format!("subflow:{subflow_name}");
+        validate_graph_body(subflow, &workflow.subflows, &prefix, issues);
     }
 }
 
@@ -2041,6 +2135,45 @@ mod tests {
     }
 
     #[test]
+    fn validates_run_as_rejects_blank_command_tokens_and_empty_user() {
+        let blank_token = {
+            let mut workflow = workflow(Vec::new(), Vec::new(), "missing");
+            workflow.run_as = Some(RunAsConfig {
+                command: Some(vec!["".to_string()]),
+                ..Default::default()
+            });
+            validate_workflow(workflow)
+        };
+        assert!(blank_token.issues.iter().any(|issue| {
+            issue.severity == "error" && issue.message.contains("blank tokens")
+        }));
+
+        let whitespace_token = {
+            let mut workflow = workflow(Vec::new(), Vec::new(), "missing");
+            workflow.run_as = Some(RunAsConfig {
+                command: Some(vec!["tmux".to_string(), "   ".to_string()]),
+                ..Default::default()
+            });
+            validate_workflow(workflow)
+        };
+        assert!(whitespace_token.issues.iter().any(|issue| {
+            issue.severity == "error" && issue.message.contains("blank tokens")
+        }));
+
+        let empty_user = {
+            let mut workflow = workflow(Vec::new(), Vec::new(), "missing");
+            workflow.run_as = Some(RunAsConfig {
+                user: Some("".to_string()),
+                ..Default::default()
+            });
+            validate_workflow(workflow)
+        };
+        assert!(empty_user.issues.iter().any(|issue| {
+            issue.severity == "error" && issue.message.contains("runAs.user must not be empty")
+        }));
+    }
+
+    #[test]
     fn evaluates_conditions() {
         let (matched, error) = evaluate_condition(
             &json!({ "score": 12, "status": "ok" }),
@@ -2504,6 +2637,82 @@ mod tests {
     }
 
     #[test]
+    fn validates_subflow_body_rules_with_scoped_issues() {
+        let mut call = node("call", "Call Broken", WorkflowNodeType::Call);
+        call.subflow_config = Some(SubflowConfig {
+            workflow_name: "broken".to_string(),
+            exit_node_id: Some("exit".to_string()),
+            inputs: Vec::new(),
+            max_depth: default_max_call_depth(),
+        });
+
+        let mut decide = node("decide", "Route", WorkflowNodeType::Decide);
+        decide.decide_config = Some(DecideConfig {
+            inputs: Vec::new(),
+            prompt: "Choose a route".to_string(),
+            model: None,
+            outcomes: vec!["yes".to_string(), "no".to_string()],
+        });
+        let mut exit = node("exit", "Exit", WorkflowNodeType::Task);
+        exit.agent = Some("claude".to_string());
+        exit.prompt = "Finish".to_string();
+
+        let broken_subflow = workflow(
+            vec![decide, exit],
+            vec![
+                WorkflowEdge {
+                    id: "branch_yes".to_string(),
+                    from: "decide".to_string(),
+                    to: "exit".to_string(),
+                    outcome: WorkflowEdgeOutcome::Branch,
+                    label: Some("yes".to_string()),
+                    branch_id: None,
+                    condition: None,
+                },
+                WorkflowEdge {
+                    id: "branch_maybe".to_string(),
+                    from: "decide".to_string(),
+                    to: "missing".to_string(),
+                    outcome: WorkflowEdgeOutcome::Branch,
+                    label: Some("maybe".to_string()),
+                    branch_id: None,
+                    condition: None,
+                },
+            ],
+            "decide",
+        );
+        let mut parent = workflow(vec![call], vec![], "call");
+        parent
+            .subflows
+            .insert("broken".to_string(), Box::new(broken_subflow));
+
+        let result = validate_workflow(parent);
+
+        assert!(
+            result.issues.iter().any(|issue| {
+                issue.severity == "error"
+                    && issue.node_id.as_deref() == Some("subflow:broken:decide")
+                    && issue.message.contains("subflow:broken")
+                    && issue
+                        .message
+                        .contains("does not match an outgoing branch edge label")
+            }),
+            "expected scoped decide validation error, got {:?}",
+            result.issues
+        );
+        assert!(
+            result.issues.iter().any(|issue| {
+                issue.severity == "error"
+                    && issue.node_id.as_deref() == Some("subflow:broken:decide")
+                    && issue.message.contains("subflow:broken")
+                    && issue.message.contains("references unknown target node")
+            }),
+            "expected scoped dangling edge validation error, got {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
     fn warns_on_subflow_call_cycles() {
         let mut call = node("call", "Recursive Call", WorkflowNodeType::Call);
         call.subflow_config = Some(SubflowConfig {
@@ -2545,6 +2754,53 @@ mod tests {
                 .any(|issue| issue.severity == "error" && issue.message.contains("marker")),
             "expected marker validation error, got {:?}",
             result.issues
+        );
+
+        let mut invalid_regex = node("wait", "Wait", WorkflowNodeType::Wait);
+        invalid_regex.wait_config = Some(WaitConfig {
+            mode: WaitMode::Until,
+            marker: Some("[unclosed".to_string()),
+            ..Default::default()
+        });
+        let invalid_regex_result = validate_workflow(workflow(vec![invalid_regex], vec![], "wait"));
+        assert!(
+            invalid_regex_result.issues.iter().any(|issue| {
+                issue.severity == "error" && issue.message.contains("invalid wait marker regex")
+            }),
+            "expected invalid regex error, got {:?}",
+            invalid_regex_result.issues
+        );
+
+        let mut negative_idle = node("wait", "Wait", WorkflowNodeType::Wait);
+        negative_idle.wait_config = Some(WaitConfig {
+            idle_seconds: Some(-1.0),
+            ..Default::default()
+        });
+        let negative_idle_result = validate_workflow(workflow(vec![negative_idle], vec![], "wait"));
+        assert!(
+            negative_idle_result.issues.iter().any(|issue| {
+                issue.severity == "error"
+                    && issue.message.contains("idle_seconds")
+                    && issue.message.contains("finite non-negative")
+            }),
+            "expected negative idle_seconds error, got {:?}",
+            negative_idle_result.issues
+        );
+
+        let mut nan_ready = node("wait", "Wait", WorkflowNodeType::Wait);
+        nan_ready.wait_config = Some(WaitConfig {
+            ready_stable_seconds: Some(f64::NAN),
+            ..Default::default()
+        });
+        let nan_ready_result = validate_workflow(workflow(vec![nan_ready], vec![], "wait"));
+        assert!(
+            nan_ready_result.issues.iter().any(|issue| {
+                issue.severity == "error"
+                    && issue.message.contains("ready_stable_seconds")
+                    && issue.message.contains("finite non-negative")
+            }),
+            "expected NaN ready_stable_seconds error, got {:?}",
+            nan_ready_result.issues
         );
     }
 

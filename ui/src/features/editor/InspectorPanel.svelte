@@ -570,6 +570,7 @@
               <span>Idle seconds</span>
               <input
                 type="number"
+                min="0"
                 step="0.5"
                 value={rc.idleSeconds ?? ""}
                 placeholder="default"
@@ -580,6 +581,7 @@
               <span>Ready-stable (s)</span>
               <input
                 type="number"
+                min="0"
                 step="0.5"
                 value={rc.readyStableSeconds ?? ""}
                 placeholder="default"
@@ -1149,6 +1151,7 @@
               <span>Idle seconds</span>
               <input
                 type="number"
+                min="0"
                 step="0.5"
                 value={wc.idleSeconds ?? ""}
                 placeholder="default"
@@ -1161,6 +1164,7 @@
               <span>Ready-stable (s)</span>
               <input
                 type="number"
+                min="0"
                 step="0.5"
                 value={wc.readyStableSeconds ?? ""}
                 placeholder="default"
