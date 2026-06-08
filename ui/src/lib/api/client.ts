@@ -55,9 +55,9 @@ export const api = {
     postJson<{ success: boolean }>(
       `/api/runs/${encodeURIComponent(runId)}/approve`, { approved, userInput },
     ),
-  respondToInteraction: (runId: string, response: string) =>
+  respondToInteraction: (runId: string, sessionId: string, response: string) =>
     postJson<{ success: boolean }>(
-      `/api/runs/${encodeURIComponent(runId)}/respond-interaction`, { response },
+      `/api/runs/${encodeURIComponent(runId)}/respond-interaction`, { sessionId, response },
     ),
   abortRun: (runId: string) =>
     postJson<{ success: boolean }>(`/api/runs/${encodeURIComponent(runId)}/abort`),

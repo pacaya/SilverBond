@@ -528,7 +528,7 @@ struct ActiveRun {
     sender: broadcast::Sender<RuntimeEvent>,
     abort_flag: Arc<AtomicBool>,
     approval_sender: Arc<Mutex<Option<oneshot::Sender<ApprovalDecision>>>>,
-    interaction_sender: Arc<Mutex<Option<oneshot::Sender<String>>>>,
+    interaction_senders: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
     active_panes: Arc<Mutex<BTreeMap<String, String>>>,
 }
 
@@ -546,7 +546,7 @@ impl RunRegistry {
                 sender,
                 abort_flag: Arc::new(AtomicBool::new(false)),
                 approval_sender: Arc::new(Mutex::new(None)),
-                interaction_sender: Arc::new(Mutex::new(None)),
+                interaction_senders: Arc::new(Mutex::new(HashMap::new())),
                 active_panes: Arc::new(Mutex::new(BTreeMap::new())),
             }
         });
@@ -629,6 +629,7 @@ impl RunRegistry {
     async fn set_pending_interaction(
         &self,
         run_id: &str,
+        session_id: &str,
         sender: oneshot::Sender<String>,
     ) -> anyhow::Result<()> {
         let active = self
@@ -638,13 +639,25 @@ impl RunRegistry {
             .get(run_id)
             .cloned()
             .context("run is not active")?;
-        *active.interaction_sender.lock().await = Some(sender);
+        let mut interactions = active.interaction_senders.lock().await;
+        anyhow::ensure!(
+            !interactions.contains_key(session_id),
+            "interaction already pending for this session"
+        );
+        interactions.insert(session_id.to_string(), sender);
         Ok(())
+    }
+
+    async fn clear_pending_interaction(&self, run_id: &str, session_id: &str) {
+        if let Some(active) = self.inner.lock().await.get(run_id).cloned() {
+            active.interaction_senders.lock().await.remove(session_id);
+        }
     }
 
     pub(crate) async fn resolve_interaction(
         &self,
         run_id: &str,
+        session_id: &str,
         response: String,
     ) -> anyhow::Result<()> {
         let active = self
@@ -654,9 +667,9 @@ impl RunRegistry {
             .get(run_id)
             .cloned()
             .context("no active interaction for this run")?;
-        let sender = active.interaction_sender.lock().await.take();
+        let sender = active.interaction_senders.lock().await.remove(session_id);
         let Some(sender) = sender else {
-            anyhow::bail!("no active interaction for this run");
+            anyhow::bail!("no active interaction for this run and session");
         };
         sender
             .send(response)
@@ -922,8 +935,15 @@ impl RuntimeContext {
         Ok(())
     }
 
-    pub async fn respond_interaction(&self, run_id: &str, response: String) -> anyhow::Result<()> {
-        self.registry.resolve_interaction(run_id, response).await
+    pub async fn respond_interaction(
+        &self,
+        run_id: &str,
+        session_id: &str,
+        response: String,
+    ) -> anyhow::Result<()> {
+        self.registry
+            .resolve_interaction(run_id, session_id, response)
+            .await
     }
 }
 
@@ -1069,6 +1089,7 @@ pub async fn run_node_preview(
             &prompt_clone,
             &cwd_string,
             Some(&config_clone),
+            None,
         )
     })
     .await
@@ -1676,12 +1697,8 @@ async fn execute_workflow(
     mut checkpoint: RuntimeCheckpoint,
     resumed: bool,
 ) -> anyhow::Result<()> {
-    let run_inv = ctx.run_invocation.clone().or_else(|| {
-        workflow
-            .run_as
-            .as_ref()
-            .map(crate::tmux_exec::build_tmux_invocation)
-    });
+    let run_inv =
+        resolve_workflow_invocation(ctx.run_invocation.clone(), workflow.run_as.clone()).await?;
     let ctx = RuntimeContext {
         run_invocation: run_inv,
         ..ctx
@@ -2200,6 +2217,35 @@ async fn handle_skipped_task(
     Ok(())
 }
 
+async fn resolve_workflow_invocation(
+    existing: Option<TmuxInvocation>,
+    run_as: Option<model::RunAsConfig>,
+) -> anyhow::Result<Option<TmuxInvocation>> {
+    resolve_workflow_invocation_with(existing, run_as, crate::tmux_exec::build_tmux_invocation)
+        .await
+}
+
+async fn resolve_workflow_invocation_with<F>(
+    existing: Option<TmuxInvocation>,
+    run_as: Option<model::RunAsConfig>,
+    build: F,
+) -> anyhow::Result<Option<TmuxInvocation>>
+where
+    F: FnOnce(&model::RunAsConfig) -> TmuxInvocation + Send + 'static,
+{
+    if existing.is_some() {
+        return Ok(existing);
+    }
+    let Some(run_as) = run_as else {
+        return Ok(None);
+    };
+
+    tokio::task::spawn_blocking(move || build(&run_as))
+        .await
+        .context("tmux invocation resolver task panicked")
+        .map(Some)
+}
+
 async fn handle_subflow_node(
     ctx: &RuntimeContext,
     root_workflow: &WorkflowV3,
@@ -2559,6 +2605,7 @@ async fn run_cursor_task(
             run_ctx.total_executed.saturating_sub(1),
             run_ctx.workflow_nodes_len,
             &run_ctx.cwd,
+            ctx.run_invocation.clone(),
         )
         .await?;
         if orchestrator.success && !orchestrator.output.is_empty() {
@@ -2720,8 +2767,9 @@ async fn run_decide_node(
     let cwd = run_ctx.cwd.clone();
     let agent = DEFAULT_AGENT.to_string();
     let prompt_for_task = resolved_prompt.clone();
+    let inv = ctx.run_invocation.clone();
     let result = tokio::task::spawn_blocking(move || {
-        crate::tmux_exec::run_tmux_oneshot(&agent, &prompt_for_task, &cwd, None)
+        crate::tmux_exec::run_tmux_oneshot(&agent, &prompt_for_task, &cwd, None, inv)
     })
     .await
     .context("join error in decide node")??;
@@ -4853,6 +4901,7 @@ async fn select_next_decision(
                 &result.output,
                 &branch_edges,
                 &checkpoint.cwd,
+                ctx.run_invocation.clone(),
             )
             .await?;
             let chosen_id = orchestration
@@ -5234,8 +5283,13 @@ pub(crate) async fn escalate_agent_interaction(
     description: &str,
     output_so_far: &str,
 ) -> anyhow::Result<String> {
-    // Emit event to UI
-    emit_event(
+    let (sender, receiver) = oneshot::channel();
+    ctx.registry
+        .set_pending_interaction(run_id, session_id, sender)
+        .await?;
+    let mut pending = PendingInteractionGuard::new(&ctx.registry, run_id, session_id);
+
+    if let Err(err) = emit_event(
         ctx,
         run_id,
         RuntimeEvent::new("agent_interaction_required")
@@ -5244,15 +5298,16 @@ pub(crate) async fn escalate_agent_interaction(
             .with("description", description)
             .with("outputSoFar", output_so_far),
     )
-    .await?;
-
-    // Wait for human response via oneshot channel
-    let (sender, receiver) = oneshot::channel();
-    ctx.registry.set_pending_interaction(run_id, sender).await?;
+    .await
+    {
+        pending.clear_now().await;
+        return Err(err);
+    }
 
     let response = receiver
         .await
         .map_err(|_| anyhow::anyhow!("Interaction channel closed"))?;
+    pending.disarm();
 
     // Emit resolved event
     emit_event(
@@ -5268,6 +5323,55 @@ pub(crate) async fn escalate_agent_interaction(
     Ok(response)
 }
 
+struct PendingInteractionGuard {
+    registry: RunRegistry,
+    run_id: String,
+    session_id: String,
+    armed: bool,
+}
+
+impl PendingInteractionGuard {
+    fn new(registry: &RunRegistry, run_id: &str, session_id: &str) -> Self {
+        Self {
+            registry: registry.clone(),
+            run_id: run_id.to_string(),
+            session_id: session_id.to_string(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    async fn clear_now(&mut self) {
+        if self.armed {
+            self.registry
+                .clear_pending_interaction(&self.run_id, &self.session_id)
+                .await;
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for PendingInteractionGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let registry = self.registry.clone();
+        let run_id = std::mem::take(&mut self.run_id);
+        let session_id = std::mem::take(&mut self.session_id);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let _ = handle.spawn(async move {
+                registry
+                    .clear_pending_interaction(&run_id, &session_id)
+                    .await;
+            });
+        }
+    }
+}
+
 async fn run_orchestrator_refinement(
     goal: &str,
     node: &WorkflowNode,
@@ -5276,6 +5380,7 @@ async fn run_orchestrator_refinement(
     step_index: u32,
     total_steps: usize,
     cwd: &str,
+    inv: Option<TmuxInvocation>,
 ) -> anyhow::Result<NodeResult> {
     let prompt = format!(
         "You are an AI orchestrator managing a multi-step agentic workflow.\n\nWORKFLOW GOAL: {goal}\nCURRENT STEP: {} of {} — \"{}\"\nORIGINAL PROMPT: {original_prompt}\nPREVIOUS OUTPUT: {}\n\nRewrite or refine the prompt for this step to make it as effective as possible given the workflow goal and the previous output. Keep it if it is already optimal.\nRespond with ONLY the final prompt text. No explanation, no markdown, no preamble.",
@@ -5292,7 +5397,7 @@ async fn run_orchestrator_refinement(
     let owned_prompt = prompt.clone();
     let owned_cwd = cwd.to_string();
     tokio::task::spawn_blocking(move || {
-        crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None)
+        crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None, inv)
     })
     .await
     .context("join error in orchestrator")?
@@ -5304,6 +5409,7 @@ async fn run_orchestrator_branch(
     output: &str,
     branches: &[&WorkflowEdge],
     cwd: &str,
+    inv: Option<TmuxInvocation>,
 ) -> anyhow::Result<NodeResult> {
     let branch_list = branches
         .iter()
@@ -5324,7 +5430,7 @@ async fn run_orchestrator_branch(
     let owned_prompt = prompt.clone();
     let owned_cwd = cwd.to_string();
     tokio::task::spawn_blocking(move || {
-        crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None)
+        crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None, inv)
     })
     .await
     .context("join error in orchestrator")?
@@ -5333,7 +5439,9 @@ async fn run_orchestrator_branch(
 #[cfg(test)]
 mod tests {
     use std::{
+        cell::Cell,
         collections::{HashMap, VecDeque},
+        fs,
         path::{Path, PathBuf},
         sync::Arc,
         time::{Duration, Instant},
@@ -5354,6 +5462,10 @@ mod tests {
     };
 
     use super::*;
+
+    thread_local! {
+        static ASYNC_WORKER_MARKER: Cell<bool> = const { Cell::new(false) };
+    }
 
     #[derive(Debug, Clone)]
     struct ScriptedStep {
@@ -5525,6 +5637,231 @@ mod tests {
                 })
             })
         }
+    }
+
+    async fn next_interaction_required(
+        events: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+    ) -> RuntimeEvent {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .expect("timed out waiting for interaction event")
+                .expect("event stream closed");
+            if event.kind == "agent_interaction_required" {
+                return event;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_interactions_resolve_by_session_id() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db);
+        let run_id = "run_concurrent_interactions";
+        ctx.registry.register(run_id).await;
+        let mut events = ctx.registry.subscribe(run_id).await.unwrap();
+
+        let task_a = {
+            let ctx = ctx.clone();
+            let run_id = run_id.to_string();
+            tokio::spawn(async move {
+                escalate_agent_interaction(
+                    &ctx,
+                    &run_id,
+                    "session-a",
+                    "question",
+                    "question a",
+                    "output a",
+                )
+                .await
+            })
+        };
+        let task_b = {
+            let ctx = ctx.clone();
+            let run_id = run_id.to_string();
+            tokio::spawn(async move {
+                escalate_agent_interaction(
+                    &ctx,
+                    &run_id,
+                    "session-b",
+                    "question",
+                    "question b",
+                    "output b",
+                )
+                .await
+            })
+        };
+
+        let first = next_interaction_required(&mut events).await;
+        let second = next_interaction_required(&mut events).await;
+        let mut sessions = vec![
+            first
+                .data
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap()
+                .to_string(),
+            second
+                .data
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .unwrap()
+                .to_string(),
+        ];
+        sessions.sort();
+        assert_eq!(sessions, vec!["session-a", "session-b"]);
+
+        ctx.respond_interaction(run_id, "session-b", "response b".to_string())
+            .await
+            .unwrap();
+        ctx.respond_interaction(run_id, "session-a", "response a".to_string())
+            .await
+            .unwrap();
+
+        let response_a = tokio::time::timeout(Duration::from_secs(1), task_a)
+            .await
+            .expect("timed out waiting for session-a")
+            .unwrap()
+            .unwrap();
+        let response_b = tokio::time::timeout(Duration::from_secs(1), task_b)
+            .await
+            .expect("timed out waiting for session-b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response_a, "response a");
+        assert_eq!(response_b, "response b");
+    }
+
+    #[tokio::test]
+    async fn interaction_can_be_resolved_immediately_after_required_event() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db);
+        let run_id = "run_interaction_race";
+        ctx.registry.register(run_id).await;
+        let mut events = ctx.registry.subscribe(run_id).await.unwrap();
+
+        let task = {
+            let ctx = ctx.clone();
+            let run_id = run_id.to_string();
+            tokio::spawn(async move {
+                escalate_agent_interaction(
+                    &ctx,
+                    &run_id,
+                    "race-session",
+                    "question",
+                    "respond now",
+                    "",
+                )
+                .await
+            })
+        };
+
+        let event = next_interaction_required(&mut events).await;
+        let session_id = event.data.get("sessionId").and_then(Value::as_str).unwrap();
+        assert_eq!(session_id, "race-session");
+
+        ctx.respond_interaction(run_id, session_id, "immediate response".to_string())
+            .await
+            .unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("timed out waiting for interaction response")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, "immediate response");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn run_as_invocation_resolution_uses_blocking_pool() {
+        ASYNC_WORKER_MARKER.with(|marker| marker.set(true));
+        let run_as = model::RunAsConfig {
+            command: Some(vec!["sandbox-prefix".to_string()]),
+            user: None,
+            socket: Some("run-as-socket".to_string()),
+        };
+
+        let resolved = resolve_workflow_invocation_with(None, Some(run_as), |run_as| {
+            let ran_inline = ASYNC_WORKER_MARKER.with(|marker| marker.get());
+            assert!(
+                !ran_inline,
+                "runAs tmux invocation resolution ran inline on the async worker"
+            );
+            TmuxInvocation {
+                prefix: run_as.command.clone().unwrap_or_default(),
+                socket: run_as.socket.clone(),
+                tmux_bin: "tmux-from-builder".to_string(),
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        ASYNC_WORKER_MARKER.with(|marker| marker.set(false));
+        assert_eq!(resolved.prefix, vec!["sandbox-prefix"]);
+        assert_eq!(resolved.socket.as_deref(), Some("run-as-socket"));
+        assert_eq!(resolved.tmux_bin, "tmux-from-builder");
+    }
+
+    #[cfg(unix)]
+    fn fake_run_as_config(
+        temp: &TempDir,
+        stem: &str,
+        socket: &str,
+    ) -> (model::RunAsConfig, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = temp.path().join(format!("{stem}-prefix.sh"));
+        let log = temp.path().join(format!("{stem}-args.log"));
+        fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\nshift\nprintf '%s\\n' \"$@\" > \"$log\"\nexit 87\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        (
+            model::RunAsConfig {
+                command: Some(vec![
+                    script.to_string_lossy().into_owned(),
+                    log.to_string_lossy().into_owned(),
+                    "sandbox-prefix".to_string(),
+                ]),
+                user: None,
+                socket: Some(socket.to_string()),
+            },
+            log,
+        )
+    }
+
+    #[cfg(unix)]
+    fn fake_run_as_invocation(
+        temp: &TempDir,
+        stem: &str,
+        socket: &str,
+    ) -> (TmuxInvocation, PathBuf) {
+        let (run_as, log) = fake_run_as_config(temp, stem, socket);
+        let inv = crate::tmux_exec::build_tmux_invocation(&run_as);
+        let _ = fs::remove_file(&log);
+
+        (inv, log)
+    }
+
+    #[cfg(unix)]
+    fn assert_recorded_run_as_tmux_args(log: &Path, socket: &str) {
+        let recorded = fs::read_to_string(log).expect("fake tmux prefix should record arguments");
+        let args = recorded.lines().collect::<Vec<_>>();
+        assert_eq!(args.first().copied(), Some("sandbox-prefix"));
+        assert_eq!(args.get(1).copied(), Some("tmux"));
+        assert_eq!(args.get(2).copied(), Some("-L"));
+        assert_eq!(args.get(3).copied(), Some(socket));
+        assert_eq!(args.get(4).copied(), Some("new-session"));
     }
 
     fn task_node(id: &str, name: &str, prompt: &str) -> WorkflowNode {
@@ -5914,6 +6251,119 @@ mod tests {
             subflows: BTreeMap::new(),
             ui: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_as_decide_oneshot_uses_invocation_prefix_and_socket() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+
+        let socket = "decide-sandbox";
+        let (run_as, log) = fake_run_as_config(&temp, "decide", socket);
+
+        let mut node = task_node("decide", "Decide", "");
+        node.node_type = WorkflowNodeType::Decide;
+        node.agent = None;
+        node.decide_config = Some(model::DecideConfig {
+            inputs: Vec::new(),
+            prompt: "Choose an outcome".to_string(),
+            model: None,
+            outcomes: vec!["approve".to_string()],
+        });
+
+        let mut workflow = workflow_from_parts("decide", vec![node], vec![]);
+        workflow.cwd = temp.path().to_string_lossy().into_owned();
+        workflow.run_as = Some(run_as);
+        let checkpoint = build_initial_checkpoint(&workflow, "run_decide", BTreeMap::new(), None);
+        db.upsert_run(&PersistedRun {
+            checkpoint: checkpoint.clone(),
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+        let ctx = RuntimeContext::new(db);
+
+        let _ = execute_workflow(ctx, workflow, checkpoint, false).await;
+        assert_recorded_run_as_tmux_args(&log, socket);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_as_orchestrator_oneshots_use_invocation_prefix_and_socket() {
+        let temp = TempDir::new().unwrap();
+
+        let refinement_socket = "orchestrator-refinement-sandbox";
+        let (refinement_run_as, refinement_log) =
+            fake_run_as_config(&temp, "orchestrator-refinement", refinement_socket);
+        let refinement_db = Database::new(temp.path().join("orchestrator-refinement.db"));
+        refinement_db.init().await.unwrap();
+        let mut refinement_workflow = workflow_from_parts(
+            "first",
+            vec![
+                task_node("first", "First", "first prompt"),
+                task_node("second", "Second", "second prompt"),
+            ],
+            vec![success_edge("first_second", "first", "second", None)],
+        );
+        refinement_workflow.cwd = temp.path().to_string_lossy().into_owned();
+        refinement_workflow.use_orchestrator = true;
+        refinement_workflow.run_as = Some(refinement_run_as);
+        let refinement_checkpoint = build_initial_checkpoint(
+            &refinement_workflow,
+            "run_orchestrator_refinement",
+            BTreeMap::new(),
+            None,
+        );
+        refinement_db
+            .upsert_run(&PersistedRun {
+                checkpoint: refinement_checkpoint.clone(),
+                workflow: refinement_workflow.clone(),
+            })
+            .await
+            .unwrap();
+        let refinement_ctx = RuntimeContext::with_runner(
+            refinement_db,
+            Arc::new(ScriptedRunner::new([(
+                "first prompt".to_string(),
+                vec![ScriptedStep::success("previous output")],
+            )])),
+        );
+        let _ = execute_workflow(
+            refinement_ctx,
+            refinement_workflow,
+            refinement_checkpoint,
+            false,
+        )
+        .await;
+        assert_recorded_run_as_tmux_args(&refinement_log, refinement_socket);
+
+        let branch_socket = "orchestrator-branch-sandbox";
+        let (branch_inv, branch_log) =
+            fake_run_as_invocation(&temp, "orchestrator-branch", branch_socket);
+        let node = task_node("task", "Task", "prompt");
+        let branch_edge = WorkflowEdge {
+            id: "edge_branch".to_string(),
+            from: "task".to_string(),
+            to: "next".to_string(),
+            outcome: WorkflowEdgeOutcome::Branch,
+            label: Some("Branch A".to_string()),
+            branch_id: Some("branch_a".to_string()),
+            condition: None,
+        };
+        let branch_refs = [&branch_edge];
+        let branch = run_orchestrator_branch(
+            "goal",
+            &node,
+            "task output",
+            &branch_refs,
+            &temp.path().to_string_lossy(),
+            Some(branch_inv),
+        )
+        .await;
+        assert!(branch.is_err());
+        assert_recorded_run_as_tmux_args(&branch_log, branch_socket);
     }
 
     #[cfg(unix)]
@@ -7633,6 +8083,35 @@ mod tests {
         assert_eq!(
             select_decide_outcome(&outcomes, "`DONE`"),
             Some("DONE".to_string())
+        );
+    }
+
+    #[test]
+    fn decide_routing_uses_sentinel_extracted_answer_for_multiline_prompt() {
+        let outcomes = vec!["approve".to_string(), "reject".to_string()];
+        let prompt = "Choose exactly one outcome:\n- approve\n- reject";
+        let capture = concat!(
+            "ready\n",
+            "Choose exactly one outcome:\n",
+            "- approve\n",
+            "- reject\n",
+            "SB_PROMPT_END_decide\n",
+            "reject\n",
+            "SB_RESPONSE_DONE_decide\n"
+        );
+
+        let response = crate::tmux_exec::extract_after_prompt_with_sentinels(
+            "ready\n",
+            capture,
+            prompt,
+            Some("SB_PROMPT_END_decide"),
+            Some("SB_RESPONSE_DONE_decide"),
+        );
+
+        assert_eq!(response.trim(), "reject");
+        assert_eq!(
+            select_decide_outcome(&outcomes, &response),
+            Some("reject".to_string())
         );
     }
 

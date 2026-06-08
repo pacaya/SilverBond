@@ -137,7 +137,7 @@ class WorkflowStore {
   lines = $state<RunLine[]>([]);
   nodeStates = $state<Record<string, NodeRuntimeState>>({});
   approval = $state<ApprovalState | null>(null);
-  interaction = $state<InteractionState | null>(null);
+  interactions = $state<InteractionState[]>([]);
   errorMessage = $state<string>("");
 
   /* ── live pane terminal ───────────────────────────────────────────── */
@@ -167,6 +167,10 @@ class WorkflowStore {
 
   get canRedo() {
     return this.redoStack.length > 0;
+  }
+
+  get interaction() {
+    return this.interactions[0] ?? null;
   }
 
   undo() {
@@ -518,7 +522,7 @@ class WorkflowStore {
     this.runId = null;
     this.running = false;
     this.approval = null;
-    this.interaction = null;
+    this.interactions = [];
     this.nodeStates = {};
   }
 
@@ -644,21 +648,33 @@ class WorkflowStore {
         break;
       case "agent_interaction_required":
         push("warning", `Agent interaction required: ${String(event.description ?? "")}`);
-        this.interaction = {
-          sessionId: String(event.sessionId ?? ""),
-          description: String(event.description ?? ""),
-          outputSoFar: String(event.outputSoFar ?? ""),
-          interactionType: (event.interactionType as InteractionState["interactionType"]) ?? "question",
-        };
+        {
+          const interaction = {
+            sessionId: String(event.sessionId ?? ""),
+            description: String(event.description ?? ""),
+            outputSoFar: String(event.outputSoFar ?? ""),
+            interactionType: (event.interactionType as InteractionState["interactionType"]) ?? "question",
+          };
+          const index = this.interactions.findIndex((item) => item.sessionId === interaction.sessionId);
+          if (index === -1) {
+            this.interactions.push(interaction);
+          } else {
+            this.interactions[index] = interaction;
+          }
+        }
         break;
       case "agent_interaction_resolved":
         push("detail", `Interaction resolved: ${String(event.description ?? "")}`);
-        this.interaction = null;
+        if (typeof event.sessionId === "string" && event.sessionId) {
+          this.interactions = this.interactions.filter((item) => item.sessionId !== event.sessionId);
+        } else {
+          this.interactions = this.interactions.slice(1);
+        }
         break;
       case "done":
         push(event.aborted ? "error" : "success", event.aborted ? "Workflow aborted" : "Workflow complete");
         this.approval = null;
-        this.interaction = null;
+        this.interactions = [];
         this.running = false;
         break;
       default:

@@ -437,7 +437,8 @@
           if (store.runId) api.approveRun(store.runId, approved, userInput);
         }}
         onInteractionResponse={(response) => {
-          if (store.runId) api.respondToInteraction(store.runId, response);
+          const sessionId = store.interaction?.sessionId;
+          if (store.runId && sessionId) api.respondToInteraction(store.runId, sessionId, response);
         }}
       />
     {:else if store.panelTab === "terminal"}

@@ -579,6 +579,34 @@ enum InteractivePollResult {
     TimedOut(InteractiveCapture),
 }
 
+struct PromptCaptureMarkers {
+    prompt_end: String,
+    response_end: String,
+}
+
+impl PromptCaptureMarkers {
+    fn new() -> Self {
+        let token = uuid::Uuid::now_v7().simple().to_string();
+        Self {
+            prompt_end: format!("SB_PROMPT_END_{token}"),
+            response_end: format!("SB_RESPONSE_DONE_{token}"),
+        }
+    }
+}
+
+fn wrap_prompt_for_capture_markers(prompt: &str, markers: &PromptCaptureMarkers) -> String {
+    let (response_prefix, response_suffix) = split_marker_for_prompt(&markers.response_end);
+    format!(
+        "{prompt}\n\nWhen your answer is complete, print the completion marker formed by joining `{response_prefix}` and `{response_suffix}` with no spaces on its own final line. Do not print either marker anywhere else.\n{}",
+        markers.prompt_end
+    )
+}
+
+fn split_marker_for_prompt(marker: &str) -> (&str, &str) {
+    let midpoint = marker.len() / 2;
+    marker.split_at(midpoint)
+}
+
 fn run_agent_interactive(
     agent: String,
     prompt: String,
@@ -701,8 +729,10 @@ fn run_agent_interactive(
             ));
         }
 
+        let capture_markers = PromptCaptureMarkers::new();
+        let prompt_to_send = wrap_prompt_for_capture_markers(&effective_prompt, &capture_markers);
         let before = capture_visible_stripped(&pane_id)?;
-        send_text(&pane_id, &effective_prompt, true)?;
+        send_text(&pane_id, &prompt_to_send, true)?;
 
         let subagent_timeout = agent_cfg
             .orchestrator
@@ -718,6 +748,7 @@ fn run_agent_interactive(
             idle_seconds,
             ready_stable_seconds,
             cfg.and_then(|cfg| cfg.until.as_deref()),
+            Some(&capture_markers),
             agent_cfg.auto_approve,
             subagent_timeout,
             &interaction_patterns,
@@ -802,18 +833,27 @@ pub(crate) fn run_tmux_oneshot(
     prompt: &str,
     cwd: &str,
     config: Option<&AgentConfig>,
+    inv: Option<TmuxInvocation>,
 ) -> anyhow::Result<NodeResult> {
-    run_agent_interactive(
-        agent.to_string(),
-        prompt.to_string(),
-        cwd.to_string(),
-        None,
-        None,
-        config,
-        None,
-        None,
-        None,
-    )
+    let run = || {
+        run_agent_interactive(
+            agent.to_string(),
+            prompt.to_string(),
+            cwd.to_string(),
+            None,
+            None,
+            config,
+            None,
+            None,
+            None,
+        )
+    };
+
+    if let Some(inv) = inv {
+        tmux_tools_core::with_invocation(inv, run)
+    } else {
+        run()
+    }
 }
 
 pub(crate) fn cleanup_panes(panes: &[String]) -> anyhow::Result<()> {
@@ -1079,7 +1119,7 @@ fn wait_for_agent_ready_interactive(
             &ready_signal.regex,
             ready_signal.scan_lines,
             ready_stable_seconds,
-            &None,
+            &[],
         ) {
             return Ok(reason);
         }
@@ -1102,6 +1142,7 @@ fn poll_agent_interactive(
     idle_seconds: f64,
     ready_stable_seconds: f64,
     until: Option<&str>,
+    capture_markers: Option<&PromptCaptureMarkers>,
     auto_approve: bool,
     subagent_timeout: Duration,
     interaction_patterns: &[CompiledInteractionPattern],
@@ -1109,13 +1150,13 @@ fn poll_agent_interactive(
     interaction: Option<&InteractionEscalation>,
 ) -> anyhow::Result<InteractivePollResult> {
     let ready_signal = ready_signal_for_pane(pane)?;
-    let until_regex = until
-        .map(|pattern| Regex::new(pattern).context("invalid wait marker regex"))
-        .transpose()?;
+    let until_regexes = compile_until_regexes(until, capture_markers)?;
+    let allow_idle_completion = ready_signal.regex.is_some() || until.is_some();
     let mut deadline = Instant::now() + timeout;
     let mut last_seen = before.to_owned();
     let mut progress = CaptureProgress::new(before, Instant::now());
     let mut handled_matches = Vec::new();
+    let mut handled_destructive_matches = HandledDestructiveMatches::default();
 
     loop {
         let now = Instant::now();
@@ -1125,13 +1166,16 @@ fn poll_agent_interactive(
         if has_new_text {
             last_seen = capture.clone();
         }
-        let output_so_far = extract_after_prompt(before, &capture, prompt);
+        let output_so_far =
+            extract_after_prompt_with_markers(before, &capture, prompt, capture_markers);
 
-        if has_new_text
-            && destructive_regexes
-                .iter()
-                .any(|regex| regex.is_match(&new_text))
-        {
+        // Cumulative over the visible pane; a line that scrolls fully off-screen is still out of scope.
+        if let Some(destructive_match) = next_unhandled_destructive_match(
+            destructive_regexes,
+            &output_so_far,
+            &handled_destructive_matches,
+        ) {
+            handled_destructive_matches.record(destructive_match);
             let reply = escalate_or_fallback(
                 interaction,
                 pane,
@@ -1163,27 +1207,14 @@ fn poll_agent_interactive(
                     let is_destructive = destructive_regexes
                         .iter()
                         .any(|regex| regex.is_match(&output_so_far));
-                    let reply = if is_destructive {
-                        escalate_or_fallback(
-                            interaction,
-                            pane,
-                            InteractionKind::DestructiveWarning.event_type(),
-                            &pattern.description,
-                            &output_so_far,
-                            "n",
-                        )?
-                    } else if auto_approve {
-                        "y".to_owned()
-                    } else {
-                        escalate_or_fallback(
-                            interaction,
-                            pane,
-                            InteractionKind::PermissionRequest.event_type(),
-                            &pattern.description,
-                            &output_so_far,
-                            "y",
-                        )?
-                    };
+                    let reply = permission_request_reply(
+                        interaction,
+                        pane,
+                        &pattern.description,
+                        &output_so_far,
+                        is_destructive,
+                        auto_approve,
+                    )?;
                     send_reply_if_present(pane, &reply)?;
                     continue;
                 }
@@ -1202,19 +1233,21 @@ fn poll_agent_interactive(
             }
         }
 
-        if let Some(_) = progress.observe(
+        if let Some(reason) = progress.observe(
             &capture,
             now,
             idle_seconds,
             &ready_signal.regex,
             ready_signal.scan_lines,
             ready_stable_seconds,
-            &until_regex,
+            &until_regexes,
         ) {
-            return Ok(InteractivePollResult::Completed(InteractiveCapture {
-                output: output_so_far,
-                final_capture: capture,
-            }));
+            if is_interactive_completion_reason(reason, allow_idle_completion) {
+                return Ok(InteractivePollResult::Completed(InteractiveCapture {
+                    output: output_so_far,
+                    final_capture: capture,
+                }));
+            }
         }
 
         if now >= deadline {
@@ -1225,6 +1258,31 @@ fn poll_agent_interactive(
         }
 
         sleep(Duration::from_millis(250));
+    }
+}
+
+fn compile_until_regexes(
+    until: Option<&str>,
+    capture_markers: Option<&PromptCaptureMarkers>,
+) -> anyhow::Result<Vec<Regex>> {
+    let mut regexes = Vec::new();
+    if let Some(pattern) = until {
+        regexes.push(Regex::new(pattern).context("invalid wait marker regex")?);
+    }
+    if let Some(markers) = capture_markers {
+        regexes.push(
+            Regex::new(&regex::escape(&markers.response_end))
+                .context("invalid response sentinel regex")?,
+        );
+    }
+    Ok(regexes)
+}
+
+fn is_interactive_completion_reason(reason: IdleReason, allow_idle_completion: bool) -> bool {
+    match reason {
+        IdleReason::Idle => allow_idle_completion,
+        IdleReason::ReadyMatched | IdleReason::UntilMatched => true,
+        IdleReason::TimedOut => false,
     }
 }
 
@@ -1251,8 +1309,51 @@ fn escalate_or_fallback(
     if let Some(interaction) = interaction {
         interaction.request(session_id, interaction_type, description, output_so_far)
     } else {
+        if interaction_type == InteractionKind::PermissionRequest.event_type()
+            && fallback.eq_ignore_ascii_case("n")
+        {
+            tracing::warn!(
+                session_id,
+                interaction_type,
+                description,
+                "permission_denied: no interaction channel is available"
+            );
+        }
         Ok(fallback.to_owned())
     }
+}
+
+fn permission_request_reply(
+    interaction: Option<&InteractionEscalation>,
+    pane: &str,
+    description: &str,
+    output_so_far: &str,
+    is_destructive: bool,
+    auto_approve: bool,
+) -> anyhow::Result<String> {
+    if is_destructive {
+        return escalate_or_fallback(
+            interaction,
+            pane,
+            InteractionKind::DestructiveWarning.event_type(),
+            description,
+            output_so_far,
+            "n",
+        );
+    }
+
+    if auto_approve {
+        return Ok("y".to_owned());
+    }
+
+    escalate_or_fallback(
+        interaction,
+        pane,
+        InteractionKind::PermissionRequest.event_type(),
+        description,
+        output_so_far,
+        "n",
+    )
 }
 
 fn send_reply_if_present(pane: &str, reply: &str) -> anyhow::Result<()> {
@@ -1260,6 +1361,61 @@ fn send_reply_if_present(pane: &str, reply: &str) -> anyhow::Result<()> {
         send_text(pane, reply, true)?;
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct HandledDestructiveMatches {
+    spans: HashSet<String>,
+    lines: HashSet<String>,
+}
+
+impl HandledDestructiveMatches {
+    fn is_handled(&self, matched: &DestructiveMatch) -> bool {
+        self.spans.contains(&matched.span_key) || self.lines.contains(&matched.line_key)
+    }
+
+    fn record(&mut self, matched: DestructiveMatch) {
+        self.spans.insert(matched.span_key);
+        self.lines.insert(matched.line_key);
+    }
+}
+
+struct DestructiveMatch {
+    span_key: String,
+    line_key: String,
+}
+
+struct BuiltCommand {
+    command: String,
+    env: Vec<(String, String)>,
+}
+
+fn next_unhandled_destructive_match(
+    regexes: &[Regex],
+    text: &str,
+    handled_matches: &HandledDestructiveMatches,
+) -> Option<DestructiveMatch> {
+    for regex in regexes {
+        for matched in regex.find_iter(text) {
+            let line_start = text[..matched.start()]
+                .rfind('\n')
+                .map(|idx| idx + 1)
+                .unwrap_or(0);
+            let line_end = text[matched.end()..]
+                .find('\n')
+                .map(|idx| matched.end() + idx)
+                .unwrap_or(text.len());
+            let line = text[line_start..line_end].trim();
+            let candidate = DestructiveMatch {
+                span_key: format!("{}:{}:{}", regex.as_str(), matched.start(), matched.end()),
+                line_key: format!("{}:{}", regex.as_str(), line),
+            };
+            if !handled_matches.is_handled(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 fn next_unhandled_pattern_match(
@@ -1307,7 +1463,7 @@ impl CaptureProgress {
         ready_regex: &Option<Regex>,
         ready_scan_lines: usize,
         ready_stable_seconds: f64,
-        until_regex: &Option<Regex>,
+        until_regexes: &[Regex],
     ) -> Option<IdleReason> {
         if self.previous_capture != stripped {
             self.last_change = now;
@@ -1315,9 +1471,7 @@ impl CaptureProgress {
         }
         self.capture_count += 1;
 
-        let until_now = until_regex
-            .as_ref()
-            .is_some_and(|regex| regex.is_match(stripped));
+        let until_now = until_regexes.iter().any(|regex| regex.is_match(stripped));
         if self
             .until_debounce
             .observe(until_now, now, ready_stable_seconds)
@@ -1413,9 +1567,14 @@ fn spawn_pane(
         .and_then(|cfg| cfg.agent.as_deref())
         .or(fallback_agent)
         .map(str::to_owned);
-    let command = command_override
+    let built_command = command_override
         .or_else(|| cfg.and_then(|cfg| cfg.command.clone()))
-        .map(Ok)
+        .map(|command| {
+            Ok(BuiltCommand {
+                command,
+                env: Vec::new(),
+            })
+        })
         .unwrap_or_else(|| {
             let agent = agent
                 .as_deref()
@@ -1429,7 +1588,7 @@ fn spawn_pane(
         .and_then(|cfg| cfg.cwd.as_deref())
         .filter(|value| !value.trim().is_empty())
         .unwrap_or(cwd);
-    let command = wrap_keep_open(&command, work_dir);
+    let command = wrap_keep_open(&built_command.command, work_dir);
 
     let mut args = vec![
         "new-session".to_owned(),
@@ -1443,6 +1602,10 @@ fn spawn_pane(
     if !work_dir.trim().is_empty() {
         args.push("-c".to_owned());
         args.push(work_dir.to_owned());
+    }
+    for (key, value) in &built_command.env {
+        args.push("-e".to_owned());
+        args.push(format!("{key}={value}"));
     }
     args.push(command.clone());
 
@@ -1476,34 +1639,53 @@ fn build_agent_command(
     agent: &str,
     cfg: Option<&SpawnConfig>,
     agent_config: Option<&AgentConfig>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<BuiltCommand> {
     let extra_args = cfg.map(|cfg| cfg.extra_args.as_slice()).unwrap_or(&[]);
-    let explicit_access = cfg.and_then(|cfg| cfg.access.as_deref());
     let registry = agents::Registry::load()?;
-    let profile = explicit_access
-        .map(str::to_owned)
-        .or_else(|| access_profile_from_config(agent_config));
 
-    let argv = match registry.launch_argv(agent, profile.as_deref()) {
-        Ok((binary, args)) => std::iter::once(binary)
-            .chain(args)
-            .chain(extra_args.iter().cloned())
-            .collect::<Vec<_>>(),
-        Err(error) => {
-            if registry.get(agent).is_some() {
-                return Err(error);
-            }
-            std::iter::once(agent.to_owned())
+    let (argv, env) = if let Some(agent_config) = agent_config {
+        let drv =
+            driver::get_driver(agent).ok_or_else(|| anyhow!("No driver for agent: {agent}"))?;
+        let session_args = drv.build_session_args(agent_config)?;
+        let binary = registry
+            .get(agent)
+            .map(|spec| spec.binary.clone())
+            .or_else(|| driver::agent_binary(agent))
+            .unwrap_or_else(|| agent.to_owned());
+        (
+            std::iter::once(binary)
+                .chain(session_args.args)
                 .chain(extra_args.iter().cloned())
-                .collect::<Vec<_>>()
-        }
+                .collect::<Vec<_>>(),
+            session_args.env,
+        )
+    } else {
+        let explicit_access = cfg.and_then(|cfg| cfg.access.as_deref());
+        let argv = match registry.launch_argv(agent, explicit_access) {
+            Ok((binary, args)) => std::iter::once(binary)
+                .chain(args)
+                .chain(extra_args.iter().cloned())
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                if registry.get(agent).is_some() {
+                    return Err(error);
+                }
+                std::iter::once(agent.to_owned())
+                    .chain(extra_args.iter().cloned())
+                    .collect::<Vec<_>>()
+            }
+        };
+        (argv, Vec::new())
     };
 
-    Ok(argv
-        .iter()
-        .map(|arg| shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" "))
+    Ok(BuiltCommand {
+        command: argv
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" "),
+        env,
+    })
 }
 
 fn access_profile_from_config(config: Option<&AgentConfig>) -> Option<String> {
@@ -1757,7 +1939,7 @@ fn sanitize_tmux_name(value: &str) -> String {
 }
 
 fn wrap_keep_open(cmd: &str, cwd: &str) -> String {
-    let inner = format!("cd {} && exec {}; exec zsh -li", shell_quote(cwd), cmd);
+    let inner = format!("cd {} && {{ {}; }}; exec zsh -li", shell_quote(cwd), cmd);
     format!("zsh -lic {}", shell_quote(&inner))
 }
 
@@ -1765,7 +1947,51 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn extract_after_prompt(before: &str, after: &str, prompt_text: &str) -> String {
+pub(crate) fn extract_after_prompt(before: &str, after: &str, prompt_text: &str) -> String {
+    extract_after_prompt_with_sentinels(before, after, prompt_text, None, None)
+}
+
+fn extract_after_prompt_with_markers(
+    before: &str,
+    after: &str,
+    prompt_text: &str,
+    markers: Option<&PromptCaptureMarkers>,
+) -> String {
+    extract_after_prompt_with_sentinels(
+        before,
+        after,
+        prompt_text,
+        markers.map(|markers| markers.prompt_end.as_str()),
+        markers.map(|markers| markers.response_end.as_str()),
+    )
+}
+
+pub(crate) fn extract_after_prompt_with_sentinels(
+    before: &str,
+    after: &str,
+    prompt_text: &str,
+    prompt_end_marker: Option<&str>,
+    response_end_marker: Option<&str>,
+) -> String {
+    if let Some(prompt_end_marker) = prompt_end_marker {
+        if let Some(start) = marker_line_end(after, prompt_end_marker) {
+            let answer_region = &after[start..];
+            let answer_region = if let Some(response_end_marker) = response_end_marker {
+                trim_before_last_marker_line(answer_region, response_end_marker)
+                    .unwrap_or(answer_region)
+            } else {
+                answer_region
+            };
+            return answer_region.to_owned();
+        }
+    }
+
+    if let Some(response_end_marker) = response_end_marker {
+        if let Some(end) = marker_line_start(after, response_end_marker) {
+            return after[..end].to_owned();
+        }
+    }
+
     let before_lines = before.lines().collect::<HashSet<_>>();
     let mut first_new_match_end = None;
     let mut last_match_end = None;
@@ -1787,6 +2013,30 @@ fn extract_after_prompt(before: &str, after: &str, prompt_text: &str) -> String 
         .or(last_match_end)
         .map(|index| after[index..].to_owned())
         .unwrap_or_else(|| after.to_owned())
+}
+
+fn marker_line_end(text: &str, marker: &str) -> Option<usize> {
+    let marker_start = text.find(marker)?;
+    Some(
+        text[marker_start..]
+            .find('\n')
+            .map(|idx| marker_start + idx + 1)
+            .unwrap_or(text.len()),
+    )
+}
+
+fn marker_line_start(text: &str, marker: &str) -> Option<usize> {
+    let marker_start = text.rfind(marker)?;
+    Some(
+        text[..marker_start]
+            .rfind('\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(0),
+    )
+}
+
+fn trim_before_last_marker_line<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    marker_line_start(text, marker).map(|line_start| &text[..line_start])
 }
 
 #[cfg(test)]
@@ -1871,5 +2121,295 @@ mod tests {
             vec!["custom"],
             "command should take precedence over user"
         );
+    }
+
+    #[test]
+    fn build_agent_command_appends_resolved_session_safety_args() {
+        let spawn_cfg = SpawnConfig {
+            extra_args: vec!["--tail-flag".to_string()],
+            ..Default::default()
+        };
+        let agent_config = AgentConfig {
+            model: Some("claude-test-model".to_string()),
+            allowed_tools: Some(vec!["Read".to_string(), "Grep".to_string()]),
+            disallowed_tools: Some(vec!["Bash(rm *)".to_string()]),
+            ..AgentConfig::default()
+        };
+
+        let built = build_agent_command("claude", Some(&spawn_cfg), Some(&agent_config)).unwrap();
+
+        assert!(built.command.contains("'--model' 'claude-test-model'"));
+        assert!(built.command.contains("'--allowedTools' 'Read'"));
+        assert!(built.command.contains("'--allowedTools' 'Grep'"));
+        assert!(built.command.contains("'--disallowedTools' 'Bash(rm *)'"));
+        assert!(
+            !built.command.contains("'--permission-mode'"),
+            "fine-grained tool control should replace the access-mode shorthand"
+        );
+        assert!(
+            built.command.find("'--model'").unwrap() < built.command.find("'--tail-flag'").unwrap(),
+            "driver-rendered session args should precede caller extra args"
+        );
+        assert!(built.env.is_empty());
+    }
+
+    #[test]
+    fn build_agent_command_uses_driver_access_args_without_registry_duplicate() {
+        let agent_config = AgentConfig {
+            access_mode: AccessMode::ReadOnly,
+            ..AgentConfig::default()
+        };
+
+        let built = build_agent_command("codex", None, Some(&agent_config)).unwrap();
+
+        assert!(!built.command.contains("'--model'"));
+        assert!(built.command.contains("'exec'"));
+        assert!(built.command.contains("'--sandbox' 'read-only'"));
+        assert_eq!(
+            built.command.matches("'--sandbox'").count(),
+            1,
+            "registry launch args and driver session args must not both emit access flags"
+        );
+    }
+
+    #[test]
+    fn wrap_keep_open_runs_follow_up_shell_after_short_lived_command() {
+        if !zsh_available() {
+            return;
+        }
+        let temp = tempfile::TempDir::new().unwrap();
+        for file in [".zshenv", ".zprofile", ".zshrc", ".zlogin"] {
+            std::fs::write(temp.path().join(file), "").unwrap();
+        }
+        let cwd = temp.path().to_string_lossy();
+        let wrapped = wrap_keep_open("true", &cwd);
+        let mut child = std::process::Command::new("zsh")
+            .arg("-lc")
+            .arg(wrapped)
+            .env("ZDOTDIR", temp.path())
+            .env("PS1", "")
+            .env("PROMPT", "")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let mut stdin = child.stdin.take().unwrap();
+        use std::io::Write;
+        stdin
+            .write_all(b"printf '%s\\n' keep-open-proof\nexit\n")
+            .unwrap();
+        drop(stdin);
+
+        let output = wait_for_child_output(child, Duration::from_secs(3));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("keep-open-proof"),
+            "short-lived command should return to the keep-open shell; stdout={stdout:?} stderr={stderr:?}"
+        );
+    }
+
+    fn zsh_available() -> bool {
+        std::process::Command::new("zsh")
+            .arg("-c")
+            .arg("true")
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn wait_for_child_output(
+        mut child: std::process::Child,
+        timeout: Duration,
+    ) -> std::process::Output {
+        let started = Instant::now();
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                return child.wait_with_output().unwrap();
+            }
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "timed out waiting for keep-open shell; stdout={:?} stderr={:?}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn permission_request_without_interaction_denies_by_default() {
+        let reply = permission_request_reply(
+            None,
+            "%1",
+            "Tool permission prompt",
+            "Allow this action? [y/n]",
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(reply, "n");
+    }
+
+    #[test]
+    fn permission_request_auto_approve_still_allows_non_destructive_prompt() {
+        let reply = permission_request_reply(
+            None,
+            "%1",
+            "Tool permission prompt",
+            "Allow this action? [y/n]",
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(reply, "y");
+    }
+
+    #[test]
+    fn cumulative_destructive_scan_catches_split_command_once() {
+        let regexes = vec![Regex::new(r"rm\s+-rf\s+\S+").unwrap()];
+        let mut handled = HandledDestructiveMatches::default();
+
+        assert!(
+            next_unhandled_destructive_match(&regexes, "rm -r", &handled).is_none(),
+            "partial split command should not match yet"
+        );
+
+        let matched = next_unhandled_destructive_match(&regexes, "rm -rf /tmp/project", &handled)
+            .expect("complete cumulative output should match");
+        handled.record(matched);
+
+        assert!(
+            next_unhandled_destructive_match(&regexes, "rm -rf /tmp/project", &handled).is_none(),
+            "same destructive line should escalate once"
+        );
+    }
+
+    #[test]
+    fn cumulative_destructive_scan_catches_repainted_completion() {
+        let regexes = vec![Regex::new(r"rm\s+-rf\s+\S+").unwrap()];
+        let previous = "rm -r\npermission UI";
+        let current = "rm -rf /tmp/project\npermission UI";
+        let delta = capture_delta(previous, current);
+        assert!(
+            !regexes[0].is_match(&delta),
+            "delta-only scan should miss a destructive command completed before the suffix"
+        );
+
+        let mut handled = HandledDestructiveMatches::default();
+        let matched = next_unhandled_destructive_match(&regexes, current, &handled)
+            .expect("cumulative visible output should match");
+        handled.record(matched);
+        assert!(
+            next_unhandled_destructive_match(&regexes, current, &handled).is_none(),
+            "repainted destructive line should not escalate twice"
+        );
+    }
+
+    #[test]
+    fn markerless_visual_idle_is_not_interactive_completion() {
+        assert!(!is_interactive_completion_reason(IdleReason::Idle, false));
+    }
+
+    #[test]
+    fn configured_marker_matches_complete_interactive_polling() {
+        assert!(is_interactive_completion_reason(
+            IdleReason::ReadyMatched,
+            false
+        ));
+        assert!(is_interactive_completion_reason(
+            IdleReason::UntilMatched,
+            false
+        ));
+        assert!(is_interactive_completion_reason(IdleReason::Idle, true));
+    }
+
+    #[test]
+    fn capture_progress_reports_until_marker_match() {
+        let now = Instant::now();
+        let mut progress = CaptureProgress::new("working", now);
+        let until_regexes = vec![Regex::new("DONE").unwrap()];
+        let reason = progress.observe(
+            "answer\nDONE",
+            now,
+            2.0,
+            &None,
+            DEFAULT_READY_SCAN_LINES,
+            0.0,
+            &until_regexes,
+        );
+        assert_eq!(reason, Some(IdleReason::UntilMatched));
+    }
+
+    #[test]
+    fn prompt_capture_wrapper_does_not_echo_response_marker_literal() {
+        let markers = PromptCaptureMarkers {
+            prompt_end: "SB_PROMPT_END_test".to_string(),
+            response_end: "SB_RESPONSE_DONE_test".to_string(),
+        };
+        let wrapped = wrap_prompt_for_capture_markers("Choose an outcome", &markers);
+        assert!(wrapped.contains(&markers.prompt_end));
+        assert!(
+            !wrapped.contains(&markers.response_end),
+            "the exact response sentinel must not appear in the echoed prompt"
+        );
+    }
+
+    #[test]
+    fn extract_after_prompt_uses_sentinels_for_multiline_prompt() {
+        let before = "ready\n";
+        let prompt = "Choose one:\n- approve\n- reject";
+        let after = concat!(
+            "ready\n",
+            "Choose one:\n",
+            "- approve\n",
+            "- reject\n",
+            "SB_PROMPT_END_test\n",
+            "reject\n",
+            "SB_RESPONSE_DONE_test\n"
+        );
+
+        let output = extract_after_prompt_with_sentinels(
+            before,
+            after,
+            prompt,
+            Some("SB_PROMPT_END_test"),
+            Some("SB_RESPONSE_DONE_test"),
+        );
+
+        assert_eq!(output.trim(), "reject");
+        assert!(!output.contains("- approve"));
+    }
+
+    #[test]
+    fn extract_after_prompt_uses_sentinels_for_wrapped_tui_prompt() {
+        let before = "ready\n";
+        let prompt = "Choose one:\n- approve\n- reject";
+        let after = concat!(
+            "ready\n",
+            "Choose one:\n",
+            "- appro\n",
+            "ve\n",
+            "- reje\n",
+            "ct\n",
+            "SB_PROMPT_END_test\n",
+            "approve\n",
+            "SB_RESPONSE_DONE_test\n"
+        );
+
+        let output = extract_after_prompt_with_sentinels(
+            before,
+            after,
+            prompt,
+            Some("SB_PROMPT_END_test"),
+            Some("SB_RESPONSE_DONE_test"),
+        );
+
+        assert_eq!(output.trim(), "approve");
+        assert!(!output.contains("reject"));
     }
 }

@@ -1002,6 +1002,7 @@ async fn approve_run(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct InteractionResponseRequest {
+    session_id: String,
     response: String,
 }
 
@@ -1012,7 +1013,7 @@ async fn respond_interaction(
 ) -> Result<Json<Value>, ApiError> {
     state
         .runtime
-        .respond_interaction(&run_id, request.response)
+        .respond_interaction(&run_id, &request.session_id, request.response)
         .await?;
     Ok(Json(json!({ "success": true })))
 }
