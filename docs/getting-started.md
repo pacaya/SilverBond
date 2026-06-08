@@ -5,6 +5,7 @@
 - **Rust** (stable toolchain) — for building the backend
 - **Node.js** (v18+) and **npm** — for building the frontend
 - **just** — command runner ([install guide](https://github.com/casey/just#installation))
+- **tmux** — all agent execution (worker tasks and lightweight classifier calls) runs in tmux panes
 - At least one supported agent CLI installed and on PATH:
   - `claude` (Claude Code CLI)
   - `codex` (OpenAI Codex CLI)
@@ -98,6 +99,34 @@ All commands are defined in the `justfile`:
 | `just check` | Run cargo check |
 | `just clean` | Remove built frontend assets |
 
+## Agent Execution and Observability
+
+SilverBond launches every agent — full worker tasks and lightweight classifier calls alike — in **tmux panes**. There is no direct subprocess or `--print` path; observability is via tmux attach.
+
+### Agent-User Sandbox
+
+Workflows can set a top-level `runAs` field to run agents under a dedicated Unix user:
+
+```json
+{
+  "runAs": {
+    "user": "agent-sandbox"
+  }
+}
+```
+
+This isolates agent sessions on a per-user tmux socket (mode `0700`). Control commands run as the target user via `sudo -u <user>`, and agent workloads launch through `zsh -lic`. See [Workflow Schema](workflow-schema.md#run-as-runas) for the full `runAs` shape.
+
+### Watching Running Agents
+
+To attach to a running agent pane:
+
+```
+sudo -u <user> tmux -L <socket> attach -t <session>
+```
+
+The run panel and capabilities API (`GET /api/capabilities`) expose `attachCommand` hints for the current run. Use tmux attach to observe live agent output — there is no separate session-history endpoint.
+
 ## Creating Your First Workflow
 
 1. Start the application (dev or production mode)
@@ -105,5 +134,6 @@ All commands are defined in the `justfile`:
 3. Add nodes (task, approval, split, collector) via the graph editor
 4. Connect nodes with edges to define control flow
 5. Configure node properties in the inspector panel
-6. Click **Run** to execute the workflow
-7. Monitor execution in the run panel; approve approval nodes when prompted
+6. Optionally set `runAs` in the workflow inspector to run under a dedicated agent user
+7. Click **Run** to execute the workflow
+8. Monitor execution in the run panel; attach to tmux panes for live agent output; approve approval nodes when prompted

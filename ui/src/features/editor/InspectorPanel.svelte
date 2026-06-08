@@ -9,6 +9,7 @@
     ContextSource,
     InputBinding,
     ReasoningLevel,
+    RunAsConfig,
     RuntimeCapabilities,
     SplitFailurePolicy,
     ValidationResponse,
@@ -43,6 +44,60 @@
   let testLoading = $state(false);
   let testExpanded = $state(false);
   let showAgentDefaultsFor = $state<string | null>(null);
+
+  /* Run As / Sandbox */
+  let attachHintCopied = $state(false);
+
+  function hasRunAsValues(config: RunAsConfig): boolean {
+    return Boolean(
+      config.user || config.socket || (config.command && config.command.length > 0),
+    );
+  }
+
+  function updateRunAs(key: "user" | "socket", value: string) {
+    store.updateWorkflow((wf) => {
+      const next: RunAsConfig = { ...(wf.runAs ?? {}) };
+      const trimmed = value.trim();
+      if (trimmed) {
+        next[key] = trimmed;
+      } else {
+        delete next[key];
+      }
+      wf.runAs = hasRunAsValues(next) ? next : undefined;
+    });
+  }
+
+  function updateRunAsCommand(value: string) {
+    store.updateWorkflow((wf) => {
+      const next: RunAsConfig = { ...(wf.runAs ?? {}) };
+      const tokens = value.trim().split(/\s+/).filter(Boolean);
+      if (tokens.length > 0) {
+        next.command = tokens;
+      } else {
+        delete next.command;
+      }
+      wf.runAs = hasRunAsValues(next) ? next : undefined;
+    });
+  }
+
+  let runAsAttachHint = $derived.by(() => {
+    const runAs = activeWorkflow.runAs;
+    const user = runAs?.user?.trim() || "<user>";
+    const socket = runAs?.socket?.trim() || "<socket>";
+    return `sudo -u ${user} tmux -L ${socket} attach -t <session>`;
+  });
+
+  async function copyAttachHint() {
+    try {
+      await navigator.clipboard.writeText(runAsAttachHint);
+      attachHintCopied = true;
+      setTimeout(() => {
+        attachHintCopied = false;
+      }, 1500);
+    } catch {
+      attachHintCopied = false;
+    }
+  }
 
   /* JSON editor local state */
   let jsonDrafts = $state<Record<string, string>>({});
@@ -1454,6 +1509,52 @@
       </label>
     </section>
 
+    <section class="inspectorSection">
+      <div class="inspectorSection__title">Run As / Sandbox</div>
+      <small class="helperText">
+        Launch spawned panes under a different user, via a custom command prefix,
+        and on a dedicated tmux socket.
+      </small>
+      <label class="field">
+        <span>User</span>
+        <input
+          value={activeWorkflow.runAs?.user ?? ""}
+          placeholder="e.g. sandbox"
+          oninput={(e) => updateRunAs("user", (e.target as HTMLInputElement).value)}
+        />
+      </label>
+      <label class="field">
+        <span>Command prefix</span>
+        <input
+          value={(activeWorkflow.runAs?.command ?? []).join(" ")}
+          placeholder="e.g. sudo -u sandbox"
+          oninput={(e) => updateRunAsCommand((e.target as HTMLInputElement).value)}
+        />
+        <small class="helperText">Space-separated. Takes precedence over "User" when set.</small>
+      </label>
+      <label class="field">
+        <span>Socket</span>
+        <input
+          value={activeWorkflow.runAs?.socket ?? ""}
+          placeholder="e.g. silverbond"
+          oninput={(e) => updateRunAs("socket", (e.target as HTMLInputElement).value)}
+        />
+      </label>
+      <div class="field">
+        <span>Attach hint</span>
+        <div class="attachHint">
+          <code class="attachHint__cmd">{runAsAttachHint}</code>
+          <button
+            class="button button--ghost"
+            type="button"
+            onclick={copyAttachHint}
+          >
+            {attachHintCopied ? "Copied" : "Copy"}
+          </button>
+        </div>
+      </div>
+    </section>
+
     <!-- Workflow Agent Defaults -->
     {#if capabilities}
       <section class="inspectorSection">
@@ -1563,5 +1664,25 @@
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  .attachHint {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .attachHint__cmd {
+    flex: 1;
+    min-width: 0;
+    padding: 10px 12px;
+    border-radius: 14px;
+    border: 1px solid var(--border);
+    background: rgba(15, 23, 42, 0.66);
+    color: var(--text-bright);
+    font-family: var(--font-mono, ui-monospace, monospace);
+    font-size: 12px;
+    overflow-x: auto;
+    white-space: nowrap;
   }
 </style>

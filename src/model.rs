@@ -194,6 +194,14 @@ pub struct AgentDefaults {
     pub orchestrator: Option<OrchestratorConfig>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RunAsConfig {
+    pub user: Option<String>,
+    pub command: Option<Vec<String>>,
+    pub socket: Option<String>,
+}
+
 /// Per-node agent configuration override. Extends `AgentDefaults` with fine-grained tool control.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
@@ -650,6 +658,8 @@ pub struct WorkflowV3 {
     pub cwd: String,
     #[serde(default)]
     pub use_orchestrator: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_as: Option<RunAsConfig>,
     pub entry_node_id: String,
     #[serde(default)]
     pub variables: Vec<WorkflowVariable>,
@@ -779,6 +789,8 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
     let mut issues = Vec::new();
     let mut seen_nodes = BTreeSet::new();
     let mut seen_edges = BTreeSet::new();
+
+    validate_run_as_config(workflow.run_as.as_ref(), &mut issues);
 
     for node in &workflow.nodes {
         if !seen_nodes.insert(node.id.clone()) {
@@ -1120,6 +1132,61 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
         issues,
         graph: graph_meta,
     }
+}
+
+fn validate_run_as_config(run_as: Option<&RunAsConfig>, issues: &mut Vec<ValidationIssue>) {
+    let Some(run_as) = run_as else {
+        return;
+    };
+
+    if run_as.user.is_some() && run_as.command.is_some() {
+        tracing::warn!("workflow runAs has both user and command set; command takes precedence");
+    }
+
+    if run_as.command.as_ref().is_some_and(Vec::is_empty) {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: None,
+            message: "runAs.command must not be empty.".to_string(),
+        });
+    }
+
+    if let Some(user) = run_as.user.as_deref() {
+        if user.chars().any(is_run_as_user_shell_metachar) {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: None,
+                message: "runAs.user contains shell metacharacters.".to_string(),
+            });
+        }
+    }
+}
+
+fn is_run_as_user_shell_metachar(ch: char) -> bool {
+    ch.is_whitespace()
+        || matches!(
+            ch,
+            ';' | '\''
+                | '"'
+                | '`'
+                | '$'
+                | '&'
+                | '|'
+                | '>'
+                | '<'
+                | '\\'
+                | '!'
+                | '*'
+                | '?'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '#'
+                | '~'
+        )
 }
 
 fn validate_tmux_node_config(node: &WorkflowNode, issues: &mut Vec<ValidationIssue>) {
@@ -1894,6 +1961,7 @@ mod tests {
             goal: "goal".to_string(),
             cwd: String::new(),
             use_orchestrator: false,
+            run_as: None,
             entry_node_id: entry_node_id.to_string(),
             variables: Vec::new(),
             limits: WorkflowLimits::default(),
@@ -1924,6 +1992,7 @@ mod tests {
             goal: String::new(),
             cwd: String::new(),
             use_orchestrator: false,
+            run_as: None,
             entry_node_id: "missing".to_string(),
             variables: Vec::new(),
             limits: WorkflowLimits::default(),
@@ -1939,6 +2008,36 @@ mod tests {
                 .iter()
                 .any(|issue| issue.message.contains("entryNodeId"))
         );
+    }
+
+    #[test]
+    fn validates_run_as_command_is_not_empty() {
+        let mut workflow = workflow(Vec::new(), Vec::new(), "missing");
+        workflow.run_as = Some(RunAsConfig {
+            command: Some(Vec::new()),
+            ..Default::default()
+        });
+
+        let result = validate_workflow(workflow);
+        assert!(result.issues.iter().any(|issue| issue.severity == "error"
+            && issue.message.contains("runAs.command must not be empty")));
+    }
+
+    #[test]
+    fn validates_run_as_user_shell_safety() {
+        let mut workflow = workflow(Vec::new(), Vec::new(), "missing");
+        workflow.run_as = Some(RunAsConfig {
+            user: Some("bad user".to_string()),
+            ..Default::default()
+        });
+
+        let result = validate_workflow(workflow);
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue
+                    .message
+                    .contains("runAs.user contains shell metacharacters")
+        }));
     }
 
     #[test]
@@ -2642,6 +2741,105 @@ mod tests {
             "epic-dev.json has validation errors: {:?}",
             errors
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Stage 9: runAs serde round-trip
+    // -----------------------------------------------------------------------
+
+    /// A WorkflowV3 with `runAs` serializes/deserializes with camelCase keys
+    /// and the fields survive the round-trip intact.
+    #[test]
+    fn run_as_config_round_trips_with_camel_case_keys() {
+        let workflow = WorkflowV3 {
+            version: 3,
+            name: Some("run-as-test".to_string()),
+            goal: "test".to_string(),
+            cwd: "/tmp".to_string(),
+            use_orchestrator: false,
+            run_as: Some(RunAsConfig {
+                user: Some("agent".to_string()),
+                command: None,
+                socket: Some("test-socket".to_string()),
+            }),
+            entry_node_id: "n1".to_string(),
+            variables: Vec::new(),
+            limits: WorkflowLimits::default(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            agent_defaults: BTreeMap::new(),
+            subflows: BTreeMap::new(),
+            ui: None,
+        };
+
+        let serialized = serde_json::to_value(&workflow).expect("serialization must succeed");
+
+        // Verify camelCase keys are used
+        assert!(
+            serialized.get("runAs").is_some(),
+            "top-level key should be camelCase \"runAs\", got: {:?}",
+            serialized.as_object().map(|m| m.keys().collect::<Vec<_>>())
+        );
+        let run_as_val = &serialized["runAs"];
+        assert_eq!(run_as_val["user"], "agent");
+        assert_eq!(run_as_val["socket"], "test-socket");
+        // command is None → serialized as null (no skip_serializing_if on RunAsConfig fields)
+        assert!(
+            run_as_val["command"].is_null(),
+            "None command should serialize as null, got: {:?}",
+            run_as_val["command"]
+        );
+
+        // Verify round-trip fidelity
+        let deserialized: WorkflowV3 =
+            serde_json::from_value(serialized).expect("deserialization must succeed");
+        assert_eq!(workflow, deserialized);
+        let run_as = deserialized.run_as.as_ref().unwrap();
+        assert_eq!(run_as.user.as_deref(), Some("agent"));
+        assert_eq!(run_as.socket.as_deref(), Some("test-socket"));
+        assert!(run_as.command.is_none());
+    }
+
+    /// A WorkflowV3 with runAs.command round-trips correctly.
+    #[test]
+    fn run_as_command_variant_round_trips() {
+        let workflow = WorkflowV3 {
+            version: 3,
+            name: None,
+            goal: String::new(),
+            cwd: String::new(),
+            use_orchestrator: false,
+            run_as: Some(RunAsConfig {
+                user: None,
+                command: Some(vec!["docker".to_string(), "exec".to_string(), "box".to_string()]),
+                socket: None,
+            }),
+            entry_node_id: "n1".to_string(),
+            variables: Vec::new(),
+            limits: WorkflowLimits::default(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            agent_defaults: BTreeMap::new(),
+            subflows: BTreeMap::new(),
+            ui: None,
+        };
+
+        let serialized = serde_json::to_value(&workflow).expect("serialization must succeed");
+        let run_as_val = &serialized["runAs"];
+        assert_eq!(
+            run_as_val["command"],
+            serde_json::json!(["docker", "exec", "box"])
+        );
+        // socket is None → serialized as null (no skip_serializing_if on RunAsConfig fields)
+        assert!(
+            run_as_val["socket"].is_null(),
+            "None socket should serialize as null, got: {:?}",
+            run_as_val["socket"]
+        );
+
+        let deserialized: WorkflowV3 =
+            serde_json::from_value(serialized).expect("deserialization must succeed");
+        assert_eq!(workflow, deserialized);
     }
 
     #[test]

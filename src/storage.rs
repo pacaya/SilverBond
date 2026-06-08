@@ -679,6 +679,7 @@ mod tests {
             goal: "goal".to_string(),
             cwd: String::new(),
             use_orchestrator: false,
+            run_as: None,
             entry_node_id: "n1".to_string(),
             variables: Vec::new(),
             limits: WorkflowLimits {

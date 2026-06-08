@@ -99,6 +99,18 @@ export interface WorkflowLimits {
   maxVisitsPerNode: number;
 }
 
+/**
+ * Workflow-level "run as" / sandbox configuration. Mirrors the backend
+ * `RunAsConfig` (serialized camelCase). Controls how spawned panes are launched:
+ * under a different user, via a custom command prefix, and on a dedicated tmux
+ * socket.
+ */
+export interface RunAsConfig {
+  user?: string;
+  command?: string[];
+  socket?: string;
+}
+
 export interface WorkflowUiCanvasNode {
   x: number;
   y: number;
@@ -257,6 +269,8 @@ export interface WorkflowDocument {
   nodes: WorkflowNode[];
   edges: WorkflowEdge[];
   agentDefaults?: Record<string, AgentDefaults>;
+  /** Optional "run as" / sandbox config applied when launching panes. */
+  runAs?: RunAsConfig;
   /** Run-local catalog of saved subgraphs referenced by subflow/call nodes. */
   subflows?: Record<string, WorkflowDocument>;
   ui?: WorkflowUiState;

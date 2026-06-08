@@ -5,11 +5,9 @@
 
 use std::path::PathBuf;
 
-use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tmux_tools_core::agents;
-use tokio::process::Command;
 
 use crate::pty_output::{ContextInfo, CostInfo};
 
@@ -207,68 +205,6 @@ impl Default for AgentConfig {
             orchestrator: None,
         }
     }
-}
-
-const DEFAULT_DECIDE_FALLBACK_MODEL: &str = "claude-sonnet-4-5";
-
-/// Invoke the default LLM backend for lightweight router/classifier calls.
-///
-/// This intentionally uses the existing CLI-backed driver path instead of adding
-/// a separate HTTP client. The caller passes the preferred model; on failure,
-/// non-fallback models are retried once with the configured fallback model.
-pub async fn call_llm(model: &str, prompt: &str) -> anyhow::Result<String> {
-    let model = model.trim();
-    let model = if model.is_empty() {
-        DEFAULT_DECIDE_FALLBACK_MODEL
-    } else {
-        model
-    };
-    match call_claude_print(model, prompt).await {
-        Ok(output) => Ok(output),
-        Err(error) if model != DEFAULT_DECIDE_FALLBACK_MODEL => {
-            call_claude_print(DEFAULT_DECIDE_FALLBACK_MODEL, prompt)
-                .await
-                .with_context(|| {
-                    format!(
-                        "LLM call failed for model {model}; fallback model {DEFAULT_DECIDE_FALLBACK_MODEL} also failed: {error}"
-                    )
-                })
-        }
-        Err(error) => Err(error),
-    }
-}
-
-async fn call_claude_print(model: &str, prompt: &str) -> anyhow::Result<String> {
-    let config = AgentConfig {
-        model: Some(model.to_string()),
-        access_mode: AccessMode::ReadOnly,
-        ephemeral_session: true,
-        ..Default::default()
-    };
-    let args = ClaudeDriver.build_session_args(&config)?;
-    let mut command = Command::new(ClaudeDriver.name());
-    command.arg("--print");
-    command.args(args.args);
-    command.arg(prompt);
-    for (key, value) in args.env {
-        command.env(key, value);
-    }
-
-    let output = command
-        .output()
-        .await
-        .with_context(|| format!("failed to run {}", ClaudeDriver.name()))?;
-    if let Some(temp_dir) = args.temp_dir {
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-    anyhow::ensure!(
-        output.status.success(),
-        "{} exited with status {}: {}",
-        ClaudeDriver.name(),
-        output.status,
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 // ---------------------------------------------------------------------------

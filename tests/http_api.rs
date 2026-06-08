@@ -304,6 +304,7 @@ async fn exposes_capabilities() {
     assert_eq!(capabilities["features"]["split"], true);
     assert_eq!(capabilities["features"]["collector"], true);
     assert_eq!(capabilities["features"]["subflow"], true);
+    assert_eq!(capabilities["features"]["runAs"], true);
 
     // Verify capability flags match expected values for claude
     let claude_caps = &capabilities["agents"]["claude"]["capabilities"];

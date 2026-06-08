@@ -22,18 +22,22 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use futures::{SinkExt, Stream, StreamExt, stream::SplitSink};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tmux_tools_core::stream::{CaptureAnsiOpts, capture_ansi, stream_pane};
+use tmux_tools_core::{
+    TmuxInvocation, stream::{CaptureAnsiOpts, capture_ansi, stream_pane}, tmux, with_invocation,
+};
 use tokio::{io::AsyncReadExt, time::Instant};
 
 use crate::{
     app::AppState,
     model::{
-        WorkflowNode, WorkflowNodeType, WorkflowV3, normalize_workflow_value, validate_workflow,
+        RunAsConfig, WorkflowNode, WorkflowNodeType, WorkflowV3, normalize_workflow_value,
+        validate_workflow,
     },
     runtime::{
-        NodeTestContext, RuntimeCheckpoint, RuntimeStatus, available_agents, check_cli,
-        run_node_preview,
+        InterruptedRunSummary, NodeTestContext, PersistedRun, RuntimeCheckpoint, RuntimeStatus,
+        available_agents, check_cli, run_node_preview,
     },
+    tmux_exec::build_tmux_invocation,
 };
 
 const PANE_STREAM_HEARTBEAT: Duration = Duration::from_secs(5);
@@ -105,8 +109,188 @@ async fn capabilities() -> Result<Json<Value>, ApiError> {
             "split": true,
             "collector": true,
             "subflow": true,
+            "runAs": true,
         }
     })))
+}
+
+fn run_tmux_invocation(workflow: &WorkflowV3) -> TmuxInvocation {
+    workflow
+        .run_as
+        .as_ref()
+        .map(build_tmux_invocation)
+        .unwrap_or_default()
+}
+
+fn build_attach_command(run_as: Option<&RunAsConfig>, session_name: &str) -> String {
+    let socket = run_as
+        .and_then(|cfg| cfg.socket.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("silverbond");
+
+    if let Some(command) = run_as
+        .and_then(|cfg| cfg.command.as_ref())
+        .filter(|tokens| !tokens.is_empty())
+    {
+        return format!(
+            "{} tmux -L {socket} attach -t {session_name}",
+            command.join(" ")
+        );
+    }
+
+    if let Some(user) = run_as
+        .and_then(|cfg| cfg.user.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return format!("sudo -u {user} tmux -L {socket} attach -t {session_name}");
+    }
+
+    format!("tmux -L {socket} attach -t {session_name}")
+}
+
+fn session_name_from_value(value: &Value) -> Option<String> {
+    ["sessionName", "session_name"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn session_name_from_checkpoint(checkpoint: &RuntimeCheckpoint) -> Option<String> {
+    if let Some(node_id) = checkpoint.current_node_id.as_deref() {
+        if let Some(result) = checkpoint.all_results.get(node_id) {
+            if let Some(name) = result
+                .parsed_output
+                .as_ref()
+                .and_then(session_name_from_value)
+            {
+                return Some(name);
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(&result.output) {
+                if let Some(name) = session_name_from_value(&value) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+
+    for result in checkpoint.all_results.values().rev() {
+        if let Some(name) = result
+            .parsed_output
+            .as_ref()
+            .and_then(session_name_from_value)
+        {
+            return Some(name);
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(&result.output) {
+            if let Some(name) = session_name_from_value(&value) {
+                return Some(name);
+            }
+        }
+    }
+
+    None
+}
+
+async fn session_name_from_active_pane(
+    state: &AppState,
+    run_id: &str,
+    invocation: &TmuxInvocation,
+    current_node_id: Option<&str>,
+) -> Option<String> {
+    let pane = if let Some(node_id) = current_node_id {
+        state
+            .runtime
+            .registry
+            .resolve_active_pane(run_id, node_id)
+            .await
+    } else {
+        state
+            .runtime
+            .registry
+            .resolve_active_pane(run_id, "active")
+            .await
+    }?;
+    let invocation = invocation.clone();
+    tokio::task::spawn_blocking(move || {
+        with_invocation(invocation, || {
+            tmux::run_checked(&[
+                "display-message",
+                "-p",
+                "-t",
+                pane.as_str(),
+                "-F",
+                "#{session_name}",
+            ])
+            .ok()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+async fn resolve_run_session_name(
+    state: &AppState,
+    run_id: &str,
+    persisted: &PersistedRun,
+) -> Option<String> {
+    let invocation = run_tmux_invocation(&persisted.workflow);
+    session_name_from_active_pane(
+        state,
+        run_id,
+        &invocation,
+        persisted.checkpoint.current_node_id.as_deref(),
+    )
+    .await
+    .or_else(|| session_name_from_checkpoint(&persisted.checkpoint))
+}
+
+async fn run_observability_object(
+    state: &AppState,
+    run_id: &str,
+) -> serde_json::Map<String, Value> {
+    let mut fields = serde_json::Map::new();
+    let Ok(Some(persisted)) = state.runtime.db.get_run(run_id).await else {
+        return fields;
+    };
+    let Some(session_name) = resolve_run_session_name(state, run_id, &persisted).await else {
+        return fields;
+    };
+    fields.insert("sessionName".to_owned(), json!(session_name));
+    fields.insert(
+        "attachCommand".to_owned(),
+        json!(build_attach_command(
+            persisted.workflow.run_as.as_ref(),
+            &session_name
+        )),
+    );
+    fields
+}
+
+fn merge_run_observability(value: &mut Value, observability: serde_json::Map<String, Value>) {
+    if observability.is_empty() {
+        return;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.extend(observability);
+}
+
+async fn enrich_interrupted_run(
+    state: &AppState,
+    run: InterruptedRunSummary,
+) -> Result<Value, ApiError> {
+    let run_id = run.run_id.clone();
+    let mut value = serde_json::to_value(run)?;
+    merge_run_observability(&mut value, run_observability_object(state, &run_id).await);
+    Ok(value)
 }
 
 async fn list_workflows(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -295,7 +479,9 @@ async fn create_run(
             request.start_node_id,
         )
         .await?;
-    Ok(Json(json!({ "success": true, "runId": run_id })))
+    let mut response = json!({ "success": true, "runId": run_id });
+    merge_run_observability(&mut response, run_observability_object(&state, &run_id).await);
+    Ok(Json(response))
 }
 
 async fn stream_run(
@@ -364,8 +550,9 @@ async fn pane_stream_socket(
     run_id: String,
     pane: String,
 ) -> anyhow::Result<()> {
-    let pane_target = match resolve_run_pane_target(&state, &run_id, &pane).await {
-        Ok(target) => target,
+    let (pane_target, invocation) =
+        match resolve_run_pane_context(&state, &run_id, &pane).await {
+        Ok(context) => context,
         Err(error) => {
             send_socket_error_and_close(&mut socket, 0, &error.to_string()).await;
             return Ok(());
@@ -374,9 +561,9 @@ async fn pane_stream_socket(
 
     let (mut sender, mut receiver) = socket.split();
     let mut next_seq = 0_u64;
-    send_snapshot(&mut sender, &pane_target, &mut next_seq).await?;
+    send_snapshot(&mut sender, &pane_target, &invocation, &mut next_seq).await?;
 
-    let mut pane_reader = match stream_pane(&pane_target).await {
+    let mut pane_reader = match start_pane_stream(&pane_target, &invocation).await {
         Ok(reader) => reader,
         Err(error) => {
             let message = format!("pane stream unavailable: {error}");
@@ -399,7 +586,7 @@ async fn pane_stream_socket(
             client_message = receiver.next() => {
                 match client_message {
                     Some(Ok(message)) if is_resync_request(&message) => {
-                        send_snapshot(&mut sender, &pane_target, &mut next_seq).await?;
+                        send_snapshot(&mut sender, &pane_target, &invocation, &mut next_seq).await?;
                         heartbeat.as_mut().reset(Instant::now() + PANE_STREAM_HEARTBEAT);
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -439,7 +626,7 @@ async fn pane_stream_socket(
                                     pane_target = %pane_target,
                                     "pane websocket send stalled; sending snapshot resync"
                                 );
-                                send_snapshot(&mut sender, &pane_target, &mut next_seq).await?;
+                                send_snapshot(&mut sender, &pane_target, &invocation, &mut next_seq).await?;
                                 heartbeat.as_mut().reset(Instant::now() + PANE_STREAM_HEARTBEAT);
                             }
                             Err(error) => {
@@ -487,33 +674,35 @@ async fn pane_stream_socket(
     Ok(())
 }
 
-async fn resolve_run_pane_target(
+async fn resolve_run_pane_context(
     state: &AppState,
     run_id: &str,
     pane: &str,
-) -> anyhow::Result<String> {
-    if let Some(target) = state
-        .runtime
-        .registry
-        .resolve_active_pane(run_id, pane)
-        .await
-    {
-        return Ok(target);
-    }
-
+) -> anyhow::Result<(String, TmuxInvocation)> {
     let persisted = state
         .runtime
         .db
         .get_run(run_id)
         .await?
         .context("run not found")?;
+    let invocation = run_tmux_invocation(&persisted.workflow);
+
+    if let Some(target) = state
+        .runtime
+        .registry
+        .resolve_active_pane(run_id, pane)
+        .await
+    {
+        return Ok((target, invocation));
+    }
+
     let candidates = pane_candidates(&persisted.checkpoint);
     if let Some(target) = match_pane_candidate(
         pane,
         &candidates,
         persisted.checkpoint.current_node_id.as_deref(),
     ) {
-        return Ok(target);
+        return Ok((target, invocation));
     }
 
     if matches!(
@@ -523,6 +712,21 @@ async fn resolve_run_pane_target(
         anyhow::bail!("run has no active pane matching {pane}");
     }
     anyhow::bail!("run has no pane matching {pane}");
+}
+
+async fn start_pane_stream(
+    pane_target: &str,
+    invocation: &TmuxInvocation,
+) -> anyhow::Result<impl AsyncReadExt + Send + Unpin + 'static> {
+    let pane_target = pane_target.to_string();
+    let invocation = invocation.clone();
+    tokio::task::spawn_blocking(move || {
+        with_invocation(invocation, || {
+            futures::executor::block_on(stream_pane(&pane_target))
+        })
+    })
+    .await
+    .context("stream_pane task panicked")?
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -632,11 +836,15 @@ enum PaneWsSendError {
 async fn send_snapshot(
     sender: &mut SplitSink<WebSocket, Message>,
     pane_target: &str,
+    invocation: &TmuxInvocation,
     next_seq: &mut u64,
 ) -> anyhow::Result<()> {
     let target = pane_target.to_string();
+    let invocation = invocation.clone();
     let snapshot = tokio::task::spawn_blocking(move || {
-        capture_ansi(&target, CaptureAnsiOpts::default()).map(|snapshot| snapshot.into_bytes())
+        with_invocation(invocation, || {
+            capture_ansi(&target, CaptureAnsiOpts::default()).map(|snapshot| snapshot.into_bytes())
+        })
     })
     .await
     .context("capture_ansi task panicked")??;
@@ -822,7 +1030,9 @@ async fn resume_run(
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     state.runtime.resume_run(&run_id).await?;
-    Ok(Json(json!({ "success": true, "runId": run_id })))
+    let mut response = json!({ "success": true, "runId": run_id });
+    merge_run_observability(&mut response, run_observability_object(&state, &run_id).await);
+    Ok(Json(response))
 }
 
 async fn restart_run(
@@ -830,7 +1040,12 @@ async fn restart_run(
     Path((run_id, node_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     let new_run_id = state.runtime.restart_from(&run_id, &node_id).await?;
-    Ok(Json(json!({ "success": true, "runId": new_run_id })))
+    let mut response = json!({ "success": true, "runId": new_run_id });
+    merge_run_observability(
+        &mut response,
+        run_observability_object(&state, &new_run_id).await,
+    );
+    Ok(Json(response))
 }
 
 async fn dismiss_run(
@@ -850,9 +1065,12 @@ async fn dismiss_run(
 }
 
 async fn interrupted_runs(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    Ok(Json(serde_json::to_value(
-        state.runtime.db.list_interrupted_runs().await?,
-    )?))
+    let runs = state.runtime.db.list_interrupted_runs().await?;
+    let mut enriched = Vec::with_capacity(runs.len());
+    for run in runs {
+        enriched.push(enrich_interrupted_run(&state, run).await?);
+    }
+    Ok(Json(json!(enriched)))
 }
 
 async fn list_logs(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -881,21 +1099,28 @@ async fn delete_log(
 }
 
 async fn list_sessions(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let sessions = state.runtime.session_manager.list_sessions().await;
-    Ok(Json(serde_json::to_value(sessions)?))
+    let runs = state.runtime.db.list_interrupted_runs().await?;
+    let mut sessions = Vec::with_capacity(runs.len());
+    for run in runs {
+        let mut session = enrich_interrupted_run(&state, run).await?;
+        if let Some(object) = session.as_object_mut() {
+            if let Some(run_id) = object.get("runId").cloned() {
+                object.insert("id".to_owned(), run_id);
+            }
+        }
+        sessions.push(session);
+    }
+    Ok(Json(json!(sessions)))
 }
 
 async fn session_history(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
+    State(_state): State<AppState>,
+    Path(_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let history = state
-        .runtime
-        .session_manager
-        .get_history(&id)
-        .await
-        .map_err(|_| ApiError::status(StatusCode::NOT_FOUND, "Session not found"))?;
-    Ok(Json(serde_json::to_value(history)?))
+    Err(ApiError::status(
+        StatusCode::NOT_FOUND,
+        "Session history not available",
+    ))
 }
 
 fn node_from_value(value: Value) -> anyhow::Result<WorkflowNode> {

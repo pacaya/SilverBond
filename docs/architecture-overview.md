@@ -2,12 +2,12 @@
 
 ## What SilverBond Is
 
-SilverBond is a local-first graph workflow runner. It lets users visually author directed graphs of tasks, then executes them by shelling out to local agent CLIs (Claude, Codex, Cursor, Antigravity). The system is designed around a few core ideas:
+SilverBond is a local-first graph workflow runner. It lets users visually author directed graphs of tasks, then executes them by launching local agent CLIs inside **tmux panes** (Claude, Codex, Cursor, Antigravity). All agent calls — worker tasks and lightweight classifier invocations — use the same tmux-based execution path. The system is designed around a few core ideas:
 
 - **Local-first**: No cloud coordinator, remote queue, or managed database required
 - **Runtime-authoritative**: The Rust backend owns all business logic — validation, traversal, execution, checkpoints
 - **Graph-native**: Control flow is explicit in the workflow document (`entryNodeId`, `nodes[]`, `edges[]`)
-- **Observable**: Every runtime decision is inspectable via SSE events, persisted checkpoints, event journal replay, and execution logs
+- **Observable**: Every runtime decision is inspectable via SSE events, persisted checkpoints, event journal replay, execution logs, and live tmux pane attach
 
 ## System Topology
 
@@ -36,11 +36,18 @@ SilverBond is a local-first graph workflow runner. It lets users visually author
 │                    │(driver) │ │  (storage.rs) │ │
 │                    └────┬────┘ └──────────────┘ │
 └─────────────────────────┼───────────────────────┘
-                          │ subprocess
-          ┌───────────┬───┴───┬───────────┐
-          │           │       │           │
-      claude CLI  codex CLI  cursor-agent  agy
+                          │ tmux control (sudo -u <user> -L <socket>)
+┌─────────────────────────┼───────────────────────┐
+│              tmux server (per-UID 0700 socket)     │
+│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌─────┐ │
+│  │ pane     │ │ pane     │ │ pane     │ │ ... │ │
+│  │ claude   │ │ codex    │ │ cursor   │ │     │ │
+│  └──────────┘ └──────────┘ └──────────┘ └─────┘ │
+└───────────────────────────────────────────────────┘
+         workloads via zsh -lic in each pane
 ```
+
+Each target user has their own tmux server on a dedicated socket (mode `0700`). The backend issues control commands through `sudo -u <user>` (or a workflow `runAs.command` override) and launches agent workloads through `zsh -lic`. Workflows can set `runAs: { user?, command?, socket? }` to run under a dedicated agent-user sandbox.
 
 ## Deployment Modes
 
@@ -65,8 +72,8 @@ SilverBond/
 │   ├── model.rs            # Workflow schema + validation
 │   ├── runtime.rs          # Execution engine
 │   ├── driver.rs           # Agent CLI abstraction
-│   ├── session.rs          # PTY session management + interaction escalation
-│   ├── pty_output.rs       # PTY output parsing (LazyLock regexes)
+│   ├── tmux_exec.rs        # tmux pane lifecycle, agent execution, interaction escalation
+│   ├── pty_output.rs       # Pane output parsing (LazyLock regexes)
 │   ├── storage.rs          # SQLite + file persistence
 │   ├── frontend.rs         # Embedded asset serving
 │   └── util.rs             # Helpers
@@ -89,7 +96,7 @@ SilverBond/
 2. **Validation**: The frontend sends the workflow to `POST /api/validate-workflow`. The backend runs graph analysis (reachability, dead-ends, duplicate IDs, missing prompts) and returns issues.
 3. **Persistence**: `POST /api/workflows` saves the workflow as a JSON file in the `workflows/` directory.
 4. **Execution**: `POST /api/runs` creates a run. The runtime validates the workflow, creates an initial checkpoint, and begins graph traversal.
-5. **Agent Calls**: For each task node, the runtime resolves the prompt (variable substitution, context sources), selects the appropriate agent driver, builds CLI arguments, and spawns the agent as a subprocess.
+5. **Agent Calls**: For each task node, the runtime resolves the prompt (variable substitution, context sources), selects the appropriate agent driver, builds CLI arguments, and launches the agent in a tmux pane (respecting workflow `runAs` for user/socket selection). Lightweight classifier calls (orchestrator) use the same tmux path.
 6. **Events**: Runtime decisions are emitted as events, persisted to SQLite, and streamed to the frontend via SSE.
 7. **Checkpoints**: After each node execution, the runtime persists a checkpoint to SQLite. This enables resume after process restart.
 8. **History**: When a run completes, a durable execution log is persisted for later review.

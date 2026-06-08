@@ -1,19 +1,67 @@
 # Agent Drivers
 
-SilverBond executes workflow tasks by shelling out to local agent CLIs. The driver layer (`driver.rs`) provides a uniform abstraction over different agent implementations.
+SilverBond executes workflow tasks by launching local agent CLIs inside **tmux panes**. Every agent invocation — full worker tasks and lightweight classifier calls (orchestrator prompt refinement, branch choice, loop verdicts) alike — runs through the same tmux-based path. The driver layer (`driver.rs`) provides a uniform abstraction over different agent implementations; the runtime (`tmux_exec.rs`) owns pane lifecycle, readiness detection, and output capture.
+
+There are only two execution modes:
+
+| Mode | Status | Description |
+|------|--------|-------------|
+| **Interactive CLI TUI** | Current | Agents run in tmux panes with full terminal interactivity. Observable via tmux attach. |
+| **Direct API** | Future | Planned headless API calls without tmux (not yet implemented). |
+
+The legacy `--print` / `call_claude_print` path and direct-PTY (`expectrl`) execution have been removed entirely.
 
 ## Architecture
 
 ```
-Runtime
+Runtime (tmux_exec.rs)
   │
   ├── resolve_agent_config()   # Merge node → workflow → driver defaults
+  │
+  ├── build_tmux_invocation()  # runAs → sudo prefix + socket selection
+  │
+  ├── tmux server (per-user socket) → pane per agent invocation
   │
   └── AgentDriver trait
         ├── ClaudeDriver           # claude CLI
         ├── CodexDriver            # codex CLI
         └── RegistryProfileDriver  # registry-defined CLIs (cursor-agent, agy, …)
 ```
+
+## User Switch and `runAs`
+
+The user switch happens **once** at the tmux server boundary, not per pane:
+
+- **Per-UID sockets** — each target user gets their own tmux server socket (mode `0700`), isolating sessions between users.
+- **Control commands** — tmux control operations (`new-session`, `send-keys`, `capture-pane`, etc.) run as the target user via a `sudo -u <user> -H --` prefix and `-L <socket>`.
+- **Workloads** — agent CLIs launch through the target user's login+interactive shell: `zsh -lic`.
+
+Workflows can set a top-level `runAs` field to control this behavior:
+
+```json
+{
+  "runAs": {
+    "user": "agent-sandbox",
+    "socket": "silverbond"
+  }
+}
+```
+
+| Field | Effect |
+|-------|--------|
+| `user` | Synthesizes a `sudo -u <user> -H --` prefix for tmux control commands |
+| `command` | Verbatim argv-prefix escape hatch (overrides the synthesized `sudo` prefix) |
+| `socket` | Override the tmux socket name (defaults to `silverbond`; normally derived from user) |
+
+When both `user` and `command` are set, `command` takes precedence.
+
+To observe a running agent pane:
+
+```
+sudo -u <user> tmux -L <socket> attach -t <session>
+```
+
+The `GET /api/capabilities` endpoint exposes a `features.runAs` flag and per-run `attachCommand` hints for observability. Session history is no longer served via a dedicated API endpoint — attach to the tmux pane directly.
 
 Beyond the two built-in drivers (Claude, Codex), additional agents are defined as
 **tmux-tools registry profiles** and driven generically by `RegistryProfileDriver`. The
@@ -40,7 +88,7 @@ trait AgentDriver: Send + Sync {
 - **`capabilities()`** — declares what the driver supports
 - **`build_args()`** — constructs CLI command and arguments from prompt + config
 - **`parse_output()`** — parses CLI stdout/stderr into structured `AgentOutput`
-- **`interaction_patterns()`** — returns regex patterns for detecting interactive PTY prompts
+- **`interaction_patterns()`** — returns regex patterns for detecting interactive prompts in tmux pane output
 - **`destructive_blocklist()`** — returns patterns that always require human approval
 
 ## Agent Config
@@ -125,7 +173,7 @@ agent in `agents.toml` (`[<agent>.capabilities]`).
 
 ## Interaction Patterns
 
-Each driver declares regex patterns for detecting interactive PTY prompts via `interaction_patterns()`. Patterns are classified by `InteractionKind`:
+Each driver declares regex patterns for detecting interactive prompts in tmux pane output via `interaction_patterns()`. Patterns are classified by `InteractionKind`:
 
 | Kind | Behavior |
 |------|----------|
@@ -241,7 +289,7 @@ are injected (those capabilities are off by default for registry profiles).
 - `full-access` → `--dangerously-skip-permissions` (dangerous; requires explicit permission)
 - No interactive read-only mode — for a guaranteed no-write run use `agy -p "<prompt>"` headless.
 
-**Output parsing:** registry-profile drivers report no cost/context (PTY-driven interactive
+**Output parsing:** registry-profile drivers report no cost/context (tmux-driven interactive
 sessions). Readiness and interaction detection come from the registry profile's `ready_regex`
 and the shared destructive blocklist.
 

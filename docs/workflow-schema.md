@@ -22,6 +22,9 @@ SilverBond uses a graph-native workflow schema. The only accepted format is vers
   "nodes": [],
   "edges": [],
   "agentDefaults": {},
+  "runAs": {
+    "user": "agent-sandbox"
+  },
   "ui": {}
 }
 ```
@@ -33,6 +36,7 @@ SilverBond uses a graph-native workflow schema. The only accepted format is vers
 | `goal` | `string` | Yes | High-level description of what the workflow achieves |
 | `cwd` | `string` | No | Default working directory for agent execution |
 | `useOrchestrator` | `boolean` | No | Enable orchestrator for prompt refinement, branch choice, and loop verdicts |
+| `runAs` | `RunAsConfig` | No | User/socket sandbox for tmux-based agent execution (see below) |
 | `entryNodeId` | `string` | Yes | ID of the first node to execute |
 | `variables` | `Variable[]` | No | Workflow-level variables available in prompt templates |
 | `limits` | `Limits` | No | Execution guardrails |
@@ -60,11 +64,43 @@ Variables are referenced in prompts with `{{var:name}}` syntax.
 
 Guards against runaway execution. If either limit is hit, the run fails.
 
+### Run As (`runAs`)
+
+Workflow-level sandbox configuration for tmux-based agent execution. All agents — worker tasks and lightweight classifier calls — run in tmux panes under the identity and socket specified here.
+
+```json
+{
+  "runAs": {
+    "user": "agent-sandbox",
+    "command": ["sudo", "-u", "agent-sandbox", "-H", "--"],
+    "socket": "silverbond"
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `user` | `string` | Synthesizes a `sudo -u <user> -H --` prefix for tmux control commands |
+| `command` | `string[]` | Verbatim argv-prefix escape hatch; overrides the synthesized `sudo` prefix when set |
+| `socket` | `string` | Override the tmux socket name (defaults to `silverbond`) |
+
+When both `user` and `command` are set, `command` takes precedence. The user switch happens once at the tmux server boundary: each target user gets a per-UID socket (mode `0700`), control commands run through the prefix, and agent workloads launch via `zsh -lic`.
+
+**Execution modes:** SilverBond currently runs all agents in interactive CLI TUI mode (tmux panes). A future direct-API mode (headless, no tmux) is planned but not yet implemented.
+
+**Observability:** To watch a running agent pane, attach with:
+
+```
+sudo -u <user> tmux -L <socket> attach -t <session>
+```
+
+The capabilities endpoint (`GET /api/capabilities`) exposes `features.runAs` and per-run `attachCommand` hints. Session observability is via tmux attach, not a dedicated history API.
+
 ## Node Types
 
 ### Task Node
 
-Executes a prompt using a local agent CLI.
+Executes a prompt using a local agent CLI launched in a tmux pane.
 
 ```json
 {
@@ -278,7 +314,7 @@ Resolution order: node-level `agentConfig` overrides → workflow-level `agentDe
 
 ### Auto-Approve
 
-When `autoApprove` is `true`, permission-request prompts detected during PTY execution are automatically approved — unless the prompt matches the destructive blocklist. Destructive patterns always require human confirmation.
+When `autoApprove` is `true`, permission-request prompts detected during tmux pane execution are automatically approved — unless the prompt matches the destructive blocklist. Destructive patterns always require human confirmation.
 
 ### OrchestratorConfig
 
@@ -322,7 +358,7 @@ Optional orchestrator configuration for interaction classification and prompt re
 | `maxBudgetUsd` | `number` | Maximum cost in USD |
 | `allowedTools` | `string[]` | Whitelist of allowed tools (node-level only) |
 | `disallowedTools` | `string[]` | Blacklist of disallowed tools (node-level only) |
-| `autoApprove` | `boolean` | Auto-approve PTY permission prompts (blocked by destructive blocklist) |
+| `autoApprove` | `boolean` | Auto-approve tmux permission prompts (blocked by destructive blocklist) |
 | `orchestrator` | `OrchestratorConfig` | Orchestrator configuration for interaction classification |
 
 Not all agents support all fields. The frontend shows only capability-supported fields per agent. See [Agent Drivers](agent-drivers.md) for capability details.

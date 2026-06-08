@@ -13,9 +13,9 @@ Today it is built as:
 - multi-cursor checkpoints with execution epochs, split families, and collector barriers
 - SQLite-backed checkpoints, event history, interrupted runs, and execution logs
 - per-node agent configuration: model selection, reasoning level, system prompt, access mode, tool control, budget/turn limits, session continuity
+- tmux-based agent execution: all agents (workers and classifier calls) run in tmux panes, observable via attach; optional `runAs` sandbox per workflow
 
-The runtime shells out to locally installed agent CLIs (`claude`, `codex`, `cursor-agent`, and `agy`).
-Tauri is packaging and windowing, not a second runtime model.
+The runtime launches locally installed agent CLIs (`claude`, `codex`, `cursor-agent`, and `agy`) inside **tmux panes** on a per-user socket. Workloads run through `zsh -lic`; control commands respect workflow `runAs` for user switching. Tauri is packaging and windowing, not a second runtime model.
 
 ## Key Documents
 
