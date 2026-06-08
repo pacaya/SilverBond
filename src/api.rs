@@ -11,9 +11,9 @@ use axum::{
         Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
     response::{
-        IntoResponse,
+        IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
@@ -23,15 +23,16 @@ use futures::{SinkExt, Stream, StreamExt, stream::SplitSink};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tmux_tools_core::{
-    TmuxInvocation, stream::{CaptureAnsiOpts, capture_ansi, stream_pane}, tmux, with_invocation,
+    TmuxInvocation,
+    stream::{CaptureAnsiOpts, capture_ansi, stream_pane},
+    tmux, with_invocation,
 };
-use tokio::{io::AsyncReadExt, time::Instant};
+use tokio::{io::AsyncReadExt, sync::broadcast, time::Instant};
 
 use crate::{
-    app::AppState,
+    app::{AppState, PaneStreamEntry},
     model::{
-        RunAsConfig, WorkflowNode, WorkflowNodeType, WorkflowV3, normalize_workflow_value,
-        validate_workflow,
+        WorkflowNode, WorkflowNodeType, WorkflowV3, normalize_workflow_value, validate_workflow,
     },
     runtime::{
         InterruptedRunSummary, NodeTestContext, PersistedRun, RuntimeCheckpoint, RuntimeStatus,
@@ -75,8 +76,6 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/runs/{run_id}/dismiss", post(dismiss_run))
         .route("/api/interrupted-runs", get(interrupted_runs))
-        .route("/api/sessions", get(list_sessions))
-        .route("/api/sessions/{id}/history", get(session_history))
         .route("/api/logs", get(list_logs))
         .route("/api/logs/{id}", get(get_log).delete(delete_log))
         .with_state(state)
@@ -122,32 +121,36 @@ fn run_tmux_invocation(workflow: &WorkflowV3) -> TmuxInvocation {
         .unwrap_or_default()
 }
 
-fn build_attach_command(run_as: Option<&RunAsConfig>, session_name: &str) -> String {
-    let socket = run_as
-        .and_then(|cfg| cfg.socket.as_deref())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("silverbond");
+fn shell_quote(token: &str) -> String {
+    shlex::try_quote(token)
+        .map(|quoted| quoted.into_owned())
+        .unwrap_or_else(|_| format!("'{}'", token.replace('\'', "'\\''")))
+}
 
-    if let Some(command) = run_as
-        .and_then(|cfg| cfg.command.as_ref())
-        .filter(|tokens| !tokens.is_empty())
-    {
-        return format!(
-            "{} tmux -L {socket} attach -t {session_name}",
-            command.join(" ")
-        );
+fn build_attach_command(invocation: &TmuxInvocation, session_name: &str) -> String {
+    let mut parts = Vec::new();
+
+    for token in &invocation.prefix {
+        parts.push(shell_quote(token));
     }
 
-    if let Some(user) = run_as
-        .and_then(|cfg| cfg.user.as_deref())
+    parts.push(shell_quote(&invocation.tmux_bin));
+
+    if let Some(socket) = invocation
+        .socket
+        .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        return format!("sudo -u {user} tmux -L {socket} attach -t {session_name}");
+        parts.push("-L".to_owned());
+        parts.push(shell_quote(socket));
     }
 
-    format!("tmux -L {socket} attach -t {session_name}")
+    parts.push("attach".to_owned());
+    parts.push("-t".to_owned());
+    parts.push(shell_quote(session_name));
+
+    parts.join(" ")
 }
 
 fn session_name_from_value(value: &Value) -> Option<String> {
@@ -262,13 +265,11 @@ async fn run_observability_object(
     let Some(session_name) = resolve_run_session_name(state, run_id, &persisted).await else {
         return fields;
     };
+    let invocation = run_tmux_invocation(&persisted.workflow);
     fields.insert("sessionName".to_owned(), json!(session_name));
     fields.insert(
         "attachCommand".to_owned(),
-        json!(build_attach_command(
-            persisted.workflow.run_as.as_ref(),
-            &session_name
-        )),
+        json!(build_attach_command(&invocation, &session_name)),
     );
     fields
 }
@@ -480,7 +481,10 @@ async fn create_run(
         )
         .await?;
     let mut response = json!({ "success": true, "runId": run_id });
-    merge_run_observability(&mut response, run_observability_object(&state, &run_id).await);
+    merge_run_observability(
+        &mut response,
+        run_observability_object(&state, &run_id).await,
+    );
     Ok(Json(response))
 }
 
@@ -525,8 +529,16 @@ async fn stream_run(
 pub async fn pane_stream_ws(
     State(state): State<AppState>,
     Path((run_id, pane)): Path<(String, String)>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> Response {
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        match origin.to_str() {
+            Ok(origin) if is_allowed_origin(origin) => {}
+            _ => return StatusCode::FORBIDDEN.into_response(),
+        }
+    }
+
     ws.on_upgrade(move |socket| async move {
         let log_run_id = run_id.clone();
         let log_pane = pane.clone();
@@ -542,6 +554,14 @@ pub async fn pane_stream_ws(
         });
         let _ = task.await;
     })
+    .into_response()
+}
+
+fn is_allowed_origin(origin: &str) -> bool {
+    let origin = origin.trim();
+    origin.starts_with("tauri://")
+        || origin.starts_with("http://127.0.0.1:")
+        || origin.starts_with("http://localhost:")
 }
 
 async fn pane_stream_socket(
@@ -550,8 +570,7 @@ async fn pane_stream_socket(
     run_id: String,
     pane: String,
 ) -> anyhow::Result<()> {
-    let (pane_target, invocation) =
-        match resolve_run_pane_context(&state, &run_id, &pane).await {
+    let (pane_target, invocation) = match resolve_run_pane_context(&state, &run_id, &pane).await {
         Ok(context) => context,
         Err(error) => {
             send_socket_error_and_close(&mut socket, 0, &error.to_string()).await;
@@ -563,24 +582,11 @@ async fn pane_stream_socket(
     let mut next_seq = 0_u64;
     send_snapshot(&mut sender, &pane_target, &invocation, &mut next_seq).await?;
 
-    let mut pane_reader = match start_pane_stream(&pane_target, &invocation).await {
-        Ok(reader) => reader,
-        Err(error) => {
-            let message = format!("pane stream unavailable: {error}");
-            let _ = send_error_frame(&mut sender, &mut next_seq, &message).await;
-            tracing::warn!(
-                run_id = %run_id,
-                pane = %pane,
-                pane_target = %pane_target,
-                error = %error,
-                "failed to start pane stream"
-            );
-            return Ok(());
-        }
-    };
+    let mut pane_receiver =
+        subscribe_pane_stream(&state, &run_id, &pane, &pane_target, &invocation).await;
 
     let mut heartbeat = Box::pin(tokio::time::sleep(PANE_STREAM_HEARTBEAT));
-    let mut buffer = [0_u8; 8192];
+    let mut stream_chunks_seen = false;
     loop {
         tokio::select! {
             client_message = receiver.next() => {
@@ -603,19 +609,11 @@ async fn pane_stream_socket(
                     }
                 }
             }
-            read_result = pane_reader.read(&mut buffer) => {
-                match read_result {
-                    Ok(0) => {
-                        tracing::debug!(
-                            run_id = %run_id,
-                            pane = %pane,
-                            pane_target = %pane_target,
-                            "pane stream reached EOF"
-                        );
-                        break;
-                    }
-                    Ok(bytes_read) => {
-                        match send_data_frame(&mut sender, &buffer[..bytes_read], &mut next_seq).await {
+            stream_result = pane_receiver.recv() => {
+                match stream_result {
+                    Ok(bytes) => {
+                        stream_chunks_seen = true;
+                        match send_data_frame(&mut sender, &bytes, &mut next_seq).await {
                             Ok(()) => {
                                 heartbeat.as_mut().reset(Instant::now() + PANE_STREAM_HEARTBEAT);
                             }
@@ -641,14 +639,32 @@ async fn pane_stream_socket(
                             }
                         }
                     }
-                    Err(error) => {
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(
                             run_id = %run_id,
                             pane = %pane,
                             pane_target = %pane_target,
-                            error = %error,
-                            "pane stream read failed"
+                            skipped,
+                            "pane websocket stream lagged; sending snapshot resync"
                         );
+                        send_snapshot(&mut sender, &pane_target, &invocation, &mut next_seq).await?;
+                        heartbeat.as_mut().reset(Instant::now() + PANE_STREAM_HEARTBEAT);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::debug!(
+                            run_id = %run_id,
+                            pane = %pane,
+                            pane_target = %pane_target,
+                            "pane stream reached EOF"
+                        );
+                        if !stream_chunks_seen {
+                            let _ = send_error_frame(
+                                &mut sender,
+                                &mut next_seq,
+                                "pane stream unavailable",
+                            )
+                            .await;
+                        }
                         break;
                     }
                 }
@@ -670,6 +686,9 @@ async fn pane_stream_socket(
             }
         }
     }
+
+    drop(pane_receiver);
+    state.pane_streams.unsubscribe(&pane_target).await;
 
     Ok(())
 }
@@ -729,6 +748,126 @@ async fn start_pane_stream(
     .context("stream_pane task panicked")?
 }
 
+async fn subscribe_pane_stream(
+    state: &AppState,
+    run_id: &str,
+    pane: &str,
+    pane_target: &str,
+    invocation: &TmuxInvocation,
+) -> broadcast::Receiver<Vec<u8>> {
+    let mut streams = state.pane_streams.inner.lock().await;
+    if let Some(entry) = streams.get_mut(pane_target) {
+        entry.refcount = entry.refcount.saturating_add(1);
+        return entry.sender.subscribe();
+    }
+
+    let (sender, receiver) = broadcast::channel::<Vec<u8>>(256);
+    streams.insert(
+        pane_target.to_string(),
+        PaneStreamEntry {
+            sender: sender.clone(),
+            refcount: 1,
+        },
+    );
+    drop(streams);
+
+    spawn_pane_stream_task(
+        state.clone(),
+        run_id.to_string(),
+        pane.to_string(),
+        pane_target.to_string(),
+        invocation.clone(),
+        sender,
+    );
+
+    receiver
+}
+
+fn spawn_pane_stream_task(
+    state: AppState,
+    run_id: String,
+    pane: String,
+    pane_target: String,
+    invocation: TmuxInvocation,
+    sender: broadcast::Sender<Vec<u8>>,
+) {
+    tokio::spawn(async move {
+        {
+            let mut pane_reader = match start_pane_stream(&pane_target, &invocation).await {
+                Ok(reader) => reader,
+                Err(error) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        pane = %pane,
+                        pane_target = %pane_target,
+                        error = %error,
+                        "failed to start pane stream"
+                    );
+                    state
+                        .pane_streams
+                        .remove_if_sender(&pane_target, &sender)
+                        .await;
+                    return;
+                }
+            };
+
+            let mut buffer = [0_u8; 8192];
+            loop {
+                tokio::select! {
+                    _ = sender.closed() => {
+                        tracing::debug!(
+                            run_id = %run_id,
+                            pane = %pane,
+                            pane_target = %pane_target,
+                            "pane stream has no subscribers"
+                        );
+                        break;
+                    }
+                    read_result = pane_reader.read(&mut buffer) => {
+                        match read_result {
+                            Ok(0) => {
+                                tracing::debug!(
+                                    run_id = %run_id,
+                                    pane = %pane,
+                                    pane_target = %pane_target,
+                                    "pane stream reached EOF"
+                                );
+                                break;
+                            }
+                            Ok(bytes_read) => {
+                                if sender.send(buffer[..bytes_read].to_vec()).is_err() {
+                                    tracing::debug!(
+                                        run_id = %run_id,
+                                        pane = %pane,
+                                        pane_target = %pane_target,
+                                        "pane stream has no subscribers"
+                                    );
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    run_id = %run_id,
+                                    pane = %pane,
+                                    pane_target = %pane_target,
+                                    error = %error,
+                                    "pane stream read failed"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        state
+            .pane_streams
+            .remove_if_sender(&pane_target, &sender)
+            .await;
+    });
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PaneCandidate {
     key: String,
@@ -737,6 +876,7 @@ struct PaneCandidate {
 
 fn pane_candidates(checkpoint: &RuntimeCheckpoint) -> Vec<PaneCandidate> {
     let mut candidates = Vec::new();
+    let trusted_targets = trusted_pane_targets(checkpoint);
     for (node_id, result) in &checkpoint.all_results {
         push_pane_candidate(
             &mut candidates,
@@ -744,10 +884,22 @@ fn pane_candidates(checkpoint: &RuntimeCheckpoint) -> Vec<PaneCandidate> {
             result.metadata.agent_session_id.as_deref(),
         );
         if let Some(value) = &result.parsed_output {
-            push_pane_candidate(&mut candidates, node_id, pane_target_from_value(value));
+            push_output_pane_candidate(
+                &mut candidates,
+                &trusted_targets,
+                &checkpoint.run_id,
+                node_id,
+                pane_target_from_value(value),
+            );
         }
         if let Ok(value) = serde_json::from_str::<Value>(&result.output) {
-            push_pane_candidate(&mut candidates, node_id, pane_target_from_value(&value));
+            push_output_pane_candidate(
+                &mut candidates,
+                &trusted_targets,
+                &checkpoint.run_id,
+                node_id,
+                pane_target_from_value(&value),
+            );
         }
     }
 
@@ -760,6 +912,52 @@ fn pane_candidates(checkpoint: &RuntimeCheckpoint) -> Vec<PaneCandidate> {
     }
 
     candidates
+}
+
+fn trusted_pane_targets(checkpoint: &RuntimeCheckpoint) -> BTreeSet<String> {
+    let mut trusted_targets = BTreeSet::new();
+    for result in checkpoint.all_results.values() {
+        insert_trusted_pane_target(
+            &mut trusted_targets,
+            result.metadata.agent_session_id.as_deref(),
+        );
+    }
+    for execution in &checkpoint.execution_log.node_executions {
+        insert_trusted_pane_target(
+            &mut trusted_targets,
+            execution.metadata.agent_session_id.as_deref(),
+        );
+    }
+    trusted_targets
+}
+
+fn insert_trusted_pane_target(trusted_targets: &mut BTreeSet<String>, target: Option<&str>) {
+    let Some(target) = target.map(str::trim).filter(|target| !target.is_empty()) else {
+        return;
+    };
+    trusted_targets.insert(target.to_string());
+}
+
+fn push_output_pane_candidate(
+    candidates: &mut Vec<PaneCandidate>,
+    trusted_targets: &BTreeSet<String>,
+    run_id: &str,
+    node_id: &str,
+    target: Option<&str>,
+) {
+    let Some(target) = target.map(str::trim).filter(|target| !target.is_empty()) else {
+        return;
+    };
+    if trusted_targets.contains(target) {
+        push_pane_candidate(candidates, node_id, Some(target));
+    } else {
+        tracing::warn!(
+            run_id = %run_id,
+            node_id = %node_id,
+            pane_target = %target,
+            "ignored untrusted pane target from node output"
+        );
+    }
 }
 
 fn push_pane_candidate(candidates: &mut Vec<PaneCandidate>, key: &str, target: Option<&str>) {
@@ -1032,7 +1230,10 @@ async fn resume_run(
 ) -> Result<Json<Value>, ApiError> {
     state.runtime.resume_run(&run_id).await?;
     let mut response = json!({ "success": true, "runId": run_id });
-    merge_run_observability(&mut response, run_observability_object(&state, &run_id).await);
+    merge_run_observability(
+        &mut response,
+        run_observability_object(&state, &run_id).await,
+    );
     Ok(Json(response))
 }
 
@@ -1099,31 +1300,6 @@ async fn delete_log(
     Ok(Json(json!({ "success": true })))
 }
 
-async fn list_sessions(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let runs = state.runtime.db.list_interrupted_runs().await?;
-    let mut sessions = Vec::with_capacity(runs.len());
-    for run in runs {
-        let mut session = enrich_interrupted_run(&state, run).await?;
-        if let Some(object) = session.as_object_mut() {
-            if let Some(run_id) = object.get("runId").cloned() {
-                object.insert("id".to_owned(), run_id);
-            }
-        }
-        sessions.push(session);
-    }
-    Ok(Json(json!(sessions)))
-}
-
-async fn session_history(
-    State(_state): State<AppState>,
-    Path(_id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    Err(ApiError::status(
-        StatusCode::NOT_FOUND,
-        "Session history not available",
-    ))
-}
-
 fn node_from_value(value: Value) -> anyhow::Result<WorkflowNode> {
     if value.get("version").is_some() || value.get("entryNodeId").is_some() {
         anyhow::bail!("workflow payload is not valid for node testing");
@@ -1174,5 +1350,200 @@ where
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (self.status, Json(self.body)).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        app::PaneStreamRegistry,
+        runtime::{
+            AgentExecutionMetadata, ExecutionLog, NodeExecutionLog, NodeResult, RuntimeStatus,
+        },
+    };
+
+    #[test]
+    fn build_attach_command_omits_socket_flag_for_default_invocation() {
+        let invocation = TmuxInvocation::default();
+        let command = build_attach_command(&invocation, "my-run");
+        assert!(!command.contains("-L"));
+        assert_eq!(command, "tmux attach -t my-run");
+    }
+
+    #[test]
+    fn build_attach_command_includes_socket_flag_for_run_as_invocation() {
+        let invocation = TmuxInvocation {
+            prefix: vec![
+                "sudo".to_string(),
+                "-u".to_string(),
+                "agent".to_string(),
+                "-H".to_string(),
+                "--".to_string(),
+            ],
+            socket: Some("silverbond".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+        let command = build_attach_command(&invocation, "my-run");
+        assert!(command.contains("-L silverbond"));
+        assert_eq!(
+            command,
+            "sudo -u agent -H -- tmux -L silverbond attach -t my-run"
+        );
+    }
+
+    #[test]
+    fn build_attach_command_quotes_tokens_with_spaces() {
+        let invocation = TmuxInvocation::default();
+        let command = build_attach_command(&invocation, "my session");
+        assert!(command.contains("'my session'") || command.contains("\"my session\""));
+        assert!(!command.ends_with("my session"));
+    }
+
+    #[test]
+    fn origin_allowlist_accepts_tauri_and_local_development() {
+        assert!(is_allowed_origin("tauri://localhost"));
+        assert!(is_allowed_origin("http://127.0.0.1:3333"));
+        assert!(is_allowed_origin("http://localhost:5173"));
+        assert!(!is_allowed_origin("https://evil.com"));
+        assert!(!is_allowed_origin("http://evil.com:3333"));
+    }
+
+    #[test]
+    fn pane_candidates_ignore_untrusted_json_targets() {
+        let mut checkpoint = test_checkpoint();
+        checkpoint.all_results.insert(
+            "node1".to_string(),
+            NodeResult {
+                parsed_output: Some(json!({ "target": "%999" })),
+                output: r#"{"target":"%999"}"#.to_string(),
+                metadata: AgentExecutionMetadata {
+                    agent_session_id: Some("%123".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        checkpoint.all_results.insert(
+            "node2".to_string(),
+            NodeResult {
+                parsed_output: Some(json!({ "target": "%222" })),
+                ..Default::default()
+            },
+        );
+        checkpoint
+            .execution_log
+            .node_executions
+            .push(NodeExecutionLog {
+                node_id: "node2".to_string(),
+                metadata: AgentExecutionMetadata {
+                    agent_session_id: Some("%222".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+
+        let candidates = pane_candidates(&checkpoint);
+
+        assert!(
+            !candidates
+                .iter()
+                .any(|candidate| candidate.target == "%999")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.key == "node1" && candidate.target == "%123")
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.key == "node2" && candidate.target == "%222")
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_stream_registry_fans_out_and_cleans_up() {
+        let registry = PaneStreamRegistry::default();
+        let (sender, mut first_receiver) = broadcast::channel::<Vec<u8>>(256);
+        let mut second_receiver = {
+            let mut streams = registry.inner.lock().await;
+            streams.insert(
+                "%1".to_string(),
+                PaneStreamEntry {
+                    sender: sender.clone(),
+                    refcount: 1,
+                },
+            );
+            let entry = streams.get_mut("%1").expect("pane stream entry exists");
+            entry.refcount += 1;
+            entry.sender.subscribe()
+        };
+
+        sender.send(b"chunk".to_vec()).unwrap();
+        assert_eq!(first_receiver.recv().await.unwrap(), b"chunk".to_vec());
+        assert_eq!(second_receiver.recv().await.unwrap(), b"chunk".to_vec());
+
+        registry.unsubscribe("%1").await;
+        assert_eq!(
+            registry
+                .inner
+                .lock()
+                .await
+                .get("%1")
+                .map(|entry| entry.refcount),
+            Some(1)
+        );
+
+        registry.unsubscribe("%1").await;
+        assert!(!registry.inner.lock().await.contains_key("%1"));
+    }
+
+    fn test_checkpoint() -> RuntimeCheckpoint {
+        RuntimeCheckpoint {
+            run_id: "run-test".to_string(),
+            status: RuntimeStatus::Running,
+            workflow_name: "workflow".to_string(),
+            current_node_id: None,
+            current_node_name: None,
+            all_results: BTreeMap::new(),
+            batch_item_results: BTreeMap::new(),
+            last_output: String::new(),
+            execution_epoch: 0,
+            active_cursors: Vec::new(),
+            split_families: BTreeMap::new(),
+            collector_barriers: BTreeMap::new(),
+            queued_approvals: Vec::new(),
+            loop_counters: BTreeMap::new(),
+            visit_counters: BTreeMap::new(),
+            total_executed: 0,
+            output_hashes: BTreeMap::new(),
+            last_branch_origin_id: None,
+            last_branch_choice: None,
+            var_map: BTreeMap::new(),
+            goal: String::new(),
+            cwd: String::new(),
+            use_orchestrator: false,
+            max_total_steps: 0,
+            max_visits_per_node: 0,
+            started_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            pending_approval: None,
+            execution_log: ExecutionLog {
+                run_id: "run-test".to_string(),
+                workflow_name: "workflow".to_string(),
+                goal: String::new(),
+                cwd: String::new(),
+                start_time: "2026-01-01T00:00:00Z".to_string(),
+                end_time: None,
+                use_orchestrator: false,
+                aborted: false,
+                total_duration: String::new(),
+                node_executions: Vec::new(),
+                decisions: Vec::new(),
+                transitions: Vec::new(),
+                terminal_reason: None,
+            },
+        }
     }
 }

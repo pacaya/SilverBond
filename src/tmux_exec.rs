@@ -25,7 +25,7 @@ use crate::{
         WorkflowNode, WorkflowNodeType,
     },
     pty_output::strip_ansi,
-    runtime::{AgentExecutionMetadata, NodeResult, NodeRunner, RuntimeContext},
+    runtime::{AgentExecutionMetadata, NodeResult, NodeRunner, RuntimeContext, active_pane_key},
 };
 
 #[derive(Debug, Clone, Default)]
@@ -178,9 +178,11 @@ impl NodeRunner for TmuxNodeRunner {
         previous_output: String,
         ctx: RuntimeContext,
         run_id: String,
+        cursor_id: String,
     ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
         let inv = ctx.run_invocation.clone();
-        let active_pane = ActivePaneRegistration::new(&ctx, run_id.clone(), node.id.clone());
+        let active_pane =
+            ActivePaneRegistration::new(&ctx, run_id.clone(), cursor_id, node.id.clone());
         let interaction = InteractionEscalation::new(ctx, run_id);
         Box::pin(async move {
             tokio::task::spawn_blocking(move || {
@@ -272,19 +274,46 @@ struct SpawnedPane {
     command: String,
 }
 
+struct SessionGuard {
+    session_name: Option<String>,
+}
+
+impl SessionGuard {
+    fn new(session_name: String) -> Self {
+        Self {
+            session_name: Some(session_name),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.session_name = None;
+    }
+}
+
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        if let Some(ref session) = self.session_name {
+            let _ = tmux::run(&["kill-session", "-t", session]);
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ActivePaneRegistration {
     registry: crate::runtime::RunRegistry,
     run_id: String,
+    cursor_id: String,
     key: String,
     handle: tokio::runtime::Handle,
 }
 
 impl ActivePaneRegistration {
-    fn new(ctx: &RuntimeContext, run_id: String, key: String) -> Self {
+    fn new(ctx: &RuntimeContext, run_id: String, cursor_id: String, node_id: String) -> Self {
+        let key = active_pane_key(&cursor_id, &node_id);
         Self {
             registry: ctx.registry.clone(),
             run_id,
+            cursor_id,
             key,
             handle: tokio::runtime::Handle::current(),
         }
@@ -321,9 +350,18 @@ impl ActivePaneRegistration {
     fn resolve(&self, key: &str) -> Option<String> {
         let registry = self.registry.clone();
         let run_id = self.run_id.clone();
-        let key = key.to_string();
-        self.handle
-            .block_on(async move { registry.resolve_active_pane(&run_id, &key).await })
+        let same_cursor_key = active_pane_key(&self.cursor_id, key);
+        let fallback_key = key.to_string();
+        self.handle.block_on(async move {
+            if let Some(target) = registry
+                .resolve_active_pane(&run_id, &same_cursor_key)
+                .await
+            {
+                Some(target)
+            } else {
+                registry.resolve_active_pane(&run_id, &fallback_key).await
+            }
+        })
     }
 }
 
@@ -1613,6 +1651,7 @@ fn spawn_pane(
     if pane_id.is_empty() {
         return Err(anyhow!("tmux new-session returned an empty pane id"));
     }
+    let mut session_guard = SessionGuard::new(session_name.clone());
 
     if let Some(agent) = &agent {
         names::set(&pane_id, names::KEY_AGENT, agent)?;
@@ -1627,6 +1666,7 @@ fn spawn_pane(
         names::set(&pane_id, names::KEY_CWD, work_dir)?;
     }
 
+    session_guard.disarm();
     Ok(SpawnedPane {
         pane_id,
         session_name,
@@ -2217,6 +2257,60 @@ mod tests {
             .arg("true")
             .status()
             .is_ok_and(|status| status.success())
+    }
+
+    fn tmux_available() -> bool {
+        tmux::run(&["list-sessions"]).is_ok()
+    }
+
+    fn tmux_session_exists(session_name: &str) -> bool {
+        tmux::run(&["has-session", "-t", session_name])
+            .is_ok_and(|output| output.exit_code == 0)
+    }
+
+    #[test]
+    fn session_guard_kills_session_on_drop_without_disarm() {
+        if !tmux_available() {
+            return;
+        }
+        let session_name = format!(
+            "silverbond-test-guard-{}",
+            uuid::Uuid::now_v7().simple()
+        );
+        tmux::run_checked(&["new-session", "-d", "-s", &session_name, "sleep", "600"]).unwrap();
+        assert!(tmux_session_exists(&session_name));
+
+        {
+            let _guard = SessionGuard::new(session_name.clone());
+        }
+
+        assert!(
+            !tmux_session_exists(&session_name),
+            "SessionGuard should kill the session on drop when not disarmed"
+        );
+    }
+
+    #[test]
+    fn session_guard_disarm_prevents_kill_on_drop() {
+        if !tmux_available() {
+            return;
+        }
+        let session_name = format!(
+            "silverbond-test-disarm-{}",
+            uuid::Uuid::now_v7().simple()
+        );
+        tmux::run_checked(&["new-session", "-d", "-s", &session_name, "sleep", "600"]).unwrap();
+
+        {
+            let mut guard = SessionGuard::new(session_name.clone());
+            guard.disarm();
+        }
+
+        assert!(
+            tmux_session_exists(&session_name),
+            "disarmed SessionGuard must not kill the session on drop"
+        );
+        let _ = tmux::run(&["kill-session", "-t", &session_name]);
     }
 
     fn wait_for_child_output(

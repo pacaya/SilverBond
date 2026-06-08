@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use axum::{Router, routing::get};
+use tokio::sync::{Mutex, broadcast};
 
 use crate::{
     api, frontend,
@@ -57,6 +58,51 @@ pub struct AppState {
     pub workflows: WorkflowStore,
     pub templates: TemplateStore,
     pub runtime: RuntimeContext,
+    pub pane_streams: PaneStreamRegistry,
+}
+
+#[derive(Clone)]
+pub struct PaneStreamRegistry {
+    pub(crate) inner: Arc<Mutex<HashMap<String, PaneStreamEntry>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PaneStreamEntry {
+    pub(crate) sender: broadcast::Sender<Vec<u8>>,
+    pub(crate) refcount: usize,
+}
+
+impl Default for PaneStreamRegistry {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl PaneStreamRegistry {
+    pub(crate) async fn unsubscribe(&self, target: &str) {
+        let mut inner = self.inner.lock().await;
+        let Some(entry) = inner.get_mut(target) else {
+            return;
+        };
+        if entry.refcount <= 1 {
+            inner.remove(target);
+        } else {
+            entry.refcount -= 1;
+        }
+    }
+
+    pub(crate) async fn remove_if_sender(&self, target: &str, sender: &broadcast::Sender<Vec<u8>>) {
+        let mut inner = self.inner.lock().await;
+        let should_remove = inner
+            .get(target)
+            .map(|entry| entry.sender.same_channel(sender))
+            .unwrap_or(false);
+        if should_remove {
+            inner.remove(target);
+        }
+    }
 }
 
 pub struct Application {
@@ -90,6 +136,7 @@ impl Application {
             workflows,
             templates,
             runtime,
+            pane_streams: PaneStreamRegistry::default(),
         };
 
         Ok(Self { state, paths })

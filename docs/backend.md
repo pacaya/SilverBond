@@ -97,17 +97,16 @@ Manages all persistence:
 - `TemplateStore` — reads template JSON files from `templates/` directory
 - `seed_bundled_templates()` — copies bundled templates to the app root
 
-### `session.rs` — PTY Session Management
+### `tmux_exec.rs` — Tmux Pane Execution
 
-Manages interactive PTY sessions for agent CLIs using `expectrl`. Responsibilities:
+Runs agent and control-flow nodes inside detached tmux panes via `tmux-tools-core`. Responsibilities:
 
-- **Session lifecycle**: `create_session()` spawns PTY-backed agent processes, `close_session()` / `close_all()` clean up
-- **Interactive prompt handling**: `send_prompt_interactive()` watches for PTY prompts during execution using sentinel markers
-- **4-tier escalation**: Auto-responds to warmup patterns (Tier 1), auto-approves with destructive blocklist (Tier 2), scaffolds orchestrator classification (Tier 3), escalates to UI (Tier 4)
-- **Interaction resolution**: `respond_to_interaction()` sends human responses back to the PTY session
-- **Session state tracking**: `SessionState` enum tracks `Idle`, `Processing`, `WaitingInteraction`, `Completed`, `Error`
-- **Warmup**: `warmup_session()` runs initial auto-response phase for trust prompts
-- **History and inspection**: `get_history()` returns conversation log, `list_sessions()` provides session summaries
+- **Pane lifecycle**: `spawn_pane()` creates detached tmux sessions, registers them in the runtime's per-run `active_panes` map (`runtime.rs`), and tears them down on completion or abort
+- **Node routing**: `run_tmux_node()` dispatches `Task`, `RunAgent`, `Spawn`, `Send`, `Wait`, `Capture`, and `Kill` nodes to the appropriate tmux helpers
+- **Invocation context**: `build_tmux_invocation()` translates workflow `runAs` config into a `TmuxInvocation` (command prefix, optional `-L` socket, resolved `tmux` binary)
+- **Interactive prompt handling**: `poll_agent_interactive()` watches pane output for agent trust/permission prompts and applies the 4-tier escalation model
+- **Interaction resolution**: `respond_to_interaction()` in `runtime.rs` forwards human replies into the active pane via tmux `send-keys`
+- **Streaming**: pane output is captured for SSE/WebSocket delivery; the API resolves the active pane target from the run registry when serving live streams
 
 ### `pty_output.rs` — PTY Output Parsing
 

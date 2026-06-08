@@ -201,7 +201,7 @@ Events emitted during execution:
 
 ## Interactive PTY Prompts
 
-When task nodes execute via interactive PTY sessions (managed by `session.rs`), agent CLIs may emit interactive prompts — trust dialogs, permission requests, or destructive-action warnings. SilverBond handles these through a **4-tier escalation model**:
+When task and agent nodes execute inside tmux panes (managed by `tmux_exec.rs` and tracked in the runtime's per-run `active_panes` registry), agent CLIs may emit interactive prompts — trust dialogs, permission requests, or destructive-action warnings. SilverBond handles these through a **4-tier escalation model**:
 
 ### Tier 1: Auto-Respond (Warmup)
 
@@ -217,7 +217,7 @@ When the orchestrator is configured with `activation: "always_on"`, it can class
 
 ### Tier 4: Human-in-the-Loop
 
-Any prompt that is not auto-responded or auto-approved escalates to the user via the UI. The runtime emits an `agent_interaction_required` event, the frontend renders an interaction card in the RunPanel, and the session enters the `WaitingInteraction` state. The user can approve, reject, or type a free-form response. Once submitted, the runtime sends the response to the PTY session and emits `agent_interaction_resolved`.
+Any prompt that is not auto-responded or auto-approved escalates to the user via the UI. The runtime emits an `agent_interaction_required` event, the frontend renders an interaction card in the RunPanel, and the run pauses until a response arrives. The user can approve, reject, or type a free-form response. Once submitted, the runtime sends the response into the active tmux pane via `send-keys` and emits `agent_interaction_resolved`.
 
 Destructive-blocklist matches (`InteractionKind::DestructiveWarning`) **always** escalate to Tier 4, regardless of auto-approve settings.
 

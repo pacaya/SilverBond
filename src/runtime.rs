@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -375,6 +375,8 @@ pub struct RuntimeCheckpoint {
     pub current_node_name: Option<String>,
     #[serde(default)]
     pub all_results: BTreeMap<String, NodeResult>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub batch_item_results: BTreeMap<String, BTreeMap<usize, Value>>,
     #[serde(default)]
     pub last_output: String,
     #[serde(default)]
@@ -510,9 +512,11 @@ pub(crate) trait NodeRunner: Send + Sync {
         previous_output: String,
         ctx: RuntimeContext,
         run_id: String,
+        cursor_id: String,
     ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
         let _ = node;
         let _ = previous_output;
+        let _ = cursor_id;
         self.run_with_interaction(agent, prompt, cwd, timeout_secs, config, ctx, run_id)
     }
 }
@@ -529,12 +533,30 @@ struct ActiveRun {
     abort_flag: Arc<AtomicBool>,
     approval_sender: Arc<Mutex<Option<oneshot::Sender<ApprovalDecision>>>>,
     interaction_senders: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
-    active_panes: Arc<Mutex<BTreeMap<String, String>>>,
+    active_panes: Arc<Mutex<BTreeMap<String, ActivePaneTarget>>>,
+    active_pane_sequence: Arc<AtomicU64>,
+}
+
+#[derive(Debug, Clone)]
+struct ActivePaneTarget {
+    target: String,
+    sequence: u64,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct RunRegistry {
     inner: Arc<Mutex<HashMap<String, ActiveRun>>>,
+}
+
+pub(crate) fn active_pane_key(cursor_id: &str, node_id: &str) -> String {
+    format!("{cursor_id}:{node_id}")
+}
+
+fn active_pane_key_matches_node(key: &str, node_id: &str) -> bool {
+    key == node_id
+        || key
+            .strip_suffix(node_id)
+            .is_some_and(|prefix| prefix.ends_with(':'))
 }
 
 impl RunRegistry {
@@ -548,6 +570,7 @@ impl RunRegistry {
                 approval_sender: Arc::new(Mutex::new(None)),
                 interaction_senders: Arc::new(Mutex::new(HashMap::new())),
                 active_panes: Arc::new(Mutex::new(BTreeMap::new())),
+                active_pane_sequence: Arc::new(AtomicU64::new(0)),
             }
         });
     }
@@ -683,11 +706,15 @@ impl RunRegistry {
 
     pub(crate) async fn set_active_pane(&self, run_id: &str, key: &str, target: &str) {
         if let Some(active) = self.inner.lock().await.get(run_id).cloned() {
-            active
-                .active_panes
-                .lock()
-                .await
-                .insert(key.to_string(), target.to_string());
+            let mut panes = active.active_panes.lock().await;
+            let sequence = active.active_pane_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+            panes.insert(
+                key.to_string(),
+                ActivePaneTarget {
+                    target: target.to_string(),
+                    sequence,
+                },
+            );
         }
     }
 
@@ -703,7 +730,7 @@ impl RunRegistry {
                 .active_panes
                 .lock()
                 .await
-                .retain(|_, pane_target| pane_target != target);
+                .retain(|_, pane_target| pane_target.target != target);
         }
     }
 
@@ -711,15 +738,39 @@ impl RunRegistry {
         let active = self.inner.lock().await.get(run_id).cloned()?;
         let panes = active.active_panes.lock().await;
         if let Some(target) = panes.get(pane) {
-            return Some(target.clone());
+            return Some(target.target.clone());
         }
-        if panes.values().any(|target| target == pane) {
+        if panes.values().any(|target| target.target == pane) {
             return Some(pane.to_string());
         }
-        if matches!(pane, "active" | "current") && panes.len() == 1 {
-            return panes.values().next().cloned();
+        if matches!(pane, "active" | "current") {
+            if panes.len() == 1 {
+                return panes.values().next().map(|target| target.target.clone());
+            }
+            return None;
+        }
+        if let Some(target) = panes
+            .iter()
+            .filter(|(key, _)| active_pane_key_matches_node(key, pane))
+            .max_by_key(|(_, target)| target.sequence)
+            .map(|(_, target)| target.target.clone())
+        {
+            return Some(target);
         }
         None
+    }
+
+    pub(crate) async fn active_pane_targets(&self, run_id: &str) -> Vec<String> {
+        let Some(active) = self.inner.lock().await.get(run_id).cloned() else {
+            return Vec::new();
+        };
+        let panes = active.active_panes.lock().await;
+        panes
+            .values()
+            .map(|entry| entry.target.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     pub(crate) async fn active_pane_targets_for_keys(
@@ -732,7 +783,12 @@ impl RunRegistry {
         };
         let panes = active.active_panes.lock().await;
         keys.iter()
-            .filter_map(|key| panes.get(key).cloned())
+            .flat_map(|key| {
+                panes
+                    .iter()
+                    .filter(move |(pane_key, _)| active_pane_key_matches_node(pane_key, key))
+                    .map(|(_, entry)| entry.target.clone())
+            })
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
@@ -1387,6 +1443,7 @@ fn build_initial_checkpoint(
         current_node_id: Some(start_node_id.clone()),
         current_node_name,
         all_results: BTreeMap::new(),
+        batch_item_results: BTreeMap::new(),
         last_output: String::new(),
         execution_epoch: 1,
         active_cursors: vec![CursorState {
@@ -1617,6 +1674,17 @@ fn scoped_output_hash_key(cursor: &CursorState, node_id: &str) -> String {
     parts.join("::")
 }
 
+fn parallel_batch_checkpoint_key(cursor: &CursorState, node_id: &str) -> String {
+    let mut parts = cursor
+        .call_stack
+        .iter()
+        .map(|frame| frame.call_node_id.as_str())
+        .collect::<Vec<_>>();
+    parts.push(cursor.cursor_id.as_str());
+    parts.push(node_id);
+    parts.join("::")
+}
+
 fn select_success_edge(graph: &WorkflowGraph, node_id: &str) -> Option<WorkflowEdge> {
     graph
         .outgoing_for(node_id)
@@ -1741,6 +1809,7 @@ async fn execute_workflow(
             .await?;
             checkpoint.status = RuntimeStatus::Aborted;
             checkpoint.execution_log.terminal_reason = Some("aborted".to_string());
+            kill_active_run_panes(&ctx, &run_id).await;
             running_tasks.abort_all();
             while running_tasks.join_next().await.is_some() {}
             checkpoint.active_cursors.clear();
@@ -1760,6 +1829,9 @@ async fn execute_workflow(
         }
 
         if checkpoint.execution_log.terminal_reason.is_some() {
+            if matches!(checkpoint.status, RuntimeStatus::Aborted) {
+                kill_active_run_panes(&ctx, &run_id).await;
+            }
             running_tasks.abort_all();
             while running_tasks.join_next().await.is_some() {}
             checkpoint.active_cursors.clear();
@@ -1897,9 +1969,17 @@ async fn execute_workflow(
                         handle_approval_resolution(&ctx, &workflow, &mut checkpoint, wait.cursor_id, decision).await?;
                     }
                 }
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
             }
-        } else if let Some(task) = running_tasks.join_next().await {
-            apply_join_result(&ctx, &workflow, &mut checkpoint, task).await?;
+        } else {
+            tokio::select! {
+                task = running_tasks.join_next() => {
+                    if let Some(task) = task {
+                        apply_join_result(&ctx, &workflow, &mut checkpoint, task).await?;
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {}
+            }
         }
 
         update_checkpoint_summary(&workflow, &mut checkpoint);
@@ -2693,6 +2773,7 @@ async fn run_cursor_task(
                 cursor.last_output.clone(),
                 ctx.clone(),
                 run_ctx.run_id.clone(),
+                cursor.cursor_id.clone(),
             )
             .await?;
         if step_result.success || attempts >= max_attempts {
@@ -3658,18 +3739,44 @@ async fn handle_parallel_batch_node(
         config.body_entry
     );
     let iteration = *parent_cursor.loop_counters.get(&node.id).unwrap_or(&1);
+    let total_items = items.len();
+    let batch_key = parallel_batch_checkpoint_key(&parent_cursor, &node.id);
+    let mut item_results_by_index = checkpoint
+        .batch_item_results
+        .get(&batch_key)
+        .cloned()
+        .unwrap_or_default();
+    item_results_by_index.retain(|item_index, result| {
+        let Some(item_value) = items.get(*item_index) else {
+            return false;
+        };
+        result.get("item") == Some(item_value)
+    });
+    if item_results_by_index.is_empty() {
+        checkpoint.batch_item_results.remove(&batch_key);
+    } else {
+        checkpoint
+            .batch_item_results
+            .insert(batch_key.clone(), item_results_by_index.clone());
+    }
+
     let shared = Arc::new(RunConstantData {
         inbound_map,
         agent_defaults: workflow.agent_defaults.clone(),
         session_persistence_nodes: build_session_persistence_set(workflow),
     });
-    let mut pending_items = items.into_iter().enumerate();
-    let total_items = pending_items.len();
+    let mut pending_items = items
+        .iter()
+        .cloned()
+        .enumerate()
+        .filter(|(item_index, _)| !item_results_by_index.contains_key(item_index))
+        .collect::<VecDeque<_>>();
     let mut running = JoinSet::new();
-    let mut item_results = Vec::new();
+    let run_id = checkpoint.run_id.clone();
+    let mut batch_aborted = ctx.registry.is_aborted(&run_id).await;
 
-    while running.len() < max_concurrent {
-        let Some((item_index, item_value)) = pending_items.next() else {
+    while !batch_aborted && running.len() < max_concurrent {
+        let Some((item_index, item_value)) = pending_items.pop_front() else {
             break;
         };
         spawn_batch_item_task(
@@ -3690,15 +3797,41 @@ async fn handle_parallel_batch_node(
         .await?;
     }
 
-    while let Some(joined) = running.join_next().await {
+    while !batch_aborted {
+        let Some(joined) = running.join_next().await else {
+            break;
+        };
         let item_result = match joined {
             Ok(item_result) => item_result,
             Err(error) if error.is_cancelled() => continue,
             Err(error) => return Err(error.into()),
         };
-        item_results.push(record_batch_item_result(ctx, checkpoint, item_result).await?);
+        let item_result = record_batch_item_result(ctx, checkpoint, item_result).await?;
+        let item_index = item_result
+            .get("index")
+            .and_then(Value::as_u64)
+            .context("batch item result is missing index")? as usize;
+        item_results_by_index.insert(item_index, item_result.clone());
+        checkpoint
+            .batch_item_results
+            .entry(batch_key.clone())
+            .or_default()
+            .insert(item_index, item_result);
+        persist_checkpoint(ctx, root_workflow, checkpoint).await?;
 
-        if let Some((item_index, item_value)) = pending_items.next() {
+        if ctx.registry.is_aborted(&run_id).await {
+            batch_aborted = true;
+            break;
+        }
+
+        while running.len() < max_concurrent {
+            if ctx.registry.is_aborted(&run_id).await {
+                batch_aborted = true;
+                break;
+            }
+            let Some((item_index, item_value)) = pending_items.pop_front() else {
+                break;
+            };
             spawn_batch_item_task(
                 ctx,
                 &mut running,
@@ -3718,15 +3851,29 @@ async fn handle_parallel_batch_node(
         }
     }
 
-    item_results.sort_by_key(|result| {
-        result
-            .get("index")
-            .and_then(Value::as_u64)
-            .unwrap_or(u64::MAX)
-    });
+    if !batch_aborted && ctx.registry.is_aborted(&run_id).await {
+        batch_aborted = true;
+    }
+    if batch_aborted {
+        running.abort_all();
+        while running.join_next().await.is_some() {}
+        for (item_index, item_value) in items.iter().cloned().enumerate() {
+            item_results_by_index
+                .entry(item_index)
+                .or_insert_with(|| cancelled_batch_item_result(item_index, item_value));
+        }
+    }
+
+    checkpoint.batch_item_results.remove(&batch_key);
+
+    let item_results = item_results_by_index.values().cloned().collect::<Vec<_>>();
     let succeeded = item_results
         .iter()
         .filter(|result| result.get("success").and_then(Value::as_bool) == Some(true))
+        .count();
+    let cancelled = item_results
+        .iter()
+        .filter(|result| result.get("cancelled").and_then(Value::as_bool) == Some(true))
         .count();
     let parsed_output = json!({
         "items": item_results,
@@ -3734,6 +3881,7 @@ async fn handle_parallel_batch_node(
             "total": total_items,
             "succeeded": succeeded,
             "failed": total_items.saturating_sub(succeeded),
+            "cancelled": cancelled,
             "maxConcurrent": max_concurrent,
         }
     });
@@ -3757,11 +3905,13 @@ async fn handle_parallel_batch_node(
     }
     let output =
         serde_json::to_string_pretty(&parsed_output).unwrap_or_else(|_| parsed_output.to_string());
-    let success = succeeded == total_items;
+    let success = !batch_aborted && succeeded == total_items;
     let result = NodeResult {
         success,
         output: output.clone(),
-        stderr: if success {
+        stderr: if batch_aborted {
+            "Workflow aborted by user.".to_string()
+        } else if success {
             String::new()
         } else {
             format!(
@@ -3828,6 +3978,19 @@ async fn handle_parallel_batch_node(
             ),
     )
     .await?;
+
+    if batch_aborted {
+        emit_event(
+            ctx,
+            &run_id,
+            RuntimeEvent::new("workflow_error").with("message", "Workflow aborted by user."),
+        )
+        .await?;
+        checkpoint.status = RuntimeStatus::Aborted;
+        checkpoint.execution_log.terminal_reason = Some("aborted".to_string());
+        persist_checkpoint(ctx, root_workflow, checkpoint).await?;
+        return Ok(());
+    }
 
     if complete_subflow_if_at_exit(ctx, root_workflow, checkpoint, &cursor_id, &node, &result)
         .await?
@@ -4091,6 +4254,21 @@ async fn record_batch_item_result(
         "exitCode": task_result.result.exit_code,
         "parsedOutput": task_result.result.parsed_output,
     }))
+}
+
+fn cancelled_batch_item_result(item_index: usize, item_value: Value) -> Value {
+    json!({
+        "index": item_index,
+        "item": item_value,
+        "cursorId": Value::Null,
+        "nodeId": Value::Null,
+        "success": false,
+        "output": "",
+        "stderr": "cancelled",
+        "exitCode": -1,
+        "parsedOutput": Value::Null,
+        "cancelled": true,
+    })
 }
 
 fn read_batch_items(
@@ -5042,6 +5220,23 @@ async fn cleanup_reused_session_panes(ctx: &RuntimeContext, run_id: &str, workfl
     .await;
 }
 
+async fn kill_active_run_panes(ctx: &RuntimeContext, run_id: &str) {
+    let panes = ctx.registry.active_pane_targets(run_id).await;
+    if panes.is_empty() {
+        return;
+    }
+
+    let inv = ctx.run_invocation.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(inv) = inv {
+            tmux_tools_core::with_invocation(inv, || crate::tmux_exec::cleanup_panes(&panes))
+        } else {
+            crate::tmux_exec::cleanup_panes(&panes)
+        }
+    })
+    .await;
+}
+
 async fn emit_event(ctx: &RuntimeContext, run_id: &str, event: RuntimeEvent) -> anyhow::Result<()> {
     ctx.db.append_event(run_id, &event).await?;
     ctx.registry.send_event(run_id, event).await;
@@ -5571,6 +5766,160 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct PaneTrackingRunner {
+        registrations: Arc<Mutex<Vec<(String, String, String)>>>,
+        registered: Arc<tokio::sync::Barrier>,
+        release: Arc<tokio::sync::Barrier>,
+    }
+
+    impl PaneTrackingRunner {
+        fn new(expected_tasks: usize) -> Self {
+            Self {
+                registrations: Arc::new(Mutex::new(Vec::new())),
+                registered: Arc::new(tokio::sync::Barrier::new(expected_tasks + 1)),
+                release: Arc::new(tokio::sync::Barrier::new(expected_tasks + 1)),
+            }
+        }
+    }
+
+    impl NodeRunner for PaneTrackingRunner {
+        fn run(
+            &self,
+            _agent: String,
+            prompt: String,
+            _cwd: String,
+            _timeout_secs: Option<u64>,
+            _config: Option<AgentConfig>,
+        ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+            Box::pin(async move { Err(anyhow::anyhow!("unexpected basic run for {prompt}")) })
+        }
+
+        fn run_node_with_interaction(
+            &self,
+            node: WorkflowNode,
+            _agent: String,
+            prompt: String,
+            _cwd: String,
+            _timeout_secs: Option<u64>,
+            _config: Option<AgentConfig>,
+            _previous_output: String,
+            ctx: RuntimeContext,
+            run_id: String,
+            cursor_id: String,
+        ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+            let registrations = self.registrations.clone();
+            let registered = self.registered.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                let key = active_pane_key(&cursor_id, &node.id);
+                let pane = format!("pane-{cursor_id}");
+                ctx.registry.set_active_pane(&run_id, &key, &pane).await;
+                registrations
+                    .lock()
+                    .await
+                    .push((cursor_id.clone(), key.clone(), pane.clone()));
+                registered.wait().await;
+                release.wait().await;
+                ctx.registry.clear_active_pane(&run_id, &key).await;
+                Ok(NodeResult {
+                    success: true,
+                    output: pane,
+                    exit_code: 0,
+                    duration: "0".to_string(),
+                    agent: "mock".to_string(),
+                    prompt: prompt.clone(),
+                    resolved_prompt: Some(prompt),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone)]
+    struct AbortBlockingRunner {
+        pane_id: String,
+        kill_marker: PathBuf,
+        registered: Arc<tokio::sync::Barrier>,
+    }
+
+    #[cfg(unix)]
+    impl AbortBlockingRunner {
+        fn new(pane_id: &str, kill_marker: PathBuf) -> Self {
+            Self {
+                pane_id: pane_id.to_string(),
+                kill_marker,
+                registered: Arc::new(tokio::sync::Barrier::new(2)),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl NodeRunner for AbortBlockingRunner {
+        fn run(
+            &self,
+            _agent: String,
+            prompt: String,
+            _cwd: String,
+            _timeout_secs: Option<u64>,
+            _config: Option<AgentConfig>,
+        ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+            Box::pin(async move { Err(anyhow::anyhow!("unexpected basic run for {prompt}")) })
+        }
+
+        fn run_node_with_interaction(
+            &self,
+            node: WorkflowNode,
+            _agent: String,
+            prompt: String,
+            _cwd: String,
+            _timeout_secs: Option<u64>,
+            _config: Option<AgentConfig>,
+            _previous_output: String,
+            ctx: RuntimeContext,
+            run_id: String,
+            cursor_id: String,
+        ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+            let pane_id = self.pane_id.clone();
+            let kill_marker = self.kill_marker.clone();
+            let registered = self.registered.clone();
+            Box::pin(async move {
+                let key = active_pane_key(&cursor_id, &node.id);
+                ctx.registry.set_active_pane(&run_id, &key, &pane_id).await;
+                registered.wait().await;
+                let pane_for_result = pane_id.clone();
+                tokio::task::spawn_blocking(move || -> anyhow::Result<NodeResult> {
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while !kill_marker.exists() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    anyhow::ensure!(
+                        kill_marker.exists(),
+                        "timed out waiting for abort cleanup to kill active pane"
+                    );
+                    Ok(NodeResult {
+                        success: false,
+                        output: String::new(),
+                        stderr: "aborted".to_string(),
+                        exit_code: -1,
+                        duration: "0".to_string(),
+                        agent: "mock".to_string(),
+                        prompt: prompt.clone(),
+                        resolved_prompt: Some(prompt),
+                        metadata: AgentExecutionMetadata {
+                            agent_session_id: Some(pane_for_result),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    })
+                })
+                .await
+                .context("abort blocking runner task panicked")?
+            })
+        }
+    }
+
+    #[derive(Clone)]
     struct EchoRunner;
 
     impl NodeRunner for EchoRunner {
@@ -5851,6 +6200,37 @@ mod tests {
         let _ = fs::remove_file(&log);
 
         (inv, log)
+    }
+
+    #[cfg(unix)]
+    fn fake_tmux_kill_invocation(temp: &TempDir) -> (TmuxInvocation, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = temp.path().join("tmux-kill-prefix.sh");
+        let log = temp.path().join("tmux-kill-args.log");
+        let marker = temp.path().join("tmux-pane-killed");
+        fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\nmarker=\"$2\"\nshift 2\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"kill-pane\" ]; then touch \"$marker\"; fi\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        (
+            TmuxInvocation {
+                prefix: vec![
+                    script.to_string_lossy().into_owned(),
+                    log.to_string_lossy().into_owned(),
+                    marker.to_string_lossy().into_owned(),
+                ],
+                socket: Some("abort-kill-socket".to_string()),
+                tmux_bin: "tmux".to_string(),
+            },
+            log,
+            marker,
+        )
     }
 
     #[cfg(unix)]
@@ -6521,6 +6901,166 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn active_pane_registry_keeps_duplicate_node_ids_per_cursor() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db);
+        let run_id = "run_active_panes";
+        ctx.registry.register(run_id).await;
+
+        let first_key = active_pane_key("cursor-a", "shared");
+        let second_key = active_pane_key("cursor-b", "shared");
+        ctx.registry
+            .set_active_pane(run_id, &first_key, "%pane-a")
+            .await;
+        ctx.registry
+            .set_active_pane(run_id, &second_key, "%pane-b")
+            .await;
+
+        assert_eq!(
+            ctx.registry.resolve_active_pane(run_id, &first_key).await,
+            Some("%pane-a".to_string())
+        );
+        assert_eq!(
+            ctx.registry.resolve_active_pane(run_id, &second_key).await,
+            Some("%pane-b".to_string())
+        );
+        assert_eq!(
+            ctx.registry.resolve_active_pane(run_id, "shared").await,
+            Some("%pane-b".to_string())
+        );
+        assert_eq!(
+            ctx.registry.resolve_active_pane(run_id, "active").await,
+            None
+        );
+
+        let targets = ctx
+            .registry
+            .active_pane_targets_for_keys(run_id, &HashSet::from(["shared".to_string()]))
+            .await;
+        assert_eq!(targets, vec!["%pane-a".to_string(), "%pane-b".to_string()]);
+
+        ctx.registry.clear_active_pane(run_id, &first_key).await;
+        assert_eq!(
+            ctx.registry.resolve_active_pane(run_id, "shared").await,
+            Some("%pane-b".to_string())
+        );
+        ctx.registry.clear_active_pane(run_id, &second_key).await;
+        assert_eq!(
+            ctx.registry.resolve_active_pane(run_id, "shared").await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_active_panes_are_registered_per_child_cursor() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runner = PaneTrackingRunner::new(2);
+        let runtime = RuntimeContext::with_runner(db.clone(), Arc::new(runner.clone()));
+        let mut workflow = workflow_from_parts(
+            "batch",
+            vec![
+                parallel_batch_node("batch", "items", 2, "item", "body", None),
+                task_node("body", "Body", "work {{var:item}}"),
+            ],
+            Vec::new(),
+        );
+        workflow.variables = vec![WorkflowVariable {
+            name: "items".to_string(),
+            default: "[]".to_string(),
+        }];
+        let mut vars = BTreeMap::new();
+        vars.insert("items".to_string(), json!(["a", "b"]).to_string());
+
+        let run_id = runtime.start_run(workflow, vars, None).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), runner.registered.wait())
+            .await
+            .expect("timed out waiting for batch panes to register");
+
+        let registrations = runner.registrations.lock().await.clone();
+        assert_eq!(registrations.len(), 2);
+        let cursor_ids = registrations
+            .iter()
+            .map(|(cursor_id, _, _)| cursor_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(cursor_ids.len(), 2);
+        for (_, key, pane) in &registrations {
+            assert!(key.ends_with(":body"));
+            assert_eq!(
+                runtime.registry.resolve_active_pane(&run_id, key).await,
+                Some(pane.clone())
+            );
+        }
+
+        let targets = runtime.registry.active_pane_targets(&run_id).await;
+        assert_eq!(targets.len(), 2);
+        let by_node = runtime
+            .registry
+            .resolve_active_pane(&run_id, "body")
+            .await
+            .expect("body node should resolve to one active pane");
+        assert!(targets.contains(&by_node));
+
+        tokio::time::timeout(Duration::from_secs(1), runner.release.wait())
+            .await
+            .expect("timed out releasing batch panes");
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        assert!(
+            runtime
+                .registry
+                .active_pane_targets(&run_id)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abort_kills_active_panes_before_draining_running_tasks() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let (invocation, kill_log, kill_marker) = fake_tmux_kill_invocation(&temp);
+        let runner = AbortBlockingRunner::new("%abort-pane", kill_marker.clone());
+        let mut runtime = RuntimeContext::with_runner(db.clone(), Arc::new(runner.clone()));
+        runtime.run_invocation = Some(invocation);
+
+        let mut node = task_node("work", "Work", "long work");
+        node.timeout = Some(60);
+        let workflow = workflow_from_parts("work", vec![node], Vec::new());
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), runner.registered.wait())
+            .await
+            .expect("timed out waiting for active pane registration");
+
+        let started = Instant::now();
+        runtime.abort_run(&run_id).await.unwrap();
+        let persisted =
+            tokio::time::timeout(Duration::from_secs(2), wait_for_terminal_run(&db, &run_id))
+                .await
+                .expect("abort did not reach a terminal state promptly");
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Aborted);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "abort waited too long: {:?}",
+            started.elapsed()
+        );
+        assert!(kill_marker.exists());
+        let recorded =
+            fs::read_to_string(kill_log).expect("fake tmux should record abort cleanup arguments");
+        assert!(recorded.contains("kill-pane"));
+        assert!(recorded.contains("%abort-pane"));
+    }
+
     #[test]
     fn decide_outcome_selection_prefers_exact_then_substring() {
         let outcomes = vec!["approve".to_string(), "revise".to_string()];
@@ -6671,6 +7211,168 @@ mod tests {
             .and_then(|value| serde_json::from_str::<Value>(value).ok())
             .unwrap();
         assert_eq!(collected.as_array().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_abort_cancels_pending_items_after_next_completion() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                (
+                    "work a".to_string(),
+                    vec![ScriptedStep::success("done a").with_delay(300)],
+                ),
+                (
+                    "work b".to_string(),
+                    vec![ScriptedStep::success("done b").with_delay(300)],
+                ),
+                (
+                    "work c".to_string(),
+                    vec![ScriptedStep::success("done c").with_delay(300)],
+                ),
+                (
+                    "work d".to_string(),
+                    vec![ScriptedStep::success("done d").with_delay(300)],
+                ),
+            ])),
+        );
+        let mut workflow = workflow_from_parts(
+            "batch",
+            vec![
+                parallel_batch_node("batch", "items", 1, "item", "body", None),
+                task_node("body", "Body", "work {{var:item}}"),
+            ],
+            Vec::new(),
+        );
+        workflow.variables = vec![WorkflowVariable {
+            name: "items".to_string(),
+            default: "[]".to_string(),
+        }];
+        let mut vars = BTreeMap::new();
+        vars.insert("items".to_string(), json!(["a", "b", "c", "d"]).to_string());
+
+        let run_id = runtime.start_run(workflow, vars, None).await.unwrap();
+        wait_for_event(&db, &run_id, "cursor_spawned").await;
+
+        let abort_started = Instant::now();
+        runtime.abort_run(&run_id).await.unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Aborted);
+        assert!(
+            abort_started.elapsed() < Duration::from_millis(750),
+            "parallel_batch abort waited for the whole batch"
+        );
+        assert!(!persisted.checkpoint.all_results.contains_key("after"));
+        let batch = persisted.checkpoint.all_results.get("batch").unwrap();
+        let parsed = batch.parsed_output.as_ref().unwrap();
+        assert_eq!(parsed["summary"]["total"], json!(4));
+        assert_eq!(parsed["summary"]["succeeded"], json!(1));
+        assert_eq!(parsed["summary"]["cancelled"], json!(3));
+        assert_eq!(
+            parsed["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|item| item["cancelled"] == json!(true))
+                .count(),
+            3
+        );
+
+        let events = db.list_events(&run_id).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "cursor_spawned")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_batch_resume_skips_checkpointed_item_results() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                ("work b".to_string(), vec![ScriptedStep::success("done b")]),
+                ("work c".to_string(), vec![ScriptedStep::success("done c")]),
+                (
+                    "after".to_string(),
+                    vec![ScriptedStep::success("after done")],
+                ),
+            ])),
+        );
+        let mut workflow = workflow_from_parts(
+            "batch",
+            vec![
+                parallel_batch_node("batch", "items", 1, "item", "body", None),
+                task_node("body", "Body", "work {{var:item}}"),
+                task_node("after", "After", "after"),
+            ],
+            vec![success_edge("batch_after", "batch", "after", None)],
+        );
+        workflow.variables = vec![WorkflowVariable {
+            name: "items".to_string(),
+            default: "[]".to_string(),
+        }];
+        let mut vars = BTreeMap::new();
+        vars.insert("items".to_string(), json!(["a", "b", "c"]).to_string());
+        let run_id = "run_batch_resume";
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, vars, None);
+        let batch_key = parallel_batch_checkpoint_key(&checkpoint.active_cursors[0], "batch");
+        checkpoint.batch_item_results.insert(
+            batch_key,
+            BTreeMap::from([(
+                0,
+                json!({
+                    "index": 0,
+                    "item": "a",
+                    "cursorId": "completed-a",
+                    "nodeId": "body",
+                    "success": true,
+                    "output": "done a",
+                    "stderr": "",
+                    "exitCode": 0,
+                    "parsedOutput": Value::Null,
+                }),
+            )]),
+        );
+        db.upsert_run(&PersistedRun {
+            checkpoint,
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+
+        runtime.resume_run(run_id).await.unwrap();
+        let persisted = wait_for_terminal_run(&db, run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        assert!(persisted.checkpoint.batch_item_results.is_empty());
+        assert!(persisted.checkpoint.all_results.contains_key("after"));
+        let batch = persisted.checkpoint.all_results.get("batch").unwrap();
+        let items = batch.parsed_output.as_ref().unwrap()["items"]
+            .as_array()
+            .unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["output"], json!("done a"));
+        assert_eq!(items[1]["output"], json!("done b"));
+        assert_eq!(items[2]["output"], json!("done c"));
+
+        let events = db.list_events(run_id).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "cursor_spawned")
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]

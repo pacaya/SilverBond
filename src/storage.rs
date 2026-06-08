@@ -846,6 +846,7 @@ mod tests {
                 current_node_id: Some("n1".to_string()),
                 current_node_name: Some("Node".to_string()),
                 all_results: Default::default(),
+                batch_item_results: Default::default(),
                 last_output: String::new(),
                 execution_epoch: 1,
                 active_cursors: Vec::new(),

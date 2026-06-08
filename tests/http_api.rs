@@ -7,7 +7,7 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use silverbond::{
     api,
-    app::{AppPaths, AppState},
+    app::{AppPaths, AppState, PaneStreamRegistry},
     runtime::RuntimeContext,
     storage::{Database, TemplateStore, WorkflowStore},
 };
@@ -28,6 +28,7 @@ async fn test_router() -> (TempDir, Router) {
         workflows: WorkflowStore::new(paths.workflows_dir.clone()),
         templates: TemplateStore::new(paths.templates_dir.clone()),
         runtime: RuntimeContext::new(db),
+        pane_streams: PaneStreamRegistry::default(),
     };
     (temp, api::router(state))
 }
