@@ -28,6 +28,18 @@ type NodeRuntimeState =
   | "skipped"
   | "orchestrating";
 
+type SaveCompoundFailureCode =
+  | "missing_workflow"
+  | "empty_selection"
+  | "invalid_name"
+  | "name_in_use"
+  | "multiple_entry_nodes"
+  | "multiple_exit_nodes";
+
+export type SaveSelectionAsCompoundResult =
+  | { ok: true; nodeId: string }
+  | { ok: false; code: SaveCompoundFailureCode; reason: string };
+
 export interface RunLine {
   tone: "system" | "success" | "warning" | "error" | "detail";
   text: string;
@@ -40,7 +52,7 @@ export interface ApprovalState {
   lastOutput: string;
 }
 
-export type PaneStatus = "idle" | "connecting" | "open" | "closed";
+export type PaneStatus = "idle" | "connecting" | "open" | "closed" | "unavailable";
 
 export interface InteractionState {
   sessionId: string;
@@ -116,6 +128,27 @@ function defaultNodeConfig(type: WorkflowNodeType): Partial<WorkflowNode> {
 
 function defaultSplitFailurePolicy(): SplitFailurePolicy {
   return "best_effort_continue";
+}
+
+function defaultCanvas(
+  workflow: WorkflowDocument,
+): NonNullable<NonNullable<WorkflowDocument["ui"]>["canvas"]> {
+  return {
+    viewport: { x: 0, y: 0, zoom: 1 },
+    nodes: Object.fromEntries(
+      workflow.nodes.map((node, index) => [
+        node.id,
+        { x: 120 + index * 220, y: 120 + (index % 3) * 140 },
+      ]),
+    ),
+  };
+}
+
+function compoundFailure(
+  code: SaveCompoundFailureCode,
+  reason: string,
+): SaveSelectionAsCompoundResult {
+  return { ok: false, code, reason };
 }
 
 /* ── Undo stack ─────────────────────────────────────────────────────── */
@@ -201,6 +234,7 @@ class WorkflowStore {
     this.redoStack = [];
     this.drillStack = [];
     this.multiSelectedNodeIds = [];
+    this.selectedPane = "active";
   }
 
   createWorkflow() {
@@ -218,21 +252,42 @@ class WorkflowStore {
   /* ── compound-node drill-in ───────────────────────────────────────── */
 
   /**
-   * Resolve the document currently shown on the canvas by walking the root
-   * workflow's `subflows` catalog along the breadcrumb path. Returns the root
-   * when not drilled in. Guarantees the returned doc has a `ui.canvas`.
+   * Resolve the document currently shown on the canvas from the root subflow
+   * catalog. Subflow names are globally scoped to match backend validation and
+   * runtime resolution.
    */
-  private resolveActive(root: WorkflowDocument): WorkflowDocument {
+  private resolveActiveDocument(root: WorkflowDocument): WorkflowDocument {
     let doc = root;
     for (const name of this.drillStack) {
-      const next = doc.subflows?.[name];
+      const next = root.subflows?.[name];
       if (!next) break;
       doc = next;
     }
+    return doc;
+  }
+
+  private resolveActive(root: WorkflowDocument): WorkflowDocument {
+    const doc = this.resolveActiveDocument(root);
+    const canvas = doc.ui?.canvas ?? defaultCanvas(doc);
+    const rootSubflows = root.subflows;
+    const needsProjection = !doc.ui?.canvas || (doc !== root && doc.subflows !== rootSubflows);
+    if (!needsProjection) return doc;
+    return {
+      ...doc,
+      subflows: rootSubflows,
+      ui: {
+        ...doc.ui,
+        canvas,
+      },
+    };
+  }
+
+  private resolveActiveMutable(root: WorkflowDocument): WorkflowDocument {
+    const doc = this.resolveActiveDocument(root);
     if (!doc.ui?.canvas) {
       doc.ui = {
         ...doc.ui,
-        canvas: { viewport: { x: 0, y: 0, zoom: 1 }, nodes: {} },
+        canvas: defaultCanvas(doc),
       };
     }
     return doc;
@@ -282,7 +337,7 @@ class WorkflowStore {
     if (!this.workflow) return;
     this.pushUndo();
     // Mutations target the document currently on the canvas (root or subflow).
-    updater(this.resolveActive(this.workflow));
+    updater(this.resolveActiveMutable(this.workflow));
     this.dirty = true;
   }
 
@@ -331,7 +386,7 @@ class WorkflowStore {
       this.createWorkflow();
     }
     this.pushUndo();
-    const wf = this.resolveActive(this.workflow!);
+    const wf = this.resolveActiveMutable(this.workflow!);
     const id = createNodeId();
     const nodeCount = wf.nodes.filter((n) => n.type === type).length + 1;
     const node: WorkflowNode = {
@@ -359,7 +414,7 @@ class WorkflowStore {
   removeNode(nodeId: string) {
     if (!this.workflow) return;
     this.pushUndo();
-    const wf = this.resolveActive(this.workflow);
+    const wf = this.resolveActiveMutable(this.workflow);
     wf.nodes = wf.nodes.filter((n) => n.id !== nodeId);
     wf.edges = wf.edges.filter((e) => e.from !== nodeId && e.to !== nodeId);
     delete wf.ui?.canvas?.nodes[nodeId];
@@ -375,7 +430,7 @@ class WorkflowStore {
     if (!this.workflow) return;
     this.pushUndo();
     const nextEdge: WorkflowEdge = { ...edge, id: createEdgeId() };
-    this.resolveActive(this.workflow).edges.push(nextEdge);
+    this.resolveActiveMutable(this.workflow).edges.push(nextEdge);
     this.dirty = true;
     this.selection = { kind: "edge", id: nextEdge.id };
   }
@@ -383,7 +438,7 @@ class WorkflowStore {
   removeEdge(edgeId: string) {
     if (!this.workflow) return;
     this.pushUndo();
-    const wf = this.resolveActive(this.workflow);
+    const wf = this.resolveActiveMutable(this.workflow);
     wf.edges = wf.edges.filter((e) => e.id !== edgeId);
     this.dirty = true;
     this.selection = { kind: "workflow", id: null };
@@ -391,7 +446,7 @@ class WorkflowStore {
 
   setNodePosition(nodeId: string, position: { x: number; y: number }) {
     if (!this.workflow) return;
-    const canvas = this.resolveActive(this.workflow).ui!.canvas!;
+    const canvas = this.resolveActiveMutable(this.workflow).ui!.canvas!;
     canvas.nodes[nodeId] = position;
     this.dirty = true;
   }
@@ -400,51 +455,72 @@ class WorkflowStore {
 
   /**
    * Collapse the selected nodes into a reusable saved subflow stored on the
-   * (active) document's `subflows` catalog, replacing the region with a single
-   * `subflow` node. Entry is the selected node with no internal inbound edge;
-   * exit is the selected node with no internal outbound edge. External edges
-   * are rewired to/from the new compound node.
+   * root workflow's `subflows` catalog, replacing the active region with a
+   * single `subflow` node. The selected region must expose exactly one entry
+   * point and one terminal node.
    *
-   * Returns the new compound node id, or null when the selection is invalid.
+   * Returns the new compound node id, or a human-readable failure reason.
    */
-  saveSelectionAsCompound(nodeIds: string[], rawName: string): string | null {
-    if (!this.workflow || nodeIds.length === 0) return null;
+  saveSelectionAsCompound(nodeIds: string[], rawName: string): SaveSelectionAsCompoundResult {
+    if (!this.workflow) {
+      return compoundFailure("missing_workflow", "No workflow is loaded.");
+    }
+    if (nodeIds.length === 0) {
+      return compoundFailure("empty_selection", "Select one or more nodes to save as a compound node.");
+    }
     const name = rawName.trim();
-    if (!name) return null;
+    if (!name) {
+      return compoundFailure("invalid_name", "Enter a name for the compound node.");
+    }
 
-    const wf = this.resolveActive(this.workflow);
-    if (wf.subflows?.[name]) return null; // name collision
+    const active = this.resolveActiveDocument(this.workflow);
+    if (this.workflow.subflows?.[name]) {
+      return compoundFailure("name_in_use", `A root-level subflow named "${name}" already exists.`);
+    }
 
     const selected = new Set(nodeIds);
-    const selNodes = wf.nodes.filter((n) => selected.has(n.id));
-    if (selNodes.length === 0) return null;
+    const selNodes = active.nodes.filter((n) => selected.has(n.id));
+    if (selNodes.length === 0) {
+      return compoundFailure("empty_selection", "The selected nodes are not in the active workflow.");
+    }
 
-    const internalEdges = wf.edges.filter((e) => selected.has(e.from) && selected.has(e.to));
-    const inboundEdges = wf.edges.filter((e) => !selected.has(e.from) && selected.has(e.to));
-    const outboundEdges = wf.edges.filter((e) => selected.has(e.from) && !selected.has(e.to));
+    const internalEdges = active.edges.filter((e) => selected.has(e.from) && selected.has(e.to));
+    const inboundEdges = active.edges.filter((e) => !selected.has(e.from) && selected.has(e.to));
+    const outboundEdges = active.edges.filter((e) => selected.has(e.from) && !selected.has(e.to));
 
-    // Entry: targeted from outside, else a node with no internal inbound edge.
     const hasInternalInbound = new Set(internalEdges.map((e) => e.to));
     const inboundTargets = new Set(inboundEdges.map((e) => e.to));
-    const entry =
-      selNodes.find((n) => inboundTargets.has(n.id)) ??
-      selNodes.find((n) => !hasInternalInbound.has(n.id)) ??
-      selNodes[0];
+    const entryCandidates = selNodes.filter(
+      (n) => inboundTargets.has(n.id) || !hasInternalInbound.has(n.id),
+    );
+    if (entryCandidates.length !== 1) {
+      return compoundFailure(
+        "multiple_entry_nodes",
+        `Selection must expose exactly one entry point; found ${entryCandidates.length}. Add a single entry or merge point before saving as a compound node.`,
+      );
+    }
 
-    // Exit: a node with no internal outbound edge (terminal within the region).
     const hasInternalOutbound = new Set(internalEdges.map((e) => e.from));
-    const exit =
-      selNodes.find((n) => !hasInternalOutbound.has(n.id)) ?? selNodes[selNodes.length - 1];
+    const exitCandidates = selNodes.filter((n) => !hasInternalOutbound.has(n.id));
+    if (exitCandidates.length !== 1) {
+      return compoundFailure(
+        "multiple_exit_nodes",
+        `Selection must expose exactly one exit node; found ${exitCandidates.length}. Add a single merge point before saving as a compound node.`,
+      );
+    }
 
     this.pushUndo();
+    const wf = this.resolveActiveMutable(this.workflow);
+    const entry = entryCandidates[0];
+    const exit = exitCandidates[0];
 
     // Build the subflow document (deep clone so it is decoupled from the parent).
-    const positions = wf.ui?.canvas?.nodes ?? {};
+    const positions = (active.ui?.canvas ?? defaultCanvas(active)).nodes;
     const subflowDoc: WorkflowDocument = {
       version: 3,
       name,
       goal: "",
-      cwd: wf.cwd,
+      cwd: active.cwd,
       useOrchestrator: false,
       entryNodeId: entry.id,
       variables: [],
@@ -461,8 +537,8 @@ class WorkflowStore {
       },
     };
 
-    if (!wf.subflows) wf.subflows = {};
-    wf.subflows[name] = subflowDoc;
+    if (!this.workflow.subflows) this.workflow.subflows = {};
+    this.workflow.subflows[name] = subflowDoc;
 
     // Place the compound node at the centroid of the selected region.
     const pts = selNodes.map((n) => positions[n.id]).filter(Boolean) as { x: number; y: number }[];
@@ -494,7 +570,7 @@ class WorkflowStore {
     }
 
     // Canvas bookkeeping.
-    const canvas = this.resolveActive(this.workflow).ui!.canvas!;
+    const canvas = wf.ui!.canvas!;
     for (const n of selNodes) delete canvas.nodes[n.id];
     canvas.nodes[compoundId] = centroid;
 
@@ -505,7 +581,7 @@ class WorkflowStore {
     this.dirty = true;
     this.multiSelectedNodeIds = [];
     this.selection = { kind: "node", id: compoundId };
-    return compoundId;
+    return { ok: true, nodeId: compoundId };
   }
 
   /* ── runtime ──────────────────────────────────────────────────────── */
@@ -524,6 +600,7 @@ class WorkflowStore {
     this.approval = null;
     this.interactions = [];
     this.nodeStates = {};
+    this.selectedPane = "active";
   }
 
   setRunState(patch: { runId?: string | null; running?: boolean; approval?: ApprovalState | null }) {

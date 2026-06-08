@@ -2,7 +2,6 @@
   import { createQuery, createMutation, useQueryClient } from "@tanstack/svelte-query";
   import { api, streamRun } from "@/lib/api/client";
   import {
-    cloneWorkflow,
     createEmptyWorkflow,
     duplicateWorkflowForEditing,
     ensureCanvas,
@@ -71,11 +70,11 @@
   let validateTimer: ReturnType<typeof setTimeout> | null = null;
 
   $effect(() => {
-    const wf = store.workflow;
-    if (!wf) return;
+    const snap = $state.snapshot(store.workflow);
+    if (!snap) return;
     if (validateTimer) clearTimeout(validateTimer);
     validateTimer = setTimeout(() => {
-      validateMutation.mutate(ensureCanvas(cloneWorkflow(wf)));
+      validateMutation.mutate(ensureCanvas(snap as WorkflowDocument));
     }, 500);
     return () => {
       if (validateTimer) clearTimeout(validateTimer);

@@ -1,13 +1,14 @@
 import path from "node:path";
 import { defineConfig } from "vitest/config";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
+import { svelteTesting } from "@testing-library/svelte/vite";
 
 const rootDir = path.resolve(__dirname);
 
 export default defineConfig({
   root: rootDir,
   publicDir: false,
-  plugins: [svelte()],
+  plugins: [svelte(), svelteTesting()],
   resolve: {
     alias: {
       "@": path.resolve(rootDir, "src"),

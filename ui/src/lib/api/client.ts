@@ -130,8 +130,10 @@ export async function streamRun(
 
 const PANE_RECONNECT_BASE_MS = 500;
 const PANE_RECONNECT_MAX_MS = 5000;
+const PANE_FAST_CLOSE_MS = 1000;
+const PANE_FAST_CLOSE_LIMIT = 3;
 
-export type PaneStreamStatus = "connecting" | "open" | "closed";
+export type PaneStreamStatus = "connecting" | "open" | "closed" | "unavailable";
 
 export interface PaneStreamHandlers {
   /** Full repaint: callers should clear the terminal before writing these bytes. */
@@ -176,7 +178,9 @@ export function streamPane(
   let closed = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectDelay = PANE_RECONNECT_BASE_MS;
+  let consecutiveFastCloses = 0;
   let lastSeq = -1;
+  let resyncPending = false;
 
   const requestResync = () => {
     if (socket && socket.readyState === WebSocket.OPEN) {
@@ -208,13 +212,19 @@ export function streamPane(
     socket = ws;
     // A new connection always begins with a server snapshot — reset gap tracking.
     lastSeq = -1;
+    resyncPending = false;
+
+    let openedAt: number | null = null;
+    let firstFrameSeen = false;
 
     ws.onopen = () => {
-      reconnectDelay = PANE_RECONNECT_BASE_MS;
+      if (closed || ws !== socket) return;
+      openedAt = Date.now();
       handlers.onStatus?.("open");
     };
 
     ws.onmessage = (event) => {
+      if (closed || ws !== socket) return;
       if (typeof event.data !== "string") return;
       let frame: { type?: string; seq?: number; data?: string; error?: string };
       try {
@@ -222,19 +232,30 @@ export function streamPane(
       } catch {
         return;
       }
+      if ((frame.type === "snapshot" || frame.type === "data") && !firstFrameSeen) {
+        firstFrameSeen = true;
+        reconnectDelay = PANE_RECONNECT_BASE_MS;
+        consecutiveFastCloses = 0;
+      }
       const seq = typeof frame.seq === "number" ? frame.seq : null;
       switch (frame.type) {
         case "snapshot":
           if (seq !== null) lastSeq = seq;
-          if (frame.data) handlers.onSnapshot(decodeBase64(frame.data));
+          if (typeof frame.data === "string") handlers.onSnapshot(decodeBase64(frame.data));
+          resyncPending = false;
           break;
         case "data":
           if (seq !== null) {
             // A gap means we missed frames — request a fresh snapshot to repaint.
-            if (lastSeq >= 0 && seq > lastSeq + 1) requestResync();
+            const gapDetected = lastSeq >= 0 && seq > lastSeq + 1;
             lastSeq = seq;
+            if (gapDetected && !resyncPending) {
+              resyncPending = true;
+              requestResync();
+            }
           }
-          if (frame.data) handlers.onData(decodeBase64(frame.data));
+          if (resyncPending) return;
+          if (typeof frame.data === "string") handlers.onData(decodeBase64(frame.data));
           break;
         case "error":
           if (seq !== null) lastSeq = seq;
@@ -247,14 +268,25 @@ export function streamPane(
     };
 
     ws.onclose = () => {
+      if (closed || ws !== socket) return;
       socket = null;
-      if (!closed) {
-        handlers.onStatus?.("closed");
-        scheduleReconnect();
+      const fastClose =
+        openedAt !== null &&
+        !firstFrameSeen &&
+        Date.now() - openedAt <= PANE_FAST_CLOSE_MS;
+      consecutiveFastCloses = fastClose ? consecutiveFastCloses + 1 : 0;
+      if (consecutiveFastCloses >= PANE_FAST_CLOSE_LIMIT) {
+        closed = true;
+        handlers.onStatus?.("unavailable");
+        handlers.onError?.("Pane unavailable");
+        return;
       }
+      handlers.onStatus?.("closed");
+      scheduleReconnect();
     };
 
     ws.onerror = () => {
+      if (closed || ws !== socket) return;
       // `onclose` follows and drives reconnection; nothing extra to do here.
     };
   };

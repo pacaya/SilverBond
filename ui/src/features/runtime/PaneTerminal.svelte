@@ -24,12 +24,16 @@
   let resizeObserver: ResizeObserver | undefined;
 
   /* Panes are keyed by node id on the backend; "active" resolves the single
-   * running pane (see runtime.rs::resolve_active_pane). Only task/split nodes
-   * spawn panes. */
+   * running pane (see runtime.rs::resolve_active_pane). This hardcoded pane
+   * owner list still omits send/wait/capture runner panes and may show nodes
+   * that have not spawned a pane yet; a later backend-driven pane list is the
+   * drift-proof follow-up. */
   const paneOptions = $derived([
     { value: "active", label: "Active pane" },
     ...((workflow?.nodes ?? [])
-      .filter((node) => node.type === "task" || node.type === "split")
+      .filter(
+        (node) => node.type === "run_agent" || node.type === "spawn" || node.type === "task",
+      )
       .map((node) => ({ value: node.id, label: node.name || node.id }))),
   ]);
 
@@ -40,7 +44,9 @@
         ? "Connecting…"
         : store.paneStatus === "closed"
           ? "Reconnecting…"
-          : "Idle",
+          : store.paneStatus === "unavailable"
+            ? "Unavailable"
+            : "Idle",
   );
 
   function requestFit() {
@@ -243,6 +249,11 @@
   .paneTerminal__status--closed {
     color: #fde68a;
     border-color: rgba(253, 230, 138, 0.32);
+  }
+
+  .paneTerminal__status--unavailable {
+    color: #fda4af;
+    border-color: rgba(248, 113, 113, 0.32);
   }
 
   .paneTerminal__error {

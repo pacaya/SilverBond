@@ -70,7 +70,7 @@
   function updateRunAsCommand(value: string) {
     store.updateWorkflow((wf) => {
       const next: RunAsConfig = { ...(wf.runAs ?? {}) };
-      const tokens = value.trim().split(/\s+/).filter(Boolean);
+      const tokens = value.split(/\n/).filter((line) => line.length > 0);
       if (tokens.length > 0) {
         next.command = tokens;
       } else {
@@ -84,7 +84,10 @@
     const runAs = activeWorkflow.runAs;
     const user = runAs?.user?.trim() || "<user>";
     const socket = runAs?.socket?.trim() || "<socket>";
-    return `sudo -u ${user} tmux -L ${socket} attach -t <session>`;
+    const prefix = runAs?.command && runAs.command.length > 0
+      ? runAs.command.join(" ")
+      : `sudo -u ${user}`;
+    return `${prefix} tmux -L ${socket} attach -t <session>`;
   });
 
   async function copyAttachHint() {
@@ -196,8 +199,26 @@
   /** Get the capabilities object for the currently selected node's agent */
   let agentCaps = $derived.by((): AgentCapabilities | null => {
     if (!selectedNode || !capabilities) return null;
-    const agentName = selectedNode.agent ?? "claude";
+    const agentName = selectedNode.type === "run_agent"
+      ? selectedNode.runAgentConfig?.agent ?? selectedNode.agent ?? "claude"
+      : selectedNode.agent ?? "claude";
     return capabilities.agents[agentName]?.capabilities ?? null;
+  });
+
+  let selectedAgentValue = $derived.by(() => {
+    if (!selectedNode) return "claude";
+    if (selectedNode.type === "run_agent") {
+      return selectedNode.runAgentConfig?.agent ?? selectedNode.agent ?? "claude";
+    }
+    return selectedNode.agent ?? "claude";
+  });
+
+  let selectedPromptValue = $derived.by(() => {
+    if (!selectedNode) return "";
+    if (selectedNode.type === "run_agent") {
+      return selectedNode.runAgentConfig?.prompt ?? selectedNode.prompt;
+    }
+    return selectedNode.prompt;
   });
 
   /** Snapshot of selected node's agentConfig — single reactive read for the template */
@@ -481,11 +502,18 @@
           <label class="field">
             <span>Agent</span>
             <select
-              value={selectedNode.agent ?? "claude"}
-              onchange={(e) => store.updateWorkflow((wf) => {
-                const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-                if (n) n.agent = (e.target as HTMLSelectElement).value;
-              })}
+              value={selectedAgentValue}
+              onchange={(e) => {
+                const value = (e.target as HTMLSelectElement).value;
+                if (selectedNode!.type === "run_agent") {
+                  updateRunAgent("agent", value);
+                  return;
+                }
+                store.updateWorkflow((wf) => {
+                  const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                  if (n) n.agent = value;
+                });
+              }}
             >
               {#each Object.entries(capabilities?.agents ?? {}) as [agent, info] (agent)}
                 <option value={agent} disabled={!info.available}>{agent}{!info.available ? " (not installed)" : ""}</option>
@@ -502,12 +530,19 @@
           <div class="field field--prompt">
             <span>Prompt</span>
             <PromptTextarea
-              value={selectedNode.prompt}
+              value={selectedPromptValue}
               suggestions={promptSuggestions}
-              oninput={(e) => store.updateWorkflow((wf) => {
-                const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-                if (n) n.prompt = (e.target as HTMLTextAreaElement).value;
-              })}
+              oninput={(e) => {
+                const value = (e.target as HTMLTextAreaElement).value;
+                if (selectedNode!.type === "run_agent") {
+                  updateRunAgent("prompt", value);
+                  return;
+                }
+                store.updateWorkflow((wf) => {
+                  const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                  if (n) n.prompt = value;
+                });
+              }}
             />
           </div>
           {#if selectedNode.type === "task"}
@@ -1529,12 +1564,13 @@
       </label>
       <label class="field">
         <span>Command prefix</span>
-        <input
-          value={(activeWorkflow.runAs?.command ?? []).join(" ")}
-          placeholder="e.g. sudo -u sandbox"
-          oninput={(e) => updateRunAsCommand((e.target as HTMLInputElement).value)}
-        />
-        <small class="helperText">Space-separated. Takes precedence over "User" when set.</small>
+        <textarea
+          value={(activeWorkflow.runAs?.command ?? []).join("\n")}
+          placeholder={"sudo\n-u\nsandbox"}
+          oninput={(e) => updateRunAsCommand((e.target as HTMLTextAreaElement).value)}
+          class="field--shortTextarea"
+        ></textarea>
+        <small class="helperText">One argv element per line. Takes precedence over "User" when set.</small>
       </label>
       <label class="field">
         <span>Socket</span>

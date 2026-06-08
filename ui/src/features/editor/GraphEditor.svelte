@@ -225,9 +225,9 @@
     }
     const name = prompt("Name for the new compound node (saved subflow):");
     if (!name) return;
-    const created = store.saveSelectionAsCompound(ids, name);
-    if (!created) {
-      store.setError(`Could not create compound "${name}" (empty selection or name in use).`);
+    const result = store.saveSelectionAsCompound(ids, name);
+    if (!result.ok) {
+      store.setError(result.reason);
     }
   }
 

@@ -19,6 +19,11 @@
  *  9. error frame is forwarded to onError
  * 10. heartbeat frame is silently ignored
  * 11. first seq after reconnect resets gap tracking (no spurious resync)
+ * 12. accept-then-close reconnects use growing backoff
+ * 13. repeated accept-then-close cycles give up as unavailable
+ * 14. first snapshot/data frame resets reconnect backoff
+ * 15. late frames from a closed socket are ignored
+ * 16. gap frames and following data are suppressed until snapshot repaint
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -187,6 +192,31 @@ describe("streamPane client", () => {
     handle.close();
   });
 
+  it("3b. gap data is not forwarded again until a snapshot repaints", () => {
+    const onSnapshot = vi.fn();
+    const onData = vi.fn();
+    const handle = streamPane("run-1", "pane-0", { onSnapshot, onData });
+
+    const ws = MockWebSocket.last();
+    ws.simulateOpen();
+    ws.simulateMessage(frame("snapshot", 0, b64("snap")));
+    ws.simulateMessage(frame("data", 2, b64("gap")));
+    ws.simulateMessage(frame("data", 3, b64("pending")));
+
+    expect(ws.sent).toContain("resync");
+    expect(onData).not.toHaveBeenCalled();
+
+    ws.simulateMessage(frame("snapshot", 4, b64("fresh")));
+    ws.simulateMessage(frame("data", 5, b64("resume")));
+
+    expect(onSnapshot).toHaveBeenCalledTimes(2);
+    expect(onData).toHaveBeenCalledOnce();
+    const bytes = onData.mock.calls[0][0] as Uint8Array;
+    expect(new TextDecoder().decode(bytes)).toBe("resume");
+
+    handle.close();
+  });
+
   it("4. contiguous seq does NOT trigger resync", () => {
     const handle = streamPane("run-1", "pane-0", {
       onSnapshot: vi.fn(),
@@ -258,6 +288,93 @@ describe("streamPane client", () => {
     handle.close();
   });
 
+  it("7b. accept-then-close reconnects use growing backoff until a frame arrives", () => {
+    const handle = streamPane("run-1", "pane-0", {
+      onSnapshot: vi.fn(),
+      onData: vi.fn(),
+    });
+
+    const firstWs = MockWebSocket.last();
+    firstWs.simulateOpen();
+    firstWs.simulateClose();
+
+    vi.advanceTimersByTime(500);
+    expect(MockWebSocket.instances).toHaveLength(2);
+
+    const secondWs = MockWebSocket.last();
+    secondWs.simulateOpen();
+    secondWs.simulateClose();
+
+    vi.advanceTimersByTime(999);
+    expect(MockWebSocket.instances).toHaveLength(2);
+
+    vi.advanceTimersByTime(1);
+    expect(MockWebSocket.instances).toHaveLength(3);
+
+    handle.close();
+  });
+
+  it("7c. repeated accept-then-close cycles stop reconnecting as unavailable", () => {
+    const onStatus = vi.fn();
+    const onError = vi.fn();
+    const handle = streamPane("run-1", "pane-0", {
+      onSnapshot: vi.fn(),
+      onData: vi.fn(),
+      onError,
+      onStatus,
+    });
+
+    const firstWs = MockWebSocket.last();
+    firstWs.simulateOpen();
+    firstWs.simulateClose();
+    vi.advanceTimersByTime(500);
+
+    const secondWs = MockWebSocket.last();
+    secondWs.simulateOpen();
+    secondWs.simulateClose();
+    vi.advanceTimersByTime(1000);
+
+    const thirdWs = MockWebSocket.last();
+    thirdWs.simulateOpen();
+    thirdWs.simulateClose();
+
+    expect(onStatus).toHaveBeenLastCalledWith("unavailable");
+    expect(onError).toHaveBeenCalledWith("Pane unavailable");
+
+    const countAfterGiveUp = MockWebSocket.instances.length;
+    vi.advanceTimersByTime(10_000);
+    expect(MockWebSocket.instances).toHaveLength(countAfterGiveUp);
+
+    handle.close();
+  });
+
+  it("7d. a healthy frame resets reconnect backoff to the base delay", () => {
+    const handle = streamPane("run-1", "pane-0", {
+      onSnapshot: vi.fn(),
+      onData: vi.fn(),
+    });
+
+    const firstWs = MockWebSocket.last();
+    firstWs.simulateOpen();
+    firstWs.simulateClose();
+
+    vi.advanceTimersByTime(500);
+    expect(MockWebSocket.instances).toHaveLength(2);
+
+    const secondWs = MockWebSocket.last();
+    secondWs.simulateOpen();
+    secondWs.simulateMessage(frame("snapshot", 0, b64("healthy")));
+    secondWs.simulateClose();
+
+    vi.advanceTimersByTime(499);
+    expect(MockWebSocket.instances).toHaveLength(2);
+
+    vi.advanceTimersByTime(1);
+    expect(MockWebSocket.instances).toHaveLength(3);
+
+    handle.close();
+  });
+
   it("8. close() stops reconnection permanently", () => {
     const onStatus = vi.fn();
     const handle = streamPane("run-1", "pane-0", {
@@ -278,6 +395,18 @@ describe("streamPane client", () => {
 
     // No new socket should have been created
     expect(MockWebSocket.instances.length).toBe(countBefore);
+  });
+
+  it("8b. data frames queued on a closed socket are ignored", () => {
+    const onData = vi.fn();
+    const handle = streamPane("run-1", "pane-0", { onSnapshot: vi.fn(), onData });
+
+    const ws = MockWebSocket.last();
+    ws.simulateOpen();
+    handle.close();
+    ws.simulateMessage(frame("data", 0, b64("stale")));
+
+    expect(onData).not.toHaveBeenCalled();
   });
 
   it("9. error frame forwarded to onError with the error message", () => {
