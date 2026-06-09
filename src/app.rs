@@ -97,6 +97,21 @@ impl PaneStreamRegistry {
         let mut inner = self.inner.lock().await;
         let should_remove = inner
             .get(target)
+            .map(|entry| entry.refcount == 0 && entry.sender.same_channel(sender))
+            .unwrap_or(false);
+        if should_remove {
+            inner.remove(target);
+        }
+    }
+
+    pub(crate) async fn remove_terminal_sender(
+        &self,
+        target: &str,
+        sender: &broadcast::Sender<Vec<u8>>,
+    ) {
+        let mut inner = self.inner.lock().await;
+        let should_remove = inner
+            .get(target)
             .map(|entry| entry.sender.same_channel(sender))
             .unwrap_or(false);
         if should_remove {

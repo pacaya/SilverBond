@@ -540,6 +540,7 @@ struct ActiveRun {
 #[derive(Debug, Clone)]
 struct ActivePaneTarget {
     target: String,
+    session_name: Option<String>,
     sequence: u64,
 }
 
@@ -704,7 +705,19 @@ impl RunRegistry {
         self.inner.lock().await.remove(run_id);
     }
 
+    #[cfg(test)]
     pub(crate) async fn set_active_pane(&self, run_id: &str, key: &str, target: &str) {
+        self.set_active_pane_with_session(run_id, key, target, None)
+            .await;
+    }
+
+    pub(crate) async fn set_active_pane_with_session(
+        &self,
+        run_id: &str,
+        key: &str,
+        target: &str,
+        session_name: Option<String>,
+    ) {
         if let Some(active) = self.inner.lock().await.get(run_id).cloned() {
             let mut panes = active.active_panes.lock().await;
             let sequence = active.active_pane_sequence.fetch_add(1, Ordering::SeqCst) + 1;
@@ -712,6 +725,7 @@ impl RunRegistry {
                 key.to_string(),
                 ActivePaneTarget {
                     target: target.to_string(),
+                    session_name,
                     sequence,
                 },
             );
@@ -760,6 +774,7 @@ impl RunRegistry {
         None
     }
 
+    #[cfg(test)]
     pub(crate) async fn active_pane_targets(&self, run_id: &str) -> Vec<String> {
         let Some(active) = self.inner.lock().await.get(run_id).cloned() else {
             return Vec::new();
@@ -773,6 +788,59 @@ impl RunRegistry {
             .collect()
     }
 
+    pub(crate) async fn active_pane_cleanup_targets(
+        &self,
+        run_id: &str,
+    ) -> Vec<crate::tmux_exec::PaneCleanupTarget> {
+        let Some(active) = self.inner.lock().await.get(run_id).cloned() else {
+            return Vec::new();
+        };
+        let panes = active.active_panes.lock().await;
+        dedupe_cleanup_targets(panes.values())
+    }
+
+    pub(crate) async fn active_pane_cleanup_targets_except_keys(
+        &self,
+        run_id: &str,
+        retained_keys: &HashSet<String>,
+    ) -> Vec<crate::tmux_exec::PaneCleanupTarget> {
+        let Some(active) = self.inner.lock().await.get(run_id).cloned() else {
+            return Vec::new();
+        };
+        let panes = active.active_panes.lock().await;
+        if retained_keys.is_empty() {
+            return dedupe_cleanup_targets(panes.values());
+        }
+
+        let retained_pane_ids = panes
+            .iter()
+            .filter(|(pane_key, _)| {
+                retained_keys
+                    .iter()
+                    .any(|key| active_pane_key_matches_node(pane_key, key))
+            })
+            .map(|(_, entry)| entry.target.clone())
+            .collect::<BTreeSet<_>>();
+        let retained_session_names = panes
+            .iter()
+            .filter(|(pane_key, _)| {
+                retained_keys
+                    .iter()
+                    .any(|key| active_pane_key_matches_node(pane_key, key))
+            })
+            .filter_map(|(_, entry)| entry.session_name.clone())
+            .collect::<BTreeSet<_>>();
+
+        dedupe_cleanup_targets(panes.values().filter(|entry| {
+            !retained_pane_ids.contains(&entry.target)
+                && !entry
+                    .session_name
+                    .as_ref()
+                    .is_some_and(|session_name| retained_session_names.contains(session_name))
+        }))
+    }
+
+    #[cfg(test)]
     pub(crate) async fn active_pane_targets_for_keys(
         &self,
         run_id: &str,
@@ -793,6 +861,23 @@ impl RunRegistry {
             .into_iter()
             .collect()
     }
+}
+
+fn dedupe_cleanup_targets<'a>(
+    targets: impl IntoIterator<Item = &'a ActivePaneTarget>,
+) -> Vec<crate::tmux_exec::PaneCleanupTarget> {
+    let mut seen = BTreeSet::new();
+    let mut cleanup_targets = Vec::new();
+    for target in targets {
+        let key = (target.session_name.clone(), target.target.clone());
+        if seen.insert(key) {
+            cleanup_targets.push(crate::tmux_exec::PaneCleanupTarget::new(
+                target.target.clone(),
+                target.session_name.clone(),
+            ));
+        }
+    }
+    cleanup_targets
 }
 
 #[derive(Clone)]
@@ -2830,7 +2915,12 @@ async fn run_decide_node(
         last_branch_choice: cursor.last_branch_choice.as_deref(),
     };
     let bindings = resolve_decide_input_bindings(config, &template_context)?;
-    let resolved_prompt = render_decide_prompt(&config.prompt, &template_context, &bindings);
+    let resolved_prompt = render_decide_prompt(
+        &config.prompt,
+        &template_context,
+        &bindings,
+        &config.outcomes,
+    );
     emit_event(
         &ctx,
         &run_ctx.run_id,
@@ -2856,7 +2946,8 @@ async fn run_decide_node(
     .context("join error in decide node")??;
     let response = result.output;
     let duration = format!("{:.1}", start.elapsed().as_secs_f64());
-    let selected = select_decide_outcome(&config.outcomes, &response);
+    let parsed_response = parse_decide_structured_response(&node, &response);
+    let selected = select_decide_outcome(&config.outcomes, &response, parsed_response.as_ref());
     let (success, output, stderr) = if let Some(selected) = selected {
         (true, selected, String::new())
     } else {
@@ -2997,6 +3088,7 @@ fn render_decide_prompt(
     prompt: &str,
     context: &TemplateRuntimeContext<'_>,
     bindings: &BTreeMap<String, String>,
+    outcomes: &[String],
 ) -> String {
     let mut var_map = context.var_map.clone();
     for (name, value) in bindings {
@@ -3016,10 +3108,70 @@ fn render_decide_prompt(
     for (name, value) in bindings {
         rendered = rendered.replace(&format!("{{{{{}}}}}", name), value);
     }
-    rendered
+    rendered.push_str(&format!(
+        "\n\nChoose exactly one outcome. Emit a single JSON object in this exact shape: {{\"outcome\":\"<label>\"}}. The outcome value must exactly match one of: {}.",
+        format_decide_outcomes_for_prompt(outcomes)
+    ));
+
+    let mut json_node = context.current_node.clone();
+    json_node.response_format = Some(ResponseFormat::Json);
+    json_node.output_schema = Some(decide_output_schema(outcomes));
+    wrap_prompt_for_json(&json_node, rendered, &None)
 }
 
-fn select_decide_outcome(outcomes: &[String], response: &str) -> Option<String> {
+fn format_decide_outcomes_for_prompt(outcomes: &[String]) -> String {
+    outcomes
+        .iter()
+        .map(|outcome| serde_json::to_string(outcome).unwrap_or_else(|_| format!("\"{outcome}\"")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn decide_output_schema(outcomes: &[String]) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "outcome": {
+                "type": "string",
+                "description": format!(
+                    "The selected outcome. Must exactly match one of: {}",
+                    format_decide_outcomes_for_prompt(outcomes)
+                ),
+            }
+        },
+        "required": ["outcome"],
+        "additionalProperties": false,
+    })
+}
+
+fn parse_decide_structured_response(node: &WorkflowNode, response: &str) -> Option<Value> {
+    let mut json_node = node.clone();
+    json_node.response_format = Some(ResponseFormat::Json);
+
+    let mut result = NodeResult {
+        output: response.to_string(),
+        raw_output: Some(response.to_string()),
+        ..Default::default()
+    };
+    parse_structured_output(&json_node, &mut result);
+    result.parsed_output
+}
+
+fn select_decide_outcome(
+    outcomes: &[String],
+    response: &str,
+    structured_output: Option<&Value>,
+) -> Option<String> {
+    if let Some(parsed) = structured_output {
+        if let Some(outcome_value) = parsed.get("outcome") {
+            let outcome_label = outcome_value.as_str()?;
+            return outcomes
+                .iter()
+                .find(|outcome| outcome.as_str() == outcome_label)
+                .cloned();
+        }
+    }
+
     let trimmed = response
         .trim()
         .trim_matches('"')
@@ -5190,48 +5342,44 @@ async fn finalize_run(
             .with("status", checkpoint.status),
     )
     .await?;
-    cleanup_reused_session_panes(ctx, &run_id, workflow).await;
+    cleanup_terminal_active_panes(ctx, &run_id, workflow).await;
     ctx.registry.clear(&run_id).await;
     Ok(())
 }
 
-async fn cleanup_reused_session_panes(ctx: &RuntimeContext, run_id: &str, workflow: &WorkflowV3) {
+async fn cleanup_terminal_active_panes(ctx: &RuntimeContext, run_id: &str, workflow: &WorkflowV3) {
     let persistence_keys = build_session_persistence_set(workflow);
-    if persistence_keys.is_empty() {
-        return;
-    }
-
-    let panes = ctx
+    let targets = ctx
         .registry
-        .active_pane_targets_for_keys(run_id, &persistence_keys)
+        .active_pane_cleanup_targets_except_keys(run_id, &persistence_keys)
         .await;
-    if panes.is_empty() {
+    if targets.is_empty() {
         return;
     }
 
     let inv = ctx.run_invocation.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if let Some(inv) = inv {
-            tmux_tools_core::with_invocation(inv, || crate::tmux_exec::cleanup_panes(&panes))
+            tmux_tools_core::with_invocation(inv, || crate::tmux_exec::cleanup_panes(&targets))
         } else {
-            crate::tmux_exec::cleanup_panes(&panes)
+            crate::tmux_exec::cleanup_panes(&targets)
         }
     })
     .await;
 }
 
 async fn kill_active_run_panes(ctx: &RuntimeContext, run_id: &str) {
-    let panes = ctx.registry.active_pane_targets(run_id).await;
-    if panes.is_empty() {
+    let targets = ctx.registry.active_pane_cleanup_targets(run_id).await;
+    if targets.is_empty() {
         return;
     }
 
     let inv = ctx.run_invocation.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if let Some(inv) = inv {
-            tmux_tools_core::with_invocation(inv, || crate::tmux_exec::cleanup_panes(&panes))
+            tmux_tools_core::with_invocation(inv, || crate::tmux_exec::cleanup_panes(&targets))
         } else {
-            crate::tmux_exec::cleanup_panes(&panes)
+            crate::tmux_exec::cleanup_panes(&targets)
         }
     })
     .await;
@@ -5835,6 +5983,62 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct PersistentPaneRunner {
+        pane_id: String,
+    }
+
+    impl PersistentPaneRunner {
+        fn new(pane_id: &str) -> Self {
+            Self {
+                pane_id: pane_id.to_string(),
+            }
+        }
+    }
+
+    impl NodeRunner for PersistentPaneRunner {
+        fn run(
+            &self,
+            _agent: String,
+            prompt: String,
+            _cwd: String,
+            _timeout_secs: Option<u64>,
+            _config: Option<AgentConfig>,
+        ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+            Box::pin(async move { Err(anyhow::anyhow!("unexpected basic run for {prompt}")) })
+        }
+
+        fn run_node_with_interaction(
+            &self,
+            node: WorkflowNode,
+            _agent: String,
+            prompt: String,
+            _cwd: String,
+            _timeout_secs: Option<u64>,
+            _config: Option<AgentConfig>,
+            _previous_output: String,
+            ctx: RuntimeContext,
+            run_id: String,
+            cursor_id: String,
+        ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+            let pane_id = self.pane_id.clone();
+            Box::pin(async move {
+                let key = active_pane_key(&cursor_id, &node.id);
+                ctx.registry.set_active_pane(&run_id, &key, &pane_id).await;
+                Ok(NodeResult {
+                    success: true,
+                    output: pane_id,
+                    exit_code: 0,
+                    duration: "0".to_string(),
+                    agent: "mock".to_string(),
+                    prompt: prompt.clone(),
+                    resolved_prompt: Some(prompt),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
     #[cfg(unix)]
     #[derive(Clone)]
     struct AbortBlockingRunner {
@@ -6231,6 +6435,37 @@ mod tests {
             log,
             marker,
         )
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_path(path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if path.exists() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for path {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn wait_for_registry_empty(registry: &RunRegistry, run_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if registry.active_pane_targets(run_id).await.is_empty() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for run {} active pane registry to clear",
+                run_id
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[cfg(unix)]
@@ -6955,6 +7190,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_cleanup_targets_skip_persistent_panes_and_reused_aliases() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db);
+        let run_id = "run_cleanup_targets";
+        ctx.registry.register(run_id).await;
+
+        ctx.registry
+            .set_active_pane_with_session(
+                run_id,
+                &active_pane_key("cursor", "source"),
+                "%pane-source",
+                Some("session-source".to_string()),
+            )
+            .await;
+        ctx.registry
+            .set_active_pane(run_id, &active_pane_key("cursor", "reused"), "%pane-source")
+            .await;
+        ctx.registry
+            .set_active_pane_with_session(
+                run_id,
+                &active_pane_key("cursor", "other"),
+                "%pane-other",
+                Some("session-other".to_string()),
+            )
+            .await;
+
+        let targets = ctx
+            .registry
+            .active_pane_cleanup_targets_except_keys(run_id, &HashSet::from(["source".to_string()]))
+            .await;
+
+        assert_eq!(
+            targets,
+            vec![crate::tmux_exec::PaneCleanupTarget::new(
+                "%pane-other".to_string(),
+                Some("session-other".to_string())
+            )]
+        );
+    }
+
+    #[tokio::test]
     async fn parallel_batch_active_panes_are_registered_per_child_cursor() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
@@ -7021,6 +7299,86 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn completed_run_cleans_non_persistent_active_panes() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let (invocation, kill_log, kill_marker) = fake_tmux_kill_invocation(&temp);
+        let mut runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(PersistentPaneRunner::new("%completed-pane")),
+        );
+        runtime.run_invocation = Some(invocation);
+
+        let workflow = workflow_from_parts(
+            "work",
+            vec![task_node("work", "Work", "complete work")],
+            Vec::new(),
+        );
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        wait_for_path(&kill_marker).await;
+        wait_for_registry_empty(&runtime.registry, &run_id).await;
+        let recorded =
+            fs::read_to_string(kill_log).expect("fake tmux should record completion cleanup");
+        assert!(recorded.contains("kill-pane"));
+        assert!(recorded.contains("%completed-pane"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_backstop_run_cleans_non_persistent_active_panes() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let (invocation, kill_log, kill_marker) = fake_tmux_kill_invocation(&temp);
+        let mut runtime = RuntimeContext::new(db.clone());
+        runtime.run_invocation = Some(invocation);
+        let workflow = workflow_from_parts(
+            "backstop",
+            vec![task_node("work", "Work", "register pane")],
+            Vec::new(),
+        );
+        let run_id = "run_failed_cleanup";
+        let checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        runtime.registry.register(run_id).await;
+        runtime
+            .registry
+            .set_active_pane(run_id, &active_pane_key("cursor", "work"), "%failed-pane")
+            .await;
+
+        fail_workflow_after_error(
+            &runtime,
+            workflow,
+            checkpoint,
+            run_id,
+            anyhow::anyhow!("forced workflow failure"),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        let persisted = db
+            .get_run(run_id)
+            .await
+            .unwrap()
+            .expect("failed run should be persisted");
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Failed);
+        wait_for_path(&kill_marker).await;
+        wait_for_registry_empty(&runtime.registry, &run_id).await;
+        let recorded =
+            fs::read_to_string(kill_log).expect("fake tmux should record failed cleanup");
+        assert!(recorded.contains("kill-pane"));
+        assert!(recorded.contains("%failed-pane"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn abort_kills_active_panes_before_draining_running_tasks() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
@@ -7066,14 +7424,14 @@ mod tests {
         let outcomes = vec!["approve".to_string(), "revise".to_string()];
 
         assert_eq!(
-            select_decide_outcome(&outcomes, "revise"),
+            select_decide_outcome(&outcomes, "revise", None),
             Some("revise".to_string())
         );
         assert_eq!(
-            select_decide_outcome(&outcomes, "I would approve this path."),
+            select_decide_outcome(&outcomes, "I would approve this path.", None),
             Some("approve".to_string())
         );
-        assert_eq!(select_decide_outcome(&outcomes, "unknown"), None);
+        assert_eq!(select_decide_outcome(&outcomes, "unknown", None), None);
     }
 
     #[tokio::test]
@@ -8759,16 +9117,16 @@ mod tests {
         ];
         // Exact match
         assert_eq!(
-            select_decide_outcome(&outcomes, "revise"),
+            select_decide_outcome(&outcomes, "revise", None),
             Some("revise".to_string())
         );
         // Substring match when no exact match
         assert_eq!(
-            select_decide_outcome(&outcomes, "I would approve this."),
+            select_decide_outcome(&outcomes, "I would approve this.", None),
             Some("approve".to_string())
         );
         // No match
-        assert_eq!(select_decide_outcome(&outcomes, "unknown"), None);
+        assert_eq!(select_decide_outcome(&outcomes, "unknown", None), None);
     }
 
     #[test]
@@ -8779,11 +9137,11 @@ mod tests {
             "BLOCKED".to_string(),
         ];
         assert_eq!(
-            select_decide_outcome(&outcomes, "  \"NEXT_STORY\"  "),
+            select_decide_outcome(&outcomes, "  \"NEXT_STORY\"  ", None),
             Some("NEXT_STORY".to_string())
         );
         assert_eq!(
-            select_decide_outcome(&outcomes, "`DONE`"),
+            select_decide_outcome(&outcomes, "`DONE`", None),
             Some("DONE".to_string())
         );
     }
@@ -8812,23 +9170,46 @@ mod tests {
 
         assert_eq!(response.trim(), "reject");
         assert_eq!(
-            select_decide_outcome(&outcomes, &response),
+            select_decide_outcome(&outcomes, &response, None),
             Some("reject".to_string())
         );
     }
 
     #[test]
-    fn decide_outcome_overlapping_labels_prefers_longest_at_same_offset() {
-        let outcomes = vec![
-            "approve".to_string(),
-            "approve_with_changes".to_string(),
-        ];
+    fn decide_routing_prefers_json_artifact_outcome_over_prose() {
+        let outcomes = vec!["approve".to_string(), "reject".to_string()];
+        let node = task_node("decide", "Decide", "prompt");
+        let response = r#"{"outcome":"approve","reason":"I would not reject this."}"#;
+        let parsed = parse_decide_structured_response(&node, response);
+
         assert_eq!(
-            select_decide_outcome(&outcomes, "approve_with_changes"),
+            select_decide_outcome(&outcomes, response, parsed.as_ref()),
+            Some("approve".to_string())
+        );
+    }
+
+    #[test]
+    fn decide_routing_invalid_json_artifact_outcome_does_not_fall_back_to_prose() {
+        let outcomes = vec!["approve".to_string(), "reject".to_string()];
+        let node = task_node("decide", "Decide", "prompt");
+        let response = r#"{"outcome":"maybe","reason":"approve"}"#;
+        let parsed = parse_decide_structured_response(&node, response);
+
+        assert_eq!(
+            select_decide_outcome(&outcomes, response, parsed.as_ref()),
+            None
+        );
+    }
+
+    #[test]
+    fn decide_outcome_overlapping_labels_prefers_longest_at_same_offset() {
+        let outcomes = vec!["approve".to_string(), "approve_with_changes".to_string()];
+        assert_eq!(
+            select_decide_outcome(&outcomes, "approve_with_changes", None),
             Some("approve_with_changes".to_string())
         );
         assert_eq!(
-            select_decide_outcome(&outcomes, "My decision is approve_with_changes."),
+            select_decide_outcome(&outcomes, "My decision is approve_with_changes.", None),
             Some("approve_with_changes".to_string())
         );
     }
@@ -8837,31 +9218,28 @@ mod tests {
     fn decide_outcome_reasoning_bleed_does_not_misroute_on_substring_sibling() {
         let outcomes = vec!["revise".to_string(), "approve".to_string()];
         assert_eq!(
-            select_decide_outcome(&outcomes, "I approve this revision."),
+            select_decide_outcome(&outcomes, "I approve this revision.", None),
             Some("approve".to_string())
         );
     }
 
     #[test]
     fn decide_outcome_ambiguous_multi_match_returns_none() {
-        let outcomes = vec![
-            "approve".to_string(),
-            "approve-with-changes".to_string(),
-        ];
+        let outcomes = vec!["approve".to_string(), "approve-with-changes".to_string()];
         assert_eq!(
-            select_decide_outcome(&outcomes, "approve-with-changes"),
+            select_decide_outcome(&outcomes, "approve-with-changes", None),
             Some("approve-with-changes".to_string())
         );
 
         let outcomes = vec!["yes".to_string(), "no".to_string()];
         assert_eq!(
-            select_decide_outcome(&outcomes, "yes and no are both valid"),
+            select_decide_outcome(&outcomes, "yes and no are both valid", None),
             Some("yes".to_string())
         );
 
         let outcomes = vec!["pick".to_string(), "pick".to_string()];
         assert_eq!(
-            select_decide_outcome(&outcomes, "I choose pick."),
+            select_decide_outcome(&outcomes, "I choose pick.", None),
             None
         );
     }

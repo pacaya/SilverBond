@@ -37,6 +37,21 @@ impl TmuxNodeRunner {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct PaneCleanupTarget {
+    pub(crate) pane_id: String,
+    pub(crate) session_name: Option<String>,
+}
+
+impl PaneCleanupTarget {
+    pub(crate) fn new(pane_id: String, session_name: Option<String>) -> Self {
+        Self {
+            pane_id,
+            session_name,
+        }
+    }
+}
+
 pub fn build_tmux_invocation(run_as: &RunAsConfig) -> TmuxInvocation {
     let prefix = if let Some(command) = &run_as.command {
         command.clone()
@@ -320,12 +335,19 @@ impl ActivePaneRegistration {
     }
 
     fn set(&self, target: &str) {
+        self.set_with_session(target, None);
+    }
+
+    fn set_with_session(&self, target: &str, session_name: Option<&str>) {
         let registry = self.registry.clone();
         let run_id = self.run_id.clone();
         let key = self.key.clone();
         let target = target.to_string();
+        let session_name = session_name.map(str::to_string);
         self.handle.block_on(async move {
-            registry.set_active_pane(&run_id, &key, &target).await;
+            registry
+                .set_active_pane_with_session(&run_id, &key, &target, session_name)
+                .await;
         });
     }
 
@@ -429,7 +451,7 @@ fn execute_spawn(
         .unwrap_or(default_cwd);
     let spawned = spawn_pane(cfg, agent.as_deref(), cwd, None, None, None)?;
     if let Some(active_pane) = active_pane {
-        active_pane.set(&spawned.pane_id);
+        active_pane.set_with_session(&spawned.pane_id, Some(&spawned.session_name));
     }
     let parsed = json!({
         "paneId": spawned.pane_id,
@@ -742,7 +764,7 @@ fn run_agent_interactive(
             None,
         )?;
         if let Some(active_pane) = active_pane {
-            active_pane.set(&spawned.pane_id);
+            active_pane.set_with_session(&spawned.pane_id, Some(&spawned.session_name));
         }
         (spawned.pane_id, Some(spawned.session_name), false)
     };
@@ -894,11 +916,16 @@ pub(crate) fn run_tmux_oneshot(
     }
 }
 
-pub(crate) fn cleanup_panes(panes: &[String]) -> anyhow::Result<()> {
-    let mut seen = HashSet::new();
-    for pane in panes {
-        if seen.insert(pane.clone()) {
-            let _ = tmux::run(&["kill-pane", "-t", pane]);
+pub(crate) fn cleanup_panes(targets: &[PaneCleanupTarget]) -> anyhow::Result<()> {
+    let mut seen_sessions = HashSet::new();
+    let mut seen_panes = HashSet::new();
+    for target in targets {
+        if let Some(session_name) = target.session_name.as_deref() {
+            if seen_sessions.insert(session_name.to_string()) {
+                let _ = tmux::run(&["kill-session", "-t", session_name]);
+            }
+        } else if seen_panes.insert(target.pane_id.clone()) {
+            let _ = tmux::run(&["kill-pane", "-t", &target.pane_id]);
         }
     }
     Ok(())
@@ -954,7 +981,7 @@ fn run_agent_sequence(
             None,
         )?;
         if let Some(active_pane) = active_pane {
-            active_pane.set(&spawned.pane_id);
+            active_pane.set_with_session(&spawned.pane_id, Some(&spawned.session_name));
         }
         (spawned.pane_id, Some(spawned.session_name), false)
     };
@@ -1189,7 +1216,6 @@ fn poll_agent_interactive(
 ) -> anyhow::Result<InteractivePollResult> {
     let ready_signal = ready_signal_for_pane(pane)?;
     let until_regexes = compile_until_regexes(until, capture_markers)?;
-    let allow_idle_completion = ready_signal.regex.is_some() || until.is_some();
     let mut deadline = Instant::now() + timeout;
     let mut last_seen = before.to_owned();
     let mut progress = CaptureProgress::new(before, Instant::now());
@@ -1280,7 +1306,7 @@ fn poll_agent_interactive(
             ready_stable_seconds,
             &until_regexes,
         ) {
-            if is_interactive_completion_reason(reason, allow_idle_completion) {
+            if is_interactive_completion_reason(reason) {
                 return Ok(InteractivePollResult::Completed(InteractiveCapture {
                     output: output_so_far,
                     final_capture: capture,
@@ -1316,11 +1342,10 @@ fn compile_until_regexes(
     Ok(regexes)
 }
 
-fn is_interactive_completion_reason(reason: IdleReason, allow_idle_completion: bool) -> bool {
+fn is_interactive_completion_reason(reason: IdleReason) -> bool {
     match reason {
-        IdleReason::Idle => allow_idle_completion,
         IdleReason::ReadyMatched | IdleReason::UntilMatched => true,
-        IdleReason::TimedOut => false,
+        IdleReason::Idle | IdleReason::TimedOut => false,
     }
 }
 
@@ -2313,6 +2338,57 @@ mod tests {
         let _ = tmux::run(&["kill-session", "-t", &session_name]);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_panes_kills_registered_sessions_and_pane_fallbacks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-cleanup-prefix.sh");
+        let log = temp.path().join("tmux-cleanup-args.log");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\nshift\nprintf '%s\\n' \"$@\" >> \"$log\"\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![
+                script.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+            ],
+            socket: Some("cleanup-test-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+        tmux_tools_core::with_invocation(invocation, || {
+            cleanup_panes(&[
+                PaneCleanupTarget::new(
+                    "%ephemeral-pane".to_string(),
+                    Some("ephemeral-session".to_string()),
+                ),
+                PaneCleanupTarget::new("%external-pane".to_string(), None),
+            ])
+        })
+        .unwrap();
+
+        let recorded =
+            std::fs::read_to_string(log).expect("fake tmux prefix should record cleanup args");
+        let args = recorded.lines().collect::<Vec<_>>();
+        assert!(
+            args.windows(3)
+                .any(|window| window == ["kill-session", "-t", "ephemeral-session"]),
+            "ephemeral sessions should be killed by session name; args={args:?}"
+        );
+        assert!(
+            args.windows(3)
+                .any(|window| window == ["kill-pane", "-t", "%external-pane"]),
+            "external/reused panes should fall back to kill-pane; args={args:?}"
+        );
+    }
+
     fn wait_for_child_output(
         mut child: std::process::Child,
         timeout: Duration,
@@ -2406,20 +2482,43 @@ mod tests {
 
     #[test]
     fn markerless_visual_idle_is_not_interactive_completion() {
-        assert!(!is_interactive_completion_reason(IdleReason::Idle, false));
+        assert!(!is_interactive_completion_reason(IdleReason::Idle));
     }
 
     #[test]
-    fn configured_marker_matches_complete_interactive_polling() {
-        assert!(is_interactive_completion_reason(
-            IdleReason::ReadyMatched,
-            false
-        ));
-        assert!(is_interactive_completion_reason(
-            IdleReason::UntilMatched,
-            false
-        ));
-        assert!(is_interactive_completion_reason(IdleReason::Idle, true));
+    fn only_affirmative_signals_complete_interactive_polling() {
+        assert!(is_interactive_completion_reason(IdleReason::ReadyMatched));
+        assert!(is_interactive_completion_reason(IdleReason::UntilMatched));
+        assert!(!is_interactive_completion_reason(IdleReason::Idle));
+        assert!(!is_interactive_completion_reason(IdleReason::TimedOut));
+    }
+
+    #[test]
+    fn stable_screen_without_sentinel_or_ready_match_does_not_complete() {
+        let now = Instant::now();
+        let mut progress = CaptureProgress::new("frozen shell prompt", now);
+        let first_reason = progress.observe(
+            "frozen shell prompt",
+            now,
+            2.0,
+            &None,
+            DEFAULT_READY_SCAN_LINES,
+            0.0,
+            &[],
+        );
+        let reason = progress.observe(
+            "frozen shell prompt",
+            now + Duration::from_secs(3),
+            2.0,
+            &None,
+            DEFAULT_READY_SCAN_LINES,
+            0.0,
+            &[],
+        );
+
+        assert_eq!(first_reason, None);
+        assert!(matches!(reason, Some(IdleReason::Idle)));
+        assert!(!is_interactive_completion_reason(reason.unwrap()));
     }
 
     #[test]

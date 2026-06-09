@@ -401,8 +401,12 @@ pub struct SendConfig {
     pub target: Option<String>,
     #[serde(default)]
     pub text: String,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enter: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]

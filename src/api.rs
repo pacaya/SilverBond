@@ -27,7 +27,11 @@ use tmux_tools_core::{
     stream::{CaptureAnsiOpts, capture_ansi, stream_pane},
     tmux, with_invocation,
 };
-use tokio::{io::AsyncReadExt, sync::broadcast, time::Instant};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    sync::broadcast,
+    time::Instant,
+};
 
 use crate::{
     app::{AppState, PaneStreamEntry},
@@ -43,6 +47,14 @@ use crate::{
 
 const PANE_STREAM_HEARTBEAT: Duration = Duration::from_secs(5);
 const PANE_STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(2);
+const PANE_STREAM_READ_MAX_RETRIES: usize = 5;
+const PANE_STREAM_READ_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneStreamTaskExit {
+    NoSubscribers,
+    Terminal,
+}
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -783,6 +795,95 @@ async fn subscribe_pane_stream(
     receiver
 }
 
+async fn pump_pane_stream<R>(
+    pane_reader: &mut R,
+    sender: &broadcast::Sender<Vec<u8>>,
+    run_id: &str,
+    pane: &str,
+    pane_target: &str,
+    retry_delay: Duration,
+) -> PaneStreamTaskExit
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = [0_u8; 8192];
+    let mut consecutive_read_errors = 0_usize;
+    loop {
+        tokio::select! {
+            _ = sender.closed() => {
+                tracing::debug!(
+                    run_id = %run_id,
+                    pane = %pane,
+                    pane_target = %pane_target,
+                    "pane stream has no subscribers"
+                );
+                break PaneStreamTaskExit::NoSubscribers;
+            }
+            read_result = pane_reader.read(&mut buffer) => {
+                match read_result {
+                    Ok(0) => {
+                        tracing::debug!(
+                            run_id = %run_id,
+                            pane = %pane,
+                            pane_target = %pane_target,
+                            "pane stream reached EOF"
+                        );
+                        break PaneStreamTaskExit::Terminal;
+                    }
+                    Ok(bytes_read) => {
+                        consecutive_read_errors = 0;
+                        if sender.send(buffer[..bytes_read].to_vec()).is_err() {
+                            tracing::debug!(
+                                run_id = %run_id,
+                                pane = %pane,
+                                pane_target = %pane_target,
+                                "pane stream has no subscribers"
+                            );
+                            break PaneStreamTaskExit::NoSubscribers;
+                        }
+                    }
+                    Err(error) => {
+                        consecutive_read_errors += 1;
+                        if consecutive_read_errors > PANE_STREAM_READ_MAX_RETRIES {
+                            tracing::warn!(
+                                run_id = %run_id,
+                                pane = %pane,
+                                pane_target = %pane_target,
+                                error = %error,
+                                retries = PANE_STREAM_READ_MAX_RETRIES,
+                                "pane stream read failed permanently"
+                            );
+                            break PaneStreamTaskExit::Terminal;
+                        }
+
+                        tracing::warn!(
+                            run_id = %run_id,
+                            pane = %pane,
+                            pane_target = %pane_target,
+                            error = %error,
+                            retry = consecutive_read_errors,
+                            max_retries = PANE_STREAM_READ_MAX_RETRIES,
+                            "pane stream read failed; retrying"
+                        );
+                        tokio::select! {
+                            _ = sender.closed() => {
+                                tracing::debug!(
+                                    run_id = %run_id,
+                                    pane = %pane,
+                                    pane_target = %pane_target,
+                                    "pane stream has no subscribers"
+                                );
+                                break PaneStreamTaskExit::NoSubscribers;
+                            }
+                            _ = tokio::time::sleep(retry_delay) => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn spawn_pane_stream_task(
     state: AppState,
     run_id: String,
@@ -792,79 +893,44 @@ fn spawn_pane_stream_task(
     sender: broadcast::Sender<Vec<u8>>,
 ) {
     tokio::spawn(async move {
-        {
-            let mut pane_reader = match start_pane_stream(&pane_target, &invocation).await {
-                Ok(reader) => reader,
-                Err(error) => {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        pane = %pane,
-                        pane_target = %pane_target,
-                        error = %error,
-                        "failed to start pane stream"
-                    );
-                    state
-                        .pane_streams
-                        .remove_if_sender(&pane_target, &sender)
-                        .await;
-                    return;
-                }
-            };
+        let exit = match start_pane_stream(&pane_target, &invocation).await {
+            Ok(mut pane_reader) => {
+                pump_pane_stream(
+                    &mut pane_reader,
+                    &sender,
+                    &run_id,
+                    &pane,
+                    &pane_target,
+                    PANE_STREAM_READ_RETRY_DELAY,
+                )
+                .await
+            }
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    pane = %pane,
+                    pane_target = %pane_target,
+                    error = %error,
+                    "failed to start pane stream"
+                );
+                PaneStreamTaskExit::Terminal
+            }
+        };
 
-            let mut buffer = [0_u8; 8192];
-            loop {
-                tokio::select! {
-                    _ = sender.closed() => {
-                        tracing::debug!(
-                            run_id = %run_id,
-                            pane = %pane,
-                            pane_target = %pane_target,
-                            "pane stream has no subscribers"
-                        );
-                        break;
-                    }
-                    read_result = pane_reader.read(&mut buffer) => {
-                        match read_result {
-                            Ok(0) => {
-                                tracing::debug!(
-                                    run_id = %run_id,
-                                    pane = %pane,
-                                    pane_target = %pane_target,
-                                    "pane stream reached EOF"
-                                );
-                                break;
-                            }
-                            Ok(bytes_read) => {
-                                if sender.send(buffer[..bytes_read].to_vec()).is_err() {
-                                    tracing::debug!(
-                                        run_id = %run_id,
-                                        pane = %pane,
-                                        pane_target = %pane_target,
-                                        "pane stream has no subscribers"
-                                    );
-                                    break;
-                                }
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    run_id = %run_id,
-                                    pane = %pane,
-                                    pane_target = %pane_target,
-                                    error = %error,
-                                    "pane stream read failed"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                }
+        match exit {
+            PaneStreamTaskExit::NoSubscribers => {
+                state
+                    .pane_streams
+                    .remove_if_sender(&pane_target, &sender)
+                    .await;
+            }
+            PaneStreamTaskExit::Terminal => {
+                state
+                    .pane_streams
+                    .remove_terminal_sender(&pane_target, &sender)
+                    .await;
             }
         }
-
-        state
-            .pane_streams
-            .remove_if_sender(&pane_target, &sender)
-            .await;
     });
 }
 
@@ -1356,12 +1422,49 @@ impl IntoResponse for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        collections::VecDeque,
+        io,
+        pin::Pin,
+        task::{Context as TaskContext, Poll},
+    };
+    use tokio::io::ReadBuf;
+
     use crate::{
         app::PaneStreamRegistry,
         runtime::{
             AgentExecutionMetadata, ExecutionLog, NodeExecutionLog, NodeResult, RuntimeStatus,
         },
     };
+
+    struct ScriptedReader {
+        reads: VecDeque<io::Result<Vec<u8>>>,
+    }
+
+    impl ScriptedReader {
+        fn new(reads: Vec<io::Result<Vec<u8>>>) -> Self {
+            Self {
+                reads: reads.into(),
+            }
+        }
+    }
+
+    impl AsyncRead for ScriptedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            match self.reads.pop_front() {
+                Some(Ok(bytes)) => {
+                    buf.put_slice(&bytes);
+                    Poll::Ready(Ok(()))
+                }
+                Some(Err(error)) => Poll::Ready(Err(error)),
+                None => Poll::Ready(Ok(())),
+            }
+        }
+    }
 
     #[test]
     fn build_attach_command_omits_socket_flag_for_default_invocation() {
@@ -1496,6 +1599,90 @@ mod tests {
         );
 
         registry.unsubscribe("%1").await;
+        assert!(!registry.inner.lock().await.contains_key("%1"));
+    }
+
+    #[tokio::test]
+    async fn pane_stream_retry_keeps_receivers_after_transient_read_error() {
+        let (sender, mut receiver) = broadcast::channel::<Vec<u8>>(16);
+        let mut reader = ScriptedReader::new(vec![
+            Err(io::Error::new(io::ErrorKind::Interrupted, "temporary")),
+            Ok(b"chunk".to_vec()),
+            Ok(Vec::new()),
+        ]);
+
+        let exit = pump_pane_stream(
+            &mut reader,
+            &sender,
+            "run-test",
+            "pane-test",
+            "%1",
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(exit, PaneStreamTaskExit::Terminal);
+        assert_eq!(receiver.recv().await.unwrap(), b"chunk".to_vec());
+    }
+
+    #[tokio::test]
+    async fn pane_stream_read_errors_stop_after_retry_limit() {
+        let (sender, mut receiver) = broadcast::channel::<Vec<u8>>(16);
+        let mut reader = ScriptedReader::new(
+            (0..=PANE_STREAM_READ_MAX_RETRIES)
+                .map(|attempt| {
+                    Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("failure {attempt}"),
+                    ))
+                })
+                .collect(),
+        );
+
+        let exit = pump_pane_stream(
+            &mut reader,
+            &sender,
+            "run-test",
+            "pane-test",
+            "%1",
+            Duration::ZERO,
+        )
+        .await;
+
+        assert_eq!(exit, PaneStreamTaskExit::Terminal);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pane_stream_registry_remove_if_sender_keeps_live_subscribers() {
+        let registry = PaneStreamRegistry::default();
+        let (sender, _receiver) = broadcast::channel::<Vec<u8>>(16);
+        {
+            let mut streams = registry.inner.lock().await;
+            streams.insert(
+                "%1".to_string(),
+                PaneStreamEntry {
+                    sender: sender.clone(),
+                    refcount: 2,
+                },
+            );
+        }
+
+        registry.remove_if_sender("%1", &sender).await;
+        assert_eq!(
+            registry
+                .inner
+                .lock()
+                .await
+                .get("%1")
+                .map(|entry| entry.refcount),
+            Some(2)
+        );
+
+        registry.remove_terminal_sender("%1", &sender).await;
         assert!(!registry.inner.lock().await.contains_key("%1"));
     }
 

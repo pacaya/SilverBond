@@ -132,6 +132,7 @@ const PANE_RECONNECT_BASE_MS = 500;
 const PANE_RECONNECT_MAX_MS = 5000;
 const PANE_FAST_CLOSE_MS = 1000;
 const PANE_FAST_CLOSE_LIMIT = 3;
+const PANE_HEARTBEAT_TIMEOUT_MS = 15000;
 
 export type PaneStreamStatus = "connecting" | "open" | "closed" | "unavailable";
 
@@ -151,13 +152,17 @@ export interface PaneStreamHandle {
   close: () => void;
 }
 
-function decodeBase64(value: string): Uint8Array {
-  const binary = atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
+function decodeBase64(value: string): Uint8Array | null {
+  try {
+    const binary = atob(value);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i += 1) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  } catch {
+    return null;
   }
-  return bytes;
 }
 
 function paneStreamUrl(runId: string, pane: string): string {
@@ -181,6 +186,14 @@ export function streamPane(
   let consecutiveFastCloses = 0;
   let lastSeq = -1;
   let resyncPending = false;
+  let heartbeatWatchdog: ReturnType<typeof setInterval> | null = null;
+
+  const clearHeartbeatWatchdog = () => {
+    if (heartbeatWatchdog) {
+      clearInterval(heartbeatWatchdog);
+      heartbeatWatchdog = null;
+    }
+  };
 
   const requestResync = () => {
     if (socket && socket.readyState === WebSocket.OPEN) {
@@ -216,10 +229,20 @@ export function streamPane(
 
     let openedAt: number | null = null;
     let firstFrameSeen = false;
+    let lastFrameTime = 0;
 
     ws.onopen = () => {
       if (closed || ws !== socket) return;
       openedAt = Date.now();
+      lastFrameTime = Date.now();
+      clearHeartbeatWatchdog();
+      heartbeatWatchdog = setInterval(() => {
+        if (closed || ws !== socket) return;
+        if (Date.now() - lastFrameTime > PANE_HEARTBEAT_TIMEOUT_MS) {
+          handlers.onStatus?.("connecting");
+          ws.close();
+        }
+      }, PANE_HEARTBEAT_TIMEOUT_MS / 3);
       handlers.onStatus?.("open");
     };
 
@@ -238,10 +261,26 @@ export function streamPane(
         consecutiveFastCloses = 0;
       }
       const seq = typeof frame.seq === "number" ? frame.seq : null;
+      if (
+        frame.type === "snapshot" ||
+        frame.type === "data" ||
+        frame.type === "heartbeat" ||
+        frame.type === "error"
+      ) {
+        lastFrameTime = Date.now();
+      }
       switch (frame.type) {
         case "snapshot":
           if (seq !== null) lastSeq = seq;
-          if (typeof frame.data === "string") handlers.onSnapshot(decodeBase64(frame.data));
+          if (typeof frame.data === "string") {
+            const bytes = decodeBase64(frame.data);
+            if (bytes === null) {
+              handlers.onError?.("malformed base64 in snapshot frame");
+              requestResync();
+              break;
+            }
+            handlers.onSnapshot(bytes);
+          }
           resyncPending = false;
           break;
         case "data":
@@ -255,7 +294,15 @@ export function streamPane(
             }
           }
           if (resyncPending) return;
-          if (typeof frame.data === "string") handlers.onData(decodeBase64(frame.data));
+          if (typeof frame.data === "string") {
+            const bytes = decodeBase64(frame.data);
+            if (bytes === null) {
+              handlers.onError?.("malformed base64 in data frame");
+              requestResync();
+              break;
+            }
+            handlers.onData(bytes);
+          }
           break;
         case "error":
           if (seq !== null) lastSeq = seq;
@@ -269,6 +316,7 @@ export function streamPane(
 
     ws.onclose = () => {
       if (closed || ws !== socket) return;
+      clearHeartbeatWatchdog();
       socket = null;
       const fastClose =
         openedAt !== null &&
@@ -297,6 +345,7 @@ export function streamPane(
     requestResync,
     close: () => {
       closed = true;
+      clearHeartbeatWatchdog();
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
