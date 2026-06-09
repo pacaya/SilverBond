@@ -78,9 +78,9 @@ async fn validates_and_saves_workflows() {
             {
                 "id": "n1",
                 "name": "Node 1",
-                "type": "task",
                 "agent": "claude",
-                "prompt": "Say hi"
+                "prompt": "Say hi",
+                "kind": { "type": "task" }
             }
         ],
         "edges": [],
@@ -195,6 +195,109 @@ async fn rejects_legacy_workflow_payloads() {
 }
 
 #[tokio::test]
+async fn test_node_accepts_v3_task_node() {
+    let (temp, router) = test_router().await;
+    let task_node = json!({
+        "id": "preview-task",
+        "name": "Preview Task",
+        "agent": "echo",
+        "prompt": "Preview task",
+        "kind": { "type": "task" }
+    });
+
+    let (status, preview) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .uri("/api/test-node")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "node": task_node,
+                    "cwd": temp.path().to_string_lossy()
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{preview:?}");
+    assert_eq!(preview["success"], true);
+    assert_eq!(preview["agent"], "echo");
+    assert_eq!(preview["resolvedPrompt"], "Preview task");
+}
+
+#[tokio::test]
+async fn test_node_rejects_non_preview_node_payloads() {
+    let (_temp, router) = test_router().await;
+    let split_node = json!({
+        "id": "split-node",
+        "name": "Split Node",
+        "prompt": "",
+        "kind": { "type": "split" }
+    });
+
+    let (status, rejection) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .uri("/api/test-node")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "node": split_node })).unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        rejection["error"]
+            .as_str()
+            .unwrap()
+            .contains("task or approval kind types")
+    );
+
+    let workflow_payload = json!({
+        "version": 3,
+        "name": "Workflow Payload",
+        "entryNodeId": "preview-task",
+        "nodes": [
+            {
+                "id": "preview-task",
+                "name": "Preview Task",
+                "agent": "echo",
+                "prompt": "Preview task",
+                "kind": { "type": "task" }
+            }
+        ],
+        "edges": []
+    });
+
+    let (status, rejection) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .uri("/api/test-node")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "node": workflow_payload })).unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        rejection["error"]
+            .as_str()
+            .unwrap()
+            .contains("provide a single node")
+    );
+}
+
+#[tokio::test]
 async fn validates_workflow_with_agent_config() {
     let (_temp, router) = test_router().await;
     let workflow = json!({
@@ -218,22 +321,24 @@ async fn validates_workflow_with_agent_config() {
             {
                 "id": "n1",
                 "name": "Analysis",
-                "type": "task",
                 "agent": "claude",
                 "prompt": "Analyze code",
-                "agentConfig": {
-                    "maxBudgetUsd": 1.5,
-                    "systemPrompt": "Be thorough."
+                "kind": {
+                    "type": "task",
+                    "agentConfig": {
+                        "maxBudgetUsd": 1.5,
+                        "systemPrompt": "Be thorough."
+                    }
                 },
                 "cwd": "/project"
             },
             {
                 "id": "n2",
                 "name": "Follow-up",
-                "type": "task",
                 "agent": "claude",
                 "prompt": "Continue analysis",
-                "continueSessionFrom": "n1"
+                "continueSessionFrom": "n1",
+                "kind": { "type": "task" }
             }
         ],
         "edges": [
@@ -262,8 +367,11 @@ async fn validates_workflow_with_agent_config() {
     assert_eq!(w["agentDefaults"]["claude"]["accessMode"], "edit");
 
     // Verify node config preserved
-    assert_eq!(w["nodes"][0]["agentConfig"]["maxBudgetUsd"], 1.5);
-    assert_eq!(w["nodes"][0]["agentConfig"]["systemPrompt"], "Be thorough.");
+    assert_eq!(w["nodes"][0]["kind"]["agentConfig"]["maxBudgetUsd"], 1.5);
+    assert_eq!(
+        w["nodes"][0]["kind"]["agentConfig"]["systemPrompt"],
+        "Be thorough."
+    );
     assert_eq!(w["nodes"][0]["cwd"], "/project");
     assert_eq!(w["nodes"][1]["continueSessionFrom"], "n1");
 }
@@ -355,9 +463,9 @@ async fn lists_templates_without_failing_on_invalid_files() {
                 {
                     "id": "n1",
                     "name": "Node 1",
-                    "type": "task",
                     "agent": "claude",
-                    "prompt": "Say hi"
+                    "prompt": "Say hi",
+                    "kind": { "type": "task" }
                 }
             ],
             "edges": []
@@ -400,7 +508,12 @@ async fn creates_and_approves_runs() {
         "variables": [],
         "limits": { "maxTotalSteps": 5, "maxVisitsPerNode": 5 },
         "nodes": [
-            { "id": "a1", "name": "Approval", "type": "approval", "prompt": "Approve?" }
+            {
+                "id": "a1",
+                "name": "Approval",
+                "prompt": "Approve?",
+                "kind": { "type": "approval" }
+            }
         ],
         "edges": []
     });

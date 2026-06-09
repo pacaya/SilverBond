@@ -7,7 +7,10 @@
   "useOrchestrator": true,
   "entryNodeId": "rs1",
   "variables": [
-    { "name": "topic", "default": "AI safety" }
+    {
+      "name": "topic",
+      "default": "AI safety"
+    }
   ],
   "limits": {
     "maxTotalSteps": 50,
@@ -17,24 +20,30 @@
     {
       "id": "rs1",
       "name": "Initial Research",
-      "type": "task",
       "agent": "claude",
-      "prompt": "Research the topic: {{var:topic}}. Provide an initial overview covering key concepts, recent developments, and open questions."
+      "prompt": "Research the topic: {{var:topic}}. Provide an initial overview covering key concepts, recent developments, and open questions.",
+      "kind": {
+        "type": "task"
+      }
     },
     {
       "id": "rs2",
       "name": "Refine Research",
-      "type": "task",
       "agent": "claude",
       "prompt": "Expand on the research so far. Add more detail, find additional perspectives, and address gaps:\n\n{{previous_output}}",
-      "loopMaxIterations": 3
+      "loopMaxIterations": 3,
+      "kind": {
+        "type": "task"
+      }
     },
     {
       "id": "rs3",
       "name": "Final Summary",
-      "type": "task",
       "agent": "claude",
-      "prompt": "Synthesize all findings into a concise, well-structured summary report:\n\n{{all_predecessors}}"
+      "prompt": "Synthesize all findings into a concise, well-structured summary report:\n\n{{all_predecessors}}",
+      "kind": {
+        "type": "task"
+      }
     }
   ],
   "edges": [
@@ -71,11 +80,24 @@
   ],
   "ui": {
     "canvas": {
-      "viewport": { "x": 0, "y": 0, "zoom": 1 },
+      "viewport": {
+        "x": 0,
+        "y": 0,
+        "zoom": 1
+      },
       "nodes": {
-        "rs1": { "x": 120, "y": 140 },
-        "rs2": { "x": 400, "y": 60 },
-        "rs3": { "x": 680, "y": 140 }
+        "rs1": {
+          "x": 120,
+          "y": 140
+        },
+        "rs2": {
+          "x": 400,
+          "y": 60
+        },
+        "rs3": {
+          "x": 680,
+          "y": 140
+        }
       }
     }
   }

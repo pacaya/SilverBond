@@ -53,35 +53,39 @@ const dualReviewWorkflow: WorkflowDocument = {
     {
       id: "split-reviewers",
       name: "Split Reviewers",
-      type: "split",
+      kind: { type: "split" },
       prompt: "",
     },
     {
       id: "reviewer-a",
       name: "Reviewer A",
-      type: "run_agent",
-      prompt: "",
-      runAgentConfig: {
-        agent: "claude",
-        prompt: "Perform an adversarial code review focused on correctness and security.",
-        killAfter: true,
+      kind: {
+        type: "run_agent",
+        runAgentConfig: {
+          agent: "claude",
+          prompt: "Perform an adversarial code review focused on correctness and security.",
+          killAfter: true,
+        },
       },
+      prompt: "",
     },
     {
       id: "reviewer-b",
       name: "Reviewer B",
-      type: "run_agent",
-      prompt: "",
-      runAgentConfig: {
-        agent: "claude",
-        prompt: "Perform an adversarial code review focused on code quality and maintainability.",
-        killAfter: true,
+      kind: {
+        type: "run_agent",
+        runAgentConfig: {
+          agent: "claude",
+          prompt: "Perform an adversarial code review focused on code quality and maintainability.",
+          killAfter: true,
+        },
       },
+      prompt: "",
     },
     {
       id: "collect-reviews",
       name: "Collect Reviews",
-      type: "collector",
+      kind: { type: "collector" },
       prompt: "",
     },
   ],

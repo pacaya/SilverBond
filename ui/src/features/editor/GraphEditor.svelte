@@ -167,21 +167,22 @@
     if (!connection.source || !connection.target) return;
     const outgoing = activeWorkflow.edges.filter((e) => e.from === connection.source);
     const sourceNode = activeWorkflow.nodes.find((node) => node.id === connection.source);
+    const sourceType = sourceNode?.kind.type;
     let outcome: WorkflowEdgeOutcome = "success";
 
-    if (sourceNode?.type === "collector" && outgoing.some((edge) => edge.outcome === "success")) {
+    if (sourceType === "collector" && outgoing.some((edge) => edge.outcome === "success")) {
       store.setError("Collector nodes can only have one success edge.");
       return;
     }
 
-    if (sourceNode?.type === "split" || sourceNode?.type === "collector") {
+    if (sourceType === "split" || sourceType === "collector") {
       outcome = "success";
-    } else if (sourceNode?.type === "decide") {
+    } else if (sourceType === "decide") {
       // Decide nodes route exclusively through branch edges.
       outcome = "branch";
-    } else if (sourceNode?.type === "task" || sourceNode?.type === "run_agent") {
+    } else if (sourceType === "task" || sourceType === "run_agent") {
       outcome = outgoing.some((e) => e.outcome === "success") ? "branch" : "success";
-    } else if (sourceNode?.type === "approval") {
+    } else if (sourceType === "approval") {
       outcome = outgoing.some((e) => e.outcome === "success") ? "reject" : "success";
     }
 

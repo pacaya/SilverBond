@@ -25,8 +25,8 @@ use uuid::Uuid;
 use crate::{
     driver::{self, AgentConfig, NodeOutcome},
     model::{
-        self, ContextSource, ResponseFormat, SplitFailurePolicy, WorkflowEdge, WorkflowEdgeOutcome,
-        WorkflowGraph, WorkflowNode, WorkflowNodeType, WorkflowV3, evaluate_condition,
+        self, ContextSource, NodeKind, ResponseFormat, SplitFailurePolicy, WorkflowEdge,
+        WorkflowEdgeOutcome, WorkflowGraph, WorkflowNode, WorkflowV3, evaluate_condition,
         get_nested_field,
     },
     storage::Database,
@@ -1411,61 +1411,73 @@ fn build_session_persistence_set(workflow: &WorkflowV3) -> HashSet<String> {
         .collect()
 }
 
-fn is_runner_node_type(node_type: &WorkflowNodeType) -> bool {
+fn is_runner_node_kind(kind: &NodeKind) -> bool {
     matches!(
-        node_type,
-        WorkflowNodeType::Task
-            | WorkflowNodeType::Decide
-            | WorkflowNodeType::Spawn
-            | WorkflowNodeType::Send
-            | WorkflowNodeType::Wait
-            | WorkflowNodeType::Capture
-            | WorkflowNodeType::Kill
-            | WorkflowNodeType::RunAgent
+        kind,
+        NodeKind::Task { .. }
+            | NodeKind::Decide { .. }
+            | NodeKind::Spawn { .. }
+            | NodeKind::Send { .. }
+            | NodeKind::Wait { .. }
+            | NodeKind::Capture { .. }
+            | NodeKind::Kill { .. }
+            | NodeKind::RunAgent { .. }
     )
 }
 
 fn prompt_template_for_node(node: &WorkflowNode) -> &str {
-    if let Some(prompt) = match node.node_type {
-        WorkflowNodeType::RunAgent => node
-            .run_agent_config
-            .as_ref()
-            .and_then(|config| config.prompt.as_deref()),
-        WorkflowNodeType::Send => node
-            .send_config
-            .as_ref()
-            .map(|config| config.text.as_str())
-            .filter(|text| !text.is_empty()),
-        WorkflowNodeType::Decide => node
-            .decide_config
-            .as_ref()
-            .map(|config| config.prompt.as_str()),
-        _ => None,
-    } {
-        return prompt;
+    match &node.kind {
+        NodeKind::RunAgent {
+            run_agent_config, ..
+        } => run_agent_config.prompt.as_deref().unwrap_or(&node.prompt),
+        NodeKind::Send { send_config } => {
+            if send_config.text.is_empty() {
+                &node.prompt
+            } else {
+                send_config.text.as_str()
+            }
+        }
+        NodeKind::Decide { decide_config } => decide_config.prompt.as_str(),
+        NodeKind::Task { .. }
+        | NodeKind::Approval
+        | NodeKind::Split
+        | NodeKind::Collector
+        | NodeKind::ParallelBatch { .. }
+        | NodeKind::Subflow { .. }
+        | NodeKind::Call { .. }
+        | NodeKind::Spawn { .. }
+        | NodeKind::Wait { .. }
+        | NodeKind::Capture { .. }
+        | NodeKind::Kill { .. } => &node.prompt,
     }
-    &node.prompt
 }
 
 fn agent_name_for_node(node: &WorkflowNode) -> String {
-    match &node.node_type {
-        WorkflowNodeType::RunAgent => node
-            .run_agent_config
-            .as_ref()
-            .and_then(|config| config.agent.clone())
+    match &node.kind {
+        NodeKind::RunAgent {
+            run_agent_config, ..
+        } => run_agent_config
+            .agent
+            .clone()
             .or_else(|| node.agent.clone())
             .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
-        WorkflowNodeType::Spawn => node
-            .spawn_config
-            .as_ref()
-            .and_then(|config| config.agent.clone())
+        NodeKind::Spawn { spawn_config } => spawn_config
+            .agent
+            .clone()
             .or_else(|| node.agent.clone())
             .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
-        WorkflowNodeType::Send
-        | WorkflowNodeType::Wait
-        | WorkflowNodeType::Capture
-        | WorkflowNodeType::Kill => "tmux".to_string(),
-        _ => node
+        NodeKind::Send { .. }
+        | NodeKind::Wait { .. }
+        | NodeKind::Capture { .. }
+        | NodeKind::Kill { .. } => "tmux".to_string(),
+        NodeKind::Task { .. }
+        | NodeKind::Approval
+        | NodeKind::Split
+        | NodeKind::Collector
+        | NodeKind::Decide { .. }
+        | NodeKind::ParallelBatch { .. }
+        | NodeKind::Subflow { .. }
+        | NodeKind::Call { .. } => node
             .agent
             .clone()
             .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
@@ -1473,18 +1485,23 @@ fn agent_name_for_node(node: &WorkflowNode) -> String {
 }
 
 fn timeout_for_node(node: &WorkflowNode) -> Option<u64> {
-    match &node.node_type {
-        WorkflowNodeType::RunAgent => node
-            .run_agent_config
-            .as_ref()
-            .and_then(|config| config.timeout)
-            .or(node.timeout),
-        WorkflowNodeType::Wait => node
-            .wait_config
-            .as_ref()
-            .and_then(|config| config.timeout)
-            .or(node.timeout),
-        _ => node.timeout,
+    match &node.kind {
+        NodeKind::RunAgent {
+            run_agent_config, ..
+        } => run_agent_config.timeout.or(node.timeout),
+        NodeKind::Wait { wait_config } => wait_config.timeout.or(node.timeout),
+        NodeKind::Task { .. }
+        | NodeKind::Approval
+        | NodeKind::Split
+        | NodeKind::Collector
+        | NodeKind::Decide { .. }
+        | NodeKind::ParallelBatch { .. }
+        | NodeKind::Subflow { .. }
+        | NodeKind::Call { .. }
+        | NodeKind::Spawn { .. }
+        | NodeKind::Send { .. }
+        | NodeKind::Capture { .. }
+        | NodeKind::Kill { .. } => node.timeout,
     }
 }
 
@@ -1838,7 +1855,7 @@ fn nearest_collectors_for_node(graph: &WorkflowGraph, node_id: &str) -> Vec<Coll
             let Some(target_node) = graph.node_map.get(edge.to.as_str()) else {
                 continue;
             };
-            if target_node.node_type == WorkflowNodeType::Collector {
+            if matches!(&target_node.kind, NodeKind::Collector) {
                 found_distance.get_or_insert(distance + 1);
                 targets.insert(
                     (edge.to.clone(), merge_key_for_edge(edge)),
@@ -1973,7 +1990,7 @@ async fn execute_workflow(
                 checkpoint.execution_log.terminal_reason = Some("aborted".to_string());
                 break;
             };
-            if !is_runner_node_type(&node.node_type) {
+            if !is_runner_node_kind(&node.kind) {
                 continue;
             }
             let Some(iteration) =
@@ -2189,15 +2206,15 @@ async fn process_immediate_cursors(
             return Ok(true);
         };
 
-        match &node.node_type {
-            WorkflowNodeType::Task
-            | WorkflowNodeType::Decide
-            | WorkflowNodeType::Spawn
-            | WorkflowNodeType::Send
-            | WorkflowNodeType::Wait
-            | WorkflowNodeType::Capture
-            | WorkflowNodeType::Kill
-            | WorkflowNodeType::RunAgent => {
+        match &node.kind {
+            NodeKind::Task { .. }
+            | NodeKind::Decide { .. }
+            | NodeKind::Spawn { .. }
+            | NodeKind::Send { .. }
+            | NodeKind::Wait { .. }
+            | NodeKind::Capture { .. }
+            | NodeKind::Kill { .. }
+            | NodeKind::RunAgent { .. } => {
                 if should_skip_cursor_node(&node, &cursor, checkpoint) {
                     let Some(_) =
                         prepare_cursor_visit(ctx, workflow, checkpoint, &cursor_id, &node).await?
@@ -2209,7 +2226,7 @@ async fn process_immediate_cursors(
                     return Ok(true);
                 }
             }
-            WorkflowNodeType::Approval => {
+            NodeKind::Approval => {
                 let Some(_) =
                     prepare_cursor_visit(ctx, workflow, checkpoint, &cursor_id, &node).await?
                 else {
@@ -2218,7 +2235,7 @@ async fn process_immediate_cursors(
                 queue_approval(ctx, checkpoint, cursor_id, node).await?;
                 return Ok(true);
             }
-            WorkflowNodeType::Split => {
+            NodeKind::Split => {
                 let Some(_) =
                     prepare_cursor_visit(ctx, workflow, checkpoint, &cursor_id, &node).await?
                 else {
@@ -2227,7 +2244,7 @@ async fn process_immediate_cursors(
                 handle_split_node(ctx, &active_graph, checkpoint, cursor_id, node).await?;
                 return Ok(true);
             }
-            WorkflowNodeType::Collector => {
+            NodeKind::Collector => {
                 let Some(_) =
                     prepare_cursor_visit(ctx, workflow, checkpoint, &cursor_id, &node).await?
                 else {
@@ -2237,7 +2254,8 @@ async fn process_immediate_cursors(
                     .await?;
                 return Ok(true);
             }
-            WorkflowNodeType::ParallelBatch => {
+            NodeKind::ParallelBatch { batch_config } => {
+                let config = batch_config.clone();
                 let Some(_) =
                     prepare_cursor_visit(ctx, workflow, checkpoint, &cursor_id, &node).await?
                 else {
@@ -2251,19 +2269,29 @@ async fn process_immediate_cursors(
                     checkpoint,
                     cursor_id,
                     node,
+                    config,
                 )
                 .await?;
                 return Ok(true);
             }
-            WorkflowNodeType::Subflow | WorkflowNodeType::Call => {
+            NodeKind::Subflow { subflow_config } | NodeKind::Call { subflow_config } => {
+                let config = subflow_config.clone();
                 let Some(_) =
                     prepare_cursor_visit(ctx, active_workflow, checkpoint, &cursor_id, &node)
                         .await?
                 else {
                     return Ok(true);
                 };
-                handle_subflow_node(ctx, workflow, &active_graph, checkpoint, cursor_id, node)
-                    .await?;
+                handle_subflow_node(
+                    ctx,
+                    workflow,
+                    &active_graph,
+                    checkpoint,
+                    cursor_id,
+                    node,
+                    config,
+                )
+                .await?;
                 return Ok(true);
             }
         }
@@ -2432,15 +2460,12 @@ async fn handle_subflow_node(
     checkpoint: &mut RuntimeCheckpoint,
     cursor_id: String,
     node: WorkflowNode,
+    config: model::SubflowConfig,
 ) -> anyhow::Result<()> {
     let Some(index) = find_cursor_index(checkpoint, &cursor_id) else {
         return Ok(());
     };
     let parent_cursor = checkpoint.active_cursors[index].clone();
-    let config = node
-        .subflow_config
-        .clone()
-        .context("subflow node is missing subflowConfig")?;
     let subflow_name = config.workflow_name.trim().to_string();
     let subflow = root_workflow
         .subflows
@@ -2722,8 +2747,16 @@ async fn run_cursor_task(
     node: WorkflowNode,
     iteration: u32,
 ) -> anyhow::Result<CursorTaskResult> {
-    if node.node_type == WorkflowNodeType::Decide {
-        return run_decide_node(ctx, run_ctx, cursor, node, iteration).await;
+    if let NodeKind::Decide { decide_config } = &node.kind {
+        return run_decide_node(
+            ctx,
+            run_ctx,
+            cursor,
+            node.clone(),
+            decide_config.clone(),
+            iteration,
+        )
+        .await;
     }
 
     let prompt_template = prompt_template_for_node(&node);
@@ -2912,12 +2945,9 @@ async fn run_decide_node(
     run_ctx: CursorTaskExecutionContext,
     cursor: CursorState,
     node: WorkflowNode,
+    config: model::DecideConfig,
     iteration: u32,
 ) -> anyhow::Result<CursorTaskResult> {
-    let config = node
-        .decide_config
-        .as_ref()
-        .context("decide node is missing decideConfig")?;
     let template_context = TemplateRuntimeContext {
         current_node_id: &node.id,
         current_node: &node,
@@ -2928,7 +2958,7 @@ async fn run_decide_node(
         last_branch_origin_id: cursor.last_branch_origin_id.as_deref(),
         last_branch_choice: cursor.last_branch_choice.as_deref(),
     };
-    let bindings = resolve_decide_input_bindings(config, &template_context)?;
+    let bindings = resolve_decide_input_bindings(&config, &template_context)?;
     let resolved_prompt = render_decide_prompt(
         &config.prompt,
         &template_context,
@@ -3323,7 +3353,7 @@ async fn apply_join_result(
             cursor_id: Some(task_result.cursor_id.clone()),
             node_id: task_result.node.id.clone(),
             node_name: task_result.node.name.clone(),
-            node_type: task_result.node.node_type.as_str().to_string(),
+            node_type: task_result.node.node_type().as_str().to_string(),
             agent: agent_name_for_node(&task_result.node),
             original_prompt: prompt_template_for_node(&task_result.node).to_string(),
             resolved_prompt: task_result.resolved_prompt.clone(),
@@ -3576,7 +3606,7 @@ async fn complete_subflow_if_at_exit(
             cursor_id: Some(cursor_id.to_string()),
             node_id: frame.call_node_id.clone(),
             node_name: frame.call_node_name.clone(),
-            node_type: call_node.node_type.as_str().to_string(),
+            node_type: call_node.node_type().as_str().to_string(),
             agent: "subflow".to_string(),
             original_prompt: call_node.prompt.clone(),
             resolved_prompt: format!("subflow:{}", frame.subflow_name),
@@ -3866,11 +3896,8 @@ async fn handle_parallel_batch_node(
     checkpoint: &mut RuntimeCheckpoint,
     cursor_id: String,
     node: WorkflowNode,
+    config: model::BatchConfig,
 ) -> anyhow::Result<()> {
-    let config = node
-        .batch_config
-        .clone()
-        .context("parallel_batch node is missing batchConfig")?;
     let Some(parent_index) = find_cursor_index(checkpoint, &cursor_id) else {
         return Ok(());
     };
@@ -3903,7 +3930,7 @@ async fn handle_parallel_batch_node(
             )
         })?;
     anyhow::ensure!(
-        is_runner_node_type(&body_node.node_type),
+        is_runner_node_kind(&body_node.kind),
         "parallel_batch bodyEntry \"{}\" is not an executable node",
         config.body_entry
     );
@@ -4111,7 +4138,7 @@ async fn handle_parallel_batch_node(
             cursor_id: Some(cursor_id.clone()),
             node_id: node.id.clone(),
             node_name: node.name.clone(),
-            node_type: node.node_type.as_str().to_string(),
+            node_type: node.node_type().as_str().to_string(),
             agent: "system".to_string(),
             original_prompt: node.prompt.clone(),
             resolved_prompt: node.prompt.clone(),
@@ -4399,7 +4426,7 @@ async fn record_batch_item_result(
             cursor_id: Some(task_result.cursor_id.clone()),
             node_id: task_result.node.id.clone(),
             node_name: task_result.node.name.clone(),
-            node_type: task_result.node.node_type.as_str().to_string(),
+            node_type: task_result.node.node_type().as_str().to_string(),
             agent: agent_name_for_node(&task_result.node),
             original_prompt: prompt_template_for_node(&task_result.node).to_string(),
             resolved_prompt: task_result.resolved_prompt.clone(),
@@ -5124,7 +5151,7 @@ async fn select_next_decision(
         .find(|edge| edge.outcome == WorkflowEdgeOutcome::LoopExit)
         .map(|edge| (*edge).clone());
 
-    if node.node_type == WorkflowNodeType::Decide {
+    if matches!(&node.kind, NodeKind::Decide { .. }) {
         let chosen_label = result.output.trim();
         let chosen = branch_edges
             .iter()
@@ -5836,9 +5863,9 @@ mod tests {
     use crate::{
         driver::{AccessMode, AgentConfig, ReasoningLevel, get_driver},
         model::{
-            AgentDefaults, AgentNodeConfig, BatchConfig, InputBinding, SplitFailurePolicy,
-            SubflowConfig, WorkflowEdge, WorkflowEdgeOutcome, WorkflowLimits, WorkflowNode,
-            WorkflowNodeType, WorkflowV3, WorkflowVariable, normalize_workflow_value,
+            AgentDefaults, AgentNodeConfig, BatchConfig, InputBinding, NodeKind,
+            SplitFailurePolicy, SubflowConfig, WorkflowEdge, WorkflowEdgeOutcome, WorkflowLimits,
+            WorkflowNode, WorkflowNodeType, WorkflowV3, WorkflowVariable, normalize_workflow_value,
             resolve_agent_config,
         },
         storage::Database,
@@ -6574,7 +6601,7 @@ mod tests {
         WorkflowNode {
             id: id.to_string(),
             name: name.to_string(),
-            node_type: WorkflowNodeType::Task,
+            kind: WorkflowNodeType::Task.into(),
             agent: Some("mock".to_string()),
             prompt: prompt.to_string(),
             context_sources: Vec::new(),
@@ -6587,18 +6614,8 @@ mod tests {
             loop_max_iterations: None,
             loop_condition: None,
             split_failure_policy: SplitFailurePolicy::BestEffortContinue,
-            agent_config: None,
             cwd: None,
             continue_session_from: None,
-            decide_config: None,
-            batch_config: None,
-            spawn_config: None,
-            send_config: None,
-            wait_config: None,
-            capture_config: None,
-            kill_config: None,
-            run_agent_config: None,
-            subflow_config: None,
         }
     }
 
@@ -6606,7 +6623,7 @@ mod tests {
         WorkflowNode {
             id: id.to_string(),
             name: name.to_string(),
-            node_type: WorkflowNodeType::Approval,
+            kind: WorkflowNodeType::Approval.into(),
             agent: None,
             prompt: prompt.to_string(),
             context_sources: Vec::new(),
@@ -6619,18 +6636,8 @@ mod tests {
             loop_max_iterations: None,
             loop_condition: None,
             split_failure_policy: SplitFailurePolicy::BestEffortContinue,
-            agent_config: None,
             cwd: None,
             continue_session_from: None,
-            decide_config: None,
-            batch_config: None,
-            spawn_config: None,
-            send_config: None,
-            wait_config: None,
-            capture_config: None,
-            kill_config: None,
-            run_agent_config: None,
-            subflow_config: None,
         }
     }
 
@@ -6638,7 +6645,7 @@ mod tests {
         WorkflowNode {
             id: id.to_string(),
             name: format!("Split {}", id),
-            node_type: WorkflowNodeType::Split,
+            kind: WorkflowNodeType::Split.into(),
             agent: None,
             prompt: String::new(),
             context_sources: Vec::new(),
@@ -6651,18 +6658,8 @@ mod tests {
             loop_max_iterations: None,
             loop_condition: None,
             split_failure_policy: policy,
-            agent_config: None,
             cwd: None,
             continue_session_from: None,
-            decide_config: None,
-            batch_config: None,
-            spawn_config: None,
-            send_config: None,
-            wait_config: None,
-            capture_config: None,
-            kill_config: None,
-            run_agent_config: None,
-            subflow_config: None,
         }
     }
 
@@ -6670,7 +6667,7 @@ mod tests {
         WorkflowNode {
             id: id.to_string(),
             name: format!("Collector {}", id),
-            node_type: WorkflowNodeType::Collector,
+            kind: WorkflowNodeType::Collector.into(),
             agent: None,
             prompt: String::new(),
             context_sources: Vec::new(),
@@ -6683,18 +6680,8 @@ mod tests {
             loop_max_iterations: None,
             loop_condition: None,
             split_failure_policy: SplitFailurePolicy::BestEffortContinue,
-            agent_config: None,
             cwd: None,
             continue_session_from: None,
-            decide_config: None,
-            batch_config: None,
-            spawn_config: None,
-            send_config: None,
-            wait_config: None,
-            capture_config: None,
-            kill_config: None,
-            run_agent_config: None,
-            subflow_config: None,
         }
     }
 
@@ -6709,7 +6696,15 @@ mod tests {
         WorkflowNode {
             id: id.to_string(),
             name: format!("Batch {}", id),
-            node_type: WorkflowNodeType::ParallelBatch,
+            kind: NodeKind::ParallelBatch {
+                batch_config: BatchConfig {
+                    items_binding: items_binding.to_string(),
+                    max_concurrent,
+                    item_var: item_var.to_string(),
+                    body_entry: body_entry.to_string(),
+                    collector_var: collector_var.map(str::to_string),
+                },
+            },
             agent: None,
             prompt: String::new(),
             context_sources: Vec::new(),
@@ -6722,24 +6717,8 @@ mod tests {
             loop_max_iterations: None,
             loop_condition: None,
             split_failure_policy: SplitFailurePolicy::BestEffortContinue,
-            agent_config: None,
             cwd: None,
             continue_session_from: None,
-            decide_config: None,
-            batch_config: Some(BatchConfig {
-                items_binding: items_binding.to_string(),
-                max_concurrent,
-                item_var: item_var.to_string(),
-                body_entry: body_entry.to_string(),
-                collector_var: collector_var.map(str::to_string),
-            }),
-            spawn_config: None,
-            send_config: None,
-            wait_config: None,
-            capture_config: None,
-            kill_config: None,
-            run_agent_config: None,
-            subflow_config: None,
         }
     }
 
@@ -6752,7 +6731,14 @@ mod tests {
         WorkflowNode {
             id: id.to_string(),
             name: format!("Call {}", workflow_name),
-            node_type: WorkflowNodeType::Call,
+            kind: NodeKind::Call {
+                subflow_config: SubflowConfig {
+                    workflow_name: workflow_name.to_string(),
+                    exit_node_id: Some(exit_node_id.to_string()),
+                    inputs,
+                    max_depth: 5,
+                },
+            },
             agent: None,
             prompt: String::new(),
             context_sources: Vec::new(),
@@ -6765,23 +6751,8 @@ mod tests {
             loop_max_iterations: None,
             loop_condition: None,
             split_failure_policy: SplitFailurePolicy::BestEffortContinue,
-            agent_config: None,
             cwd: None,
             continue_session_from: None,
-            decide_config: None,
-            batch_config: None,
-            spawn_config: None,
-            send_config: None,
-            wait_config: None,
-            capture_config: None,
-            kill_config: None,
-            run_agent_config: None,
-            subflow_config: Some(SubflowConfig {
-                workflow_name: workflow_name.to_string(),
-                exit_node_id: Some(exit_node_id.to_string()),
-                inputs,
-                max_depth: 5,
-            }),
         }
     }
 
@@ -6888,7 +6859,7 @@ mod tests {
                 WorkflowNode {
                     id: "n1".to_string(),
                     name: "Step 1".to_string(),
-                    node_type: WorkflowNodeType::Task,
+                    kind: WorkflowNodeType::Task.into(),
                     agent: Some("claude".to_string()),
                     prompt: "hello".to_string(),
                     context_sources: Vec::new(),
@@ -6901,23 +6872,13 @@ mod tests {
                     loop_max_iterations: None,
                     loop_condition: None,
                     split_failure_policy: SplitFailurePolicy::BestEffortContinue,
-                    agent_config: None,
                     cwd: None,
                     continue_session_from: None,
-                    decide_config: None,
-                    batch_config: None,
-                    spawn_config: None,
-                    send_config: None,
-                    wait_config: None,
-                    capture_config: None,
-                    kill_config: None,
-                    run_agent_config: None,
-                    subflow_config: None,
                 },
                 WorkflowNode {
                     id: "n2".to_string(),
                     name: "Step 2".to_string(),
-                    node_type: WorkflowNodeType::Task,
+                    kind: WorkflowNodeType::Task.into(),
                     agent: Some("claude".to_string()),
                     prompt: "world".to_string(),
                     context_sources: Vec::new(),
@@ -6930,18 +6891,8 @@ mod tests {
                     loop_max_iterations: None,
                     loop_condition: None,
                     split_failure_policy: SplitFailurePolicy::BestEffortContinue,
-                    agent_config: None,
                     cwd: None,
                     continue_session_from: None,
-                    decide_config: None,
-                    batch_config: None,
-                    spawn_config: None,
-                    send_config: None,
-                    wait_config: None,
-                    capture_config: None,
-                    kill_config: None,
-                    run_agent_config: None,
-                    subflow_config: None,
                 },
             ],
             edges: vec![WorkflowEdge {
@@ -6970,14 +6921,15 @@ mod tests {
         let (run_as, log) = fake_run_as_config(&temp, "decide", socket);
 
         let mut node = task_node("decide", "Decide", "");
-        node.node_type = WorkflowNodeType::Decide;
+        node.kind = NodeKind::Decide {
+            decide_config: model::DecideConfig {
+                inputs: Vec::new(),
+                prompt: "Choose an outcome".to_string(),
+                model: None,
+                outcomes: vec!["approve".to_string()],
+            },
+        };
         node.agent = None;
-        node.decide_config = Some(model::DecideConfig {
-            inputs: Vec::new(),
-            prompt: "Choose an outcome".to_string(),
-            model: None,
-            outcomes: vec!["approve".to_string()],
-        });
 
         let mut workflow = workflow_from_parts("decide", vec![node], vec![]);
         workflow.cwd = temp.path().to_string_lossy().into_owned();
@@ -7126,7 +7078,7 @@ mod tests {
         let node = WorkflowNode {
             id: "n2".to_string(),
             name: "Step 2".to_string(),
-            node_type: WorkflowNodeType::Task,
+            kind: WorkflowNodeType::Task.into(),
             agent: Some("claude".to_string()),
             prompt: "Prev {{previous_output}} Var {{var:name}} {{node:n1.output}}".to_string(),
             context_sources: Vec::new(),
@@ -7139,18 +7091,8 @@ mod tests {
             loop_max_iterations: None,
             loop_condition: None,
             split_failure_policy: SplitFailurePolicy::BestEffortContinue,
-            agent_config: None,
             cwd: None,
             continue_session_from: None,
-            decide_config: None,
-            batch_config: None,
-            spawn_config: None,
-            send_config: None,
-            wait_config: None,
-            capture_config: None,
-            kill_config: None,
-            run_agent_config: None,
-            subflow_config: None,
         };
         let mut results = BTreeMap::new();
         results.insert(
@@ -8840,13 +8782,13 @@ mod tests {
         // Claude node with node-level override
         let mut claude_node = task_node("n1", "Claude Step", "prompt1");
         claude_node.agent = Some("claude".to_string());
-        claude_node.agent_config = Some(AgentNodeConfig {
+        claude_node.kind.set_agent_config(Some(AgentNodeConfig {
             base: AgentDefaults {
                 max_budget_usd: Some(1.5),
                 ..Default::default()
             },
             ..Default::default()
-        });
+        }));
 
         let claude_config = resolve_agent_config(
             &defaults,
@@ -9003,21 +8945,23 @@ mod tests {
             "nodes": [{
                 "id": "n1",
                 "name": "Step 1",
-                "type": "task",
                 "agent": "claude",
                 "prompt": "hello",
-                "agentConfig": {
-                    "maxBudgetUsd": 1.5,
-                    "toolToggles": { "webSearch": false }
+                "kind": {
+                    "type": "task",
+                    "agentConfig": {
+                        "maxBudgetUsd": 1.5,
+                        "toolToggles": { "webSearch": false }
+                    }
                 },
                 "cwd": "/custom"
             }, {
                 "id": "n2",
                 "name": "Step 2",
-                "type": "task",
                 "agent": "codex",
                 "prompt": "world",
-                "continueSessionFrom": null
+                "continueSessionFrom": null,
+                "kind": { "type": "task" }
             }],
             "edges": [{ "id": "e1", "from": "n1", "to": "n2", "outcome": "success" }]
         });
@@ -9040,11 +8984,8 @@ mod tests {
 
         // Node config parsed
         let n1 = &w.nodes[0];
-        assert!(n1.agent_config.is_some());
-        assert_eq!(
-            n1.agent_config.as_ref().unwrap().base.max_budget_usd,
-            Some(1.5)
-        );
+        let agent_config = n1.kind.agent_config().unwrap();
+        assert_eq!(agent_config.base.max_budget_usd, Some(1.5));
         assert_eq!(n1.cwd.as_deref(), Some("/custom"));
     }
 
@@ -9084,7 +9025,14 @@ mod tests {
         WorkflowNode {
             id: id.to_string(),
             name: name.to_string(),
-            node_type: WorkflowNodeType::RunAgent,
+            kind: NodeKind::RunAgent {
+                run_agent_config: model::RunAgentConfig {
+                    agent: Some(agent.to_string()),
+                    prompt: Some(prompt.to_string()),
+                    ..Default::default()
+                },
+                agent_config: None,
+            },
             agent: Some(agent.to_string()),
             prompt: String::new(),
             context_sources: Vec::new(),
@@ -9097,22 +9045,8 @@ mod tests {
             loop_max_iterations: None,
             loop_condition: None,
             split_failure_policy: SplitFailurePolicy::BestEffortContinue,
-            agent_config: None,
             cwd: None,
             continue_session_from: None,
-            decide_config: None,
-            batch_config: None,
-            spawn_config: None,
-            send_config: None,
-            wait_config: None,
-            capture_config: None,
-            kill_config: None,
-            run_agent_config: Some(model::RunAgentConfig {
-                agent: Some(agent.to_string()),
-                prompt: Some(prompt.to_string()),
-                ..Default::default()
-            }),
-            subflow_config: None,
         }
     }
 
@@ -9429,7 +9363,11 @@ mod tests {
         // one level of nesting; a second attempt exceeds it).
         let mut recurse_call = call_node("recurse", "self_ref", "recurse", vec![]);
         // Override max_depth to 1 so the second call is caught.
-        if let Some(ref mut cfg) = recurse_call.subflow_config {
+        if let NodeKind::Call {
+            ref mut subflow_config,
+        } = recurse_call.kind
+        {
+            let cfg = subflow_config;
             cfg.max_depth = 1;
         }
 
@@ -9439,7 +9377,11 @@ mod tests {
             "call",
             vec![{
                 let mut n = call_node("call", "self_ref", "recurse", vec![]);
-                if let Some(ref mut cfg) = n.subflow_config {
+                if let NodeKind::Call {
+                    ref mut subflow_config,
+                } = n.kind
+                {
+                    let cfg = subflow_config;
                     cfg.max_depth = 1;
                 }
                 n

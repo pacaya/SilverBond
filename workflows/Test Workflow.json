@@ -14,18 +14,22 @@
     {
       "id": "node_89baf740",
       "name": "Say Hi",
-      "type": "task",
       "agent": "claude",
       "prompt": "Please say \"HI\"",
-      "responseFormat": "text"
+      "responseFormat": "text",
+      "kind": {
+        "type": "task"
+      }
     },
     {
       "id": "node_13647e43",
       "name": "Respond",
-      "type": "task",
       "agent": "claude",
       "prompt": "Please respond to the message ",
-      "responseFormat": "text"
+      "responseFormat": "text",
+      "kind": {
+        "type": "task"
+      }
     }
   ],
   "edges": [
@@ -39,9 +43,9 @@
   "ui": {
     "canvas": {
       "viewport": {
-        "x": 0.0,
-        "y": 0.0,
-        "zoom": 1.0
+        "x": 0,
+        "y": 0,
+        "zoom": 1
       },
       "nodes": {
         "node_13647e43": {
@@ -49,8 +53,8 @@
           "y": 310.8202589179511
         },
         "node_89baf740": {
-          "x": 188.0,
-          "y": 164.0
+          "x": 188,
+          "y": 164
         }
       }
     }

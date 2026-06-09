@@ -25,8 +25,8 @@ use tmux_tools_core::{
 use crate::{
     driver::{self, AccessMode, AgentConfig, InteractionKind, NodeOutcome},
     model::{
-        CaptureConfig, RunAgentConfig, RunAsConfig, SpawnConfig, WaitConfig, WaitMode,
-        WorkflowNode, WorkflowNodeType,
+        CaptureConfig, KillConfig, NodeKind, RunAgentConfig, RunAsConfig, SendConfig, SpawnConfig,
+        WaitConfig, WaitMode, WorkflowNode,
     },
     pty_output::strip_ansi,
     runtime::{AgentExecutionMetadata, NodeResult, NodeRunner, RuntimeContext, active_pane_key},
@@ -261,36 +261,66 @@ fn run_tmux_node(
     interaction: Option<InteractionEscalation>,
 ) -> anyhow::Result<NodeResult> {
     let continue_session_from = node.continue_session_from.clone();
-    match &node.node_type {
-        WorkflowNodeType::Task | WorkflowNodeType::RunAgent => run_agent_interactive(
+    match &node.kind {
+        NodeKind::Task { .. } => run_agent_interactive(
             agent,
             prompt,
             cwd,
             timeout_secs,
-            node.run_agent_config.as_ref(),
+            None,
             config,
             continue_session_from.as_deref(),
             active_pane.as_ref(),
             interaction.as_ref(),
         ),
-        WorkflowNodeType::Spawn => execute_spawn(&node, &agent, &cwd, active_pane.as_ref()),
-        WorkflowNodeType::Send => {
-            execute_send(&node, &prompt, &previous_output, active_pane.as_ref())
+        NodeKind::RunAgent {
+            run_agent_config, ..
+        } => run_agent_interactive(
+            agent,
+            prompt,
+            cwd,
+            timeout_secs,
+            Some(run_agent_config),
+            config,
+            continue_session_from.as_deref(),
+            active_pane.as_ref(),
+            interaction.as_ref(),
+        ),
+        NodeKind::Spawn { spawn_config } => {
+            execute_spawn(&node, spawn_config, &agent, &cwd, active_pane.as_ref())
         }
-        WorkflowNodeType::Wait => {
-            execute_wait(&node, timeout_secs, &previous_output, active_pane.as_ref())
+        NodeKind::Send { send_config } => execute_send(
+            &node,
+            send_config,
+            &prompt,
+            &previous_output,
+            active_pane.as_ref(),
+        ),
+        NodeKind::Wait { wait_config } => execute_wait(
+            &node,
+            wait_config,
+            timeout_secs,
+            &previous_output,
+            active_pane.as_ref(),
+        ),
+        NodeKind::Capture { capture_config } => execute_capture(
+            &node,
+            capture_config,
+            &previous_output,
+            active_pane.as_ref(),
+        ),
+        NodeKind::Kill { kill_config } => {
+            execute_kill(&node, kill_config, &previous_output, active_pane.as_ref())
         }
-        WorkflowNodeType::Capture => execute_capture(&node, &previous_output, active_pane.as_ref()),
-        WorkflowNodeType::Kill => execute_kill(&node, &previous_output, active_pane.as_ref()),
-        WorkflowNodeType::Approval
-        | WorkflowNodeType::Split
-        | WorkflowNodeType::Collector
-        | WorkflowNodeType::Decide
-        | WorkflowNodeType::ParallelBatch
-        | WorkflowNodeType::Subflow
-        | WorkflowNodeType::Call => Err(anyhow!(
+        NodeKind::Approval
+        | NodeKind::Split
+        | NodeKind::Collector
+        | NodeKind::Decide { .. }
+        | NodeKind::ParallelBatch { .. }
+        | NodeKind::Subflow { .. }
+        | NodeKind::Call { .. } => Err(anyhow!(
             "tmux runner cannot execute {} nodes directly",
-            node.node_type.as_str()
+            node.node_type_str()
         )),
     }
 }
@@ -460,24 +490,27 @@ impl InteractionEscalation {
 
 fn execute_spawn(
     node: &WorkflowNode,
+    cfg: &SpawnConfig,
     default_agent: &str,
     default_cwd: &str,
     active_pane: Option<&ActivePaneRegistration>,
 ) -> anyhow::Result<NodeResult> {
     let start = Instant::now();
-    let cfg = node.spawn_config.as_ref();
     let has_command = cfg
-        .and_then(|cfg| cfg.command.as_deref())
+        .command
+        .as_deref()
         .is_some_and(|command| !command.trim().is_empty());
     let agent = cfg
-        .and_then(|cfg| cfg.agent.clone())
+        .agent
+        .clone()
         .or_else(|| node.agent.clone())
         .or_else(|| (!has_command).then(|| default_agent.to_owned()));
     let cwd = cfg
-        .and_then(|cfg| cfg.cwd.as_deref())
+        .cwd
+        .as_deref()
         .or(node.cwd.as_deref())
         .unwrap_or(default_cwd);
-    let spawned = spawn_pane(cfg, agent.as_deref(), cwd, None, None, None)?;
+    let spawned = spawn_pane(Some(cfg), agent.as_deref(), cwd, None, None, None)?;
     if let Some(active_pane) = active_pane {
         active_pane.set_with_session(&spawned.pane_id, Some(&spawned.session_name));
     }
@@ -498,12 +531,12 @@ fn execute_spawn(
 
 fn execute_send(
     node: &WorkflowNode,
+    cfg: &SendConfig,
     resolved_prompt: &str,
     previous_output: &str,
     active_pane: Option<&ActivePaneRegistration>,
 ) -> anyhow::Result<NodeResult> {
     let start = Instant::now();
-    let cfg = node.send_config.clone().unwrap_or_default();
     let pane = resolve_pane_target(cfg.target.as_deref(), previous_output)?;
     if let Some(active_pane) = active_pane {
         active_pane.set(&pane);
@@ -532,12 +565,12 @@ fn execute_send(
 
 fn execute_wait(
     node: &WorkflowNode,
+    cfg: &WaitConfig,
     timeout_secs: Option<u64>,
     previous_output: &str,
     active_pane: Option<&ActivePaneRegistration>,
 ) -> anyhow::Result<NodeResult> {
     let start = Instant::now();
-    let cfg = node.wait_config.clone().unwrap_or_default();
     let pane = resolve_pane_target(cfg.target.as_deref(), previous_output)?;
     if let Some(active_pane) = active_pane {
         active_pane.set(&pane);
@@ -568,11 +601,11 @@ fn execute_wait(
 
 fn execute_capture(
     node: &WorkflowNode,
+    cfg: &CaptureConfig,
     previous_output: &str,
     active_pane: Option<&ActivePaneRegistration>,
 ) -> anyhow::Result<NodeResult> {
     let start = Instant::now();
-    let cfg = node.capture_config.clone().unwrap_or_default();
     let pane = resolve_pane_target(cfg.target.as_deref(), previous_output)?;
     if let Some(active_pane) = active_pane {
         active_pane.set(&pane);
@@ -605,11 +638,11 @@ fn execute_capture(
 
 fn execute_kill(
     node: &WorkflowNode,
+    cfg: &KillConfig,
     previous_output: &str,
     active_pane: Option<&ActivePaneRegistration>,
 ) -> anyhow::Result<NodeResult> {
     let start = Instant::now();
-    let cfg = node.kill_config.clone().unwrap_or_default();
     let previous = parse_previous(previous_output);
     let session = cfg
         .session_name
@@ -2352,7 +2385,12 @@ mod tests {
     #[test]
     fn build_invocation_command_prefix_is_verbatim() {
         let cfg = RunAsConfig {
-            command: Some(vec!["docker".to_string(), "exec".to_string(), "-it".to_string(), "sandbox".to_string()]),
+            command: Some(vec![
+                "docker".to_string(),
+                "exec".to_string(),
+                "-it".to_string(),
+                "sandbox".to_string(),
+            ]),
             user: None,
             socket: None,
         };
@@ -2511,8 +2549,7 @@ mod tests {
     }
 
     fn tmux_session_exists(session_name: &str) -> bool {
-        tmux::run(&["has-session", "-t", session_name])
-            .is_ok_and(|output| output.exit_code == 0)
+        tmux::run(&["has-session", "-t", session_name]).is_ok_and(|output| output.exit_code == 0)
     }
 
     #[test]
@@ -2520,10 +2557,7 @@ mod tests {
         if !tmux_available() {
             return;
         }
-        let session_name = format!(
-            "silverbond-test-guard-{}",
-            uuid::Uuid::now_v7().simple()
-        );
+        let session_name = format!("silverbond-test-guard-{}", uuid::Uuid::now_v7().simple());
         tmux::run_checked(&["new-session", "-d", "-s", &session_name, "sleep", "600"]).unwrap();
         assert!(tmux_session_exists(&session_name));
 
@@ -2542,10 +2576,7 @@ mod tests {
         if !tmux_available() {
             return;
         }
-        let session_name = format!(
-            "silverbond-test-disarm-{}",
-            uuid::Uuid::now_v7().simple()
-        );
+        let session_name = format!("silverbond-test-disarm-{}", uuid::Uuid::now_v7().simple());
         tmux::run_checked(&["new-session", "-d", "-s", &session_name, "sleep", "600"]).unwrap();
 
         {

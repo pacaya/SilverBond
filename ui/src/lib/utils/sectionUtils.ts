@@ -33,7 +33,10 @@ export function isSectionAvailable(sectionId: string, agentCaps: AgentCapabiliti
 }
 
 export function sectionHasValues(node: WorkflowNode, sectionId: SectionId): boolean {
-  const cfg = node.agentConfig ?? {};
+  const cfg =
+    node.kind.type === "task" || node.kind.type === "run_agent"
+      ? node.kind.agentConfig ?? {}
+      : {};
   switch (sectionId) {
     case "agent-tuning":
       return !!(cfg.accessMode || cfg.model || cfg.reasoningLevel || cfg.systemPrompt ||

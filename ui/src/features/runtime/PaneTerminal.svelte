@@ -32,7 +32,10 @@
     { value: "active", label: "Active pane" },
     ...((workflow?.nodes ?? [])
       .filter(
-        (node) => node.type === "run_agent" || node.type === "spawn" || node.type === "task",
+        (node) =>
+          node.kind.type === "run_agent" ||
+          node.kind.type === "spawn" ||
+          node.kind.type === "task",
       )
       .map((node) => ({ value: node.id, label: node.name || node.id }))),
   ]);

@@ -109,16 +109,18 @@ describe("InspectorPanel", () => {
     const runAgentNode: WorkflowNode = {
       id: "reviewer-a",
       name: "Reviewer A",
-      type: "run_agent",
+      kind: {
+        type: "run_agent",
+        runAgentConfig: {
+          agent: "claude",
+          prompt: "Nested prompt from template",
+          killAfter: true,
+        },
+      },
       agent: "",
       prompt: "",
       contextSources: [],
       responseFormat: null,
-      runAgentConfig: {
-        agent: "claude",
-        prompt: "Nested prompt from template",
-        killAfter: true,
-      },
     };
 
     const { container } = renderInspector(workflow({
@@ -139,8 +141,10 @@ describe("InspectorPanel", () => {
     const node = store.workflow!.nodes[0];
     expect(node.agent).toBe("");
     expect(node.prompt).toBe("");
-    expect(node.runAgentConfig?.agent).toBe("codex");
-    expect(node.runAgentConfig?.prompt).toBe("Edited nested prompt");
+    expect(node.kind.type).toBe("run_agent");
+    if (node.kind.type !== "run_agent") throw new Error("node was not run_agent");
+    expect(node.kind.runAgentConfig?.agent).toBe("codex");
+    expect(node.kind.runAgentConfig?.prompt).toBe("Edited nested prompt");
   });
 
   it("round-trips run-as command prefix as one argv element per line", async () => {

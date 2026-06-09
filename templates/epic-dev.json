@@ -7,8 +7,14 @@
   "useOrchestrator": false,
   "entryNodeId": "read-sprint-status",
   "variables": [
-    { "name": "sprint_doc", "default": "docs/sprint.md" },
-    { "name": "project_context", "default": "" }
+    {
+      "name": "sprint_doc",
+      "default": "docs/sprint.md"
+    },
+    {
+      "name": "project_context",
+      "default": ""
+    }
   ],
   "limits": {
     "maxTotalSteps": 200,
@@ -18,64 +24,92 @@
     {
       "id": "read-sprint-status",
       "name": "Read Sprint Status",
-      "type": "run_agent",
-      "runAgentConfig": {
-        "agent": "claude",
-        "prompt": "Read the sprint document at {{var:sprint_doc}} and summarize the current sprint status. List completed stories, in-progress work, and remaining backlog items. Project context: {{var:project_context}}"
+      "kind": {
+        "type": "run_agent",
+        "runAgentConfig": {
+          "agent": "claude",
+          "prompt": "Read the sprint document at {{var:sprint_doc}} and summarize the current sprint status. List completed stories, in-progress work, and remaining backlog items. Project context: {{var:project_context}}"
+        }
       }
     },
     {
       "id": "decide-pick-story",
       "name": "Decide Pick Story",
-      "type": "decide",
-      "decideConfig": {
-        "inputs": [
-          { "name": "sprint_status", "source": "node:read-sprint-status.output" }
-        ],
-        "prompt": "Based on the sprint status, decide the next action. Return NEXT_STORY if there is a story ready to implement, DONE if all stories are complete, or BLOCKED if progress is blocked and needs human intervention.\n\nSprint status:\n{{sprint_status}}",
-        "outcomes": ["NEXT_STORY", "DONE", "BLOCKED"]
+      "kind": {
+        "type": "decide",
+        "decideConfig": {
+          "inputs": [
+            {
+              "name": "sprint_status",
+              "source": "node:read-sprint-status.output"
+            }
+          ],
+          "prompt": "Based on the sprint status, decide the next action. Return NEXT_STORY if there is a story ready to implement, DONE if all stories are complete, or BLOCKED if progress is blocked and needs human intervention.\n\nSprint status:\n{{sprint_status}}",
+          "outcomes": [
+            "NEXT_STORY",
+            "DONE",
+            "BLOCKED"
+          ]
+        }
       }
     },
     {
       "id": "run-story-runner",
       "name": "Run Story Runner",
-      "type": "run_agent",
-      "runAgentConfig": {
-        "agent": "claude",
-        "prompt": "Implement the next story from the sprint backlog. Read {{var:sprint_doc}} for story details and acceptance criteria. Project context: {{var:project_context}}\n\nPrevious sprint status:\n{{node:read-sprint-status.output}}"
+      "kind": {
+        "type": "run_agent",
+        "runAgentConfig": {
+          "agent": "claude",
+          "prompt": "Implement the next story from the sprint backlog. Read {{var:sprint_doc}} for story details and acceptance criteria. Project context: {{var:project_context}}\n\nPrevious sprint status:\n{{node:read-sprint-status.output}}"
+        }
       }
     },
     {
       "id": "decide-story-result",
       "name": "Decide Story Result",
-      "type": "decide",
-      "decideConfig": {
-        "inputs": [
-          { "name": "story_output", "source": "node:run-story-runner.output" }
-        ],
-        "prompt": "Evaluate the story implementation result. Return COMPLETE if the story meets acceptance criteria, FAILED if implementation failed and should be retried, or NEEDS_REVIEW if human review is required before continuing.\n\nStory output:\n{{story_output}}",
-        "outcomes": ["COMPLETE", "FAILED", "NEEDS_REVIEW"]
+      "kind": {
+        "type": "decide",
+        "decideConfig": {
+          "inputs": [
+            {
+              "name": "story_output",
+              "source": "node:run-story-runner.output"
+            }
+          ],
+          "prompt": "Evaluate the story implementation result. Return COMPLETE if the story meets acceptance criteria, FAILED if implementation failed and should be retried, or NEEDS_REVIEW if human review is required before continuing.\n\nStory output:\n{{story_output}}",
+          "outcomes": [
+            "COMPLETE",
+            "FAILED",
+            "NEEDS_REVIEW"
+          ]
+        }
       }
     },
     {
       "id": "approval-blocked",
       "name": "Approval Blocked",
-      "type": "approval",
-      "prompt": "The sprint is blocked. Review the blocker and decide whether to resume implementation or end the epic."
+      "prompt": "The sprint is blocked. Review the blocker and decide whether to resume implementation or end the epic.",
+      "kind": {
+        "type": "approval"
+      }
     },
     {
       "id": "approval-story-review",
       "name": "Approval Story Review",
-      "type": "approval",
-      "prompt": "Review the completed story implementation before continuing the sprint loop."
+      "prompt": "Review the completed story implementation before continuing the sprint loop.",
+      "kind": {
+        "type": "approval"
+      }
     },
     {
       "id": "generate-completion-report",
       "name": "Generate Completion Report",
-      "type": "run_agent",
-      "runAgentConfig": {
-        "agent": "claude",
-        "prompt": "Generate a final epic completion report summarizing all work done during this sprint run. Include completed stories, any blocked items, and outstanding issues. Sprint doc: {{var:sprint_doc}}"
+      "kind": {
+        "type": "run_agent",
+        "runAgentConfig": {
+          "agent": "claude",
+          "prompt": "Generate a final epic completion report summarizing all work done during this sprint run. Include completed stories, any blocked items, and outstanding issues. Sprint doc: {{var:sprint_doc}}"
+        }
       }
     }
   ],

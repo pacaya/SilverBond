@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { store } from "@/lib/stores/workflowStore.svelte";
 import type {
+  NodeKind,
   WorkflowDocument,
   WorkflowEdge,
   WorkflowNode,
@@ -37,13 +38,49 @@ function node(
   return {
     id,
     name: id,
-    type,
+    kind: kind(type),
     agent: type === "task" ? "claude" : null,
     prompt: "",
     contextSources: [],
     responseFormat: type === "task" ? "text" : null,
     ...patch,
   };
+}
+
+function kind(type: WorkflowNodeType): NodeKind {
+  switch (type) {
+    case "task":
+      return { type: "task" };
+    case "approval":
+      return { type: "approval" };
+    case "split":
+      return { type: "split" };
+    case "collector":
+      return { type: "collector" };
+    case "decide":
+      return { type: "decide", decideConfig: { prompt: "", inputs: [], outcomes: [] } };
+    case "parallel_batch":
+      return {
+        type: "parallel_batch",
+        batchConfig: { itemsBinding: "", maxConcurrent: 4, itemVar: "item", bodyEntry: "" },
+      };
+    case "subflow":
+      return { type: "subflow", subflowConfig: { workflowName: "", inputs: [], maxDepth: 10 } };
+    case "call":
+      return { type: "call", subflowConfig: { workflowName: "", inputs: [], maxDepth: 10 } };
+    case "spawn":
+      return { type: "spawn", spawnConfig: { agent: "claude" } };
+    case "send":
+      return { type: "send", sendConfig: { text: "", enter: true } };
+    case "wait":
+      return { type: "wait", waitConfig: { mode: "idle" } };
+    case "capture":
+      return { type: "capture", captureConfig: { all: false, ansi: false } };
+    case "kill":
+      return { type: "kill", killConfig: {} };
+    case "run_agent":
+      return { type: "run_agent", runAgentConfig: { killAfter: true } };
+  }
 }
 
 function edge(id: string, from: string, to: string): WorkflowEdge {
@@ -92,13 +129,13 @@ describe("workflowStore", () => {
 
     const [split, collector] = store.workflow!.nodes;
     expect(split).toMatchObject({
-      type: "split",
+      kind: { type: "split" },
       agent: null,
       responseFormat: null,
       splitFailurePolicy: "best_effort_continue",
     });
     expect(collector).toMatchObject({
-      type: "collector",
+      kind: { type: "collector" },
       agent: null,
       responseFormat: null,
       splitFailurePolicy: undefined,
@@ -206,7 +243,10 @@ describe("workflowStore", () => {
         entryNodeId: "call_a",
         nodes: [
           node("call_a", "subflow", {
-            subflowConfig: { workflowName: "A", inputs: [], maxDepth: 10 },
+            kind: {
+              type: "subflow",
+              subflowConfig: { workflowName: "A", inputs: [], maxDepth: 10 },
+            },
           }),
         ],
         subflows: { A: subflowA },
@@ -222,10 +262,13 @@ describe("workflowStore", () => {
     expect(store.workflow!.subflows?.A?.subflows?.B).toBeUndefined();
 
     const compound = store.activeWorkflow!.nodes.find(
-      (n) => n.type === "subflow" && n.subflowConfig?.workflowName === "B",
+      (n) => n.kind.type === "subflow" && n.kind.subflowConfig.workflowName === "B",
     );
     expect(compound).toBeDefined();
-    expect(store.workflow!.subflows?.[compound!.subflowConfig!.workflowName]).toBeDefined();
+    const compoundKind = compound!.kind;
+    expect(compoundKind.type).toBe("subflow");
+    if (compoundKind.type !== "subflow") throw new Error("compound node was not a subflow");
+    expect(store.workflow!.subflows?.[compoundKind.subflowConfig.workflowName]).toBeDefined();
     expect(store.drillIntoSubflow(compound!.id)).toBe(true);
     expect(store.activeWorkflow?.name).toBe("B");
   });
@@ -270,7 +313,19 @@ describe("workflowStore", () => {
     expect(store.workflow!.subflows?.Valid?.entryNodeId).toBe("a");
     expect(store.workflow!.subflows?.Valid?.nodes.map((n) => n.id)).toEqual(["a", "b"]);
     expect(store.workflow!.nodes).toHaveLength(1);
-    expect(store.workflow!.nodes[0].subflowConfig).toMatchObject({
+    const savedCompoundKind = store.workflow!.nodes[0].kind;
+    expect(savedCompoundKind).toMatchObject({
+      type: "subflow",
+      subflowConfig: {
+        workflowName: "Valid",
+        exitNodeId: "b",
+      },
+    });
+    expect(savedCompoundKind.type).toBe("subflow");
+    if (savedCompoundKind.type !== "subflow") {
+      throw new Error("saved compound node was not a subflow");
+    }
+    expect(savedCompoundKind.subflowConfig).toMatchObject({
       workflowName: "Valid",
       exitNodeId: "b",
     });
@@ -312,7 +367,10 @@ describe("workflowStore", () => {
         entryNodeId: "call_child",
         nodes: [
           node("call_child", "subflow", {
-            subflowConfig: { workflowName: "Child", inputs: [], maxDepth: 10 },
+            kind: {
+              type: "subflow",
+              subflowConfig: { workflowName: "Child", inputs: [], maxDepth: 10 },
+            },
           }),
         ],
         subflows: { Child: child },

@@ -35,9 +35,7 @@ use tokio::{
 
 use crate::{
     app::{AppState, PaneStreamEntry},
-    model::{
-        WorkflowNode, WorkflowNodeType, WorkflowV3, normalize_workflow_value, validate_workflow,
-    },
+    model::{NodeKind, WorkflowNode, WorkflowV3, normalize_workflow_value, validate_workflow},
     runtime::{
         InterruptedRunSummary, NodeTestContext, PersistedRun, RuntimeCheckpoint, RuntimeStatus,
         available_agents, check_cli, run_node_preview,
@@ -398,18 +396,25 @@ fn collect_referenced_subflows(workflow: &WorkflowV3) -> BTreeSet<String> {
 
 fn collect_referenced_subflows_in_workflow(workflow: &WorkflowV3, names: &mut BTreeSet<String>) {
     for node in &workflow.nodes {
-        if !matches!(
-            node.node_type,
-            WorkflowNodeType::Subflow | WorkflowNodeType::Call
-        ) {
-            continue;
-        }
-        if let Some(name) = node
-            .subflow_config
-            .as_ref()
-            .map(|config| config.workflow_name.trim())
-            .filter(|name| !name.is_empty())
-        {
+        let config = match &node.kind {
+            NodeKind::Subflow { subflow_config } | NodeKind::Call { subflow_config } => {
+                subflow_config
+            }
+            NodeKind::Task { .. }
+            | NodeKind::Approval
+            | NodeKind::Split
+            | NodeKind::Collector
+            | NodeKind::Decide { .. }
+            | NodeKind::ParallelBatch { .. }
+            | NodeKind::Spawn { .. }
+            | NodeKind::Send { .. }
+            | NodeKind::Wait { .. }
+            | NodeKind::Capture { .. }
+            | NodeKind::Kill { .. }
+            | NodeKind::RunAgent { .. } => continue,
+        };
+        let name = config.workflow_name.trim();
+        if !name.is_empty() {
             names.insert(name.to_string());
         }
     }
@@ -436,7 +441,7 @@ async fn test_node(Json(request): Json<TestStepRequest>) -> Result<Json<Value>, 
         .map_err(|error| ApiError::status(StatusCode::BAD_REQUEST, error.to_string()))?;
     let node = node_from_value(node_value)
         .map_err(|error| ApiError::status(StatusCode::BAD_REQUEST, error.to_string()))?;
-    if node.node_type != WorkflowNodeType::Task {
+    if !matches!(&node.kind, NodeKind::Task { .. }) {
         return Err(ApiError::status(
             StatusCode::BAD_REQUEST,
             "Only task nodes can be tested",
@@ -1367,18 +1372,21 @@ async fn delete_log(
 }
 
 fn node_from_value(value: Value) -> anyhow::Result<WorkflowNode> {
-    if value.get("version").is_some() || value.get("entryNodeId").is_some() {
-        anyhow::bail!("workflow payload is not valid for node testing");
-    }
-    if value
-        .get("type")
-        .and_then(Value::as_str)
-        .map(|ty| matches!(ty, "task" | "approval"))
-        .unwrap_or(false)
+    if value.get("version").is_some()
+        || value.get("nodes").is_some()
+        || value.get("entryNodeId").is_some()
     {
-        return Ok(serde_json::from_value(value)?);
+        anyhow::bail!("workflow payload is not valid for node testing; provide a single node");
     }
-    anyhow::bail!("node payload must use canonical v3 task or approval types")
+    let node: WorkflowNode = serde_json::from_value(value)
+        .context("node payload must be a canonical v3 WorkflowNode")?;
+    if matches!(&node.kind, NodeKind::Task { .. } | NodeKind::Approval) {
+        return Ok(node);
+    }
+    anyhow::bail!(
+        "node payload must use canonical v3 task or approval kind types; got {}",
+        node.kind.as_str()
+    )
 }
 
 #[derive(Debug)]

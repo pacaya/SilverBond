@@ -5,8 +5,10 @@ import {
   ensureCanvas,
 } from "@/lib/types/workflow";
 import type {
+  NodeKind,
   RunEvent,
   SplitFailurePolicy,
+  SubflowConfig,
   ValidationResponse,
   WorkflowDocument,
   WorkflowEdge,
@@ -96,34 +98,48 @@ function defaultNodeName(type: WorkflowNodeType, count: number): string {
 }
 
 /** Minimal valid per-type config so a freshly-dropped node round-trips through backend serde. */
-function defaultNodeConfig(type: WorkflowNodeType): Partial<WorkflowNode> {
+function defaultNodeKind(type: WorkflowNodeType): NodeKind {
   switch (type) {
+    case "task":
+      return { type: "task" };
+    case "approval":
+      return { type: "approval" };
+    case "split":
+      return { type: "split" };
+    case "collector":
+      return { type: "collector" };
     case "decide":
-      return { decideConfig: { prompt: "", inputs: [], outcomes: [] } };
+      return { type: "decide", decideConfig: { prompt: "", inputs: [], outcomes: [] } };
     case "parallel_batch":
       return {
+        type: "parallel_batch",
         batchConfig: { itemsBinding: "", maxConcurrent: 4, itemVar: "item", bodyEntry: "" },
       };
     case "run_agent":
       // agent lives on node.agent (set in addNode); prompt stays unset so it
       // does not shadow node.prompt on the backend (Some("") would win).
-      return { runAgentConfig: { killAfter: true } };
+      return { type: "run_agent", runAgentConfig: { killAfter: true } };
     case "spawn":
-      return { spawnConfig: { agent: "claude" } };
+      return { type: "spawn", spawnConfig: { agent: "claude" } };
     case "send":
-      return { sendConfig: { text: "", enter: true } };
+      return { type: "send", sendConfig: { text: "", enter: true } };
     case "wait":
-      return { waitConfig: { mode: "idle" } };
+      return { type: "wait", waitConfig: { mode: "idle" } };
     case "capture":
-      return { captureConfig: { all: false, ansi: false } };
+      return { type: "capture", captureConfig: { all: false, ansi: false } };
     case "kill":
-      return { killConfig: {} };
+      return { type: "kill", killConfig: {} };
     case "subflow":
+      return { type: "subflow", subflowConfig: { workflowName: "", inputs: [], maxDepth: 10 } };
     case "call":
-      return { subflowConfig: { workflowName: "", inputs: [], maxDepth: 10 } };
-    default:
-      return {};
+      return { type: "call", subflowConfig: { workflowName: "", inputs: [], maxDepth: 10 } };
   }
+}
+
+function nodeSubflowConfig(node: WorkflowNode | undefined): SubflowConfig | null {
+  if (!node) return null;
+  if (node.kind.type !== "subflow" && node.kind.type !== "call") return null;
+  return node.kind.subflowConfig;
 }
 
 function defaultSplitFailurePolicy(): SplitFailurePolicy {
@@ -314,7 +330,7 @@ class WorkflowStore {
     if (!this.workflow) return false;
     const active = this.resolveActive(this.workflow);
     const node = active.nodes.find((n) => n.id === nodeId);
-    const name = node?.subflowConfig?.workflowName;
+    const name = nodeSubflowConfig(node)?.workflowName;
     if (!name || !this.workflow.subflows?.[name]) return false;
     this.drillStack = [...this.drillStack, name];
     this.selection = { kind: "workflow", id: null };
@@ -388,17 +404,16 @@ class WorkflowStore {
     this.pushUndo();
     const wf = this.resolveActiveMutable(this.workflow!);
     const id = createNodeId();
-    const nodeCount = wf.nodes.filter((n) => n.type === type).length + 1;
+    const nodeCount = wf.nodes.filter((n) => n.kind.type === type).length + 1;
     const node: WorkflowNode = {
       id,
       name: defaultNodeName(type, nodeCount),
-      type,
+      kind: defaultNodeKind(type),
       agent: type === "task" || type === "run_agent" ? "claude" : null,
       prompt: "",
       contextSources: [],
       responseFormat: type === "task" ? "text" : null,
       splitFailurePolicy: type === "split" ? defaultSplitFailurePolicy() : undefined,
-      ...defaultNodeConfig(type),
     };
     wf.nodes.push(node);
     const canvas = ensureCanvas(wf).ui!.canvas!;
@@ -550,12 +565,14 @@ class WorkflowStore {
     const compoundNode: WorkflowNode = {
       id: compoundId,
       name,
-      type: "subflow",
+      kind: {
+        type: "subflow",
+        subflowConfig: { workflowName: name, exitNodeId: exit.id, inputs: [], maxDepth: 10 },
+      },
       agent: null,
       prompt: "",
       contextSources: [],
       responseFormat: null,
-      subflowConfig: { workflowName: name, exitNodeId: exit.id, inputs: [], maxDepth: 10 },
     };
 
     // Remove selected nodes + their internal edges; keep boundary edges to rewire.

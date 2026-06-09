@@ -6,13 +6,22 @@
     AgentCapabilities,
     AgentDefaults,
     AgentNodeConfig,
+    BatchConfig,
+    CaptureConfig,
     ContextSource,
+    DecideConfig,
     InputBinding,
+    KillConfig,
     ReasoningLevel,
+    RunAgentConfig,
     RunAsConfig,
     RuntimeCapabilities,
+    SendConfig,
     SplitFailurePolicy,
+    SpawnConfig,
+    SubflowConfig,
     ValidationResponse,
+    WaitConfig,
     WorkflowDocument,
     WorkflowEdge,
     WorkflowNode,
@@ -196,45 +205,107 @@
     selectedNode ? buildSuggestions(activeWorkflow, selectedNode.id) : [],
   );
 
+  const DEFAULT_RUN_AGENT_CONFIG: RunAgentConfig = { killAfter: true };
+  const DEFAULT_DECIDE_CONFIG: DecideConfig = { prompt: "", inputs: [], outcomes: [] };
+  const DEFAULT_BATCH_CONFIG: BatchConfig = {
+    itemsBinding: "",
+    maxConcurrent: 4,
+    itemVar: "item",
+    bodyEntry: "",
+  };
+  const DEFAULT_SPAWN_CONFIG: SpawnConfig = {};
+  const DEFAULT_SEND_CONFIG: SendConfig = { text: "", enter: true };
+  const DEFAULT_WAIT_CONFIG: WaitConfig = { mode: "idle" };
+  const DEFAULT_CAPTURE_CONFIG: CaptureConfig = { all: false, ansi: false };
+  const DEFAULT_KILL_CONFIG: KillConfig = {};
+  const DEFAULT_SUBFLOW_CONFIG: SubflowConfig = { workflowName: "", inputs: [], maxDepth: 10 };
+
+  function nodeAgentConfig(node: WorkflowNode | null): AgentNodeConfig {
+    if (!node) return {};
+    if (node.kind.type !== "task" && node.kind.type !== "run_agent") return {};
+    return node.kind.agentConfig ?? {};
+  }
+
+  function runAgentConfig(node: WorkflowNode): RunAgentConfig {
+    return node.kind.type === "run_agent"
+      ? node.kind.runAgentConfig ?? DEFAULT_RUN_AGENT_CONFIG
+      : DEFAULT_RUN_AGENT_CONFIG;
+  }
+
+  function decideConfig(node: WorkflowNode): DecideConfig {
+    return node.kind.type === "decide" ? node.kind.decideConfig : DEFAULT_DECIDE_CONFIG;
+  }
+
+  function batchConfig(node: WorkflowNode): BatchConfig {
+    return node.kind.type === "parallel_batch" ? node.kind.batchConfig : DEFAULT_BATCH_CONFIG;
+  }
+
+  function spawnConfig(node: WorkflowNode): SpawnConfig {
+    return node.kind.type === "spawn" ? node.kind.spawnConfig ?? DEFAULT_SPAWN_CONFIG : DEFAULT_SPAWN_CONFIG;
+  }
+
+  function sendConfig(node: WorkflowNode): SendConfig {
+    return node.kind.type === "send" ? node.kind.sendConfig ?? DEFAULT_SEND_CONFIG : DEFAULT_SEND_CONFIG;
+  }
+
+  function waitConfig(node: WorkflowNode): WaitConfig {
+    return node.kind.type === "wait" ? node.kind.waitConfig ?? DEFAULT_WAIT_CONFIG : DEFAULT_WAIT_CONFIG;
+  }
+
+  function captureConfig(node: WorkflowNode): CaptureConfig {
+    return node.kind.type === "capture" ? node.kind.captureConfig : DEFAULT_CAPTURE_CONFIG;
+  }
+
+  function killConfig(node: WorkflowNode): KillConfig {
+    return node.kind.type === "kill" ? node.kind.killConfig : DEFAULT_KILL_CONFIG;
+  }
+
+  function subflowConfig(node: WorkflowNode): SubflowConfig {
+    return node.kind.type === "subflow" || node.kind.type === "call"
+      ? node.kind.subflowConfig
+      : DEFAULT_SUBFLOW_CONFIG;
+  }
+
   /** Get the capabilities object for the currently selected node's agent */
   let agentCaps = $derived.by((): AgentCapabilities | null => {
     if (!selectedNode || !capabilities) return null;
-    const agentName = selectedNode.type === "run_agent"
-      ? selectedNode.runAgentConfig?.agent ?? selectedNode.agent ?? "claude"
+    const agentName = selectedNode.kind.type === "run_agent"
+      ? runAgentConfig(selectedNode).agent ?? selectedNode.agent ?? "claude"
       : selectedNode.agent ?? "claude";
     return capabilities.agents[agentName]?.capabilities ?? null;
   });
 
   let selectedAgentValue = $derived.by(() => {
     if (!selectedNode) return "claude";
-    if (selectedNode.type === "run_agent") {
-      return selectedNode.runAgentConfig?.agent ?? selectedNode.agent ?? "claude";
+    if (selectedNode.kind.type === "run_agent") {
+      return runAgentConfig(selectedNode).agent ?? selectedNode.agent ?? "claude";
     }
     return selectedNode.agent ?? "claude";
   });
 
   let selectedPromptValue = $derived.by(() => {
     if (!selectedNode) return "";
-    if (selectedNode.type === "run_agent") {
-      return selectedNode.runAgentConfig?.prompt ?? selectedNode.prompt;
+    if (selectedNode.kind.type === "run_agent") {
+      return runAgentConfig(selectedNode).prompt ?? selectedNode.prompt;
     }
     return selectedNode.prompt;
   });
 
   /** Snapshot of selected node's agentConfig — single reactive read for the template */
-  let nodeConfig = $derived<AgentNodeConfig>(selectedNode?.agentConfig ?? {});
+  let nodeConfig = $derived<AgentNodeConfig>(nodeAgentConfig(selectedNode));
 
   /** Update a single field on the selected node's agentConfig. Pass undefined to clear. */
   function updateNodeConfig<K extends keyof AgentNodeConfig>(key: K, value: AgentNodeConfig[K]) {
     store.updateWorkflow((wf) => {
       const n = wf.nodes.find((n) => n.id === selectedNode!.id);
       if (!n) return;
-      if (!n.agentConfig) n.agentConfig = {};
+      if (n.kind.type !== "task" && n.kind.type !== "run_agent") return;
+      if (!n.kind.agentConfig) n.kind.agentConfig = {};
       if (value === undefined) {
-        delete (n.agentConfig as Record<string, unknown>)[key];
-        if (Object.keys(n.agentConfig).length === 0) n.agentConfig = null;
+        delete (n.kind.agentConfig as Record<string, unknown>)[key];
+        if (Object.keys(n.kind.agentConfig).length === 0) n.kind.agentConfig = null;
       } else {
-        n.agentConfig[key] = value;
+        n.kind.agentConfig[key] = value;
       }
     });
   }
@@ -243,30 +314,73 @@
     return v !== "" ? Number(v) : undefined;
   }
 
-  /* ── Typed config object updaters (decide / batch / primitives / subflow) ── */
-  const CONFIG_DEFAULTS: Record<string, () => Record<string, unknown>> = {
-    runAgentConfig: () => ({ killAfter: true }),
-    decideConfig: () => ({ prompt: "", inputs: [], outcomes: [] }),
-    batchConfig: () => ({ itemsBinding: "", maxConcurrent: 4, itemVar: "item", bodyEntry: "" }),
-    spawnConfig: () => ({}),
-    sendConfig: () => ({ text: "", enter: true }),
-    waitConfig: () => ({ mode: "idle" }),
-    captureConfig: () => ({ all: false, ansi: false }),
-    killConfig: () => ({}),
-    subflowConfig: () => ({ workflowName: "", inputs: [], maxDepth: 10 }),
-  };
+  function mergeConfig<T extends object>(
+    defaults: T,
+    base: T | undefined,
+    field: string,
+    value: unknown,
+  ): T {
+    const next: Record<string, unknown> = {
+      ...(defaults as Record<string, unknown>),
+      ...((base ?? {}) as Record<string, unknown>),
+    };
+    if (value === undefined) delete next[field];
+    else next[field] = value;
+    return next as T;
+  }
 
   /** Merge a field into a node's typed config object; pass undefined to clear it. */
   function updateConfig(configKey: string, field: string, value: unknown) {
     store.updateWorkflow((wf) => {
       const n = wf.nodes.find((x) => x.id === selectedNode!.id);
       if (!n) return;
-      const rec = n as unknown as Record<string, unknown>;
-      const base = rec[configKey] as Record<string, unknown> | null | undefined;
-      const next: Record<string, unknown> = { ...(CONFIG_DEFAULTS[configKey]?.() ?? {}), ...(base ?? {}) };
-      if (value === undefined) delete next[field];
-      else next[field] = value;
-      rec[configKey] = next;
+      switch (configKey) {
+        case "runAgentConfig":
+          if (n.kind.type === "run_agent") {
+            n.kind.runAgentConfig = mergeConfig(DEFAULT_RUN_AGENT_CONFIG, n.kind.runAgentConfig, field, value);
+          }
+          break;
+        case "decideConfig":
+          if (n.kind.type === "decide") {
+            n.kind.decideConfig = mergeConfig(DEFAULT_DECIDE_CONFIG, n.kind.decideConfig, field, value);
+          }
+          break;
+        case "batchConfig":
+          if (n.kind.type === "parallel_batch") {
+            n.kind.batchConfig = mergeConfig(DEFAULT_BATCH_CONFIG, n.kind.batchConfig, field, value);
+          }
+          break;
+        case "spawnConfig":
+          if (n.kind.type === "spawn") {
+            n.kind.spawnConfig = mergeConfig(DEFAULT_SPAWN_CONFIG, n.kind.spawnConfig, field, value);
+          }
+          break;
+        case "sendConfig":
+          if (n.kind.type === "send") {
+            n.kind.sendConfig = mergeConfig(DEFAULT_SEND_CONFIG, n.kind.sendConfig, field, value);
+          }
+          break;
+        case "waitConfig":
+          if (n.kind.type === "wait") {
+            n.kind.waitConfig = mergeConfig(DEFAULT_WAIT_CONFIG, n.kind.waitConfig, field, value);
+          }
+          break;
+        case "captureConfig":
+          if (n.kind.type === "capture") {
+            n.kind.captureConfig = mergeConfig(DEFAULT_CAPTURE_CONFIG, n.kind.captureConfig, field, value);
+          }
+          break;
+        case "killConfig":
+          if (n.kind.type === "kill") {
+            n.kind.killConfig = mergeConfig(DEFAULT_KILL_CONFIG, n.kind.killConfig, field, value);
+          }
+          break;
+        case "subflowConfig":
+          if (n.kind.type === "subflow" || n.kind.type === "call") {
+            n.kind.subflowConfig = mergeConfig(DEFAULT_SUBFLOW_CONFIG, n.kind.subflowConfig, field, value);
+          }
+          break;
+      }
     });
   }
 
@@ -495,17 +609,17 @@
 
     <!-- Scrollable content area -->
     <div class="inspector__body">
-      {#if selectedNode.type === "task" || selectedNode.type === "run_agent"}
+      {#if selectedNode.kind.type === "task" || selectedNode.kind.type === "run_agent"}
         <!-- PROMPT SECTION (always visible, primary) -->
         <section class="inspectorSection">
-          <div class="inspectorSection__title">{selectedNode.type === "run_agent" ? "Agent" : "Prompt"}</div>
+          <div class="inspectorSection__title">{selectedNode.kind.type === "run_agent" ? "Agent" : "Prompt"}</div>
           <label class="field">
             <span>Agent</span>
             <select
               value={selectedAgentValue}
               onchange={(e) => {
                 const value = (e.target as HTMLSelectElement).value;
-                if (selectedNode!.type === "run_agent") {
+                if (selectedNode!.kind.type === "run_agent") {
                   updateRunAgent("agent", value);
                   return;
                 }
@@ -534,7 +648,7 @@
               suggestions={promptSuggestions}
               oninput={(e) => {
                 const value = (e.target as HTMLTextAreaElement).value;
-                if (selectedNode!.type === "run_agent") {
+                if (selectedNode!.kind.type === "run_agent") {
                   updateRunAgent("prompt", value);
                   return;
                 }
@@ -545,7 +659,7 @@
               }}
             />
           </div>
-          {#if selectedNode.type === "task"}
+          {#if selectedNode.kind.type === "task"}
             <label class="field">
               <span>Response format</span>
               <select
@@ -563,8 +677,8 @@
         </section>
 
         <!-- RUN_AGENT PTY CONFIG (one-shot agent in a managed pane) -->
-        {#if selectedNode.type === "run_agent"}
-          {@const rc = selectedNode.runAgentConfig ?? { killAfter: true }}
+        {#if selectedNode.kind.type === "run_agent"}
+          {@const rc = runAgentConfig(selectedNode)}
           <section class="inspectorSection">
             <div class="inspectorSection__title">Agent run</div>
             <small class="helperText">Spawns the agent in a PTY pane, waits for completion, then captures output.</small>
@@ -741,7 +855,7 @@
             {#if agentCaps?.sessionReuse}
               {@const currentAgent = selectedNode.agent ?? "claude"}
               {@const eligibleNodes = activeWorkflow.nodes.filter(
-                (n) => n.type === "task" && n.id !== selectedNode!.id && (n.agent ?? "claude") === currentAgent
+                (n) => n.kind.type === "task" && n.id !== selectedNode!.id && (n.agent ?? "claude") === currentAgent
               )}
               {#if eligibleNodes.length > 0}
                 <label class="field">
@@ -917,7 +1031,7 @@
           onToggle={toggleSection}
         />
 
-      {:else if selectedNode.type === "approval"}
+      {:else if selectedNode.kind.type === "approval"}
         <section class="inspectorSection">
           <div class="inspectorSection__title">Approval</div>
           <div class="field field--prompt">
@@ -932,7 +1046,7 @@
             />
           </div>
         </section>
-      {:else if selectedNode.type === "split"}
+      {:else if selectedNode.kind.type === "split"}
         <section class="inspectorSection">
           <div class="inspectorSection__title">Split</div>
           <label class="field">
@@ -950,7 +1064,7 @@
             </select>
           </label>
         </section>
-      {:else if selectedNode.type === "collector"}
+      {:else if selectedNode.kind.type === "collector"}
         <section class="inspectorSection">
           <div class="inspectorSection__title">Collector</div>
           <p style="margin: 0; color: var(--text-dim); line-height: 1.5;">
@@ -958,8 +1072,8 @@
           </p>
         </section>
 
-      {:else if selectedNode.type === "decide"}
-        {@const dc = selectedNode.decideConfig ?? { prompt: "", inputs: [], outcomes: [] }}
+      {:else if selectedNode.kind.type === "decide"}
+        {@const dc = decideConfig(selectedNode)}
         <section class="inspectorSection">
           <div class="inspectorSection__title">Decide</div>
           <small class="helperText">An LLM reads the inputs and picks one outcome; each outcome maps to a branch edge.</small>
@@ -995,8 +1109,8 @@
         </section>
         {@render inputBindings(dc.inputs ?? [], updateDecide)}
 
-      {:else if selectedNode.type === "parallel_batch"}
-        {@const bc = selectedNode.batchConfig ?? { itemsBinding: "", maxConcurrent: 4, itemVar: "item", bodyEntry: "" }}
+      {:else if selectedNode.kind.type === "parallel_batch"}
+        {@const bc = batchConfig(selectedNode)}
         <section class="inspectorSection">
           <div class="inspectorSection__title">Parallel batch</div>
           <small class="helperText">Fans out over a collection, running the body subgraph once per item.</small>
@@ -1047,8 +1161,8 @@
           </label>
         </section>
 
-      {:else if selectedNode.type === "spawn"}
-        {@const sc = selectedNode.spawnConfig ?? {}}
+      {:else if selectedNode.kind.type === "spawn"}
+        {@const sc = spawnConfig(selectedNode)}
         <section class="inspectorSection">
           <div class="inspectorSection__title">Spawn</div>
           <small class="helperText">Launches a long-lived agent/command into a managed PTY pane.</small>
@@ -1118,8 +1232,8 @@
           </label>
         </section>
 
-      {:else if selectedNode.type === "send"}
-        {@const sd = selectedNode.sendConfig ?? { text: "", enter: true }}
+      {:else if selectedNode.kind.type === "send"}
+        {@const sd = sendConfig(selectedNode)}
         <section class="inspectorSection">
           <div class="inspectorSection__title">Send</div>
           <small class="helperText">Sends text / keystrokes to a running pane.</small>
@@ -1150,8 +1264,8 @@
           </label>
         </section>
 
-      {:else if selectedNode.type === "wait"}
-        {@const wc = selectedNode.waitConfig ?? { mode: "idle" }}
+      {:else if selectedNode.kind.type === "wait"}
+        {@const wc = waitConfig(selectedNode)}
         <section class="inspectorSection">
           <div class="inspectorSection__title">Wait</div>
           <small class="helperText">Blocks until the target pane is idle, ready, or prints a marker.</small>
@@ -1218,8 +1332,8 @@
           </label>
         </section>
 
-      {:else if selectedNode.type === "capture"}
-        {@const cc = selectedNode.captureConfig ?? { all: false, ansi: false }}
+      {:else if selectedNode.kind.type === "capture"}
+        {@const cc = captureConfig(selectedNode)}
         <section class="inspectorSection">
           <div class="inspectorSection__title">Capture</div>
           <small class="helperText">Captures pane output into the run context for downstream nodes.</small>
@@ -1261,8 +1375,8 @@
           </label>
         </section>
 
-      {:else if selectedNode.type === "kill"}
-        {@const kc = selectedNode.killConfig ?? {}}
+      {:else if selectedNode.kind.type === "kill"}
+        {@const kc = killConfig(selectedNode)}
         <section class="inspectorSection">
           <div class="inspectorSection__title">Kill</div>
           <small class="helperText">Terminates a running pane or tmux session.</small>
@@ -1284,11 +1398,11 @@
           </label>
         </section>
 
-      {:else if selectedNode.type === "subflow" || selectedNode.type === "call"}
-        {@const fc = selectedNode.subflowConfig ?? { workflowName: "", inputs: [], maxDepth: 10 }}
+      {:else if selectedNode.kind.type === "subflow" || selectedNode.kind.type === "call"}
+        {@const fc = subflowConfig(selectedNode)}
         {@const referenced = activeWorkflow.subflows?.[fc.workflowName]}
         <section class="inspectorSection">
-          <div class="inspectorSection__title">Compound ({selectedNode.type})</div>
+          <div class="inspectorSection__title">Compound ({selectedNode.kind.type})</div>
           <small class="helperText">References a reusable saved subgraph. Double-click the node on the canvas to drill in.</small>
           <label class="field">
             <span>Subflow</span>
@@ -1353,7 +1467,7 @@
     </div>
 
     <!-- STICKY TEST FOOTER (task nodes only) -->
-    {#if selectedNode.type === "task"}
+    {#if selectedNode.kind.type === "task"}
       <div class="testFooter" class:testFooter--expanded={testExpanded}>
         <button
           class="testFooter__bar"

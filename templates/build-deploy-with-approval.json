@@ -7,7 +7,10 @@
   "useOrchestrator": false,
   "entryNodeId": "bd1",
   "variables": [
-    { "name": "project_path", "default": "." }
+    {
+      "name": "project_path",
+      "default": "."
+    }
   ],
   "limits": {
     "maxTotalSteps": 50,
@@ -17,22 +20,28 @@
     {
       "id": "bd1",
       "name": "Run Tests",
-      "type": "task",
       "agent": "claude",
-      "prompt": "Run the test suite in {{var:project_path}} and report the results. Include pass/fail counts, any error details, and overall status."
+      "prompt": "Run the test suite in {{var:project_path}} and report the results. Include pass/fail counts, any error details, and overall status.",
+      "kind": {
+        "type": "task"
+      }
     },
     {
       "id": "bd2",
       "name": "Review & Approve",
-      "type": "approval",
-      "prompt": "Review the test results before proceeding with deployment."
+      "prompt": "Review the test results before proceeding with deployment.",
+      "kind": {
+        "type": "approval"
+      }
     },
     {
       "id": "bd3",
       "name": "Deploy Summary",
-      "type": "task",
       "agent": "claude",
-      "prompt": "The tests passed and deployment was approved. Create a deployment summary based on the test results:\n\n{{node:bd1.output}}"
+      "prompt": "The tests passed and deployment was approved. Create a deployment summary based on the test results:\n\n{{node:bd1.output}}",
+      "kind": {
+        "type": "task"
+      }
     }
   ],
   "edges": [
@@ -58,11 +67,24 @@
   ],
   "ui": {
     "canvas": {
-      "viewport": { "x": 0, "y": 0, "zoom": 1 },
+      "viewport": {
+        "x": 0,
+        "y": 0,
+        "zoom": 1
+      },
       "nodes": {
-        "bd1": { "x": 120, "y": 140 },
-        "bd2": { "x": 380, "y": 140 },
-        "bd3": { "x": 640, "y": 140 }
+        "bd1": {
+          "x": 120,
+          "y": 140
+        },
+        "bd2": {
+          "x": 380,
+          "y": 140
+        },
+        "bd3": {
+          "x": 640,
+          "y": 140
+        }
       }
     }
   }

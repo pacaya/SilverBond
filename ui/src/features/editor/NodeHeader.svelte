@@ -39,7 +39,7 @@
   function duplicateNode() {
     const pos = workflow.ui?.canvas?.nodes[node.id];
     const newPos = pos ? { x: pos.x + 40, y: pos.y + 40 } : undefined;
-    store.addNode(node.type, newPos);
+    store.addNode(node.kind.type, newPos);
     const newId = store.selection.kind === "node" ? store.selection.id : null;
     if (newId) {
       const clone = structuredClone(node);
@@ -67,9 +67,9 @@
 <div class="nodeHeader">
   <span
     class="nodeHeader__typeBadge"
-    style="--badge-color: {typeColors[node.type] ?? 'var(--text-dim)'}"
+    style="--badge-color: {typeColors[node.kind.type] ?? 'var(--text-dim)'}"
   >
-    {node.type}
+    {node.kind.type}
   </span>
   <input
     class="nodeHeader__name"

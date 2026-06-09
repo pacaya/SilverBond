@@ -7,7 +7,10 @@
   "useOrchestrator": false,
   "entryNodeId": "cr1",
   "variables": [
-    { "name": "focus", "default": "bugs, style issues, and potential improvements" }
+    {
+      "name": "focus",
+      "default": "bugs, style issues, and potential improvements"
+    }
   ],
   "limits": {
     "maxTotalSteps": 50,
@@ -17,23 +20,29 @@
     {
       "id": "cr1",
       "name": "Analyze Code",
-      "type": "task",
       "agent": "claude",
-      "prompt": "Analyze the code in the working directory. Focus on {{var:focus}}. List every issue you find with file paths and line numbers."
+      "prompt": "Analyze the code in the working directory. Focus on {{var:focus}}. List every issue you find with file paths and line numbers.",
+      "kind": {
+        "type": "task"
+      }
     },
     {
       "id": "cr2",
       "name": "Write Report",
-      "type": "task",
       "agent": "claude",
-      "prompt": "Based on this analysis:\n\n{{previous_output}}\n\nWrite a structured code review report. Group issues by severity (critical, warning, info). Include a summary at the top."
+      "prompt": "Based on this analysis:\n\n{{previous_output}}\n\nWrite a structured code review report. Group issues by severity (critical, warning, info). Include a summary at the top.",
+      "kind": {
+        "type": "task"
+      }
     },
     {
       "id": "cr3",
       "name": "Suggest Fixes",
-      "type": "task",
       "agent": "claude",
-      "prompt": "Based on this code review report:\n\n{{previous_output}}\n\nGenerate concrete fix suggestions for the critical and warning issues. Show the suggested code changes."
+      "prompt": "Based on this code review report:\n\n{{previous_output}}\n\nGenerate concrete fix suggestions for the critical and warning issues. Show the suggested code changes.",
+      "kind": {
+        "type": "task"
+      }
     }
   ],
   "edges": [
@@ -52,11 +61,24 @@
   ],
   "ui": {
     "canvas": {
-      "viewport": { "x": 0, "y": 0, "zoom": 1 },
+      "viewport": {
+        "x": 0,
+        "y": 0,
+        "zoom": 1
+      },
       "nodes": {
-        "cr1": { "x": 120, "y": 140 },
-        "cr2": { "x": 400, "y": 140 },
-        "cr3": { "x": 680, "y": 140 }
+        "cr1": {
+          "x": 120,
+          "y": 140
+        },
+        "cr2": {
+          "x": 400,
+          "y": 140
+        },
+        "cr3": {
+          "x": 680,
+          "y": 140
+        }
       }
     }
   }

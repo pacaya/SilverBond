@@ -197,9 +197,11 @@ impl Database {
             let Some((state_json, workflow_json)) = row else {
                 return Ok(None);
             };
+            let workflow_value: Value = serde_json::from_str(&workflow_json)?;
+            let workflow = normalize_workflow_value(workflow_value)?.workflow;
             Ok(Some(PersistedRun {
                 checkpoint: serde_json::from_str(&state_json)?,
-                workflow: serde_json::from_str(&workflow_json)?,
+                workflow,
             }))
         })
         .await?
@@ -689,7 +691,7 @@ mod tests {
             nodes: vec![WorkflowNode {
                 id: "n1".to_string(),
                 name: "Node".to_string(),
-                node_type: WorkflowNodeType::Task,
+                kind: WorkflowNodeType::Task.into(),
                 agent: Some("claude".to_string()),
                 prompt: "hi".to_string(),
                 context_sources: Vec::new(),
@@ -702,18 +704,8 @@ mod tests {
                 loop_max_iterations: None,
                 loop_condition: None,
                 split_failure_policy: crate::model::SplitFailurePolicy::BestEffortContinue,
-                agent_config: None,
                 cwd: None,
                 continue_session_from: None,
-                decide_config: None,
-                batch_config: None,
-                spawn_config: None,
-                send_config: None,
-                wait_config: None,
-                capture_config: None,
-                kill_config: None,
-                run_agent_config: None,
-                subflow_config: None,
             }],
             edges: vec![WorkflowEdge {
                 id: "e1".to_string(),
@@ -767,9 +759,9 @@ mod tests {
                 {
                     "id": "n1",
                     "name": "Node",
-                    "type": "task",
                     "agent": "claude",
-                    "prompt": "hi"
+                    "prompt": "hi",
+                    "kind": { "type": "task" }
                 }
             ],
             "edges": []

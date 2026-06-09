@@ -7,8 +7,14 @@
   "useOrchestrator": false,
   "entryNodeId": "plan",
   "variables": [
-    { "name": "plan_doc", "default": "plan.md" },
-    { "name": "implementation_tasks", "default": "[]" }
+    {
+      "name": "plan_doc",
+      "default": "plan.md"
+    },
+    {
+      "name": "implementation_tasks",
+      "default": "[]"
+    }
   ],
   "limits": {
     "maxTotalSteps": 100,
@@ -18,102 +24,122 @@
     {
       "id": "plan",
       "name": "Plan",
-      "type": "run_agent",
-      "runAgentConfig": {
-        "agent": "claude",
-        "prompt": "Read the plan document at {{var:plan_doc}} and generate a structured task list for implementation. Output a JSON array of tasks with id, description, and acceptance criteria. Existing tasks hint: {{var:implementation_tasks}}"
+      "kind": {
+        "type": "run_agent",
+        "runAgentConfig": {
+          "agent": "claude",
+          "prompt": "Read the plan document at {{var:plan_doc}} and generate a structured task list for implementation. Output a JSON array of tasks with id, description, and acceptance criteria. Existing tasks hint: {{var:implementation_tasks}}"
+        }
       }
     },
     {
       "id": "batch-impl",
       "name": "Batch Impl",
-      "type": "parallel_batch",
-      "batchConfig": {
-        "itemsBinding": "node:plan.output.tasks",
-        "maxConcurrent": 2,
-        "itemVar": "task",
-        "bodyEntry": "impl-item",
-        "collectorVar": "impl_results"
+      "kind": {
+        "type": "parallel_batch",
+        "batchConfig": {
+          "itemsBinding": "node:plan.output.tasks",
+          "maxConcurrent": 2,
+          "itemVar": "task",
+          "bodyEntry": "impl-item",
+          "collectorVar": "impl_results"
+        }
       }
     },
     {
       "id": "impl-item",
       "name": "Impl Item",
-      "type": "run_agent",
-      "runAgentConfig": {
-        "agent": "claude",
-        "prompt": "Implement the following task in an isolated worktree:\n\n{{var:task}}\n\nFollow the plan at {{var:plan_doc}} and meet all acceptance criteria."
+      "kind": {
+        "type": "run_agent",
+        "runAgentConfig": {
+          "agent": "claude",
+          "prompt": "Implement the following task in an isolated worktree:\n\n{{var:task}}\n\nFollow the plan at {{var:plan_doc}} and meet all acceptance criteria."
+        }
       }
     },
     {
       "id": "merge-gate",
       "name": "Merge Gate",
-      "type": "approval",
-      "prompt": "Review parallel implementation results and approve serial worktree merge before testing."
+      "prompt": "Review parallel implementation results and approve serial worktree merge before testing.",
+      "kind": {
+        "type": "approval"
+      }
     },
     {
       "id": "batch-test",
       "name": "Batch Test",
-      "type": "parallel_batch",
-      "batchConfig": {
-        "itemsBinding": "node:batch-impl.output.items",
-        "maxConcurrent": 4,
-        "itemVar": "impl",
-        "bodyEntry": "test-item",
-        "collectorVar": "test_results"
+      "kind": {
+        "type": "parallel_batch",
+        "batchConfig": {
+          "itemsBinding": "node:batch-impl.output.items",
+          "maxConcurrent": 4,
+          "itemVar": "impl",
+          "bodyEntry": "test-item",
+          "collectorVar": "test_results"
+        }
       }
     },
     {
       "id": "test-item",
       "name": "Test Item",
-      "type": "run_agent",
-      "runAgentConfig": {
-        "agent": "claude",
-        "prompt": "Run the test suite for this implementation result:\n\n{{var:impl}}\n\nReport pass/fail status and any failures with details."
+      "kind": {
+        "type": "run_agent",
+        "runAgentConfig": {
+          "agent": "claude",
+          "prompt": "Run the test suite for this implementation result:\n\n{{var:impl}}\n\nReport pass/fail status and any failures with details."
+        }
       }
     },
     {
       "id": "dual-review-call",
       "name": "Dual Review Call",
-      "type": "call",
-      "subflowConfig": {
-        "workflowName": "dual-review",
-        "inputs": [
-          {
-            "name": "review_scope",
-            "source": "node:batch-test.output.items"
-          }
-        ]
+      "kind": {
+        "type": "call",
+        "subflowConfig": {
+          "workflowName": "dual-review",
+          "inputs": [
+            {
+              "name": "review_scope",
+              "source": "node:batch-test.output.items"
+            }
+          ]
+        }
       }
     },
     {
       "id": "batch-fixes",
       "name": "Batch Fixes",
-      "type": "parallel_batch",
-      "batchConfig": {
-        "itemsBinding": "node:batch-test.output.items",
-        "maxConcurrent": 4,
-        "itemVar": "fix",
-        "bodyEntry": "fix-item",
-        "collectorVar": "fix_results"
+      "kind": {
+        "type": "parallel_batch",
+        "batchConfig": {
+          "itemsBinding": "node:batch-test.output.items",
+          "maxConcurrent": 4,
+          "itemVar": "fix",
+          "bodyEntry": "fix-item",
+          "collectorVar": "fix_results"
+        }
       }
     },
     {
       "id": "fix-item",
       "name": "Fix Item",
-      "type": "run_agent",
-      "runAgentConfig": {
-        "agent": "claude",
-        "prompt": "Apply fixes for test failures and review findings:\n\n{{var:fix}}\n\nDual review output:\n{{node:dual-review-call.output}}"
+      "kind": {
+        "type": "run_agent",
+        "runAgentConfig": {
+          "agent": "claude",
+          "prompt": "Apply fixes for test failures and review findings:\n\n{{var:fix}}\n\nDual review output:\n{{node:dual-review-call.output}}"
+        }
       }
     },
     {
       "id": "consolidate",
       "name": "Consolidate",
-      "type": "run_agent",
-      "runAgentConfig": {
-        "agent": "claude",
-        "prompt": "Consolidate the multi-agent implementation run into a final summary. Plan: {{var:plan_doc}}\n\nImplementation results:\n{{node:batch-impl.output.items}}\n\nTest results:\n{{node:batch-test.output.items}}\n\nReview:\n{{node:dual-review-call.output}}\n\nFix results:\n{{node:batch-fixes.output.items}}"
+      "kind": {
+        "type": "run_agent",
+        "runAgentConfig": {
+          "agent": "claude",
+          "prompt": "Consolidate the multi-agent implementation run into a final summary. Plan: {{var:plan_doc}}\n\nImplementation results:\n{{node:batch-impl.output.items}}\n\nTest results:\n{{node:batch-test.output.items}}\n\nReview:\n{{node:dual-review-call.output}}\n\nFix results:\n{{node:batch-fixes.output.items}}"
+        }
       }
     }
   ],
@@ -183,64 +209,96 @@
         {
           "id": "split-reviewers",
           "name": "Split Reviewers",
-          "type": "split"
+          "kind": {
+            "type": "split"
+          }
         },
         {
           "id": "reviewer-a",
           "name": "Reviewer A",
-          "type": "run_agent",
-          "runAgentConfig": {
-            "agent": "claude",
-            "prompt": "Perform an adversarial code review focused on correctness and security. Scope: {{var:review_scope}}\n\nIdentify bugs, logic errors, security vulnerabilities, and data-handling risks. Rank findings by severity."
+          "kind": {
+            "type": "run_agent",
+            "runAgentConfig": {
+              "agent": "claude",
+              "prompt": "Perform an adversarial code review focused on correctness and security. Scope: {{var:review_scope}}\n\nIdentify bugs, logic errors, security vulnerabilities, and data-handling risks. Rank findings by severity."
+            }
           }
         },
         {
           "id": "reviewer-b",
           "name": "Reviewer B",
-          "type": "run_agent",
-          "runAgentConfig": {
-            "agent": "claude",
-            "prompt": "Perform an adversarial code review focused on code quality and maintainability. Scope: {{var:review_scope}}\n\nIdentify readability issues, design problems, missing tests, and technical debt. Rank findings by severity."
+          "kind": {
+            "type": "run_agent",
+            "runAgentConfig": {
+              "agent": "claude",
+              "prompt": "Perform an adversarial code review focused on code quality and maintainability. Scope: {{var:review_scope}}\n\nIdentify readability issues, design problems, missing tests, and technical debt. Rank findings by severity."
+            }
           }
         },
         {
           "id": "collect-reviews",
           "name": "Collect Reviews",
-          "type": "collector"
+          "kind": {
+            "type": "collector"
+          }
         },
         {
           "id": "decide-cross-verify",
           "name": "Decide Cross Verify",
-          "type": "decide",
-          "decideConfig": {
-            "inputs": [
-              { "name": "review_a", "source": "node:reviewer-a.output" },
-              { "name": "review_b", "source": "node:reviewer-b.output" }
-            ],
-            "prompt": "Compare the two independent reviews below. Return AGREEMENT if the reviewers largely agree on findings and severity, or DISAGREEMENT if they conflict on important issues.\n\nReviewer A (correctness/security):\n{{review_a}}\n\nReviewer B (quality/maintainability):\n{{review_b}}",
-            "outcomes": ["AGREEMENT", "DISAGREEMENT"]
+          "kind": {
+            "type": "decide",
+            "decideConfig": {
+              "inputs": [
+                {
+                  "name": "review_a",
+                  "source": "node:reviewer-a.output"
+                },
+                {
+                  "name": "review_b",
+                  "source": "node:reviewer-b.output"
+                }
+              ],
+              "prompt": "Compare the two independent reviews below. Return AGREEMENT if the reviewers largely agree on findings and severity, or DISAGREEMENT if they conflict on important issues.\n\nReviewer A (correctness/security):\n{{review_a}}\n\nReviewer B (quality/maintainability):\n{{review_b}}",
+              "outcomes": [
+                "AGREEMENT",
+                "DISAGREEMENT"
+              ]
+            }
           }
         },
         {
           "id": "decide-adjudicate",
           "name": "Decide Adjudicate",
-          "type": "decide",
-          "decideConfig": {
-            "inputs": [
-              { "name": "review_a", "source": "node:reviewer-a.output" },
-              { "name": "review_b", "source": "node:reviewer-b.output" }
-            ],
-            "prompt": "The reviewers disagree. Adjudicate which review is more accurate for the conflicting findings. Return A_WINS if Reviewer A's assessment is more reliable, or B_WINS if Reviewer B's assessment is more reliable.\n\nReviewer A:\n{{review_a}}\n\nReviewer B:\n{{review_b}}",
-            "outcomes": ["A_WINS", "B_WINS"]
+          "kind": {
+            "type": "decide",
+            "decideConfig": {
+              "inputs": [
+                {
+                  "name": "review_a",
+                  "source": "node:reviewer-a.output"
+                },
+                {
+                  "name": "review_b",
+                  "source": "node:reviewer-b.output"
+                }
+              ],
+              "prompt": "The reviewers disagree. Adjudicate which review is more accurate for the conflicting findings. Return A_WINS if Reviewer A's assessment is more reliable, or B_WINS if Reviewer B's assessment is more reliable.\n\nReviewer A:\n{{review_a}}\n\nReviewer B:\n{{review_b}}",
+              "outcomes": [
+                "A_WINS",
+                "B_WINS"
+              ]
+            }
           }
         },
         {
           "id": "output-merged",
           "name": "Output Merged",
-          "type": "run_agent",
-          "runAgentConfig": {
-            "agent": "claude",
-            "prompt": "Produce a single merged review report from the dual-review process. Scope: {{var:review_scope}}\n\nReviewer A findings:\n{{node:reviewer-a.output}}\n\nReviewer B findings:\n{{node:reviewer-b.output}}\n\nCross-verify decision: {{node:decide-cross-verify.output}}\n\nAdjudication (if any): {{node:decide-adjudicate.output}}\n\nDeduplicate findings, resolve conflicts, and output a severity-ranked final report."
+          "kind": {
+            "type": "run_agent",
+            "runAgentConfig": {
+              "agent": "claude",
+              "prompt": "Produce a single merged review report from the dual-review process. Scope: {{var:review_scope}}\n\nReviewer A findings:\n{{node:reviewer-a.output}}\n\nReviewer B findings:\n{{node:reviewer-b.output}}\n\nCross-verify decision: {{node:decide-cross-verify.output}}\n\nAdjudication (if any): {{node:decide-adjudicate.output}}\n\nDeduplicate findings, resolve conflicts, and output a severity-ranked final report."
+            }
           }
         }
       ],

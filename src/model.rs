@@ -2,9 +2,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::driver::{AccessMode, AgentConfig, ReasoningLevel, ToolToggles};
+
+pub const WORKFLOW_SCHEMA_VERSION: u32 = 3;
+const LEGACY_WORKFLOW_SCHEMA_VERSION: u64 = 2;
 
 // ---------------------------------------------------------------------------
 // Orchestrator configuration
@@ -86,7 +89,7 @@ pub enum ResponseFormat {
     Json,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowNodeType {
     Task,
@@ -124,6 +127,13 @@ impl WorkflowNodeType {
             WorkflowNodeType::RunAgent => "run_agent",
         }
     }
+}
+
+fn is_default<T>(value: &T) -> bool
+where
+    T: Default + PartialEq,
+{
+    value == &T::default()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -227,7 +237,7 @@ pub fn resolve_agent_config(
     json_schema: Option<Value>,
 ) -> AgentConfig {
     let defaults = workflow_defaults.get(agent_name);
-    let node_base = node.agent_config.as_ref().map(|o| &o.base);
+    let node_base = node.kind.agent_config().map(|o| &o.base);
 
     // Helper: node override → workflow default → None
     macro_rules! merge {
@@ -243,7 +253,7 @@ pub fn resolve_agent_config(
 
     let cwd = node.cwd.clone().unwrap_or_else(|| workflow_cwd.to_string());
 
-    let overrides = node.agent_config.as_ref();
+    let overrides = node.kind.agent_config();
 
     AgentConfig {
         model: merge!(model),
@@ -567,12 +577,186 @@ pub struct WorkflowUi {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum NodeKind {
+    Task {
+        #[serde(
+            default,
+            rename = "agentConfig",
+            skip_serializing_if = "Option::is_none"
+        )]
+        agent_config: Option<AgentNodeConfig>,
+    },
+    Approval,
+    Split,
+    Collector,
+    Decide {
+        #[serde(rename = "decideConfig")]
+        decide_config: DecideConfig,
+    },
+    ParallelBatch {
+        #[serde(rename = "batchConfig", alias = "parallelBatchConfig")]
+        batch_config: BatchConfig,
+    },
+    Subflow {
+        #[serde(rename = "subflowConfig")]
+        subflow_config: SubflowConfig,
+    },
+    Call {
+        #[serde(rename = "subflowConfig")]
+        subflow_config: SubflowConfig,
+    },
+    Spawn {
+        #[serde(default, rename = "spawnConfig", skip_serializing_if = "is_default")]
+        spawn_config: SpawnConfig,
+    },
+    Send {
+        #[serde(default, rename = "sendConfig", skip_serializing_if = "is_default")]
+        send_config: SendConfig,
+    },
+    Wait {
+        #[serde(default, rename = "waitConfig", skip_serializing_if = "is_default")]
+        wait_config: WaitConfig,
+    },
+    Capture {
+        #[serde(rename = "captureConfig")]
+        capture_config: CaptureConfig,
+    },
+    Kill {
+        #[serde(rename = "killConfig")]
+        kill_config: KillConfig,
+    },
+    RunAgent {
+        #[serde(default, rename = "runAgentConfig", skip_serializing_if = "is_default")]
+        run_agent_config: RunAgentConfig,
+        #[serde(
+            default,
+            rename = "agentConfig",
+            skip_serializing_if = "Option::is_none"
+        )]
+        agent_config: Option<AgentNodeConfig>,
+    },
+}
+
+impl NodeKind {
+    pub fn node_type(&self) -> WorkflowNodeType {
+        match self {
+            NodeKind::Task { .. } => WorkflowNodeType::Task,
+            NodeKind::Approval => WorkflowNodeType::Approval,
+            NodeKind::Split => WorkflowNodeType::Split,
+            NodeKind::Collector => WorkflowNodeType::Collector,
+            NodeKind::Decide { .. } => WorkflowNodeType::Decide,
+            NodeKind::ParallelBatch { .. } => WorkflowNodeType::ParallelBatch,
+            NodeKind::Subflow { .. } => WorkflowNodeType::Subflow,
+            NodeKind::Call { .. } => WorkflowNodeType::Call,
+            NodeKind::Spawn { .. } => WorkflowNodeType::Spawn,
+            NodeKind::Send { .. } => WorkflowNodeType::Send,
+            NodeKind::Wait { .. } => WorkflowNodeType::Wait,
+            NodeKind::Capture { .. } => WorkflowNodeType::Capture,
+            NodeKind::Kill { .. } => WorkflowNodeType::Kill,
+            NodeKind::RunAgent { .. } => WorkflowNodeType::RunAgent,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        self.node_type().as_str()
+    }
+
+    pub fn agent_config(&self) -> Option<&AgentNodeConfig> {
+        match self {
+            NodeKind::Task { agent_config } | NodeKind::RunAgent { agent_config, .. } => {
+                agent_config.as_ref()
+            }
+            NodeKind::Approval
+            | NodeKind::Split
+            | NodeKind::Collector
+            | NodeKind::Decide { .. }
+            | NodeKind::ParallelBatch { .. }
+            | NodeKind::Subflow { .. }
+            | NodeKind::Call { .. }
+            | NodeKind::Spawn { .. }
+            | NodeKind::Send { .. }
+            | NodeKind::Wait { .. }
+            | NodeKind::Capture { .. }
+            | NodeKind::Kill { .. } => None,
+        }
+    }
+
+    pub fn set_agent_config(&mut self, config: Option<AgentNodeConfig>) {
+        match self {
+            NodeKind::Task { agent_config } | NodeKind::RunAgent { agent_config, .. } => {
+                *agent_config = config;
+            }
+            NodeKind::Approval
+            | NodeKind::Split
+            | NodeKind::Collector
+            | NodeKind::Decide { .. }
+            | NodeKind::ParallelBatch { .. }
+            | NodeKind::Subflow { .. }
+            | NodeKind::Call { .. }
+            | NodeKind::Spawn { .. }
+            | NodeKind::Send { .. }
+            | NodeKind::Wait { .. }
+            | NodeKind::Capture { .. }
+            | NodeKind::Kill { .. } => {}
+        }
+    }
+}
+
+impl From<WorkflowNodeType> for NodeKind {
+    fn from(node_type: WorkflowNodeType) -> Self {
+        match node_type {
+            WorkflowNodeType::Task => NodeKind::Task { agent_config: None },
+            WorkflowNodeType::Approval => NodeKind::Approval,
+            WorkflowNodeType::Split => NodeKind::Split,
+            WorkflowNodeType::Collector => NodeKind::Collector,
+            WorkflowNodeType::Decide => NodeKind::Decide {
+                decide_config: DecideConfig::default(),
+            },
+            WorkflowNodeType::ParallelBatch => NodeKind::ParallelBatch {
+                batch_config: BatchConfig::default(),
+            },
+            WorkflowNodeType::Subflow => NodeKind::Subflow {
+                subflow_config: SubflowConfig::default(),
+            },
+            WorkflowNodeType::Call => NodeKind::Call {
+                subflow_config: SubflowConfig::default(),
+            },
+            WorkflowNodeType::Spawn => NodeKind::Spawn {
+                spawn_config: SpawnConfig::default(),
+            },
+            WorkflowNodeType::Send => NodeKind::Send {
+                send_config: SendConfig::default(),
+            },
+            WorkflowNodeType::Wait => NodeKind::Wait {
+                wait_config: WaitConfig::default(),
+            },
+            WorkflowNodeType::Capture => NodeKind::Capture {
+                capture_config: CaptureConfig::default(),
+            },
+            WorkflowNodeType::Kill => NodeKind::Kill {
+                kill_config: KillConfig::default(),
+            },
+            WorkflowNodeType::RunAgent => NodeKind::RunAgent {
+                run_agent_config: RunAgentConfig::default(),
+                agent_config: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowNode {
     pub id: String,
     pub name: String,
-    #[serde(rename = "type")]
-    pub node_type: WorkflowNodeType,
+    /// Workflow schema v3 persists node kind in this exact nested, internally
+    /// tagged shape:
+    /// `{ "id": "...", "name": "...", "kind": { "type": "task", "agentConfig": { ... } }, "agent": "claude", "prompt": "..." }`.
+    /// Variant-specific config fields such as `decideConfig`, `batchConfig`,
+    /// `spawnConfig`, `runAgentConfig`, `captureConfig`, and `killConfig` live
+    /// inside `kind`; common execution/UI fields stay on the node object.
+    pub kind: NodeKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     #[serde(default)]
@@ -606,33 +790,19 @@ pub struct WorkflowNode {
     )]
     pub split_failure_policy: SplitFailurePolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub agent_config: Option<AgentNodeConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continue_session_from: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decide_config: Option<DecideConfig>,
-    #[serde(
-        default,
-        alias = "parallelBatchConfig",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub batch_config: Option<BatchConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub spawn_config: Option<SpawnConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub send_config: Option<SendConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wait_config: Option<WaitConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capture_config: Option<CaptureConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kill_config: Option<KillConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_agent_config: Option<RunAgentConfig>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subflow_config: Option<SubflowConfig>,
+}
+
+impl WorkflowNode {
+    pub fn node_type(&self) -> WorkflowNodeType {
+        self.kind.node_type()
+    }
+
+    pub fn node_type_str(&self) -> &'static str {
+        self.kind.as_str()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -759,25 +929,33 @@ impl<'a> WorkflowGraph<'a> {
 }
 
 pub fn normalize_workflow_value(value: Value) -> anyhow::Result<NormalizedWorkflow> {
+    let mut value = value;
+    let mut notices = Vec::new();
     let version = value
         .get("version")
         .and_then(Value::as_u64)
         .context("workflow version is required")?;
-    anyhow::ensure!(
-        version == 3,
-        "Only workflow version 3 is supported. Received version {}.",
-        version
-    );
+    match version {
+        LEGACY_WORKFLOW_SCHEMA_VERSION => {
+            migrate_workflow_value_v2_to_v3(&mut value)?;
+            notices.push("Migrated workflow schema from version 2 to version 3.".to_string());
+        }
+        version if version == WORKFLOW_SCHEMA_VERSION as u64 => {}
+        version => anyhow::bail!(
+            "Only workflow versions 2 and 3 are supported. Received version {}.",
+            version
+        ),
+    }
     let workflow: WorkflowV3 =
         serde_json::from_value(value).context("failed to deserialize workflow")?;
     Ok(NormalizedWorkflow {
         workflow: ensure_defaults(workflow),
-        notices: Vec::new(),
+        notices,
     })
 }
 
 pub fn ensure_defaults(mut workflow: WorkflowV3) -> WorkflowV3 {
-    workflow.version = 3;
+    workflow.version = WORKFLOW_SCHEMA_VERSION;
     if workflow.limits.max_total_steps == 0 {
         workflow.limits.max_total_steps = default_max_total_steps();
     }
@@ -785,6 +963,149 @@ pub fn ensure_defaults(mut workflow: WorkflowV3) -> WorkflowV3 {
         workflow.limits.max_visits_per_node = default_max_visits_per_node();
     }
     workflow
+}
+
+fn migrate_workflow_value_v2_to_v3(value: &mut Value) -> anyhow::Result<()> {
+    let workflow = value
+        .as_object_mut()
+        .context("workflow must be a JSON object")?;
+    workflow.insert("version".to_string(), Value::from(WORKFLOW_SCHEMA_VERSION));
+
+    migrate_v2_nodes_to_v3_kind(workflow)?;
+
+    if let Some(subflows) = workflow.get_mut("subflows") {
+        let subflows = subflows
+            .as_object_mut()
+            .context("workflow subflows must be a JSON object")?;
+        for (name, subflow) in subflows {
+            let version = subflow
+                .get("version")
+                .and_then(Value::as_u64)
+                .with_context(|| format!("subflow \"{}\" workflow version is required", name))?;
+            if version == LEGACY_WORKFLOW_SCHEMA_VERSION {
+                migrate_workflow_value_v2_to_v3(subflow)
+                    .with_context(|| format!("failed to migrate subflow \"{}\"", name))?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn migrate_v2_nodes_to_v3_kind(workflow: &mut Map<String, Value>) -> anyhow::Result<()> {
+    let Some(nodes) = workflow.get_mut("nodes") else {
+        return Ok(());
+    };
+    let nodes = nodes
+        .as_array_mut()
+        .context("workflow nodes must be a JSON array")?;
+    for node in nodes {
+        migrate_v2_node_to_v3_kind(node)?;
+    }
+    Ok(())
+}
+
+fn migrate_v2_node_to_v3_kind(node: &mut Value) -> anyhow::Result<()> {
+    let node = node
+        .as_object_mut()
+        .context("workflow node must be a JSON object")?;
+    if node.contains_key("kind") {
+        return Ok(());
+    }
+
+    let node_type = node
+        .remove("type")
+        .context("workflow node type is required for version 2 migration")?;
+    let node_type = node_type
+        .as_str()
+        .context("workflow node type must be a string for version 2 migration")?
+        .to_string();
+    let mut kind = Map::new();
+    kind.insert("type".to_string(), Value::String(node_type.clone()));
+
+    match node_type.as_str() {
+        "task" => {
+            move_v2_config_field(node, &mut kind, "agentConfig", "agentConfig");
+        }
+        "approval" | "split" | "collector" => {}
+        "decide" => {
+            move_v2_config_field(node, &mut kind, "decideConfig", "decideConfig");
+        }
+        "parallel_batch" => {
+            move_v2_batch_config_field(node, &mut kind);
+        }
+        "subflow" | "call" => {
+            move_v2_config_field(node, &mut kind, "subflowConfig", "subflowConfig");
+        }
+        "spawn" => {
+            move_v2_config_field(node, &mut kind, "spawnConfig", "spawnConfig");
+        }
+        "send" => {
+            move_v2_config_field(node, &mut kind, "sendConfig", "sendConfig");
+        }
+        "wait" => {
+            move_v2_config_field(node, &mut kind, "waitConfig", "waitConfig");
+        }
+        "capture" => {
+            move_v2_config_field(node, &mut kind, "captureConfig", "captureConfig");
+            if !kind.contains_key("captureConfig") {
+                kind.insert("captureConfig".to_string(), Value::Object(Map::new()));
+            }
+        }
+        "kill" => {
+            move_v2_config_field(node, &mut kind, "killConfig", "killConfig");
+            if !kind.contains_key("killConfig") {
+                kind.insert("killConfig".to_string(), Value::Object(Map::new()));
+            }
+        }
+        "run_agent" => {
+            move_v2_config_field(node, &mut kind, "runAgentConfig", "runAgentConfig");
+            move_v2_config_field(node, &mut kind, "agentConfig", "agentConfig");
+        }
+        _ => {}
+    }
+
+    for field in [
+        "agentConfig",
+        "decideConfig",
+        "batchConfig",
+        "parallelBatchConfig",
+        "subflowConfig",
+        "spawnConfig",
+        "sendConfig",
+        "waitConfig",
+        "captureConfig",
+        "killConfig",
+        "runAgentConfig",
+    ] {
+        node.remove(field);
+    }
+
+    node.insert("kind".to_string(), Value::Object(kind));
+    Ok(())
+}
+
+fn move_v2_config_field(
+    node: &mut Map<String, Value>,
+    kind: &mut Map<String, Value>,
+    from: &str,
+    to: &str,
+) {
+    if let Some(value) = node.remove(from)
+        && !value.is_null()
+    {
+        kind.insert(to.to_string(), value);
+    }
+}
+
+fn move_v2_batch_config_field(node: &mut Map<String, Value>, kind: &mut Map<String, Value>) {
+    if let Some(value) = node
+        .remove("batchConfig")
+        .or_else(|| node.remove("parallelBatchConfig"))
+        && !value.is_null()
+    {
+        kind.insert("batchConfig".to_string(), value);
+    }
 }
 
 pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
@@ -855,26 +1176,6 @@ fn validate_graph_body(
             });
         }
 
-        if node.node_type == WorkflowNodeType::Task
-            && node.agent.as_deref().unwrap_or("").is_empty()
-        {
-            issues.push(ValidationIssue {
-                severity: "error".to_string(),
-                node_id: Some(node.id.clone()),
-                message: format!("\"{}\" has no agent assigned.", node.name),
-            });
-        }
-
-        if node.node_type == WorkflowNodeType::Task && node.prompt.trim().is_empty() {
-            issues.push(ValidationIssue {
-                severity: "warning".to_string(),
-                node_id: Some(node.id.clone()),
-                message: format!("\"{}\" has an empty prompt.", node.name),
-            });
-        }
-
-        validate_tmux_node_config(node, issues);
-
         if node.output_schema.is_some() && node.response_format != Some(ResponseFormat::Json) {
             issues.push(ValidationIssue {
                 severity: "warning".to_string(),
@@ -910,18 +1211,124 @@ fn validate_graph_body(
             .filter(|edge| edge.outcome == WorkflowEdgeOutcome::Reject)
             .count();
 
-        if node.node_type == WorkflowNodeType::Decide {
-            validate_decide_node_config(node, outgoing, issues);
-        }
-        if node.node_type == WorkflowNodeType::ParallelBatch {
-            validate_batch_node_config(node, &graph, issues);
-        }
-        if is_subflow_node_type(&node.node_type) {
-            validate_subflow_node_config(node, subflows, issues);
+        match &node.kind {
+            NodeKind::Task { .. } => {
+                if node.agent.as_deref().unwrap_or("").is_empty() {
+                    issues.push(ValidationIssue {
+                        severity: "error".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!("\"{}\" has no agent assigned.", node.name),
+                    });
+                }
+
+                if node.prompt.trim().is_empty() {
+                    issues.push(ValidationIssue {
+                        severity: "warning".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!("\"{}\" has an empty prompt.", node.name),
+                    });
+                }
+            }
+            NodeKind::Decide { decide_config } => {
+                validate_decide_node_config(node, decide_config, outgoing, issues);
+            }
+            NodeKind::ParallelBatch { batch_config } => {
+                validate_batch_node_config(node, batch_config, &graph, issues);
+            }
+            NodeKind::Subflow { subflow_config } | NodeKind::Call { subflow_config } => {
+                validate_subflow_node_config(node, subflow_config, subflows, issues);
+            }
+            NodeKind::Spawn { spawn_config } => {
+                let has_agent = spawn_config
+                    .agent
+                    .as_deref()
+                    .or(node.agent.as_deref())
+                    .is_some_and(|agent| !agent.trim().is_empty());
+                let has_command = spawn_config
+                    .command
+                    .as_deref()
+                    .is_some_and(|command| !command.trim().is_empty());
+                if !has_agent && !has_command {
+                    issues.push(ValidationIssue {
+                        severity: "error".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!(
+                            "\"{}\" spawn node requires an agent or command.",
+                            node.name
+                        ),
+                    });
+                }
+            }
+            NodeKind::Send { send_config } => {
+                let text = if send_config.text.is_empty() {
+                    node.prompt.as_str()
+                } else {
+                    send_config.text.as_str()
+                };
+                if text.trim().is_empty() && node.prompt.trim().is_empty() {
+                    issues.push(ValidationIssue {
+                        severity: "error".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!("\"{}\" send node requires text or prompt.", node.name),
+                    });
+                }
+            }
+            NodeKind::Wait { wait_config } => {
+                validate_wait_timing_and_marker(
+                    &node.id,
+                    &node.name,
+                    wait_config.marker.as_deref(),
+                    wait_config.mode == WaitMode::Until,
+                    wait_config.idle_seconds,
+                    wait_config.ready_stable_seconds,
+                    issues,
+                );
+            }
+            NodeKind::RunAgent {
+                run_agent_config, ..
+            } => {
+                let has_agent = run_agent_config
+                    .agent
+                    .as_deref()
+                    .or(node.agent.as_deref())
+                    .is_some_and(|agent| !agent.trim().is_empty());
+                if !has_agent {
+                    issues.push(ValidationIssue {
+                        severity: "error".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!("\"{}\" run_agent node requires an agent.", node.name),
+                    });
+                }
+                let prompt = run_agent_config
+                    .prompt
+                    .as_deref()
+                    .unwrap_or(node.prompt.as_str());
+                if prompt.trim().is_empty() {
+                    issues.push(ValidationIssue {
+                        severity: "warning".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!("\"{}\" run_agent node has an empty prompt.", node.name),
+                    });
+                }
+                validate_wait_timing_and_marker(
+                    &node.id,
+                    &node.name,
+                    run_agent_config.until.as_deref(),
+                    false,
+                    run_agent_config.idle_seconds,
+                    run_agent_config.ready_stable_seconds,
+                    issues,
+                );
+            }
+            NodeKind::Approval
+            | NodeKind::Split
+            | NodeKind::Collector
+            | NodeKind::Capture { .. }
+            | NodeKind::Kill { .. } => {}
         }
 
         if success_edges > 1 {
-            if node.node_type != WorkflowNodeType::Split {
+            if !matches!(&node.kind, NodeKind::Split) {
                 issues.push(ValidationIssue {
                     severity: "error".to_string(),
                     node_id: Some(node.id.clone()),
@@ -943,7 +1350,7 @@ fn validate_graph_body(
                 message: format!("\"{}\" mixes branch and loop control edges.", node.name),
             });
         }
-        if node.node_type == WorkflowNodeType::Approval && branch_edges > 0 {
+        if matches!(&node.kind, NodeKind::Approval) && branch_edges > 0 {
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
@@ -990,27 +1397,26 @@ fn validate_graph_body(
             });
         }
 
-        if matches!(
-            node.node_type,
-            WorkflowNodeType::Split | WorkflowNodeType::Collector
-        ) && has_task_execution_config(node)
+        if matches!(&node.kind, NodeKind::Split | NodeKind::Collector)
+            && has_task_execution_config(node)
         {
+            let kind_label = if matches!(&node.kind, NodeKind::Split) {
+                "split"
+            } else {
+                "collector"
+            };
             issues.push(ValidationIssue {
                 severity: "warning".to_string(),
                 node_id: Some(node.id.clone()),
                 message: format!(
                     "\"{}\" is a {} node, so task execution fields are ignored.",
                     node.name,
-                    match node.node_type {
-                        WorkflowNodeType::Split => "split",
-                        WorkflowNodeType::Collector => "collector",
-                        _ => unreachable!(),
-                    }
+                    kind_label
                 ),
             });
         }
 
-        if node.node_type == WorkflowNodeType::Split {
+        if matches!(&node.kind, NodeKind::Split) {
             if branch_edges > 0 || loop_edges > 0 || reject_edges > 0 {
                 issues.push(ValidationIssue {
                     severity: "error".to_string(),
@@ -1036,7 +1442,7 @@ fn validate_graph_body(
             }
         }
 
-        if node.node_type == WorkflowNodeType::Collector {
+        if matches!(&node.kind, NodeKind::Collector) {
             if inbound.is_empty() {
                 issues.push(ValidationIssue {
                     severity: "error".to_string(),
@@ -1086,8 +1492,8 @@ fn validate_graph_body(
             if let Some(source_node) = graph.node_map.get(source_id.as_str()) {
                 // Must be a node type that can produce an agent session id.
                 if !matches!(
-                    source_node.node_type,
-                    WorkflowNodeType::Task | WorkflowNodeType::RunAgent
+                    &source_node.kind,
+                    NodeKind::Task { .. } | NodeKind::RunAgent { .. }
                 ) {
                     issues.push(ValidationIssue {
                         severity: "error".to_string(),
@@ -1258,10 +1664,7 @@ fn validate_wait_timing_and_marker(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node_id.to_string()),
-                message: format!(
-                    "\"{}\" has invalid wait marker regex: {}",
-                    node_name, error
-                ),
+                message: format!("\"{}\" has invalid wait marker regex: {}", node_name, error),
             });
         }
     }
@@ -1283,108 +1686,6 @@ fn validate_wait_timing_and_marker(
             });
         }
     }
-}
-
-fn validate_tmux_node_config(node: &WorkflowNode, issues: &mut Vec<ValidationIssue>) {
-    match &node.node_type {
-        WorkflowNodeType::Spawn => {
-            let config = node.spawn_config.as_ref();
-            let has_agent = config
-                .and_then(|cfg| cfg.agent.as_deref())
-                .or(node.agent.as_deref())
-                .is_some_and(|agent| !agent.trim().is_empty());
-            let has_command = config
-                .and_then(|cfg| cfg.command.as_deref())
-                .is_some_and(|command| !command.trim().is_empty());
-            if !has_agent && !has_command {
-                issues.push(ValidationIssue {
-                    severity: "error".to_string(),
-                    node_id: Some(node.id.clone()),
-                    message: format!("\"{}\" spawn node requires an agent or command.", node.name),
-                });
-            }
-        }
-        WorkflowNodeType::Send => {
-            let text = node
-                .send_config
-                .as_ref()
-                .map(|cfg| cfg.text.as_str())
-                .unwrap_or(node.prompt.as_str());
-            if text.trim().is_empty() && node.prompt.trim().is_empty() {
-                issues.push(ValidationIssue {
-                    severity: "error".to_string(),
-                    node_id: Some(node.id.clone()),
-                    message: format!("\"{}\" send node requires text or prompt.", node.name),
-                });
-            }
-        }
-        WorkflowNodeType::Wait => {
-            let config = node.wait_config.as_ref();
-            validate_wait_timing_and_marker(
-                &node.id,
-                &node.name,
-                config.and_then(|cfg| cfg.marker.as_deref()),
-                config.is_some_and(|cfg| cfg.mode == WaitMode::Until),
-                config.and_then(|cfg| cfg.idle_seconds),
-                config.and_then(|cfg| cfg.ready_stable_seconds),
-                issues,
-            );
-        }
-        WorkflowNodeType::RunAgent => {
-            let has_agent = node
-                .run_agent_config
-                .as_ref()
-                .and_then(|cfg| cfg.agent.as_deref())
-                .or(node.agent.as_deref())
-                .is_some_and(|agent| !agent.trim().is_empty());
-            if !has_agent {
-                issues.push(ValidationIssue {
-                    severity: "error".to_string(),
-                    node_id: Some(node.id.clone()),
-                    message: format!("\"{}\" run_agent node requires an agent.", node.name),
-                });
-            }
-            let prompt = node
-                .run_agent_config
-                .as_ref()
-                .and_then(|cfg| cfg.prompt.as_deref())
-                .unwrap_or(node.prompt.as_str());
-            if prompt.trim().is_empty() {
-                issues.push(ValidationIssue {
-                    severity: "warning".to_string(),
-                    node_id: Some(node.id.clone()),
-                    message: format!("\"{}\" run_agent node has an empty prompt.", node.name),
-                });
-            }
-            let config = node.run_agent_config.as_ref();
-            validate_wait_timing_and_marker(
-                &node.id,
-                &node.name,
-                config.and_then(|cfg| cfg.until.as_deref()),
-                false,
-                config.and_then(|cfg| cfg.idle_seconds),
-                config.and_then(|cfg| cfg.ready_stable_seconds),
-                issues,
-            );
-        }
-        WorkflowNodeType::Task
-        | WorkflowNodeType::Approval
-        | WorkflowNodeType::Split
-        | WorkflowNodeType::Collector
-        | WorkflowNodeType::Decide
-        | WorkflowNodeType::ParallelBatch
-        | WorkflowNodeType::Subflow
-        | WorkflowNodeType::Call
-        | WorkflowNodeType::Capture
-        | WorkflowNodeType::Kill => {}
-    }
-}
-
-fn is_subflow_node_type(node_type: &WorkflowNodeType) -> bool {
-    matches!(
-        node_type,
-        WorkflowNodeType::Subflow | WorkflowNodeType::Call
-    )
 }
 
 fn validate_subflow_catalog(workflow: &WorkflowV3, issues: &mut Vec<ValidationIssue>) {
@@ -1412,22 +1713,10 @@ fn validate_subflow_catalog(workflow: &WorkflowV3, issues: &mut Vec<ValidationIs
 
 fn validate_subflow_node_config(
     node: &WorkflowNode,
+    config: &SubflowConfig,
     subflows: &BTreeMap<String, Box<WorkflowV3>>,
     issues: &mut Vec<ValidationIssue>,
 ) {
-    let Some(config) = node.subflow_config.as_ref() else {
-        issues.push(ValidationIssue {
-            severity: "error".to_string(),
-            node_id: Some(node.id.clone()),
-            message: format!(
-                "\"{}\" {} node requires subflowConfig.",
-                node.name,
-                node.node_type.as_str()
-            ),
-        });
-        return;
-    };
-
     let workflow_name = config.workflow_name.trim();
     if workflow_name.is_empty() {
         issues.push(ValidationIssue {
@@ -1436,7 +1725,7 @@ fn validate_subflow_node_config(
             message: format!(
                 "\"{}\" {} node requires subflowConfig.workflowName.",
                 node.name,
-                node.node_type.as_str()
+                node.node_type_str()
             ),
         });
         return;
@@ -1617,11 +1906,22 @@ fn collect_subflow_calls(
     graph: &mut BTreeMap<String, Vec<(String, String, u32)>>,
 ) {
     for node in &workflow.nodes {
-        if !is_subflow_node_type(&node.node_type) {
-            continue;
-        }
-        let Some(config) = node.subflow_config.as_ref() else {
-            continue;
+        let config = match &node.kind {
+            NodeKind::Subflow { subflow_config } | NodeKind::Call { subflow_config } => {
+                subflow_config
+            }
+            NodeKind::Task { .. }
+            | NodeKind::Approval
+            | NodeKind::Split
+            | NodeKind::Collector
+            | NodeKind::Decide { .. }
+            | NodeKind::ParallelBatch { .. }
+            | NodeKind::Spawn { .. }
+            | NodeKind::Send { .. }
+            | NodeKind::Wait { .. }
+            | NodeKind::Capture { .. }
+            | NodeKind::Kill { .. }
+            | NodeKind::RunAgent { .. } => continue,
         };
         let callee = config.workflow_name.trim();
         if callee.is_empty() {
@@ -1670,18 +1970,10 @@ fn detect_subflow_cycle(
 
 fn validate_decide_node_config(
     node: &WorkflowNode,
+    config: &DecideConfig,
     outgoing: &[&WorkflowEdge],
     issues: &mut Vec<ValidationIssue>,
 ) {
-    let Some(config) = &node.decide_config else {
-        issues.push(ValidationIssue {
-            severity: "error".to_string(),
-            node_id: Some(node.id.clone()),
-            message: format!("\"{}\" decide node requires decideConfig.", node.name),
-        });
-        return;
-    };
-
     if config.prompt.trim().is_empty() {
         issues.push(ValidationIssue {
             severity: "warning".to_string(),
@@ -1797,21 +2089,10 @@ fn validate_decide_node_config(
 
 fn validate_batch_node_config(
     node: &WorkflowNode,
+    config: &BatchConfig,
     graph: &WorkflowGraph<'_>,
     issues: &mut Vec<ValidationIssue>,
 ) {
-    let Some(config) = &node.batch_config else {
-        issues.push(ValidationIssue {
-            severity: "error".to_string(),
-            node_id: Some(node.id.clone()),
-            message: format!(
-                "\"{}\" parallel_batch node requires batchConfig.",
-                node.name
-            ),
-        });
-        return;
-    };
-
     if config.items_binding.trim().is_empty() {
         issues.push(ValidationIssue {
             severity: "error".to_string(),
@@ -1883,11 +2164,8 @@ fn has_task_execution_config(node: &WorkflowNode) -> bool {
         || node.skip_condition.is_some()
         || node.loop_max_iterations.is_some()
         || node.loop_condition.is_some()
-        || node.agent_config.is_some()
+        || node.kind.agent_config().is_some()
         || node.cwd.is_some()
-        || node.decide_config.is_some()
-        || node.batch_config.is_some()
-        || node.subflow_config.is_some()
 }
 
 pub fn compute_graph_metadata(workflow: &WorkflowV3) -> GraphMetadata {
@@ -2008,7 +2286,7 @@ mod tests {
         WorkflowNode {
             id: id.to_string(),
             name: name.to_string(),
-            node_type,
+            kind: node_type.into(),
             agent: None,
             prompt: String::new(),
             context_sources: Vec::new(),
@@ -2021,18 +2299,8 @@ mod tests {
             loop_max_iterations: None,
             loop_condition: None,
             split_failure_policy: SplitFailurePolicy::BestEffortContinue,
-            agent_config: None,
             cwd: None,
             continue_session_from: None,
-            decide_config: None,
-            batch_config: None,
-            spawn_config: None,
-            send_config: None,
-            wait_config: None,
-            capture_config: None,
-            kill_config: None,
-            run_agent_config: None,
-            subflow_config: None,
         }
     }
 
@@ -2148,9 +2416,11 @@ mod tests {
             });
             validate_workflow(workflow)
         };
-        assert!(blank_token.issues.iter().any(|issue| {
-            issue.severity == "error" && issue.message.contains("blank tokens")
-        }));
+        assert!(
+            blank_token.issues.iter().any(|issue| {
+                issue.severity == "error" && issue.message.contains("blank tokens")
+            })
+        );
 
         let whitespace_token = {
             let mut workflow = workflow(Vec::new(), Vec::new(), "missing");
@@ -2160,9 +2430,11 @@ mod tests {
             });
             validate_workflow(workflow)
         };
-        assert!(whitespace_token.issues.iter().any(|issue| {
-            issue.severity == "error" && issue.message.contains("blank tokens")
-        }));
+        assert!(
+            whitespace_token.issues.iter().any(|issue| {
+                issue.severity == "error" && issue.message.contains("blank tokens")
+            })
+        );
 
         let empty_user = {
             let mut workflow = workflow(Vec::new(), Vec::new(), "missing");
@@ -2333,13 +2605,13 @@ mod tests {
             },
         );
         let mut n = node("n1", "N1", WorkflowNodeType::Task);
-        n.agent_config = Some(AgentNodeConfig {
+        n.kind.set_agent_config(Some(AgentNodeConfig {
             base: AgentDefaults {
                 model: Some("sonnet".to_string()),
                 ..Default::default()
             },
             ..Default::default()
-        });
+        }));
         n.cwd = Some("/custom".to_string());
         let config = resolve_agent_config(&defaults, "/work", "claude", &n, None, false, None);
         // Node override wins for model
@@ -2381,9 +2653,9 @@ mod tests {
             "nodes": [{
                 "id": "n1",
                 "name": "Step 1",
-                "type": "task",
                 "agent": "claude",
-                "prompt": "hello"
+                "prompt": "hello",
+                "kind": { "type": "task" }
             }],
             "edges": []
         });
@@ -2391,8 +2663,665 @@ mod tests {
         assert!(result.is_ok());
         let w = result.unwrap().workflow;
         assert!(w.agent_defaults.is_empty());
-        assert!(w.nodes[0].agent_config.is_none());
+        assert!(w.nodes[0].kind.agent_config().is_none());
         assert!(w.nodes[0].cwd.is_none());
+    }
+
+    #[test]
+    fn v2_flat_node_shape_migrates_to_v3_nested_kind() {
+        let json = json!({
+            "version": 2,
+            "goal": "test",
+            "cwd": "/tmp",
+            "useOrchestrator": false,
+            "entryNodeId": "decide",
+            "variables": [],
+            "limits": { "maxTotalSteps": 10, "maxVisitsPerNode": 5 },
+            "nodes": [{
+                "id": "decide",
+                "name": "Pick",
+                "type": "decide",
+                "decideConfig": {
+                    "prompt": "Pick one",
+                    "outcomes": ["yes"]
+                }
+            }],
+            "edges": []
+        });
+
+        let normalized = normalize_workflow_value(json).unwrap();
+
+        assert_eq!(normalized.workflow.version, 3);
+        assert!(normalized.notices.iter().any(|notice| {
+            notice.contains("Migrated workflow schema from version 2 to version 3")
+        }));
+        assert!(matches!(
+            &normalized.workflow.nodes[0].kind,
+            NodeKind::Decide { decide_config }
+                if decide_config.outcomes == vec!["yes".to_string()]
+        ));
+    }
+
+    #[test]
+    fn capture_config_presence_is_structural() {
+        let json = json!({
+            "version": 3,
+            "goal": "test",
+            "cwd": "/tmp",
+            "useOrchestrator": false,
+            "entryNodeId": "capture",
+            "variables": [],
+            "limits": { "maxTotalSteps": 10, "maxVisitsPerNode": 5 },
+            "nodes": [{
+                "id": "capture",
+                "name": "Capture",
+                "kind": { "type": "capture" }
+            }],
+            "edges": []
+        });
+
+        let error = normalize_workflow_value(json).unwrap_err();
+        assert!(error.to_string().contains("failed to deserialize workflow"));
+    }
+
+    // -----------------------------------------------------------------------
+    // T7: NodeKind round-trip and v2→v3 migration tests
+    // -----------------------------------------------------------------------
+
+    /// Confirm that every NodeKind variant serializes to the internally-tagged
+    /// `{ "type": "<snake_case>", <variantConfig> }` form and deserializes back
+    /// to the identical value.
+    #[test]
+    fn node_kind_round_trip_all_variants() {
+        let variants: Vec<NodeKind> = vec![
+            NodeKind::Task { agent_config: None },
+            NodeKind::Approval,
+            NodeKind::Split,
+            NodeKind::Collector,
+            NodeKind::Decide {
+                decide_config: DecideConfig {
+                    prompt: "Pick one".to_string(),
+                    outcomes: vec!["yes".to_string(), "no".to_string()],
+                    model: Some("claude-haiku-4-5".to_string()),
+                    inputs: vec![InputBinding {
+                        name: "ctx".to_string(),
+                        source: "n0".to_string(),
+                    }],
+                },
+            },
+            NodeKind::ParallelBatch {
+                batch_config: BatchConfig {
+                    items_binding: "items".to_string(),
+                    max_concurrent: 4,
+                    item_var: "item".to_string(),
+                    body_entry: "body".to_string(),
+                    collector_var: Some("results".to_string()),
+                },
+            },
+            NodeKind::Subflow {
+                subflow_config: SubflowConfig {
+                    workflow_name: "child".to_string(),
+                    exit_node_id: Some("exit".to_string()),
+                    inputs: vec![InputBinding {
+                        name: "x".to_string(),
+                        source: "src".to_string(),
+                    }],
+                    max_depth: 5,
+                },
+            },
+            NodeKind::Call {
+                subflow_config: SubflowConfig {
+                    workflow_name: "sub".to_string(),
+                    exit_node_id: None,
+                    inputs: Vec::new(),
+                    max_depth: default_max_call_depth(),
+                },
+            },
+            NodeKind::Spawn {
+                spawn_config: SpawnConfig {
+                    agent: Some("claude".to_string()),
+                    command: None,
+                    access: None,
+                    extra_args: Vec::new(),
+                    cwd: Some("/tmp".to_string()),
+                    name: None,
+                    session_name: Some("my-session".to_string()),
+                },
+            },
+            NodeKind::Send {
+                send_config: SendConfig {
+                    target: Some("session-1".to_string()),
+                    text: "hello".to_string(),
+                    enter: true,
+                },
+            },
+            NodeKind::Wait {
+                wait_config: WaitConfig {
+                    target: Some("session-1".to_string()),
+                    mode: WaitMode::Until,
+                    marker: Some("DONE".to_string()),
+                    timeout: Some(30),
+                    idle_seconds: None,
+                    ready_stable_seconds: None,
+                },
+            },
+            NodeKind::Capture {
+                capture_config: CaptureConfig {
+                    target: Some("session-1".to_string()),
+                    lines: Some(50),
+                    all: false,
+                    ansi: true,
+                },
+            },
+            NodeKind::Kill {
+                kill_config: KillConfig {
+                    target: Some("session-1".to_string()),
+                    session_name: None,
+                },
+            },
+            NodeKind::RunAgent {
+                run_agent_config: RunAgentConfig {
+                    agent: Some("claude".to_string()),
+                    prompt: Some("Do a thing".to_string()),
+                    cwd: None,
+                    access: None,
+                    extra_args: Vec::new(),
+                    name: None,
+                    timeout: Some(60),
+                    idle_seconds: Some(5.0),
+                    ready_stable_seconds: None,
+                    until: Some("DONE".to_string()),
+                    kill_after: true,
+                },
+                agent_config: None,
+            },
+        ];
+
+        for kind in &variants {
+            let serialized = serde_json::to_value(kind)
+                .unwrap_or_else(|e| panic!("failed to serialize {:?}: {}", kind.as_str(), e));
+
+            // The internally-tagged form must have a "type" field at the top level.
+            assert!(
+                serialized.get("type").is_some(),
+                "serialized NodeKind::{} missing top-level \"type\" field: {}",
+                kind.as_str(),
+                serialized
+            );
+            assert_eq!(
+                serialized["type"].as_str().unwrap(),
+                kind.as_str(),
+                "NodeKind::{} \"type\" field mismatch",
+                kind.as_str()
+            );
+
+            let deserialized: NodeKind = serde_json::from_value(serialized.clone())
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "failed to deserialize NodeKind::{} from {}: {}",
+                        kind.as_str(),
+                        serialized,
+                        e
+                    )
+                });
+
+            assert_eq!(
+                kind, &deserialized,
+                "round-trip mismatch for NodeKind::{}",
+                kind.as_str()
+            );
+        }
+    }
+
+    /// Confirm a `WorkflowNode` with a nested `kind` serializes and deserializes
+    /// correctly, with config fields living inside `kind` and common fields at
+    /// the node level.
+    #[test]
+    fn workflow_node_round_trip_task_and_decide() {
+        // Task node: kind.type = "task", agent/prompt at node level
+        let task_node = WorkflowNode {
+            id: "t1".to_string(),
+            name: "My Task".to_string(),
+            kind: NodeKind::Task {
+                agent_config: Some(AgentNodeConfig {
+                    base: AgentDefaults {
+                        model: Some("claude-sonnet".to_string()),
+                        max_turns: Some(10),
+                        ..Default::default()
+                    },
+                    allowed_tools: Some(vec!["Bash".to_string()]),
+                    disallowed_tools: None,
+                }),
+            },
+            agent: Some("claude".to_string()),
+            prompt: "Do something".to_string(),
+            context_sources: Vec::new(),
+            response_format: Some(ResponseFormat::Json),
+            output_schema: None,
+            retry_count: Some(2),
+            retry_delay: None,
+            timeout: Some(120),
+            skip_condition: None,
+            loop_max_iterations: None,
+            loop_condition: None,
+            split_failure_policy: SplitFailurePolicy::BestEffortContinue,
+            cwd: Some("/work".to_string()),
+            continue_session_from: None,
+        };
+
+        let serialized = serde_json::to_value(&task_node).expect("task node serialization failed");
+
+        // Config fields must live inside `kind`, NOT at the top level.
+        assert!(
+            serialized.get("kind").is_some(),
+            "serialized WorkflowNode missing \"kind\" field"
+        );
+        assert_eq!(serialized["kind"]["type"], "task");
+        assert!(
+            serialized["kind"].get("agentConfig").is_some(),
+            "agentConfig should be inside kind"
+        );
+        // Common fields remain at node level.
+        assert_eq!(serialized["agent"], "claude");
+        assert_eq!(serialized["prompt"], "Do something");
+        assert_eq!(serialized["responseFormat"], "json");
+
+        let deserialized: WorkflowNode =
+            serde_json::from_value(serialized).expect("task node deserialization failed");
+        assert_eq!(task_node, deserialized);
+
+        // Decide node: kind.type = "decide", decideConfig inside kind
+        let decide_node = WorkflowNode {
+            id: "d1".to_string(),
+            name: "Route".to_string(),
+            kind: NodeKind::Decide {
+                decide_config: DecideConfig {
+                    prompt: "Go left or right?".to_string(),
+                    outcomes: vec!["left".to_string(), "right".to_string()],
+                    model: None,
+                    inputs: Vec::new(),
+                },
+            },
+            agent: None,
+            prompt: String::new(),
+            context_sources: Vec::new(),
+            response_format: None,
+            output_schema: None,
+            retry_count: None,
+            retry_delay: None,
+            timeout: None,
+            skip_condition: None,
+            loop_max_iterations: None,
+            loop_condition: None,
+            split_failure_policy: SplitFailurePolicy::BestEffortContinue,
+            cwd: None,
+            continue_session_from: None,
+        };
+
+        let serialized =
+            serde_json::to_value(&decide_node).expect("decide node serialization failed");
+        assert_eq!(serialized["kind"]["type"], "decide");
+        assert!(
+            serialized["kind"].get("decideConfig").is_some(),
+            "decideConfig should be inside kind, got: {}",
+            serialized["kind"]
+        );
+        // decideConfig must NOT be at the top level.
+        assert!(
+            serialized.get("decideConfig").is_none(),
+            "decideConfig leaked to node top level"
+        );
+
+        let deserialized: WorkflowNode =
+            serde_json::from_value(serialized).expect("decide node deserialization failed");
+        assert_eq!(decide_node, deserialized);
+    }
+
+    /// Confirm a complete v2-style workflow (flat `type`+`decideConfig` shape at node
+    /// level) loads via the migration path and produces a valid v3 `WorkflowV3` with
+    /// the nested `kind` shape.  All node types that carried per-kind config in v2 are
+    /// exercised here.
+    #[test]
+    fn v2_to_v3_migration_all_config_carrying_node_types() {
+        let json = json!({
+            "version": 2,
+            "goal": "migration test",
+            "cwd": "/tmp",
+            "useOrchestrator": false,
+            "entryNodeId": "task1",
+            "variables": [],
+            "limits": { "maxTotalSteps": 50, "maxVisitsPerNode": 10 },
+            "nodes": [
+                // Task with agentConfig at top level (v2 flat form)
+                {
+                    "id": "task1",
+                    "name": "Task",
+                    "type": "task",
+                    "agent": "claude",
+                    "prompt": "Do a task",
+                    "agentConfig": { "model": "claude-opus" }
+                },
+                // Decide
+                {
+                    "id": "decide1",
+                    "name": "Decide",
+                    "type": "decide",
+                    "decideConfig": {
+                        "prompt": "Which way?",
+                        "outcomes": ["a", "b"]
+                    }
+                },
+                // Subflow
+                {
+                    "id": "sub1",
+                    "name": "Subflow",
+                    "type": "subflow",
+                    "subflowConfig": { "workflowName": "child" }
+                },
+                // Spawn
+                {
+                    "id": "spawn1",
+                    "name": "Spawn",
+                    "type": "spawn",
+                    "spawnConfig": { "agent": "claude", "sessionName": "sess" }
+                },
+                // Capture
+                {
+                    "id": "cap1",
+                    "name": "Capture",
+                    "type": "capture",
+                    "captureConfig": { "all": true }
+                },
+                // Kill
+                {
+                    "id": "kill1",
+                    "name": "Kill",
+                    "type": "kill",
+                    "killConfig": { "target": "sess" }
+                },
+                // RunAgent
+                {
+                    "id": "run1",
+                    "name": "RunAgent",
+                    "type": "run_agent",
+                    "agent": "echo",
+                    "prompt": "run",
+                    "runAgentConfig": { "agent": "echo" }
+                },
+                // Nodes without extra config fields (v2 simple types)
+                { "id": "approval1", "name": "Approval", "type": "approval" },
+                { "id": "split1",    "name": "Split",    "type": "split"    },
+                { "id": "collector1","name": "Collector","type": "collector" },
+                { "id": "wait1",     "name": "Wait",     "type": "wait",
+                  "waitConfig": { "mode": "idle" } }
+            ],
+            "edges": []
+        });
+
+        let normalized = normalize_workflow_value(json).expect("migration must succeed");
+
+        // Schema bumped to 3
+        assert_eq!(
+            normalized.workflow.version, 3,
+            "migrated workflow must be version 3"
+        );
+        assert!(
+            normalized
+                .notices
+                .iter()
+                .any(|n| n.contains("Migrated workflow schema from version 2 to version 3")),
+            "expected migration notice, got: {:?}",
+            normalized.notices
+        );
+
+        let nodes_by_id: std::collections::HashMap<&str, &WorkflowNode> = normalized
+            .workflow
+            .nodes
+            .iter()
+            .map(|n| (n.id.as_str(), n))
+            .collect();
+
+        // task1: kind.type == "task", agentConfig is inside kind
+        let task = nodes_by_id["task1"];
+        assert!(
+            matches!(&task.kind, NodeKind::Task { agent_config: Some(_) }),
+            "task1.kind should be Task with agentConfig, got {:?}",
+            task.kind.as_str()
+        );
+
+        // decide1: kind.type == "decide", decideConfig inside kind
+        let decide = nodes_by_id["decide1"];
+        assert!(
+            matches!(
+                &decide.kind,
+                NodeKind::Decide { decide_config }
+                    if decide_config.outcomes == vec!["a".to_string(), "b".to_string()]
+            ),
+            "decide1.kind should be Decide with outcomes [a,b]"
+        );
+
+        // sub1: kind.type == "subflow"
+        let sub = nodes_by_id["sub1"];
+        assert!(
+            matches!(
+                &sub.kind,
+                NodeKind::Subflow { subflow_config }
+                    if subflow_config.workflow_name == "child"
+            ),
+            "sub1.kind should be Subflow with workflowName=\"child\""
+        );
+
+        // spawn1: kind.type == "spawn", spawnConfig inside kind
+        let spawn = nodes_by_id["spawn1"];
+        assert!(
+            matches!(
+                &spawn.kind,
+                NodeKind::Spawn { spawn_config }
+                    if spawn_config.session_name.as_deref() == Some("sess")
+            ),
+            "spawn1.kind should be Spawn with sessionName=\"sess\""
+        );
+
+        // cap1: kind.type == "capture", captureConfig inside kind (presence is structural)
+        let cap = nodes_by_id["cap1"];
+        assert!(
+            matches!(
+                &cap.kind,
+                NodeKind::Capture { capture_config }
+                    if capture_config.all
+            ),
+            "cap1.kind should be Capture with all=true"
+        );
+
+        // kill1: kind.type == "kill", killConfig inside kind
+        let kill = nodes_by_id["kill1"];
+        assert!(
+            matches!(
+                &kill.kind,
+                NodeKind::Kill { kill_config }
+                    if kill_config.target.as_deref() == Some("sess")
+            ),
+            "kill1.kind should be Kill with target=\"sess\""
+        );
+
+        // run1: kind.type == "run_agent"
+        let run = nodes_by_id["run1"];
+        assert!(
+            matches!(&run.kind, NodeKind::RunAgent { .. }),
+            "run1.kind should be RunAgent"
+        );
+
+        // approval1, split1, collector1: no config fields
+        assert!(matches!(&nodes_by_id["approval1"].kind, NodeKind::Approval));
+        assert!(matches!(&nodes_by_id["split1"].kind, NodeKind::Split));
+        assert!(matches!(&nodes_by_id["collector1"].kind, NodeKind::Collector));
+
+        // wait1: kind.type == "wait"
+        assert!(matches!(
+            &nodes_by_id["wait1"].kind,
+            NodeKind::Wait { .. }
+        ));
+
+        // No legacy `type` / flat config fields should appear on the re-serialized node.
+        for node in &normalized.workflow.nodes {
+            let serialized = serde_json::to_value(node).expect("node serialization must succeed");
+            assert!(
+                serialized.get("type").is_none(),
+                "node \"{}\" has a top-level \"type\" field (v2 leak): {}",
+                node.id,
+                serialized
+            );
+            for legacy_field in &[
+                "decideConfig",
+                "batchConfig",
+                "parallelBatchConfig",
+                "subflowConfig",
+                "spawnConfig",
+                "sendConfig",
+                "waitConfig",
+                "captureConfig",
+                "killConfig",
+                "runAgentConfig",
+            ] {
+                assert!(
+                    serialized.get(legacy_field).is_none(),
+                    "node \"{}\" has top-level legacy field \"{}\" (v2 leak): {}",
+                    node.id,
+                    legacy_field,
+                    serialized
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn v2_to_v3_migration_capture_kill_without_config() {
+        let cases = [
+            (
+                "capture-missing-config",
+                json!({
+                    "id": "cap1",
+                    "name": "Capture",
+                    "type": "capture"
+                }),
+                NodeKind::Capture {
+                    capture_config: CaptureConfig::default(),
+                },
+            ),
+            (
+                "capture-null-config",
+                json!({
+                    "id": "cap2",
+                    "name": "Capture",
+                    "type": "capture",
+                    "captureConfig": null
+                }),
+                NodeKind::Capture {
+                    capture_config: CaptureConfig::default(),
+                },
+            ),
+            (
+                "capture-empty-config",
+                json!({
+                    "id": "cap3",
+                    "name": "Capture",
+                    "type": "capture",
+                    "captureConfig": {}
+                }),
+                NodeKind::Capture {
+                    capture_config: CaptureConfig::default(),
+                },
+            ),
+            (
+                "kill-missing-config",
+                json!({
+                    "id": "kill1",
+                    "name": "Kill",
+                    "type": "kill"
+                }),
+                NodeKind::Kill {
+                    kill_config: KillConfig::default(),
+                },
+            ),
+            (
+                "kill-null-config",
+                json!({
+                    "id": "kill2",
+                    "name": "Kill",
+                    "type": "kill",
+                    "killConfig": null
+                }),
+                NodeKind::Kill {
+                    kill_config: KillConfig::default(),
+                },
+            ),
+            (
+                "kill-empty-config",
+                json!({
+                    "id": "kill3",
+                    "name": "Kill",
+                    "type": "kill",
+                    "killConfig": {}
+                }),
+                NodeKind::Kill {
+                    kill_config: KillConfig::default(),
+                },
+            ),
+        ];
+
+        for (case_name, node_json, expected_kind) in cases {
+            let json = json!({
+                "version": 2,
+                "goal": "capture/kill migration test",
+                "cwd": "/tmp",
+                "useOrchestrator": false,
+                "entryNodeId": node_json["id"],
+                "variables": [],
+                "limits": { "maxTotalSteps": 50, "maxVisitsPerNode": 10 },
+                "nodes": [node_json],
+                "edges": []
+            });
+
+            let normalized =
+                normalize_workflow_value(json).unwrap_or_else(|error| {
+                    panic!("{case_name} migration must succeed: {error}")
+                });
+
+            assert_eq!(
+                normalized.workflow.version, 3,
+                "{case_name}: migrated workflow must be version 3"
+            );
+
+            let node = normalized
+                .workflow
+                .nodes
+                .first()
+                .expect("{case_name}: workflow must contain one node");
+            assert_eq!(
+                node.kind, expected_kind,
+                "{case_name}: migrated node kind mismatch"
+            );
+
+            let serialized =
+                serde_json::to_value(node).expect("{case_name}: node serialization must succeed");
+            assert!(
+                serialized.get("type").is_none(),
+                "{case_name}: migrated node must not leak top-level type"
+            );
+            assert!(
+                serialized.get("captureConfig").is_none()
+                    && serialized.get("killConfig").is_none(),
+                "{case_name}: migrated node must not leak top-level config fields"
+            );
+
+            let deserialized: WorkflowNode = serde_json::from_value(serialized).unwrap_or_else(
+                |error| panic!("{case_name}: migrated node must deserialize as v3: {error}"),
+            );
+            assert_eq!(
+                deserialized.kind, expected_kind,
+                "{case_name}: round-trip kind mismatch"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2444,11 +3373,11 @@ mod tests {
             "nodes": [{
                 "id": "n1",
                 "name": "Step 1",
-                "type": "task",
                 "agent": "claude",
                 "prompt": "hello",
                 "responseFormat": "json",
-                "outputSchema": {"name": "string", "score": "number"}
+                "outputSchema": {"name": "string", "score": "number"},
+                "kind": { "type": "task" }
             }],
             "edges": []
         });
@@ -2480,11 +3409,11 @@ mod tests {
             "nodes": [{
                 "id": "n1",
                 "name": "Step 1",
-                "type": "task",
                 "agent": "claude",
                 "prompt": "hello",
                 "responseFormat": "json",
-                "outputSchema": full_schema
+                "outputSchema": full_schema,
+                "kind": { "type": "task" }
             }],
             "edges": []
         });
@@ -2584,16 +3513,16 @@ mod tests {
             "nodes": [{
                 "id": "run",
                 "name": "Run Echo",
-                "type": "run_agent",
                 "agent": "echo",
-                "prompt": "hello"
+                "prompt": "hello",
+                "kind": { "type": "run_agent" }
             }],
             "edges": []
         });
 
         let normalized = normalize_workflow_value(value).unwrap();
         assert_eq!(
-            normalized.workflow.nodes[0].node_type,
+            normalized.workflow.nodes[0].node_type(),
             WorkflowNodeType::RunAgent
         );
         let result = validate_workflow(normalized.workflow);
@@ -2607,12 +3536,14 @@ mod tests {
     #[test]
     fn validates_subflow_call_required_inputs() {
         let mut call = node("call", "Call Double", WorkflowNodeType::Call);
-        call.subflow_config = Some(SubflowConfig {
-            workflow_name: "double".to_string(),
-            exit_node_id: Some("exit".to_string()),
-            inputs: Vec::new(),
-            max_depth: default_max_call_depth(),
-        });
+        call.kind = NodeKind::Call {
+            subflow_config: SubflowConfig {
+                workflow_name: "double".to_string(),
+                exit_node_id: Some("exit".to_string()),
+                inputs: Vec::new(),
+                max_depth: default_max_call_depth(),
+            },
+        };
         let mut subflow = workflow(
             vec![
                 node("entry", "Entry", WorkflowNodeType::Task),
@@ -2643,20 +3574,24 @@ mod tests {
     #[test]
     fn validates_subflow_body_rules_with_scoped_issues() {
         let mut call = node("call", "Call Broken", WorkflowNodeType::Call);
-        call.subflow_config = Some(SubflowConfig {
-            workflow_name: "broken".to_string(),
-            exit_node_id: Some("exit".to_string()),
-            inputs: Vec::new(),
-            max_depth: default_max_call_depth(),
-        });
+        call.kind = NodeKind::Call {
+            subflow_config: SubflowConfig {
+                workflow_name: "broken".to_string(),
+                exit_node_id: Some("exit".to_string()),
+                inputs: Vec::new(),
+                max_depth: default_max_call_depth(),
+            },
+        };
 
         let mut decide = node("decide", "Route", WorkflowNodeType::Decide);
-        decide.decide_config = Some(DecideConfig {
-            inputs: Vec::new(),
-            prompt: "Choose a route".to_string(),
-            model: None,
-            outcomes: vec!["yes".to_string(), "no".to_string()],
-        });
+        decide.kind = NodeKind::Decide {
+            decide_config: DecideConfig {
+                inputs: Vec::new(),
+                prompt: "Choose a route".to_string(),
+                model: None,
+                outcomes: vec!["yes".to_string(), "no".to_string()],
+            },
+        };
         let mut exit = node("exit", "Exit", WorkflowNodeType::Task);
         exit.agent = Some("claude".to_string());
         exit.prompt = "Finish".to_string();
@@ -2719,12 +3654,14 @@ mod tests {
     #[test]
     fn warns_on_subflow_call_cycles() {
         let mut call = node("call", "Recursive Call", WorkflowNodeType::Call);
-        call.subflow_config = Some(SubflowConfig {
-            workflow_name: "recursive".to_string(),
-            exit_node_id: Some("call".to_string()),
-            inputs: Vec::new(),
-            max_depth: 3,
-        });
+        call.kind = NodeKind::Call {
+            subflow_config: SubflowConfig {
+                workflow_name: "recursive".to_string(),
+                exit_node_id: Some("call".to_string()),
+                inputs: Vec::new(),
+                max_depth: 3,
+            },
+        };
         let recursive = workflow(vec![call], vec![], "call");
         let mut parent = workflow(
             vec![node("start", "Start", WorkflowNodeType::Task)],
@@ -2745,10 +3682,12 @@ mod tests {
     #[test]
     fn validates_wait_until_requires_marker() {
         let mut wait = node("wait", "Wait", WorkflowNodeType::Wait);
-        wait.wait_config = Some(WaitConfig {
-            mode: WaitMode::Until,
-            ..Default::default()
-        });
+        wait.kind = NodeKind::Wait {
+            wait_config: WaitConfig {
+                mode: WaitMode::Until,
+                ..Default::default()
+            },
+        };
         let result = validate_workflow(workflow(vec![wait], vec![], "wait"));
 
         assert!(
@@ -2761,11 +3700,13 @@ mod tests {
         );
 
         let mut invalid_regex = node("wait", "Wait", WorkflowNodeType::Wait);
-        invalid_regex.wait_config = Some(WaitConfig {
-            mode: WaitMode::Until,
-            marker: Some("[unclosed".to_string()),
-            ..Default::default()
-        });
+        invalid_regex.kind = NodeKind::Wait {
+            wait_config: WaitConfig {
+                mode: WaitMode::Until,
+                marker: Some("[unclosed".to_string()),
+                ..Default::default()
+            },
+        };
         let invalid_regex_result = validate_workflow(workflow(vec![invalid_regex], vec![], "wait"));
         assert!(
             invalid_regex_result.issues.iter().any(|issue| {
@@ -2776,10 +3717,12 @@ mod tests {
         );
 
         let mut negative_idle = node("wait", "Wait", WorkflowNodeType::Wait);
-        negative_idle.wait_config = Some(WaitConfig {
-            idle_seconds: Some(-1.0),
-            ..Default::default()
-        });
+        negative_idle.kind = NodeKind::Wait {
+            wait_config: WaitConfig {
+                idle_seconds: Some(-1.0),
+                ..Default::default()
+            },
+        };
         let negative_idle_result = validate_workflow(workflow(vec![negative_idle], vec![], "wait"));
         assert!(
             negative_idle_result.issues.iter().any(|issue| {
@@ -2792,10 +3735,12 @@ mod tests {
         );
 
         let mut nan_ready = node("wait", "Wait", WorkflowNodeType::Wait);
-        nan_ready.wait_config = Some(WaitConfig {
-            ready_stable_seconds: Some(f64::NAN),
-            ..Default::default()
-        });
+        nan_ready.kind = NodeKind::Wait {
+            wait_config: WaitConfig {
+                ready_stable_seconds: Some(f64::NAN),
+                ..Default::default()
+            },
+        };
         let nan_ready_result = validate_workflow(workflow(vec![nan_ready], vec![], "wait"));
         assert!(
             nan_ready_result.issues.iter().any(|issue| {
@@ -2816,12 +3761,14 @@ mod tests {
     fn validates_subflow_max_depth_zero_is_error() {
         // A call node with maxDepth=0 must be rejected at validation time.
         let mut call = node("call", "Call Zero Depth", WorkflowNodeType::Call);
-        call.subflow_config = Some(SubflowConfig {
-            workflow_name: "sub".to_string(),
-            exit_node_id: Some("exit".to_string()),
-            inputs: Vec::new(),
-            max_depth: 0, // invalid
-        });
+        call.kind = NodeKind::Call {
+            subflow_config: SubflowConfig {
+                workflow_name: "sub".to_string(),
+                exit_node_id: Some("exit".to_string()),
+                inputs: Vec::new(),
+                max_depth: 0, // invalid
+            },
+        };
         let sub = workflow(
             vec![
                 node("entry", "Entry", WorkflowNodeType::Task),
@@ -2849,12 +3796,14 @@ mod tests {
         // A subflow that directly calls itself should emit a cycle warning that
         // mentions the maxDepth bound so the user knows runtime safety applies.
         let mut self_call = node("call", "Self Call", WorkflowNodeType::Call);
-        self_call.subflow_config = Some(SubflowConfig {
-            workflow_name: "recurse".to_string(),
-            exit_node_id: Some("call".to_string()),
-            inputs: Vec::new(),
-            max_depth: 5,
-        });
+        self_call.kind = NodeKind::Call {
+            subflow_config: SubflowConfig {
+                workflow_name: "recurse".to_string(),
+                exit_node_id: Some("call".to_string()),
+                inputs: Vec::new(),
+                max_depth: 5,
+            },
+        };
         // The "recurse" subflow body IS self_call — single terminal node
         let recurse_body = workflow(vec![self_call], vec![], "call");
         let mut parent = workflow(
@@ -2887,12 +3836,14 @@ mod tests {
     fn validates_subflow_unknown_workflow_name_is_error() {
         // A call node referencing a workflow not in `subflows` must fail.
         let mut call = node("call", "Call Missing", WorkflowNodeType::Call);
-        call.subflow_config = Some(SubflowConfig {
-            workflow_name: "no_such_workflow".to_string(),
-            exit_node_id: None,
-            inputs: Vec::new(),
-            max_depth: default_max_call_depth(),
-        });
+        call.kind = NodeKind::Call {
+            subflow_config: SubflowConfig {
+                workflow_name: "no_such_workflow".to_string(),
+                exit_node_id: None,
+                inputs: Vec::new(),
+                max_depth: default_max_call_depth(),
+            },
+        };
         let parent = workflow(vec![call], vec![], "call");
         let result = validate_workflow(parent);
 
@@ -2909,12 +3860,14 @@ mod tests {
     fn validates_subflow_with_multiple_terminal_nodes_is_error() {
         // A subflow body with two terminal nodes violates single-exit contract.
         let mut call = node("call", "Call Multi-Exit", WorkflowNodeType::Call);
-        call.subflow_config = Some(SubflowConfig {
-            workflow_name: "multi".to_string(),
-            exit_node_id: None, // no explicit exitNodeId → auto-detect
-            inputs: Vec::new(),
-            max_depth: default_max_call_depth(),
-        });
+        call.kind = NodeKind::Call {
+            subflow_config: SubflowConfig {
+                workflow_name: "multi".to_string(),
+                exit_node_id: None, // no explicit exitNodeId → auto-detect
+                inputs: Vec::new(),
+                max_depth: default_max_call_depth(),
+            },
+        };
         // Two terminal nodes (no outgoing edges)
         let sub = workflow(
             vec![
@@ -2942,12 +3895,14 @@ mod tests {
     fn validates_decide_node_outcomes_must_match_branch_edges() {
         // A Decide node whose outcomes don't match branch edge labels should error.
         let mut decide = node("decide", "Route", WorkflowNodeType::Decide);
-        decide.decide_config = Some(DecideConfig {
-            inputs: Vec::new(),
-            prompt: "Pick a path".to_string(),
-            model: None,
-            outcomes: vec!["yes".to_string(), "no".to_string()],
-        });
+        decide.kind = NodeKind::Decide {
+            decide_config: DecideConfig {
+                inputs: Vec::new(),
+                prompt: "Pick a path".to_string(),
+                model: None,
+                outcomes: vec!["yes".to_string(), "no".to_string()],
+            },
+        };
         let yes_target = node("yes_node", "Yes", WorkflowNodeType::Task);
         let parent = workflow(
             vec![decide, yes_target],
@@ -3071,7 +4026,11 @@ mod tests {
             use_orchestrator: false,
             run_as: Some(RunAsConfig {
                 user: None,
-                command: Some(vec!["docker".to_string(), "exec".to_string(), "box".to_string()]),
+                command: Some(vec![
+                    "docker".to_string(),
+                    "exec".to_string(),
+                    "box".to_string(),
+                ]),
                 socket: None,
             }),
             entry_node_id: "n1".to_string(),

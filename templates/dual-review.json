@@ -7,7 +7,10 @@
   "useOrchestrator": false,
   "entryNodeId": "split-reviewers",
   "variables": [
-    { "name": "review_scope", "default": "Review the code changes in the working directory" }
+    {
+      "name": "review_scope",
+      "default": "Review the code changes in the working directory"
+    }
   ],
   "limits": {
     "maxTotalSteps": 50,
@@ -17,64 +20,96 @@
     {
       "id": "split-reviewers",
       "name": "Split Reviewers",
-      "type": "split"
+      "kind": {
+        "type": "split"
+      }
     },
     {
       "id": "reviewer-a",
       "name": "Reviewer A",
-      "type": "run_agent",
-      "runAgentConfig": {
-        "agent": "claude",
-        "prompt": "Perform an adversarial code review focused on correctness and security. Scope: {{var:review_scope}}\n\nIdentify bugs, logic errors, security vulnerabilities, and data-handling risks. Rank findings by severity."
+      "kind": {
+        "type": "run_agent",
+        "runAgentConfig": {
+          "agent": "claude",
+          "prompt": "Perform an adversarial code review focused on correctness and security. Scope: {{var:review_scope}}\n\nIdentify bugs, logic errors, security vulnerabilities, and data-handling risks. Rank findings by severity."
+        }
       }
     },
     {
       "id": "reviewer-b",
       "name": "Reviewer B",
-      "type": "run_agent",
-      "runAgentConfig": {
-        "agent": "claude",
-        "prompt": "Perform an adversarial code review focused on code quality and maintainability. Scope: {{var:review_scope}}\n\nIdentify readability issues, design problems, missing tests, and technical debt. Rank findings by severity."
+      "kind": {
+        "type": "run_agent",
+        "runAgentConfig": {
+          "agent": "claude",
+          "prompt": "Perform an adversarial code review focused on code quality and maintainability. Scope: {{var:review_scope}}\n\nIdentify readability issues, design problems, missing tests, and technical debt. Rank findings by severity."
+        }
       }
     },
     {
       "id": "collect-reviews",
       "name": "Collect Reviews",
-      "type": "collector"
+      "kind": {
+        "type": "collector"
+      }
     },
     {
       "id": "decide-cross-verify",
       "name": "Decide Cross Verify",
-      "type": "decide",
-      "decideConfig": {
-        "inputs": [
-          { "name": "review_a", "source": "node:reviewer-a.output" },
-          { "name": "review_b", "source": "node:reviewer-b.output" }
-        ],
-        "prompt": "Compare the two independent reviews below. Return AGREEMENT if the reviewers largely agree on findings and severity, or DISAGREEMENT if they conflict on important issues.\n\nReviewer A (correctness/security):\n{{review_a}}\n\nReviewer B (quality/maintainability):\n{{review_b}}",
-        "outcomes": ["AGREEMENT", "DISAGREEMENT"]
+      "kind": {
+        "type": "decide",
+        "decideConfig": {
+          "inputs": [
+            {
+              "name": "review_a",
+              "source": "node:reviewer-a.output"
+            },
+            {
+              "name": "review_b",
+              "source": "node:reviewer-b.output"
+            }
+          ],
+          "prompt": "Compare the two independent reviews below. Return AGREEMENT if the reviewers largely agree on findings and severity, or DISAGREEMENT if they conflict on important issues.\n\nReviewer A (correctness/security):\n{{review_a}}\n\nReviewer B (quality/maintainability):\n{{review_b}}",
+          "outcomes": [
+            "AGREEMENT",
+            "DISAGREEMENT"
+          ]
+        }
       }
     },
     {
       "id": "decide-adjudicate",
       "name": "Decide Adjudicate",
-      "type": "decide",
-      "decideConfig": {
-        "inputs": [
-          { "name": "review_a", "source": "node:reviewer-a.output" },
-          { "name": "review_b", "source": "node:reviewer-b.output" }
-        ],
-        "prompt": "The reviewers disagree. Adjudicate which review is more accurate for the conflicting findings. Return A_WINS if Reviewer A's assessment is more reliable, or B_WINS if Reviewer B's assessment is more reliable.\n\nReviewer A:\n{{review_a}}\n\nReviewer B:\n{{review_b}}",
-        "outcomes": ["A_WINS", "B_WINS"]
+      "kind": {
+        "type": "decide",
+        "decideConfig": {
+          "inputs": [
+            {
+              "name": "review_a",
+              "source": "node:reviewer-a.output"
+            },
+            {
+              "name": "review_b",
+              "source": "node:reviewer-b.output"
+            }
+          ],
+          "prompt": "The reviewers disagree. Adjudicate which review is more accurate for the conflicting findings. Return A_WINS if Reviewer A's assessment is more reliable, or B_WINS if Reviewer B's assessment is more reliable.\n\nReviewer A:\n{{review_a}}\n\nReviewer B:\n{{review_b}}",
+          "outcomes": [
+            "A_WINS",
+            "B_WINS"
+          ]
+        }
       }
     },
     {
       "id": "output-merged",
       "name": "Output Merged",
-      "type": "run_agent",
-      "runAgentConfig": {
-        "agent": "claude",
-        "prompt": "Produce a single merged review report from the dual-review process. Scope: {{var:review_scope}}\n\nReviewer A findings:\n{{node:reviewer-a.output}}\n\nReviewer B findings:\n{{node:reviewer-b.output}}\n\nCross-verify decision: {{node:decide-cross-verify.output}}\n\nAdjudication (if any): {{node:decide-adjudicate.output}}\n\nDeduplicate findings, resolve conflicts, and output a severity-ranked final report."
+      "kind": {
+        "type": "run_agent",
+        "runAgentConfig": {
+          "agent": "claude",
+          "prompt": "Produce a single merged review report from the dual-review process. Scope: {{var:review_scope}}\n\nReviewer A findings:\n{{node:reviewer-a.output}}\n\nReviewer B findings:\n{{node:reviewer-b.output}}\n\nCross-verify decision: {{node:decide-cross-verify.output}}\n\nAdjudication (if any): {{node:decide-adjudicate.output}}\n\nDeduplicate findings, resolve conflicts, and output a severity-ranked final report."
+        }
       }
     }
   ],

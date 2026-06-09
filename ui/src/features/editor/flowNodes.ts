@@ -33,21 +33,28 @@ export function buildFlowNodes(
   selectedNodeId: string | null,
 ): Node[] {
   return workflow.nodes.map((node) => {
+    const type = node.kind.type;
     const canvasPosition = workflow.ui?.canvas?.nodes?.[node.id];
     const position = canvasPosition
       ? { x: canvasPosition.x, y: canvasPosition.y }
       : { x: 180, y: 180 };
     const status = validationIndex[node.id];
-    const isCompound = node.type === "subflow" || node.type === "call";
+    const isCompound = type === "subflow" || type === "call";
 
     const data: Record<string, unknown> = isCompound
       ? (() => {
-          const subflowName = node.subflowConfig?.workflowName ?? "";
-          const inputs = (node.subflowConfig?.inputs ?? []).map((b) => b.name);
+          const subflowName =
+            node.kind.type === "subflow" || node.kind.type === "call"
+              ? node.kind.subflowConfig.workflowName
+              : "";
+          const inputs =
+            node.kind.type === "subflow" || node.kind.type === "call"
+              ? (node.kind.subflowConfig.inputs ?? []).map((b) => b.name)
+              : [];
           const missing = !subflowName || !workflow.subflows?.[subflowName];
           return {
             label: node.name,
-            nodeType: node.type,
+            nodeType: type,
             subflowName,
             inputs,
             output: subflowName ? `${subflowName}.result` : "result",
@@ -65,7 +72,7 @@ export function buildFlowNodes(
       type: isCompound ? "subflow" : "default",
       initialWidth: 220,
       initialHeight: isCompound ? 120 : 72,
-      class: clsx("graphNode", `graphNode--${node.type}`, {
+      class: clsx("graphNode", `graphNode--${type}`, {
         "graphNode--entry": workflow.entryNodeId === node.id,
         "graphNode--error": status?.error,
         "graphNode--warning": !status?.error && status?.warning,
@@ -77,7 +84,7 @@ export function buildFlowNodes(
         "graphNode--unreachable": validation?.graph.unreachableNodeIds.includes(node.id),
         "graphNode--deadend": validation?.graph.deadEndNodeIds.includes(node.id),
       }),
-      style: nodeStyle(node.type),
+      style: nodeStyle(type),
     };
   });
 }

@@ -217,10 +217,27 @@ export interface SubflowConfig {
   maxDepth: number;
 }
 
+// Internally-tagged kind variants (mirrors Rust #[serde(tag = "type")]).
+export type NodeKind =
+  | { type: "task"; agentConfig?: AgentNodeConfig | null }
+  | { type: "approval" }
+  | { type: "split" }
+  | { type: "collector" }
+  | { type: "decide"; decideConfig: DecideConfig }
+  | { type: "parallel_batch"; batchConfig: BatchConfig }
+  | { type: "subflow"; subflowConfig: SubflowConfig }
+  | { type: "call"; subflowConfig: SubflowConfig }
+  | { type: "spawn"; spawnConfig?: SpawnConfig }
+  | { type: "send"; sendConfig?: SendConfig }
+  | { type: "wait"; waitConfig?: WaitConfig }
+  | { type: "capture"; captureConfig: CaptureConfig }
+  | { type: "kill"; killConfig: KillConfig }
+  | { type: "run_agent"; runAgentConfig?: RunAgentConfig; agentConfig?: AgentNodeConfig | null };
+
 export interface WorkflowNode {
   id: string;
   name: string;
-  type: WorkflowNodeType;
+  kind: NodeKind;
   agent?: string | null;
   prompt: string;
   contextSources?: ContextSource[];
@@ -233,18 +250,8 @@ export interface WorkflowNode {
   loopMaxIterations?: number | null;
   loopCondition?: StructuredCondition | null;
   splitFailurePolicy?: SplitFailurePolicy | null;
-  agentConfig?: AgentNodeConfig | null;
   cwd?: string | null;
   continueSessionFrom?: string | null;
-  decideConfig?: DecideConfig | null;
-  batchConfig?: BatchConfig | null;
-  spawnConfig?: SpawnConfig | null;
-  sendConfig?: SendConfig | null;
-  waitConfig?: WaitConfig | null;
-  captureConfig?: CaptureConfig | null;
-  killConfig?: KillConfig | null;
-  runAgentConfig?: RunAgentConfig | null;
-  subflowConfig?: SubflowConfig | null;
 }
 
 export interface WorkflowEdge {
