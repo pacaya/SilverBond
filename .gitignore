@@ -22,6 +22,7 @@ pnpm-debug.log*
 # AI
 /.agent
 /.agents
+/docs/local
 /.claude
 /.gemini
 /.superset
