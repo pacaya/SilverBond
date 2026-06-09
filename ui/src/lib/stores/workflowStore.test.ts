@@ -115,11 +115,30 @@ describe("workflowStore", () => {
       type: "node_done",
       nodeId: "n1",
       nodeName: "Node 1",
-      result: { success: true, output: "ok", stderr: "" },
+      result: { success: true, output: "ok", stderr: "", nodeName: "Node 1" },
     });
 
     expect(store.nodeStates.n1).toBe("success");
+    expect(store.lines.some((line) => line.text === "Node 1 completed")).toBe(true);
     expect(store.lines.at(-1)?.text).toContain("ok");
+  });
+
+  it("logs subflow boundary events", () => {
+    store.applyRunEvent({
+      type: "subflow_start",
+      nodeId: "call_1",
+      subflowName: "Review Loop",
+    });
+    store.applyRunEvent({
+      type: "subflow_done",
+      nodeId: "call_1",
+      subflowName: "Review Loop",
+      output: "subflow output should not appear in log",
+    });
+
+    expect(store.lines.some((line) => line.text === "Entering subflow `Review Loop`")).toBe(true);
+    expect(store.lines.some((line) => line.text === "Subflow `Review Loop` finished")).toBe(true);
+    expect(store.lines.some((line) => line.text.includes("subflow output"))).toBe(false);
   });
 
   it("tracks split and collector runtime events", () => {

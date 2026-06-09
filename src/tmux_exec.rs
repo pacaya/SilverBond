@@ -1,6 +1,10 @@
 use std::{
     collections::HashSet,
     process::Command,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -145,9 +149,14 @@ impl NodeRunner for TmuxNodeRunner {
         ctx: RuntimeContext,
         run_id: String,
     ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
-        let inv = ctx.run_invocation.clone();
-        let interaction = InteractionEscalation::new(ctx, run_id);
         Box::pin(async move {
+            let inv = ctx.run_invocation.clone();
+            let abort_flag = ctx
+                .registry
+                .abort_signal(&run_id)
+                .await
+                .map(|(abort_flag, _)| abort_flag);
+            let interaction = InteractionEscalation::new(ctx, run_id, abort_flag);
             tokio::task::spawn_blocking(move || {
                 if let Some(inv) = inv {
                     tmux_tools_core::with_invocation(inv, || {
@@ -195,11 +204,16 @@ impl NodeRunner for TmuxNodeRunner {
         run_id: String,
         cursor_id: String,
     ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
-        let inv = ctx.run_invocation.clone();
-        let active_pane =
-            ActivePaneRegistration::new(&ctx, run_id.clone(), cursor_id, node.id.clone());
-        let interaction = InteractionEscalation::new(ctx, run_id);
         Box::pin(async move {
+            let inv = ctx.run_invocation.clone();
+            let abort_flag = ctx
+                .registry
+                .abort_signal(&run_id)
+                .await
+                .map(|(abort_flag, _)| abort_flag);
+            let active_pane =
+                ActivePaneRegistration::new(&ctx, run_id.clone(), cursor_id, node.id.clone());
+            let interaction = InteractionEscalation::new(ctx, run_id, abort_flag);
             tokio::task::spawn_blocking(move || {
                 if let Some(inv) = inv {
                     tmux_tools_core::with_invocation(inv, || {
@@ -392,15 +406,25 @@ struct InteractionEscalation {
     ctx: RuntimeContext,
     run_id: String,
     handle: tokio::runtime::Handle,
+    abort_flag: Option<Arc<AtomicBool>>,
 }
 
 impl InteractionEscalation {
-    fn new(ctx: RuntimeContext, run_id: String) -> Self {
+    fn new(ctx: RuntimeContext, run_id: String, abort_flag: Option<Arc<AtomicBool>>) -> Self {
         Self {
             ctx,
             run_id,
             handle: tokio::runtime::Handle::current(),
+            abort_flag,
         }
+    }
+
+    fn abort_flag(&self) -> Option<&AtomicBool> {
+        self.abort_flag.as_deref()
+    }
+
+    fn is_aborted(&self) -> bool {
+        abort_requested(self.abort_flag())
     }
 
     fn request(
@@ -416,7 +440,11 @@ impl InteractionEscalation {
         let interaction_type = interaction_type.to_string();
         let description = description.to_string();
         let output_so_far = output_so_far.to_string();
+        let abort_flag = self.abort_flag.clone();
         self.handle.block_on(async move {
+            if abort_requested(abort_flag.as_deref()) {
+                anyhow::bail!("Interaction aborted");
+            }
             crate::runtime::escalate_agent_interaction(
                 &ctx,
                 &run_id,
@@ -627,6 +655,7 @@ struct CompiledInteractionPattern {
     regex: Regex,
     kind: InteractionKind,
     description: String,
+    send_enter: bool,
 }
 
 struct InteractiveCapture {
@@ -634,9 +663,15 @@ struct InteractiveCapture {
     final_capture: String,
 }
 
+enum InteractiveReadyResult {
+    Ready(IdleReason),
+    Aborted,
+}
+
 enum InteractivePollResult {
     Completed(InteractiveCapture),
     TimedOut(InteractiveCapture),
+    Aborted(InteractiveCapture),
 }
 
 struct PromptCaptureMarkers {
@@ -696,6 +731,7 @@ fn run_agent_interactive(
 
     let start = Instant::now();
     let effective_prompt = prompt;
+    let abort_flag = interaction.and_then(InteractionEscalation::abort_flag);
     let effective_cwd = cfg
         .and_then(|cfg| cfg.cwd.clone())
         .unwrap_or_else(|| cwd.clone());
@@ -717,6 +753,15 @@ fn run_agent_interactive(
         "Agent {} cannot execute workflow nodes",
         effective_agent
     );
+    if abort_requested(abort_flag) {
+        return Ok(aborted_result(
+            &effective_agent,
+            &effective_prompt,
+            start.elapsed(),
+            None,
+            None,
+        ));
+    }
 
     let interaction_patterns = drv
         .interaction_patterns()
@@ -728,6 +773,7 @@ fn run_agent_interactive(
                     regex,
                     kind: pattern.kind,
                     description: pattern.description,
+                    send_enter: pattern.send_enter,
                 })
         })
         .collect::<Vec<_>>();
@@ -769,24 +815,48 @@ fn run_agent_interactive(
         (spawned.pane_id, Some(spawned.session_name), false)
     };
 
+    let subagent_timeout = agent_cfg
+        .orchestrator
+        .as_ref()
+        .and_then(|orchestrator| orchestrator.subagent_timeout_secs)
+        .map(|seconds| Duration::from_secs(seconds as u64))
+        .unwrap_or(Duration::from_secs(600));
+
     let result = (|| {
         let ready = wait_for_agent_ready_interactive(
             &pane_id,
             timeout_duration,
             idle_seconds,
             ready_stable_seconds,
+            agent_cfg.auto_approve,
+            subagent_timeout,
             &interaction_patterns,
+            &destructive_regexes,
+            interaction,
+            abort_flag,
         )?;
-        if ready == IdleReason::TimedOut {
-            return Ok(failed_result(
-                "Timed out waiting for tmux agent readiness",
-                -2,
-                &effective_agent,
-                &effective_prompt,
-                start.elapsed(),
-                Some(pane_id.clone()),
-                Some(NodeOutcome::ErrorTimeout),
-            ));
+        match ready {
+            InteractiveReadyResult::Ready(IdleReason::TimedOut) => {
+                return Ok(failed_result(
+                    "Timed out waiting for tmux agent readiness",
+                    -2,
+                    &effective_agent,
+                    &effective_prompt,
+                    start.elapsed(),
+                    Some(pane_id.clone()),
+                    Some(NodeOutcome::ErrorTimeout),
+                ));
+            }
+            InteractiveReadyResult::Aborted => {
+                return Ok(aborted_result(
+                    &effective_agent,
+                    &effective_prompt,
+                    start.elapsed(),
+                    Some(pane_id.clone()),
+                    None,
+                ));
+            }
+            InteractiveReadyResult::Ready(_) => {}
         }
 
         let capture_markers = PromptCaptureMarkers::new();
@@ -794,12 +864,6 @@ fn run_agent_interactive(
         let before = capture_visible_stripped(&pane_id)?;
         send_text(&pane_id, &prompt_to_send, true)?;
 
-        let subagent_timeout = agent_cfg
-            .orchestrator
-            .as_ref()
-            .and_then(|orchestrator| orchestrator.subagent_timeout_secs)
-            .map(|seconds| Duration::from_secs(seconds as u64))
-            .unwrap_or(Duration::from_secs(600));
         let polled = poll_agent_interactive(
             &pane_id,
             &before,
@@ -814,6 +878,7 @@ fn run_agent_interactive(
             &interaction_patterns,
             &destructive_regexes,
             interaction,
+            abort_flag,
         )?;
 
         let response = match polled {
@@ -832,6 +897,15 @@ fn run_agent_interactive(
                 result.raw_output = Some(response.final_capture);
                 result.metadata.error_type = Some("timeout".to_owned());
                 return Ok(result);
+            }
+            InteractivePollResult::Aborted(response) => {
+                return Ok(aborted_result(
+                    &effective_agent,
+                    &effective_prompt,
+                    start.elapsed(),
+                    Some(pane_id.clone()),
+                    Some(response),
+                ));
             }
         };
 
@@ -1139,13 +1213,19 @@ fn should_kill_after(
             .unwrap_or(true)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wait_for_agent_ready_interactive(
     pane: &str,
     timeout: Duration,
     idle_seconds: f64,
     ready_stable_seconds: f64,
+    auto_approve: bool,
+    subagent_timeout: Duration,
     interaction_patterns: &[CompiledInteractionPattern],
-) -> anyhow::Result<IdleReason> {
+    destructive_regexes: &[Regex],
+    interaction: Option<&InteractionEscalation>,
+    abort_flag: Option<&AtomicBool>,
+) -> anyhow::Result<InteractiveReadyResult> {
     let ready_signal = ready_signal_for_pane(pane)?;
     let start = Instant::now();
     let mut deadline = start + timeout;
@@ -1153,28 +1233,88 @@ fn wait_for_agent_ready_interactive(
     let mut last_seen = capture.clone();
     let mut progress = CaptureProgress::new(&capture, start);
     let mut handled_matches = Vec::new();
+    let mut handled_destructive_matches = HandledDestructiveMatches::default();
     let mut first_poll = true;
 
     loop {
+        if abort_requested(abort_flag) {
+            return Ok(InteractiveReadyResult::Aborted);
+        }
         let now = Instant::now();
-        capture = capture_visible_stripped(pane)?;
+        capture = match capture_visible_stripped(pane) {
+            Ok(capture) => capture,
+            Err(_err) if abort_requested(abort_flag) => {
+                return Ok(InteractiveReadyResult::Aborted);
+            }
+            Err(err) => return Err(err),
+        };
         let new_text = capture_delta(&last_seen, &capture);
         let has_new_text = !new_text.is_empty();
         if has_new_text {
             last_seen = capture.clone();
         }
 
+        if let Some(destructive_match) = next_unhandled_destructive_match(
+            destructive_regexes,
+            &capture,
+            &handled_destructive_matches,
+        ) {
+            handled_destructive_matches.record(destructive_match);
+            let reply = escalate_or_fallback(
+                interaction,
+                pane,
+                InteractionKind::DestructiveWarning.event_type(),
+                "Potentially destructive command detected",
+                &capture,
+                "n",
+            )?;
+            send_reply_if_present(pane, &reply, true)?;
+            continue;
+        }
+
         if (first_poll || has_new_text)
             && let Some((idx, key)) =
                 next_unhandled_pattern_match(interaction_patterns, &capture, &handled_matches)
-            && let InteractionKind::AutoRespond { response } = &interaction_patterns[idx].kind
         {
             handled_matches.push(key);
-            send_text(pane, response, true)?;
-            deadline = Instant::now() + timeout;
-            sleep(Duration::from_millis(300));
-            first_poll = false;
-            continue;
+            let pattern = &interaction_patterns[idx];
+            match &pattern.kind {
+                InteractionKind::AutoRespond { response } => {
+                    send_text(pane, response, pattern.send_enter)?;
+                    continue;
+                }
+                InteractionKind::SubagentActive => {
+                    deadline = Instant::now() + subagent_timeout;
+                    continue;
+                }
+                InteractionKind::PermissionRequest => {
+                    let is_destructive = destructive_regexes
+                        .iter()
+                        .any(|regex| regex.is_match(&capture));
+                    let reply = permission_request_reply(
+                        interaction,
+                        pane,
+                        &pattern.description,
+                        &capture,
+                        is_destructive,
+                        auto_approve,
+                    )?;
+                    send_reply_if_present(pane, &reply, pattern.send_enter)?;
+                    continue;
+                }
+                InteractionKind::DestructiveWarning => {
+                    let reply = escalate_or_fallback(
+                        interaction,
+                        pane,
+                        InteractionKind::DestructiveWarning.event_type(),
+                        &pattern.description,
+                        &capture,
+                        "n",
+                    )?;
+                    send_reply_if_present(pane, &reply, pattern.send_enter)?;
+                    continue;
+                }
+            }
         }
 
         if let Some(reason) = progress.observe(
@@ -1186,11 +1326,11 @@ fn wait_for_agent_ready_interactive(
             ready_stable_seconds,
             &[],
         ) {
-            return Ok(reason);
+            return Ok(InteractiveReadyResult::Ready(reason));
         }
 
         if now >= deadline {
-            return Ok(IdleReason::TimedOut);
+            return Ok(InteractiveReadyResult::Ready(IdleReason::TimedOut));
         }
 
         first_poll = false;
@@ -1213,6 +1353,7 @@ fn poll_agent_interactive(
     interaction_patterns: &[CompiledInteractionPattern],
     destructive_regexes: &[Regex],
     interaction: Option<&InteractionEscalation>,
+    abort_flag: Option<&AtomicBool>,
 ) -> anyhow::Result<InteractivePollResult> {
     let ready_signal = ready_signal_for_pane(pane)?;
     let until_regexes = compile_until_regexes(until, capture_markers)?;
@@ -1223,8 +1364,27 @@ fn poll_agent_interactive(
     let mut handled_destructive_matches = HandledDestructiveMatches::default();
 
     loop {
+        if abort_requested(abort_flag) {
+            let output_so_far =
+                extract_after_prompt_with_markers(before, &last_seen, prompt, capture_markers);
+            return Ok(InteractivePollResult::Aborted(InteractiveCapture {
+                output: output_so_far,
+                final_capture: last_seen,
+            }));
+        }
         let now = Instant::now();
-        let capture = capture_visible_stripped(pane)?;
+        let capture = match capture_visible_stripped(pane) {
+            Ok(capture) => capture,
+            Err(_err) if abort_requested(abort_flag) => {
+                let output_so_far =
+                    extract_after_prompt_with_markers(before, &last_seen, prompt, capture_markers);
+                return Ok(InteractivePollResult::Aborted(InteractiveCapture {
+                    output: output_so_far,
+                    final_capture: last_seen,
+                }));
+            }
+            Err(err) => return Err(err),
+        };
         let new_text = capture_delta(&last_seen, &capture);
         let has_new_text = !new_text.is_empty();
         if has_new_text {
@@ -1248,7 +1408,7 @@ fn poll_agent_interactive(
                 &output_so_far,
                 "n",
             )?;
-            send_reply_if_present(pane, &reply)?;
+            send_reply_if_present(pane, &reply, true)?;
             continue;
         }
 
@@ -1260,7 +1420,7 @@ fn poll_agent_interactive(
             let pattern = &interaction_patterns[idx];
             match &pattern.kind {
                 InteractionKind::AutoRespond { response } => {
-                    send_text(pane, response, true)?;
+                    send_text(pane, response, pattern.send_enter)?;
                     continue;
                 }
                 InteractionKind::SubagentActive => {
@@ -1279,7 +1439,7 @@ fn poll_agent_interactive(
                         is_destructive,
                         auto_approve,
                     )?;
-                    send_reply_if_present(pane, &reply)?;
+                    send_reply_if_present(pane, &reply, pattern.send_enter)?;
                     continue;
                 }
                 InteractionKind::DestructiveWarning => {
@@ -1291,7 +1451,7 @@ fn poll_agent_interactive(
                         &output_so_far,
                         "n",
                     )?;
-                    send_reply_if_present(pane, &reply)?;
+                    send_reply_if_present(pane, &reply, pattern.send_enter)?;
                     continue;
                 }
             }
@@ -1350,15 +1510,45 @@ fn is_interactive_completion_reason(reason: IdleReason) -> bool {
 }
 
 fn query_agent_command(pane: &str, command: &str) -> anyhow::Result<String> {
+    const QUERY_IDLE_SECONDS: f64 = 0.25;
+    const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+
     let before = capture_visible_stripped(pane)?;
     send_text(pane, command, true)?;
-    sleep(Duration::from_millis(500));
-    let after = capture_visible_stripped(pane)?;
-    let delta = capture_delta(&before, &after);
+
+    let start = Instant::now();
+    let mut capture = before.clone();
+    let mut progress = CaptureProgress::new(&capture, start);
+    let deadline = start + QUERY_TIMEOUT;
+
+    loop {
+        let now = Instant::now();
+        capture = capture_visible_stripped(pane)?;
+
+        if let Some(IdleReason::Idle) = progress.observe(
+            &capture,
+            now,
+            QUERY_IDLE_SECONDS,
+            &None,
+            DEFAULT_READY_SCAN_LINES,
+            QUERY_IDLE_SECONDS,
+            &[],
+        ) {
+            break;
+        }
+
+        if now >= deadline {
+            break;
+        }
+
+        sleep(Duration::from_millis(250));
+    }
+
+    let delta = capture_delta(&before, &capture);
     if !delta.trim().is_empty() {
         return Ok(delta);
     }
-    Ok(extract_after_prompt(&before, &after, command))
+    Ok(extract_after_prompt(&before, &capture, command))
 }
 
 fn escalate_or_fallback(
@@ -1370,7 +1560,11 @@ fn escalate_or_fallback(
     fallback: &str,
 ) -> anyhow::Result<String> {
     if let Some(interaction) = interaction {
-        interaction.request(session_id, interaction_type, description, output_so_far)
+        match interaction.request(session_id, interaction_type, description, output_so_far) {
+            Ok(reply) => Ok(reply),
+            Err(_err) if interaction.is_aborted() => Ok(String::new()),
+            Err(err) => Err(err),
+        }
     } else {
         if interaction_type == InteractionKind::PermissionRequest.event_type()
             && fallback.eq_ignore_ascii_case("n")
@@ -1419,11 +1613,15 @@ fn permission_request_reply(
     )
 }
 
-fn send_reply_if_present(pane: &str, reply: &str) -> anyhow::Result<()> {
+fn send_reply_if_present(pane: &str, reply: &str, send_enter: bool) -> anyhow::Result<()> {
     if !reply.is_empty() {
-        send_text(pane, reply, true)?;
+        send_text(pane, reply, send_enter)?;
     }
     Ok(())
+}
+
+fn abort_requested(abort_flag: Option<&AtomicBool>) -> bool {
+    abort_flag.is_some_and(|flag| flag.load(Ordering::SeqCst))
 }
 
 #[derive(Default)]
@@ -1973,6 +2171,30 @@ fn failed_result(
         },
         ..Default::default()
     }
+}
+
+fn aborted_result(
+    agent: &str,
+    prompt: &str,
+    duration: Duration,
+    pane_id: Option<String>,
+    capture: Option<InteractiveCapture>,
+) -> NodeResult {
+    let mut result = failed_result(
+        "Agent run aborted",
+        -15,
+        agent,
+        prompt,
+        duration,
+        pane_id,
+        Some(NodeOutcome::ErrorExecution),
+    );
+    result.metadata.error_type = Some("aborted".to_owned());
+    if let Some(capture) = capture {
+        result.output = capture.output;
+        result.raw_output = Some(capture.final_capture);
+    }
+    result
 }
 
 fn duration_string(duration: Duration) -> String {

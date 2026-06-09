@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tmux_tools_core::TmuxInvocation;
 use tokio::{
-    sync::{Mutex, broadcast, oneshot},
+    sync::{Mutex, Notify, broadcast, oneshot},
     task::JoinSet,
 };
 use uuid::Uuid;
@@ -531,6 +531,7 @@ struct ApprovalDecision {
 struct ActiveRun {
     sender: broadcast::Sender<RuntimeEvent>,
     abort_flag: Arc<AtomicBool>,
+    abort_notify: Arc<Notify>,
     approval_sender: Arc<Mutex<Option<oneshot::Sender<ApprovalDecision>>>>,
     interaction_senders: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
     active_panes: Arc<Mutex<BTreeMap<String, ActivePaneTarget>>>,
@@ -568,6 +569,7 @@ impl RunRegistry {
             ActiveRun {
                 sender,
                 abort_flag: Arc::new(AtomicBool::new(false)),
+                abort_notify: Arc::new(Notify::new()),
                 approval_sender: Arc::new(Mutex::new(None)),
                 interaction_senders: Arc::new(Mutex::new(HashMap::new())),
                 active_panes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -596,6 +598,7 @@ impl RunRegistry {
     async fn set_abort(&self, run_id: &str) {
         if let Some(active) = self.inner.lock().await.get(run_id).cloned() {
             active.abort_flag.store(true, Ordering::SeqCst);
+            active.abort_notify.notify_waiters();
         }
     }
 
@@ -606,6 +609,17 @@ impl RunRegistry {
             .get(run_id)
             .map(|active| active.abort_flag.load(Ordering::SeqCst))
             .unwrap_or(false)
+    }
+
+    pub(crate) async fn abort_signal(
+        &self,
+        run_id: &str,
+    ) -> Option<(Arc<AtomicBool>, Arc<Notify>)> {
+        self.inner
+            .lock()
+            .await
+            .get(run_id)
+            .map(|active| (active.abort_flag.clone(), active.abort_notify.clone()))
     }
 
     async fn set_pending_approval(
@@ -3276,6 +3290,7 @@ async fn apply_join_result(
         RuntimeEvent::new("node_done")
             .with("cursorId", task_result.cursor_id.clone())
             .with("nodeId", task_result.node.id.clone())
+            .with("nodeName", task_result.node.name.clone())
             .with("result", {
                 let mut event_result = json!({
                     "success": task_result.result.success,
@@ -3531,6 +3546,7 @@ async fn complete_subflow_if_at_exit(
         RuntimeEvent::new("node_done")
             .with("cursorId", cursor_id.to_string())
             .with("nodeId", frame.call_node_id.clone())
+            .with("nodeName", frame.call_node_name.clone())
             .with(
                 "result",
                 json!({
@@ -3761,6 +3777,7 @@ async fn handle_approval_resolution(
         RuntimeEvent::new("node_done")
             .with("cursorId", cursor_id.clone())
             .with("nodeId", node.id.clone())
+            .with("nodeName", node.name.clone())
             .with(
                 "result",
                 json!({
@@ -4115,6 +4132,7 @@ async fn handle_parallel_batch_node(
         RuntimeEvent::new("node_done")
             .with("cursorId", cursor_id.clone())
             .with("nodeId", node.id.clone())
+            .with("nodeName", node.name.clone())
             .with(
                 "result",
                 json!({
@@ -4356,6 +4374,7 @@ async fn record_batch_item_result(
         RuntimeEvent::new("node_done")
             .with("cursorId", task_result.cursor_id.clone())
             .with("nodeId", task_result.node.id.clone())
+            .with("nodeName", task_result.node.name.clone())
             .with("itemIndex", item_result.item_index)
             .with(
                 "result",
@@ -4547,6 +4566,7 @@ async fn handle_split_node(
         RuntimeEvent::new("node_done")
             .with("cursorId", cursor_id.clone())
             .with("nodeId", node.id.clone())
+            .with("nodeName", node.name.clone())
             .with(
                 "result",
                 json!({
@@ -4856,6 +4876,7 @@ async fn release_collectors_if_ready(
             RuntimeEvent::new("node_done")
                 .with("cursorId", representative_cursor_id.clone())
                 .with("nodeId", collector_id.clone())
+                .with("nodeName", node.name.clone())
                 .with(
                     "result",
                     json!({
@@ -5626,6 +5647,7 @@ pub(crate) async fn escalate_agent_interaction(
     description: &str,
     output_so_far: &str,
 ) -> anyhow::Result<String> {
+    let abort_signal = ctx.registry.abort_signal(run_id).await;
     let (sender, receiver) = oneshot::channel();
     ctx.registry
         .set_pending_interaction(run_id, session_id, sender)
@@ -5647,9 +5669,27 @@ pub(crate) async fn escalate_agent_interaction(
         return Err(err);
     }
 
-    let response = receiver
-        .await
-        .map_err(|_| anyhow::anyhow!("Interaction channel closed"))?;
+    let response = if let Some((abort_flag, abort_notify)) = abort_signal {
+        let abort_notified = abort_notify.notified();
+        tokio::pin!(abort_notified);
+        if abort_flag.load(Ordering::SeqCst) {
+            pending.clear_now().await;
+            anyhow::bail!("Interaction aborted");
+        }
+        tokio::select! {
+            response = receiver => {
+                response.map_err(|_| anyhow::anyhow!("Interaction channel closed"))?
+            }
+            _ = &mut abort_notified => {
+                pending.clear_now().await;
+                anyhow::bail!("Interaction aborted");
+            }
+        }
+    } else {
+        receiver
+            .await
+            .map_err(|_| anyhow::anyhow!("Interaction channel closed"))?
+    };
     pending.disarm();
 
     // Emit resolved event
@@ -6327,6 +6367,57 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(response, "immediate response");
+    }
+
+    #[tokio::test]
+    async fn abort_unblocks_pending_agent_interaction() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db);
+        let run_id = "run_interaction_abort";
+        ctx.registry.register(run_id).await;
+        let mut events = ctx.registry.subscribe(run_id).await.unwrap();
+
+        let task = {
+            let ctx = ctx.clone();
+            let run_id = run_id.to_string();
+            tokio::spawn(async move {
+                escalate_agent_interaction(
+                    &ctx,
+                    &run_id,
+                    "abort-session",
+                    "question",
+                    "waiting for abort",
+                    "",
+                )
+                .await
+            })
+        };
+
+        let event = next_interaction_required(&mut events).await;
+        assert_eq!(
+            event.data.get("sessionId").and_then(Value::as_str),
+            Some("abort-session")
+        );
+
+        let abort_started = Instant::now();
+        ctx.abort_run(run_id).await.unwrap();
+        let err = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("timed out waiting for aborted interaction")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(err.to_string(), "Interaction aborted");
+        assert!(
+            abort_started.elapsed() < Duration::from_millis(500),
+            "abort did not promptly unblock the interaction"
+        );
+        assert!(
+            ctx.respond_interaction(run_id, "abort-session", "late".to_string())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

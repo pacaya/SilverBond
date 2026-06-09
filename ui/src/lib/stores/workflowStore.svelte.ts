@@ -714,6 +714,12 @@ class WorkflowStore {
           lastOutput: String(event.lastOutput ?? ""),
         };
         break;
+      case "subflow_start":
+        push("system", `Entering subflow \`${String(event.subflowName ?? "")}\``);
+        break;
+      case "subflow_done":
+        push("system", `Subflow \`${String(event.subflowName ?? "")}\` finished`);
+        break;
       case "transition":
         push("detail", `${String(event.fromNodeId ?? "")} -> ${String(event.toNodeId ?? "(end)")}`);
         break;

@@ -46,6 +46,23 @@ pub struct InteractionPattern {
     pub kind: InteractionKind,
     pub pattern: String,
     pub description: String,
+    /// When false, reply keystrokes are sent without a trailing Enter (menu-style prompts).
+    pub send_enter: bool,
+}
+
+impl InteractionPattern {
+    pub fn new(
+        kind: InteractionKind,
+        pattern: impl Into<String>,
+        description: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            pattern: pattern.into(),
+            description: description.into(),
+            send_enter: true,
+        }
+    }
 }
 
 /// Shared destructive patterns common to all agent backends.
@@ -450,28 +467,28 @@ impl AgentDriver for ClaudeDriver {
 
     fn interaction_patterns(&self) -> Vec<InteractionPattern> {
         vec![
-            InteractionPattern {
-                kind: InteractionKind::AutoRespond {
+            InteractionPattern::new(
+                InteractionKind::AutoRespond {
                     response: "y".to_string(),
                 },
-                pattern: r"(?i)do you trust.*\?\s*$".to_string(),
-                description: "Trust folder prompt".to_string(),
-            },
-            InteractionPattern {
-                kind: InteractionKind::PermissionRequest,
-                pattern: r"(?i)(allow|wants to use)\s+\w+.*\?\s*\(y/n\)".to_string(),
-                description: "Tool permission prompt".to_string(),
-            },
-            InteractionPattern {
-                kind: InteractionKind::SubagentActive,
-                pattern: r"(?i)(launching|spawning)\s+agent".to_string(),
-                description: "Agent spawning a subagent".to_string(),
-            },
-            InteractionPattern {
-                kind: InteractionKind::SubagentActive,
-                pattern: r"(?i)agent.*running.*background".to_string(),
-                description: "Subagent running in background".to_string(),
-            },
+                r"(?i)do you trust.*\?\s*$",
+                "Trust folder prompt",
+            ),
+            InteractionPattern::new(
+                InteractionKind::PermissionRequest,
+                r"(?i)(allow|wants to use)\s+\w+.*\?\s*\(y/n\)",
+                "Tool permission prompt",
+            ),
+            InteractionPattern::new(
+                InteractionKind::SubagentActive,
+                r"(?i)(launching|spawning)\s+agent",
+                "Agent spawning a subagent",
+            ),
+            InteractionPattern::new(
+                InteractionKind::SubagentActive,
+                r"(?i)agent.*running.*background",
+                "Subagent running in background",
+            ),
         ]
     }
 }
@@ -599,11 +616,11 @@ impl AgentDriver for CodexDriver {
     }
 
     fn interaction_patterns(&self) -> Vec<InteractionPattern> {
-        vec![InteractionPattern {
-            kind: InteractionKind::PermissionRequest,
-            pattern: r"(?i)allow this action.*\[y/n\]".to_string(),
-            description: "Action approval prompt".to_string(),
-        }]
+        vec![InteractionPattern::new(
+            InteractionKind::PermissionRequest,
+            r"(?i)allow this action.*\[y/n\]",
+            "Action approval prompt",
+        )]
     }
 }
 
