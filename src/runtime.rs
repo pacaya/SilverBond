@@ -13,7 +13,10 @@ use anyhow::Context;
 use chrono::Utc;
 use futures::{FutureExt, future::BoxFuture};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{MapAccess, SeqAccess, Visitor},
+};
 use serde_json::{Map, Value, json};
 use tmux_tools_core::TmuxInvocation;
 use tokio::{
@@ -244,6 +247,174 @@ pub struct CollectorInputStatus {
     pub parsed_output: Option<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CollectorBarrierKey {
+    pub scope: String,
+    pub collector_id: String,
+    pub execution_epoch: u64,
+}
+
+impl CollectorBarrierKey {
+    pub fn new(
+        scope: impl Into<String>,
+        collector_id: impl Into<String>,
+        execution_epoch: u64,
+    ) -> Self {
+        Self {
+            scope: scope.into(),
+            collector_id: collector_id.into(),
+            execution_epoch,
+        }
+    }
+
+    pub fn from_cursor(cursor: &CursorState, collector_id: &str, execution_epoch: u64) -> Self {
+        Self::new(
+            collector_barrier_scope(cursor),
+            collector_id,
+            execution_epoch,
+        )
+    }
+}
+
+impl Serialize for CollectorBarrierKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("CollectorBarrierKey", 3)?;
+        state.serialize_field("scope", &self.scope)?;
+        state.serialize_field("collectorId", &self.collector_id)?;
+        state.serialize_field("executionEpoch", &self.execution_epoch)?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CollectorBarrierKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CollectorBarrierKeyFields {
+            scope: String,
+            collector_id: String,
+            execution_epoch: u64,
+        }
+
+        let fields = CollectorBarrierKeyFields::deserialize(deserializer)?;
+        Ok(Self::new(
+            fields.scope,
+            fields.collector_id,
+            fields.execution_epoch,
+        ))
+    }
+}
+
+fn parse_legacy_collector_barrier_key(barrier_key: &str) -> CollectorBarrierKey {
+    let (head, execution_epoch) = barrier_key
+        .rsplit_once(':')
+        .map(|(head, epoch)| (head, epoch.parse().unwrap_or(0)))
+        .unwrap_or((barrier_key, 0));
+    let (scope, collector_id) = head
+        .split_once(':')
+        .map(|(scope, collector_id)| (scope.to_string(), collector_id.to_string()))
+        .unwrap_or_else(|| ("root".to_string(), head.to_string()));
+    CollectorBarrierKey::new(scope, collector_id, execution_epoch)
+}
+
+mod collector_barriers_serde {
+    use super::*;
+
+    #[derive(Serialize)]
+    struct CollectorBarrierEntrySer<'a> {
+        scope: &'a str,
+        #[serde(rename = "collectorId")]
+        collector_id: &'a str,
+        #[serde(rename = "executionEpoch")]
+        execution_epoch: u64,
+        #[serde(flatten)]
+        state: &'a CollectorBarrierState,
+    }
+
+    #[derive(Deserialize)]
+    struct CollectorBarrierEntryDe {
+        scope: String,
+        #[serde(rename = "collectorId")]
+        collector_id: String,
+        #[serde(rename = "executionEpoch")]
+        execution_epoch: u64,
+        #[serde(flatten)]
+        state: CollectorBarrierState,
+    }
+
+    pub fn serialize<S>(
+        map: &BTreeMap<CollectorBarrierKey, CollectorBarrierState>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let entries = map
+            .iter()
+            .map(|(key, state)| CollectorBarrierEntrySer {
+                scope: &key.scope,
+                collector_id: &key.collector_id,
+                execution_epoch: key.execution_epoch,
+                state,
+            })
+            .collect::<Vec<_>>();
+        entries.serialize(serializer)
+    }
+
+    struct CollectorBarriersVisitor;
+
+    impl<'de> Visitor<'de> for CollectorBarriersVisitor {
+        type Value = BTreeMap<CollectorBarrierKey, CollectorBarrierState>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("collector barrier array or legacy string-keyed map")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut map = BTreeMap::new();
+            while let Some(entry) = seq.next_element::<CollectorBarrierEntryDe>()? {
+                map.insert(
+                    CollectorBarrierKey::new(
+                        entry.scope,
+                        entry.collector_id,
+                        entry.execution_epoch,
+                    ),
+                    entry.state,
+                );
+            }
+            Ok(map)
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut barriers = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, CollectorBarrierState>()? {
+                barriers.insert(parse_legacy_collector_barrier_key(&key), value);
+            }
+            Ok(barriers)
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<CollectorBarrierKey, CollectorBarrierState>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(CollectorBarriersVisitor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CollectorBarrierState {
@@ -385,8 +556,10 @@ pub struct RuntimeCheckpoint {
     pub active_cursors: Vec<CursorState>,
     #[serde(default)]
     pub split_families: BTreeMap<String, SplitFamilyState>,
+    #[serde(default, with = "collector_barriers_serde")]
+    pub collector_barriers: BTreeMap<CollectorBarrierKey, CollectorBarrierState>,
     #[serde(default)]
-    pub collector_barriers: BTreeMap<String, CollectorBarrierState>,
+    pub tmux_sessions: BTreeSet<String>,
     #[serde(default)]
     pub queued_approvals: Vec<QueuedApproval>,
     #[serde(default)]
@@ -543,6 +716,14 @@ struct ActivePaneTarget {
     target: String,
     session_name: Option<String>,
     sequence: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ActivePaneEntry {
+    pub key: String,
+    pub target: String,
+    pub session_name: Option<String>,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -719,6 +900,10 @@ impl RunRegistry {
         self.inner.lock().await.remove(run_id);
     }
 
+    pub async fn active_run_ids(&self) -> HashSet<String> {
+        self.inner.lock().await.keys().cloned().collect()
+    }
+
     #[cfg(test)]
     pub(crate) async fn set_active_pane(&self, run_id: &str, key: &str, target: &str) {
         self.set_active_pane_with_session(run_id, key, target, None)
@@ -786,6 +971,22 @@ impl RunRegistry {
             return Some(target);
         }
         None
+    }
+
+    pub(crate) async fn active_pane_entries(&self, run_id: &str) -> Vec<ActivePaneEntry> {
+        let Some(active) = self.inner.lock().await.get(run_id).cloned() else {
+            return Vec::new();
+        };
+        let panes = active.active_panes.lock().await;
+        panes
+            .iter()
+            .map(|(key, entry)| ActivePaneEntry {
+                key: key.clone(),
+                target: entry.target.clone(),
+                session_name: entry.session_name.clone(),
+                sequence: entry.sequence,
+            })
+            .collect()
     }
 
     #[cfg(test)]
@@ -1381,26 +1582,6 @@ fn collector_barrier_scope(cursor: &CursorState) -> &str {
     }
 }
 
-fn collector_barrier_key(cursor: &CursorState, collector_id: &str, execution_epoch: u64) -> String {
-    format!(
-        "{}:{}:{}",
-        collector_barrier_scope(cursor),
-        collector_id,
-        execution_epoch
-    )
-}
-
-fn collector_id_from_barrier_key(barrier_key: &str) -> &str {
-    let without_epoch = barrier_key
-        .rsplit_once(':')
-        .map(|(head, _)| head)
-        .unwrap_or(barrier_key);
-    without_epoch
-        .split_once(':')
-        .map(|(_, collector_id)| collector_id)
-        .unwrap_or(without_epoch)
-}
-
 /// Pre-scan workflow nodes: collect node IDs referenced by `continue_session_from` so
 /// those nodes run with persistent sessions (ephemeral_session = false).
 fn build_session_persistence_set(workflow: &WorkflowV3) -> HashSet<String> {
@@ -1582,6 +1763,7 @@ fn build_initial_checkpoint(
         }],
         split_families: BTreeMap::new(),
         collector_barriers: BTreeMap::new(),
+        tmux_sessions: BTreeSet::new(),
         queued_approvals: Vec::new(),
         loop_counters: BTreeMap::new(),
         visit_counters: BTreeMap::new(),
@@ -2981,10 +3163,24 @@ async fn run_decide_node(
     let start = std::time::Instant::now();
     let cwd = run_ctx.cwd.clone();
     let agent = DEFAULT_AGENT.to_string();
+    let agent_config = AgentConfig {
+        model: config
+            .model
+            .clone()
+            .or_else(|| Some(model::default_decide_model())),
+        ..AgentConfig::default()
+    };
     let prompt_for_task = resolved_prompt.clone();
     let inv = ctx.run_invocation.clone();
+    let agent_config_clone = agent_config.clone();
     let result = tokio::task::spawn_blocking(move || {
-        crate::tmux_exec::run_tmux_oneshot(&agent, &prompt_for_task, &cwd, None, inv)
+        crate::tmux_exec::run_tmux_oneshot(
+            &agent,
+            &prompt_for_task,
+            &cwd,
+            Some(&agent_config_clone),
+            inv,
+        )
     })
     .await
     .context("join error in decide node")??;
@@ -4714,7 +4910,7 @@ async fn handle_collector_entry(
             ..Default::default()
         });
     let split_family_ids = checkpoint.active_cursors[index].split_family_ids.clone();
-    let barrier_key = collector_barrier_key(
+    let barrier_key = CollectorBarrierKey::from_cursor(
         &checkpoint.active_cursors[index],
         &node.id,
         checkpoint.execution_epoch,
@@ -4792,7 +4988,7 @@ async fn release_collectors_if_ready(
         let waiting_cursor_ids = barrier.waiting_cursor_ids.clone();
         let arrivals = barrier.arrivals.clone();
         let required_len = barrier.required_inputs.len();
-        let collector_id = collector_id_from_barrier_key(&barrier_key).to_string();
+        let collector_id = barrier_key.collector_id.clone();
         let Some(node) = graph
             .node_map
             .get(collector_id.as_str())
@@ -5027,8 +5223,11 @@ async fn handle_terminal_cursor_status(
     if let Some(index) = find_cursor_index(checkpoint, &cursor_id) {
         let cursor = checkpoint.active_cursors[index].clone();
         for target in nearest_collectors_for_node(graph, &node.id) {
-            let barrier_key =
-                collector_barrier_key(&cursor, &target.collector_id, checkpoint.execution_epoch);
+            let barrier_key = CollectorBarrierKey::from_cursor(
+                &cursor,
+                &target.collector_id,
+                checkpoint.execution_epoch,
+            );
             let barrier = checkpoint
                 .collector_barriers
                 .entry(barrier_key)
@@ -5405,6 +5604,11 @@ async fn cleanup_terminal_active_panes(ctx: &RuntimeContext, run_id: &str, workf
         return;
     }
 
+    let killed_sessions = targets
+        .iter()
+        .filter_map(|target| target.session_name.clone())
+        .collect::<BTreeSet<_>>();
+
     let inv = ctx.run_invocation.clone();
     let _ = tokio::task::spawn_blocking(move || {
         if let Some(inv) = inv {
@@ -5414,6 +5618,86 @@ async fn cleanup_terminal_active_panes(ctx: &RuntimeContext, run_id: &str, workf
         }
     })
     .await;
+
+    if killed_sessions.is_empty() {
+        return;
+    }
+
+    if let Ok(Some(mut persisted)) = ctx.db.get_run(run_id).await {
+        for session in &killed_sessions {
+            persisted.checkpoint.tmux_sessions.remove(session);
+        }
+        let _ = ctx
+            .db
+            .upsert_run(&PersistedRun {
+                checkpoint: persisted.checkpoint,
+                workflow: persisted.workflow,
+            })
+            .await;
+    }
+}
+
+pub(crate) async fn register_tmux_session(
+    db: &Database,
+    run_id: &str,
+    session_name: &str,
+) -> anyhow::Result<()> {
+    let Some(mut persisted) = db.get_run(run_id).await? else {
+        return Ok(());
+    };
+    if persisted
+        .checkpoint
+        .tmux_sessions
+        .insert(session_name.to_string())
+    {
+        db.upsert_run(&persisted).await?;
+    }
+    Ok(())
+}
+
+pub async fn reap_stale_tmux_sessions(ctx: &RuntimeContext) -> anyhow::Result<()> {
+    let live_sessions = match tokio::task::spawn_blocking(crate::tmux_exec::list_silverbond_tmux_sessions).await
+    {
+        Ok(Ok(sessions)) => sessions,
+        Ok(Err(error)) => return Err(error),
+        Err(error) => return Err(error.into()),
+    };
+    if live_sessions.is_empty() {
+        return Ok(());
+    }
+
+    let checkpoint_runs = ctx.db.list_runs_with_tmux_sessions().await?;
+    let active_run_ids = ctx.registry.active_run_ids().await;
+    let mut terminal_session_runs = HashMap::<String, String>::new();
+    for (run_id, status, sessions) in checkpoint_runs {
+        if matches!(
+            status,
+            RuntimeStatus::Completed
+                | RuntimeStatus::Failed
+                | RuntimeStatus::Aborted
+                | RuntimeStatus::Restarted
+        ) {
+            for session in sessions {
+                terminal_session_runs.insert(session, run_id.clone());
+            }
+        }
+    }
+
+    for session in live_sessions {
+        let Some(run_id) = terminal_session_runs.get(&session) else {
+            continue;
+        };
+        if active_run_ids.contains(run_id) {
+            continue;
+        }
+        let session = session.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::tmux_exec::kill_tmux_session(&session);
+        })
+        .await;
+    }
+
+    Ok(())
 }
 
 async fn kill_active_run_panes(ctx: &RuntimeContext, run_id: &str) {

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { createQuery, createMutation, useQueryClient } from "@tanstack/svelte-query";
-  import { api, streamRun } from "@/lib/api/client";
+  import { api, streamRun, type RunActionResponse } from "@/lib/api/client";
   import {
     createEmptyWorkflow,
     duplicateWorkflowForEditing,
@@ -23,6 +23,14 @@
     return Object.fromEntries(
       workflow.variables.filter((v) => v.name).map((v) => [v.name, v.default])
     );
+  }
+
+  function observabilityFromPayload(payload: RunActionResponse) {
+    return {
+      sessionName: payload.sessionName ?? null,
+      attachCommand: payload.attachCommand ?? null,
+      panes: payload.panes,
+    };
   }
 
   /* ── queries ──────────────────────────────────────────────────────── */
@@ -177,6 +185,7 @@
     let hadError = false;
     try {
       const payload = await api.createRun(targetWorkflow, collectVariableOverrides(targetWorkflow));
+      store.setRunObservability(observabilityFromPayload(payload));
       store.setRunState({ runId: payload.runId, running: true });
       await streamRun(payload.runId, (event) => store.applyRunEvent(event));
     } catch (err) {
@@ -198,6 +207,7 @@
     let hadError = false;
     try {
       const payload = await api.resumeRun(runId);
+      store.setRunObservability(observabilityFromPayload(payload));
       await streamRun(payload.runId, (event) => store.applyRunEvent(event));
     } catch (err) {
       hadError = true;
@@ -218,6 +228,7 @@
     let hadError = false;
     try {
       const payload = await api.restartFromNode(runId, nodeId);
+      store.setRunObservability(observabilityFromPayload(payload));
       await streamRun(payload.runId, (event) => store.applyRunEvent(event));
     } catch (err) {
       hadError = true;
@@ -435,8 +446,7 @@
         onApproval={(approved, userInput) => {
           if (store.runId) api.approveRun(store.runId, approved, userInput);
         }}
-        onInteractionResponse={(response) => {
-          const sessionId = store.interaction?.sessionId;
+        onInteractionResponse={(sessionId, response) => {
           if (store.runId && sessionId) api.respondToInteraction(store.runId, sessionId, response);
         }}
       />

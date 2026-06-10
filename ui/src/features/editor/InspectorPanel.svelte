@@ -311,7 +311,11 @@
   }
 
   function numOrUndef(v: string): number | undefined {
-    return v !== "" ? Number(v) : undefined;
+    const n = Number(v);
+    // Guard against non-finite values (e.g. "1e999" → Infinity): return
+    // undefined so the field is omitted from the JSON rather than serialized
+    // as null, preserving the backend's number-or-absent contract.
+    return v !== "" && Number.isFinite(n) ? n : undefined;
   }
 
   function mergeConfig<T extends object>(

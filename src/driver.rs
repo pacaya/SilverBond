@@ -131,6 +131,27 @@ fn registry_capabilities_or(name: &str, fallback: AgentCapabilities) -> AgentCap
     capabilities_from_registry(name).unwrap_or(fallback)
 }
 
+fn registry_interaction_pattern(
+    pattern: &agents::InteractionPatternSpec,
+) -> Option<InteractionPattern> {
+    let kind = match pattern.kind.as_str() {
+        "permission" => InteractionKind::PermissionRequest,
+        "auto_respond" => InteractionKind::AutoRespond {
+            response: pattern.response.clone().unwrap_or_default(),
+        },
+        "subagent_active" => InteractionKind::SubagentActive,
+        "destructive_warning" => InteractionKind::DestructiveWarning,
+        _ => return None,
+    };
+
+    Some(InteractionPattern {
+        kind,
+        pattern: pattern.pattern.clone(),
+        description: pattern.description.clone(),
+        send_enter: pattern.send_enter,
+    })
+}
+
 pub fn agent_binary(name: &str) -> Option<String> {
     agents::Registry::load()
         .ok()
@@ -726,6 +747,20 @@ impl AgentDriver for RegistryProfileDriver {
     }
     fn parse_context_response(&self, _output: &str) -> Option<ContextInfo> {
         None
+    }
+
+    fn interaction_patterns(&self) -> Vec<InteractionPattern> {
+        let Ok(registry) = agents::Registry::load() else {
+            return vec![];
+        };
+        let Some(spec) = registry.get(&self.name) else {
+            return vec![];
+        };
+
+        spec.interaction_patterns
+            .iter()
+            .filter_map(registry_interaction_pattern)
+            .collect()
     }
 }
 
@@ -1379,5 +1414,27 @@ mod tests {
         assert!(!caps.structured_output);
         assert!(!caps.session_reuse);
         assert!(!caps.reasoning_config);
+    }
+
+    #[test]
+    fn registry_interaction_pattern_maps_auto_response() {
+        let pattern = registry_interaction_pattern(&agents::InteractionPatternSpec {
+            pattern: "Press Enter to continue".to_owned(),
+            kind: "auto_respond".to_owned(),
+            description: "Continue prompt".to_owned(),
+            response: Some("y".to_owned()),
+            send_enter: false,
+        })
+        .unwrap();
+
+        assert_eq!(
+            pattern.kind,
+            InteractionKind::AutoRespond {
+                response: "y".to_owned()
+            }
+        );
+        assert_eq!(pattern.pattern, "Press Enter to continue");
+        assert_eq!(pattern.description, "Continue prompt");
+        assert!(!pattern.send_enter);
     }
 }

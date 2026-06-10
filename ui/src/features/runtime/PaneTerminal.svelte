@@ -23,22 +23,49 @@
   let handle: PaneStreamHandle | null = null;
   let resizeObserver: ResizeObserver | undefined;
 
-  /* Panes are keyed by node id on the backend; "active" resolves the single
-   * running pane (see runtime.rs::resolve_active_pane). This hardcoded pane
-   * owner list still omits send/wait/capture runner panes and may show nodes
-   * that have not spawned a pane yet; a later backend-driven pane list is the
-   * drift-proof follow-up. */
-  const paneOptions = $derived([
-    { value: "active", label: "Active pane" },
-    ...((workflow?.nodes ?? [])
-      .filter(
-        (node) =>
-          node.kind.type === "run_agent" ||
-          node.kind.type === "spawn" ||
-          node.kind.type === "task",
-      )
-      .map((node) => ({ value: node.id, label: node.name || node.id }))),
-  ]);
+  function paneNodeId(pane: string): string {
+    const separator = pane.lastIndexOf(":");
+    return separator >= 0 ? pane.slice(separator + 1) : pane;
+  }
+
+  function paneLabel(pane: string): string {
+    const nodeId = paneNodeId(pane);
+    const node = workflow?.nodes.find((entry) => entry.id === nodeId);
+    return node?.name || nodeId;
+  }
+
+  const paneOptions = $derived.by(() => {
+    const observed = store.runObservability?.panes;
+    if (observed?.length) {
+      return observed.map((entry) => ({
+        value: entry.pane,
+        label: paneLabel(entry.pane),
+        attachCommand: entry.attachCommand,
+      }));
+    }
+
+    return [
+      { value: "active", label: "Active pane", attachCommand: store.runObservability?.attachCommand ?? null },
+      ...((workflow?.nodes ?? [])
+        .filter(
+          (node) =>
+            node.kind.type === "run_agent" ||
+            node.kind.type === "spawn" ||
+            node.kind.type === "task",
+        )
+        .map((node) => ({
+          value: node.id,
+          label: node.name || node.id,
+          attachCommand: store.runObservability?.attachCommand ?? null,
+        }))),
+    ];
+  });
+
+  const selectedAttachCommand = $derived(
+    paneOptions.find((option) => option.value === store.selectedPane)?.attachCommand
+      ?? store.runObservability?.attachCommand
+      ?? null,
+  );
 
   const statusLabel = $derived(
     store.paneStatus === "open"
@@ -174,6 +201,12 @@
     <div class="paneTerminal__error">{store.paneError}</div>
   {/if}
 
+  {#if selectedAttachCommand}
+    <div class="paneTerminal__attach">
+      <code>{selectedAttachCommand}</code>
+    </div>
+  {/if}
+
   <div class="paneTerminal__screen" bind:this={host}></div>
 
   {#if !runId}
@@ -267,6 +300,22 @@
     border-radius: 12px;
     border: 1px solid rgba(248, 113, 113, 0.3);
     background: rgba(248, 113, 113, 0.08);
+  }
+
+  .paneTerminal__attach {
+    flex-shrink: 0;
+    font-family: "IBM Plex Mono", monospace;
+    font-size: 0.75rem;
+    color: var(--text-dim);
+    padding: 8px 12px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    overflow-x: auto;
+  }
+
+  .paneTerminal__attach code {
+    white-space: nowrap;
   }
 
   .paneTerminal__screen {

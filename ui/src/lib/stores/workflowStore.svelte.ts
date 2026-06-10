@@ -7,6 +7,7 @@ import {
 import type {
   NodeKind,
   RunEvent,
+  RunObservability,
   SplitFailurePolicy,
   SubflowConfig,
   ValidationResponse,
@@ -193,6 +194,7 @@ class WorkflowStore {
   selectedPane = $state<string>("active");
   paneStatus = $state<PaneStatus>("idle");
   paneError = $state<string>("");
+  runObservability = $state<RunObservability | null>(null);
 
   /* ── compound-node drill-in (breadcrumb path of subflow names) ─────── */
   drillStack = $state<string[]>([]);
@@ -618,12 +620,23 @@ class WorkflowStore {
     this.interactions = [];
     this.nodeStates = {};
     this.selectedPane = "active";
+    this.runObservability = null;
   }
 
   setRunState(patch: { runId?: string | null; running?: boolean; approval?: ApprovalState | null }) {
     if (patch.runId !== undefined) this.runId = patch.runId;
     if (patch.running !== undefined) this.running = patch.running;
     if (patch.approval !== undefined) this.approval = patch.approval;
+  }
+
+  setRunObservability(observability: RunObservability | null) {
+    this.runObservability = observability;
+    const panes = observability?.panes;
+    if (panes?.length === 1) {
+      this.selectedPane = panes[0].pane;
+    } else if ((panes?.length ?? 0) > 1 && this.selectedPane === "active") {
+      this.selectedPane = panes![0].pane;
+    }
   }
 
   setNodeRuntimeState(nodeId: string, state: NodeRuntimeState) {

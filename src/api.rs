@@ -8,10 +8,11 @@ use async_stream::stream;
 use axum::{
     Json, Router,
     extract::{
-        Path, State,
+        Path, Request, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, header},
+    http::{StatusCode, header},
+    middleware::{self, Next},
     response::{
         IntoResponse, Response,
         sse::{Event, KeepAlive, Sse},
@@ -54,7 +55,49 @@ enum PaneStreamTaskExit {
     Terminal,
 }
 
+struct PaneStreamGuard {
+    state: Option<AppState>,
+    pane_target: String,
+}
+
+impl PaneStreamGuard {
+    fn new(state: AppState, pane_target: String) -> Self {
+        Self {
+            state: Some(state),
+            pane_target,
+        }
+    }
+
+    fn unsubscribe(mut self) {
+        self.spawn_unsubscribe();
+    }
+
+    fn spawn_unsubscribe(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        let pane_target = self.pane_target.clone();
+        tokio::spawn(async move {
+            state.pane_streams.unsubscribe(&pane_target).await;
+        });
+    }
+}
+
+impl Drop for PaneStreamGuard {
+    fn drop(&mut self) {
+        self.spawn_unsubscribe();
+    }
+}
+
 pub fn router(state: AppState) -> Router {
+    let stream_routes = Router::new()
+        .route("/api/runs/{run_id}/stream", get(stream_run))
+        .route(
+            "/api/runs/{run_id}/panes/{pane}/stream",
+            get(pane_stream_ws),
+        )
+        .route_layer(middleware::from_fn(require_allowed_stream_origin));
+
     Router::new()
         .route("/api/health", get(health))
         .route("/api/capabilities", get(capabilities))
@@ -67,11 +110,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/templates", get(list_templates))
         .route("/api/test-node", post(test_node))
         .route("/api/runs", post(create_run))
-        .route("/api/runs/{run_id}/stream", get(stream_run))
-        .route(
-            "/api/runs/{run_id}/panes/{pane}/stream",
-            get(pane_stream_ws),
-        )
+        .merge(stream_routes)
         .route("/api/runs/{run_id}/events", get(run_events))
         .route("/api/runs/{run_id}/approve", post(approve_run))
         .route(
@@ -89,6 +128,17 @@ pub fn router(state: AppState) -> Router {
         .route("/api/logs", get(list_logs))
         .route("/api/logs/{id}", get(get_log).delete(delete_log))
         .with_state(state)
+}
+
+async fn require_allowed_stream_origin(request: Request, next: Next) -> Response {
+    match request
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|origin| origin.to_str().ok())
+    {
+        Some(origin) if is_allowed_origin(origin) => next.run(request).await,
+        _ => StatusCode::FORBIDDEN.into_response(),
+    }
 }
 
 async fn health() -> Json<Value> {
@@ -208,6 +258,40 @@ fn session_name_from_checkpoint(checkpoint: &RuntimeCheckpoint) -> Option<String
     None
 }
 
+async fn session_name_from_pane_target(
+    invocation: &TmuxInvocation,
+    pane_target: &str,
+    stored_session_name: Option<&str>,
+) -> Option<String> {
+    if let Some(name) = stored_session_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        return Some(name.to_owned());
+    }
+
+    let invocation = invocation.clone();
+    let pane_target = pane_target.to_owned();
+    tokio::task::spawn_blocking(move || {
+        with_invocation(invocation, || {
+            tmux::run_checked(&[
+                "display-message",
+                "-p",
+                "-t",
+                pane_target.as_str(),
+                "-F",
+                "#{session_name}",
+            ])
+            .ok()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+        })
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 async fn session_name_from_active_pane(
     state: &AppState,
     run_id: &str,
@@ -227,25 +311,7 @@ async fn session_name_from_active_pane(
             .resolve_active_pane(run_id, "active")
             .await
     }?;
-    let invocation = invocation.clone();
-    tokio::task::spawn_blocking(move || {
-        with_invocation(invocation, || {
-            tmux::run_checked(&[
-                "display-message",
-                "-p",
-                "-t",
-                pane.as_str(),
-                "-F",
-                "#{session_name}",
-            ])
-            .ok()
-            .map(|name| name.trim().to_owned())
-            .filter(|name| !name.is_empty())
-        })
-    })
-    .await
-    .ok()
-    .flatten()
+    session_name_from_pane_target(invocation, &pane, None).await
 }
 
 async fn resolve_run_session_name(
@@ -272,15 +338,56 @@ async fn run_observability_object(
     let Ok(Some(persisted)) = state.runtime.db.get_run(run_id).await else {
         return fields;
     };
-    let Some(session_name) = resolve_run_session_name(state, run_id, &persisted).await else {
+    let invocation = run_tmux_invocation(&persisted.workflow);
+    let mut pane_entries = state.runtime.registry.active_pane_entries(run_id).await;
+    pane_entries.sort_by_key(|entry| entry.sequence);
+
+    let mut panes = Vec::new();
+    for entry in &pane_entries {
+        let Some(session_name) = session_name_from_pane_target(
+            &invocation,
+            &entry.target,
+            entry.session_name.as_deref(),
+        )
+        .await
+        else {
+            continue;
+        };
+        panes.push(json!({
+            "pane": entry.key,
+            "sessionName": session_name,
+            "attachCommand": build_attach_command(&invocation, &session_name),
+        }));
+    }
+
+    let (session_name, attach_command) = if let Some(last) = panes.last() {
+        (
+            last.get("sessionName")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            last.get("attachCommand")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        )
+    } else {
+        let session_name = resolve_run_session_name(state, run_id, &persisted).await;
+        (
+            session_name.clone(),
+            session_name
+                .as_ref()
+                .map(|name| build_attach_command(&invocation, name)),
+        )
+    };
+
+    let (Some(session_name), Some(attach_command)) = (session_name, attach_command) else {
         return fields;
     };
-    let invocation = run_tmux_invocation(&persisted.workflow);
+
     fields.insert("sessionName".to_owned(), json!(session_name));
-    fields.insert(
-        "attachCommand".to_owned(),
-        json!(build_attach_command(&invocation, &session_name)),
-    );
+    fields.insert("attachCommand".to_owned(), json!(attach_command));
+    if !panes.is_empty() {
+        fields.insert("panes".to_owned(), json!(panes));
+    }
     fields
 }
 
@@ -546,16 +653,8 @@ async fn stream_run(
 pub async fn pane_stream_ws(
     State(state): State<AppState>,
     Path((run_id, pane)): Path<(String, String)>,
-    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if let Some(origin) = headers.get(header::ORIGIN) {
-        match origin.to_str() {
-            Ok(origin) if is_allowed_origin(origin) => {}
-            _ => return StatusCode::FORBIDDEN.into_response(),
-        }
-    }
-
     ws.on_upgrade(move |socket| async move {
         let log_run_id = run_id.clone();
         let log_pane = pane.clone();
@@ -595,12 +694,19 @@ async fn pane_stream_socket(
         }
     };
 
+    let mut pane_receiver =
+        match subscribe_pane_stream(&state, &run_id, &pane, &pane_target, &invocation).await {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                send_socket_error_and_close(&mut socket, 0, &error.to_string()).await;
+                return Ok(());
+            }
+        };
+    let pane_stream_guard = PaneStreamGuard::new(state.clone(), pane_target.clone());
+
     let (mut sender, mut receiver) = socket.split();
     let mut next_seq = 0_u64;
     send_snapshot(&mut sender, &pane_target, &invocation, &mut next_seq).await?;
-
-    let mut pane_receiver =
-        subscribe_pane_stream(&state, &run_id, &pane, &pane_target, &invocation).await;
 
     let mut heartbeat = Box::pin(tokio::time::sleep(PANE_STREAM_HEARTBEAT));
     let mut stream_chunks_seen = false;
@@ -705,7 +811,7 @@ async fn pane_stream_socket(
     }
 
     drop(pane_receiver);
-    state.pane_streams.unsubscribe(&pane_target).await;
+    pane_stream_guard.unsubscribe();
 
     Ok(())
 }
@@ -771,11 +877,23 @@ async fn subscribe_pane_stream(
     pane: &str,
     pane_target: &str,
     invocation: &TmuxInvocation,
-) -> broadcast::Receiver<Vec<u8>> {
+) -> Result<broadcast::Receiver<Vec<u8>>, PaneStreamSubscribeError> {
     let mut streams = state.pane_streams.inner.lock().await;
+    let subscriber_limit = state.pane_streams.max_subscribers_per_pane;
     if let Some(entry) = streams.get_mut(pane_target) {
+        if entry.refcount >= subscriber_limit {
+            return Err(PaneStreamSubscribeError::TooManySubscribers {
+                limit: subscriber_limit,
+            });
+        }
         entry.refcount = entry.refcount.saturating_add(1);
-        return entry.sender.subscribe();
+        return Ok(entry.sender.subscribe());
+    }
+
+    if subscriber_limit == 0 {
+        return Err(PaneStreamSubscribeError::TooManySubscribers {
+            limit: subscriber_limit,
+        });
     }
 
     let (sender, receiver) = broadcast::channel::<Vec<u8>>(256);
@@ -797,7 +915,13 @@ async fn subscribe_pane_stream(
         sender,
     );
 
-    receiver
+    Ok(receiver)
+}
+
+#[derive(Debug, thiserror::Error)]
+enum PaneStreamSubscribeError {
+    #[error("too many pane stream subscribers (limit: {limit})")]
+    TooManySubscribers { limit: usize },
 }
 
 async fn pump_pane_stream<R>(
@@ -922,21 +1046,23 @@ fn spawn_pane_stream_task(
             }
         };
 
-        match exit {
-            PaneStreamTaskExit::NoSubscribers => {
-                state
-                    .pane_streams
-                    .remove_if_sender(&pane_target, &sender)
-                    .await;
-            }
-            PaneStreamTaskExit::Terminal => {
-                state
-                    .pane_streams
-                    .remove_terminal_sender(&pane_target, &sender)
-                    .await;
-            }
-        }
+        cleanup_pane_stream_task_exit(&state.pane_streams, &pane_target, &sender, exit).await;
     });
+}
+
+async fn cleanup_pane_stream_task_exit(
+    pane_streams: &crate::app::PaneStreamRegistry,
+    pane_target: &str,
+    sender: &broadcast::Sender<Vec<u8>>,
+    exit: PaneStreamTaskExit,
+) {
+    match exit {
+        PaneStreamTaskExit::NoSubscribers | PaneStreamTaskExit::Terminal => {
+            pane_streams
+                .remove_terminal_sender(pane_target, sender)
+                .await;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1378,15 +1504,27 @@ fn node_from_value(value: Value) -> anyhow::Result<WorkflowNode> {
     {
         anyhow::bail!("workflow payload is not valid for node testing; provide a single node");
     }
-    let node: WorkflowNode = serde_json::from_value(value)
-        .context("node payload must be a canonical v3 WorkflowNode")?;
-    if matches!(&node.kind, NodeKind::Task { .. } | NodeKind::Approval) {
-        return Ok(node);
+    match serde_json::from_value::<WorkflowNode>(value.clone()) {
+        Ok(node) => {
+            if matches!(&node.kind, NodeKind::Task { .. } | NodeKind::Approval) {
+                return Ok(node);
+            }
+            anyhow::bail!(
+                "node payload must use canonical v3 task or approval kind types; got {}",
+                node.kind.as_str()
+            )
+        }
+        Err(err) => {
+            // Give a targeted hint when the caller used the obsolete flat shape
+            // (top-level `type` with no `kind` wrapper).
+            if value.get("type").is_some() && value.get("kind").is_none() {
+                anyhow::bail!(
+                    "node uses the legacy flat shape; migrate to the canonical v3 `kind: {{ type, ... }}` form"
+                );
+            }
+            Err(anyhow::anyhow!(err).context("node payload must be a canonical v3 WorkflowNode"))
+        }
     }
-    anyhow::bail!(
-        "node payload must use canonical v3 task or approval kind types; got {}",
-        node.kind.as_str()
-    )
 }
 
 #[derive(Debug)]
@@ -1439,10 +1577,11 @@ mod tests {
     use tokio::io::ReadBuf;
 
     use crate::{
-        app::PaneStreamRegistry,
+        app::{AppPaths, AppState, PaneStreamRegistry},
         runtime::{
             AgentExecutionMetadata, ExecutionLog, NodeExecutionLog, NodeResult, RuntimeStatus,
         },
+        storage::{Database, TemplateStore, WorkflowStore},
     };
 
     struct ScriptedReader {
@@ -1471,6 +1610,19 @@ mod tests {
                 Some(Err(error)) => Poll::Ready(Err(error)),
                 None => Poll::Ready(Ok(())),
             }
+        }
+    }
+
+    fn test_app_state(pane_streams: PaneStreamRegistry) -> AppState {
+        let paths = AppPaths::from_root(std::env::temp_dir().join("silverbond-api-tests"));
+        AppState {
+            paths: paths.clone(),
+            workflows: WorkflowStore::new(paths.workflows_dir.clone()),
+            templates: TemplateStore::new(paths.templates_dir.clone()),
+            runtime: crate::runtime::RuntimeContext::new(Database::new(
+                paths.database_path.clone(),
+            )),
+            pane_streams,
         }
     }
 
@@ -1611,6 +1763,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscribe_pane_stream_rejects_when_subscriber_limit_reached() {
+        let mut registry = PaneStreamRegistry::default();
+        registry.max_subscribers_per_pane = 1;
+        let (sender, _receiver) = broadcast::channel::<Vec<u8>>(16);
+        {
+            let mut streams = registry.inner.lock().await;
+            streams.insert(
+                "%1".to_string(),
+                PaneStreamEntry {
+                    sender: sender.clone(),
+                    refcount: 1,
+                },
+            );
+        }
+        let state = test_app_state(registry.clone());
+
+        let result = subscribe_pane_stream(
+            &state,
+            "run-test",
+            "pane-test",
+            "%1",
+            &TmuxInvocation::default(),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(PaneStreamSubscribeError::TooManySubscribers { limit: 1 })
+        ));
+        assert_eq!(
+            registry
+                .inner
+                .lock()
+                .await
+                .get("%1")
+                .map(|entry| entry.refcount),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
     async fn pane_stream_retry_keeps_receivers_after_transient_read_error() {
         let (sender, mut receiver) = broadcast::channel::<Vec<u8>>(16);
         let mut reader = ScriptedReader::new(vec![
@@ -1694,6 +1887,45 @@ mod tests {
         assert!(!registry.inner.lock().await.contains_key("%1"));
     }
 
+    #[tokio::test]
+    async fn pane_stream_task_no_subscribers_uses_terminal_sender_cleanup() {
+        let registry = PaneStreamRegistry::default();
+        let (sender, _receiver) = broadcast::channel::<Vec<u8>>(16);
+        {
+            let mut streams = registry.inner.lock().await;
+            streams.insert(
+                "%1".to_string(),
+                PaneStreamEntry {
+                    sender: sender.clone(),
+                    refcount: 2,
+                },
+            );
+        }
+
+        cleanup_pane_stream_task_exit(&registry, "%1", &sender, PaneStreamTaskExit::NoSubscribers)
+            .await;
+        assert!(!registry.inner.lock().await.contains_key("%1"));
+
+        let (new_sender, _new_receiver) = broadcast::channel::<Vec<u8>>(16);
+        {
+            let mut streams = registry.inner.lock().await;
+            streams.insert(
+                "%1".to_string(),
+                PaneStreamEntry {
+                    sender: new_sender.clone(),
+                    refcount: 1,
+                },
+            );
+        }
+
+        cleanup_pane_stream_task_exit(&registry, "%1", &sender, PaneStreamTaskExit::NoSubscribers)
+            .await;
+        let streams = registry.inner.lock().await;
+        let entry = streams.get("%1").expect("new pane stream entry remains");
+        assert!(entry.sender.same_channel(&new_sender));
+        assert_eq!(entry.refcount, 1);
+    }
+
     fn test_checkpoint() -> RuntimeCheckpoint {
         RuntimeCheckpoint {
             run_id: "run-test".to_string(),
@@ -1708,6 +1940,7 @@ mod tests {
             active_cursors: Vec::new(),
             split_families: BTreeMap::new(),
             collector_barriers: BTreeMap::new(),
+            tmux_sessions: BTreeSet::new(),
             queued_approvals: Vec::new(),
             loop_counters: BTreeMap::new(),
             visit_counters: BTreeMap::new(),

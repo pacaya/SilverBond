@@ -162,6 +162,15 @@
           <div class="historyCard">
             <strong>{run.workflowName}</strong>
             <span>{run.currentNodeName || "Paused"}</span>
+            {#if run.panes?.length}
+              <div class="historyCard__panes">
+                {#each run.panes as pane (pane.pane)}
+                  <code title={pane.sessionName}>{pane.attachCommand}</code>
+                {/each}
+              </div>
+            {:else if run.attachCommand}
+              <code class="historyCard__attach">{run.attachCommand}</code>
+            {/if}
             <div class="historyCard__actions">
               <button class="button button--ghost" onclick={() => onResume(run.runId)}>
                 Resume

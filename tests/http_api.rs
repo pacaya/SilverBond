@@ -45,6 +45,13 @@ async fn json_response(router: &Router, request: Request<Body>) -> (StatusCode, 
     (status, value)
 }
 
+async fn response_status(router: &Router, request: Request<Body>) -> StatusCode {
+    let response = router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let _ = response.into_body().collect().await.unwrap();
+    status
+}
+
 #[tokio::test]
 async fn exposes_health() {
     let (_temp, router) = test_router().await;
@@ -60,6 +67,69 @@ async fn exposes_health() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(health["ok"], true);
+}
+
+#[tokio::test]
+async fn streaming_routes_require_allowed_origin() {
+    let (_temp, router) = test_router().await;
+
+    let status = response_status(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri("/api/runs/missing/stream")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let status = response_status(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri("/api/runs/missing/stream")
+            .header("origin", "https://evil.com")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let status = response_status(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri("/api/runs/missing/stream")
+            .header("origin", "http://127.0.0.1:3333")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let status = response_status(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri("/api/runs/missing/panes/active/stream")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let status = response_status(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri("/api/runs/missing/panes/active/stream")
+            .header("origin", "https://evil.com")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]

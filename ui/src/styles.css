@@ -607,6 +607,18 @@ button {
   background: rgba(9, 18, 33, 0.86);
 }
 
+.interactions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.interactions__count {
+  font-size: 0.82rem;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+}
+
 .approvalCard__header,
 .interactionCard__header,
 .historyExecution__header {

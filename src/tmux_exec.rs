@@ -29,11 +29,17 @@ use crate::{
         WaitConfig, WaitMode, WorkflowNode,
     },
     pty_output::strip_ansi,
-    runtime::{AgentExecutionMetadata, NodeResult, NodeRunner, RuntimeContext, active_pane_key},
+    runtime::{
+        AgentExecutionMetadata, NodeResult, NodeRunner, RuntimeContext, active_pane_key,
+        register_tmux_session,
+    },
+    storage::Database,
 };
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TmuxNodeRunner;
+
+const IDLE_ESCALATE_SECS: f64 = 30.0;
 
 impl TmuxNodeRunner {
     pub(crate) fn new() -> Self {
@@ -357,9 +363,22 @@ impl Drop for SessionGuard {
     }
 }
 
+/// Returns true when called from within a Tokio async task (not a `spawn_blocking` thread).
+fn in_current_task() -> bool {
+    tokio::task::try_id().is_some()
+}
+
+/// Registers active tmux panes for a workflow run.
+///
+/// # Invariant
+/// Only ever entered from a `tokio::task::spawn_blocking` blocking-pool thread where
+/// `Handle::block_on` is safe. `Handle::current()` is captured on the async runtime
+/// thread in `new()`, then `block_on` bridges back to async registry/DB calls from the
+/// blocking pool.
 #[derive(Clone)]
 struct ActivePaneRegistration {
     registry: crate::runtime::RunRegistry,
+    db: Database,
     run_id: String,
     cursor_id: String,
     key: String,
@@ -371,6 +390,7 @@ impl ActivePaneRegistration {
         let key = active_pane_key(&cursor_id, &node_id);
         Self {
             registry: ctx.registry.clone(),
+            db: ctx.db.clone(),
             run_id,
             cursor_id,
             key,
@@ -384,14 +404,22 @@ impl ActivePaneRegistration {
 
     fn set_with_session(&self, target: &str, session_name: Option<&str>) {
         let registry = self.registry.clone();
+        let db = self.db.clone();
         let run_id = self.run_id.clone();
         let key = self.key.clone();
         let target = target.to_string();
         let session_name = session_name.map(str::to_string);
+        debug_assert!(
+            !in_current_task(),
+            "Handle::block_on may only be called from spawn_blocking thread"
+        );
         self.handle.block_on(async move {
             registry
-                .set_active_pane_with_session(&run_id, &key, &target, session_name)
+                .set_active_pane_with_session(&run_id, &key, &target, session_name.clone())
                 .await;
+            if let Some(session_name) = session_name {
+                let _ = register_tmux_session(&db, &run_id, &session_name).await;
+            }
         });
     }
 
@@ -399,6 +427,10 @@ impl ActivePaneRegistration {
         let registry = self.registry.clone();
         let run_id = self.run_id.clone();
         let key = self.key.clone();
+        debug_assert!(
+            !in_current_task(),
+            "Handle::block_on may only be called from spawn_blocking thread"
+        );
         self.handle.block_on(async move {
             registry.clear_active_pane(&run_id, &key).await;
         });
@@ -408,6 +440,10 @@ impl ActivePaneRegistration {
         let registry = self.registry.clone();
         let run_id = self.run_id.clone();
         let target = target.to_string();
+        debug_assert!(
+            !in_current_task(),
+            "Handle::block_on may only be called from spawn_blocking thread"
+        );
         self.handle.block_on(async move {
             registry.clear_active_pane_target(&run_id, &target).await;
         });
@@ -418,6 +454,10 @@ impl ActivePaneRegistration {
         let run_id = self.run_id.clone();
         let same_cursor_key = active_pane_key(&self.cursor_id, key);
         let fallback_key = key.to_string();
+        debug_assert!(
+            !in_current_task(),
+            "Handle::block_on may only be called from spawn_blocking thread"
+        );
         self.handle.block_on(async move {
             if let Some(target) = registry
                 .resolve_active_pane(&run_id, &same_cursor_key)
@@ -431,6 +471,11 @@ impl ActivePaneRegistration {
     }
 }
 
+/// Escalates agent interactions back to the async runtime.
+///
+/// # Invariant
+/// Only ever entered from a `tokio::task::spawn_blocking` blocking-pool thread where
+/// `Handle::block_on` is safe.
 #[derive(Clone)]
 struct InteractionEscalation {
     ctx: RuntimeContext,
@@ -471,6 +516,10 @@ impl InteractionEscalation {
         let description = description.to_string();
         let output_so_far = output_so_far.to_string();
         let abort_flag = self.abort_flag.clone();
+        debug_assert!(
+            !in_current_task(),
+            "Handle::block_on may only be called from spawn_blocking thread"
+        );
         self.handle.block_on(async move {
             if abort_requested(abort_flag.as_deref()) {
                 anyhow::bail!("Interaction aborted");
@@ -854,6 +903,10 @@ fn run_agent_interactive(
         .and_then(|orchestrator| orchestrator.subagent_timeout_secs)
         .map(|seconds| Duration::from_secs(seconds as u64))
         .unwrap_or(Duration::from_secs(600));
+    let stale_timeout_secs = agent_cfg
+        .orchestrator
+        .as_ref()
+        .and_then(|orchestrator| orchestrator.stale_timeout_secs);
 
     let result = (|| {
         let ready = wait_for_agent_ready_interactive(
@@ -908,6 +961,7 @@ fn run_agent_interactive(
             Some(&capture_markers),
             agent_cfg.auto_approve,
             subagent_timeout,
+            stale_timeout_secs,
             &interaction_patterns,
             &destructive_regexes,
             interaction,
@@ -1021,6 +1075,23 @@ pub(crate) fn run_tmux_oneshot(
     } else {
         run()
     }
+}
+
+pub(crate) fn list_silverbond_tmux_sessions() -> anyhow::Result<Vec<String>> {
+    let output = match tmux::run_checked(&["list-sessions", "-F", "#{session_name}"]) {
+        Ok(output) => output,
+        Err(_) => return Ok(Vec::new()),
+    };
+    Ok(output
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && name.starts_with("silverbond-"))
+        .map(str::to_string)
+        .collect())
+}
+
+pub(crate) fn kill_tmux_session(session_name: &str) {
+    let _ = tmux::run(&["kill-session", "-t", session_name]);
 }
 
 pub(crate) fn cleanup_panes(targets: &[PaneCleanupTarget]) -> anyhow::Result<()> {
@@ -1383,6 +1454,7 @@ fn poll_agent_interactive(
     capture_markers: Option<&PromptCaptureMarkers>,
     auto_approve: bool,
     subagent_timeout: Duration,
+    stale_timeout_secs: Option<u32>,
     interaction_patterns: &[CompiledInteractionPattern],
     destructive_regexes: &[Regex],
     interaction: Option<&InteractionEscalation>,
@@ -1390,11 +1462,16 @@ fn poll_agent_interactive(
 ) -> anyhow::Result<InteractivePollResult> {
     let ready_signal = ready_signal_for_pane(pane)?;
     let until_regexes = compile_until_regexes(until, capture_markers)?;
+    let stale_threshold = stale_timeout_secs
+        .map(|seconds| seconds as f64)
+        .unwrap_or(IDLE_ESCALATE_SECS);
     let mut deadline = Instant::now() + timeout;
     let mut last_seen = before.to_owned();
     let mut progress = CaptureProgress::new(before, Instant::now());
     let mut handled_matches = Vec::new();
     let mut handled_destructive_matches = HandledDestructiveMatches::default();
+    let mut idle_since: Option<Instant> = None;
+    let mut escalated_idle = false;
 
     loop {
         if abort_requested(abort_flag) {
@@ -1422,6 +1499,7 @@ fn poll_agent_interactive(
         let has_new_text = !new_text.is_empty();
         if has_new_text {
             last_seen = capture.clone();
+            idle_since = None;
         }
         let output_so_far =
             extract_after_prompt_with_markers(before, &capture, prompt, capture_markers);
@@ -1504,6 +1582,23 @@ fn poll_agent_interactive(
                     output: output_so_far,
                     final_capture: capture,
                 }));
+            }
+
+            if matches!(reason, IdleReason::Idle) {
+                let idle_started = *idle_since.get_or_insert(now);
+                if !escalated_idle && (now - idle_started).as_secs_f64() >= stale_threshold {
+                    let reply = escalate_or_fallback(
+                        interaction,
+                        pane,
+                        "agent_idle",
+                        "Agent output appears stale — it may be waiting for input",
+                        &output_so_far,
+                        "",
+                    )?;
+                    send_reply_if_present(pane, &reply, true)?;
+                    escalated_idle = true;
+                    continue;
+                }
             }
         }
 
@@ -2083,7 +2178,7 @@ fn ready_signal_for_pane(pane: &str) -> anyhow::Result<ReadySignal> {
 }
 
 fn send_text(pane: &str, text: &str, enter: bool) -> anyhow::Result<()> {
-    tmux::run_checked(&["send-keys", "-t", pane, "-l", text])?;
+    tmux::run_checked(&["send-keys", "-t", pane, "-l", "--", text])?;
     if enter {
         tmux::run_checked(&["send-keys", "-t", pane, "Enter"])?;
     }
@@ -2131,10 +2226,6 @@ fn resolve_pane_target(configured: Option<&str>, previous_output: &str) -> anyho
     let previous = parse_previous(previous_output);
     let raw = configured
         .or_else(|| previous_value(&previous, &["paneId", "pane_id", "target"]))
-        .or_else(|| {
-            let trimmed = previous_output.trim();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })
         .ok_or_else(|| anyhow!("tmux pane target is required"))?;
     target::resolve(&target::parse(raw), None, None)
 }
@@ -2240,7 +2331,7 @@ fn unique_session_name(name: Option<&str>) -> String {
         .map(sanitize_tmux_name)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "run".to_owned());
-    format!("silverbond-{base}-{}", &suffix[..8])
+    format!("silverbond-{base}-{suffix}")
 }
 
 fn sanitize_tmux_name(value: &str) -> String {
@@ -2445,6 +2536,75 @@ mod tests {
             inv.prefix,
             vec!["custom"],
             "command should take precedence over user"
+        );
+    }
+
+    #[test]
+    fn unique_session_name_uses_full_uuid_suffix() {
+        let session_name = unique_session_name(Some("Reviewer A!"));
+        let prefix = "silverbond-Reviewer-A-";
+        assert!(
+            session_name.starts_with(prefix),
+            "session name should include sanitized base; got {session_name}"
+        );
+
+        let suffix = &session_name[prefix.len()..];
+        assert_eq!(
+            suffix.len(),
+            32,
+            "session suffix should keep the full compact UUID"
+        );
+        assert!(
+            suffix.chars().all(|ch| ch.is_ascii_hexdigit()),
+            "session suffix should be compact hex UUID; got {suffix}"
+        );
+    }
+
+    #[test]
+    fn unique_session_name_does_not_collide_in_bursts() {
+        let mut names = std::collections::HashSet::new();
+        for _ in 0..32 {
+            assert!(
+                names.insert(unique_session_name(Some("parallel-batch"))),
+                "burst-generated unnamed tmux sessions must be unique"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn send_text_terminates_options_before_literal_text() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-send-prefix.sh");
+        let log = temp.path().join("tmux-send-args.log");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\nshift\nprintf '%s\\n' \"$@\" >> \"$log\"\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![
+                script.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+            ],
+            socket: Some("send-test-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+        tmux_tools_core::with_invocation(invocation, || send_text("%pane-1", "-N", false)).unwrap();
+
+        let recorded =
+            std::fs::read_to_string(log).expect("fake tmux prefix should record send args");
+        let args = recorded.lines().collect::<Vec<_>>();
+        assert!(
+            args.windows(6)
+                .any(|window| window == ["send-keys", "-t", "%pane-1", "-l", "--", "-N"]),
+            "literal text that starts with '-' must appear after an end-of-options marker; args={args:?}"
         );
     }
 
@@ -2747,7 +2907,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_screen_without_sentinel_or_ready_match_does_not_complete() {
+    fn idle_does_not_auto_complete_and_requires_escalation() {
         let now = Instant::now();
         let mut progress = CaptureProgress::new("frozen shell prompt", now);
         let first_reason = progress.observe(

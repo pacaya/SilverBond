@@ -5,12 +5,18 @@ import type {
   NodeTestContext,
   NodeTestPreview,
   RunEvent,
+  RunObservability,
   RuntimeCapabilities,
   TemplateItem,
   ValidationResponse,
   WorkflowDocument,
   WorkflowItem,
 } from "@/lib/types/workflow";
+
+export type RunActionResponse = {
+  success: boolean;
+  runId: string;
+} & RunObservability;
 
 async function apiFetch<T>(input: string, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init);
@@ -48,7 +54,7 @@ export const api = {
   testNode: (node: WorkflowDocument["nodes"][number], cwd: string, mockContext: NodeTestContext) =>
     postJson<NodeTestPreview>("/api/test-node", { node, cwd, mockContext }),
   createRun: (workflow: WorkflowDocument, variableOverrides: Record<string, string>) =>
-    postJson<{ success: boolean; runId: string }>("/api/runs", {
+    postJson<RunActionResponse>("/api/runs", {
       workflow, variableOverrides, startNodeId: workflow.entryNodeId || null,
     }),
   approveRun: (runId: string, approved: boolean, userInput: string) =>
@@ -62,11 +68,11 @@ export const api = {
   abortRun: (runId: string) =>
     postJson<{ success: boolean }>(`/api/runs/${encodeURIComponent(runId)}/abort`),
   resumeRun: (runId: string) =>
-    postJson<{ success: boolean; runId: string }>(
+    postJson<RunActionResponse>(
       `/api/runs/${encodeURIComponent(runId)}/resume`,
     ),
   restartFromNode: (runId: string, nodeId: string) =>
-    postJson<{ success: boolean; runId: string }>(
+    postJson<RunActionResponse>(
       `/api/runs/${encodeURIComponent(runId)}/restart-from/${encodeURIComponent(nodeId)}`,
     ),
   dismissRun: (runId: string) =>
@@ -132,6 +138,10 @@ const PANE_RECONNECT_BASE_MS = 500;
 const PANE_RECONNECT_MAX_MS = 5000;
 const PANE_FAST_CLOSE_MS = 1000;
 const PANE_FAST_CLOSE_LIMIT = 3;
+// Sockets rejected before `onopen` (origin 403, refused, upgrade rejected) never
+// count as "fast closes" — this separate cap bounds the "can't even connect"
+// case so the reconnect loop terminates and surfaces the "unavailable" state.
+const PANE_FAILED_CONNECT_LIMIT = 5;
 const PANE_HEARTBEAT_TIMEOUT_MS = 15000;
 
 export type PaneStreamStatus = "connecting" | "open" | "closed" | "unavailable";
@@ -184,6 +194,7 @@ export function streamPane(
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let reconnectDelay = PANE_RECONNECT_BASE_MS;
   let consecutiveFastCloses = 0;
+  let consecutiveFailedConnects = 0;
   let lastSeq = -1;
   let resyncPending = false;
   let heartbeatWatchdog: ReturnType<typeof setInterval> | null = null;
@@ -193,6 +204,13 @@ export function streamPane(
       clearInterval(heartbeatWatchdog);
       heartbeatWatchdog = null;
     }
+  };
+
+  // Permanently stop reconnecting and surface the terminal "unavailable" state.
+  const giveUp = () => {
+    closed = true;
+    handlers.onStatus?.("unavailable");
+    handlers.onError?.("Pane unavailable");
   };
 
   const requestResync = () => {
@@ -219,6 +237,11 @@ export function streamPane(
       ws = new WebSocket(url);
     } catch (error) {
       handlers.onError?.(error instanceof Error ? error.message : "Unable to open pane stream");
+      consecutiveFailedConnects += 1;
+      if (consecutiveFailedConnects >= PANE_FAILED_CONNECT_LIMIT) {
+        giveUp();
+        return;
+      }
       scheduleReconnect();
       return;
     }
@@ -259,6 +282,7 @@ export function streamPane(
         firstFrameSeen = true;
         reconnectDelay = PANE_RECONNECT_BASE_MS;
         consecutiveFastCloses = 0;
+        consecutiveFailedConnects = 0;
       }
       const seq = typeof frame.seq === "number" ? frame.seq : null;
       if (
@@ -318,15 +342,20 @@ export function streamPane(
       if (closed || ws !== socket) return;
       clearHeartbeatWatchdog();
       socket = null;
+      const openedThisConnection = openedAt !== null;
       const fastClose =
         openedAt !== null &&
         !firstFrameSeen &&
         Date.now() - openedAt <= PANE_FAST_CLOSE_MS;
+      // "Connects but unstable" (fast close) and "can't even connect" (closed
+      // before onopen) are tracked independently so each terminates the loop.
       consecutiveFastCloses = fastClose ? consecutiveFastCloses + 1 : 0;
-      if (consecutiveFastCloses >= PANE_FAST_CLOSE_LIMIT) {
-        closed = true;
-        handlers.onStatus?.("unavailable");
-        handlers.onError?.("Pane unavailable");
+      consecutiveFailedConnects = openedThisConnection ? 0 : consecutiveFailedConnects + 1;
+      if (
+        consecutiveFastCloses >= PANE_FAST_CLOSE_LIMIT ||
+        consecutiveFailedConnects >= PANE_FAILED_CONNECT_LIMIT
+      ) {
+        giveUp();
         return;
       }
       handlers.onStatus?.("closed");

@@ -591,19 +591,19 @@ pub enum NodeKind {
     Split,
     Collector,
     Decide {
-        #[serde(rename = "decideConfig")]
+        #[serde(default, rename = "decideConfig")]
         decide_config: DecideConfig,
     },
     ParallelBatch {
-        #[serde(rename = "batchConfig", alias = "parallelBatchConfig")]
+        #[serde(default, rename = "batchConfig", alias = "parallelBatchConfig")]
         batch_config: BatchConfig,
     },
     Subflow {
-        #[serde(rename = "subflowConfig")]
+        #[serde(default, rename = "subflowConfig")]
         subflow_config: SubflowConfig,
     },
     Call {
-        #[serde(rename = "subflowConfig")]
+        #[serde(default, rename = "subflowConfig")]
         subflow_config: SubflowConfig,
     },
     Spawn {
@@ -1410,8 +1410,7 @@ fn validate_graph_body(
                 node_id: Some(node.id.clone()),
                 message: format!(
                     "\"{}\" is a {} node, so task execution fields are ignored.",
-                    node.name,
-                    kind_label
+                    node.name, kind_label
                 ),
             });
         }
@@ -2855,8 +2854,8 @@ mod tests {
                 kind.as_str()
             );
 
-            let deserialized: NodeKind = serde_json::from_value(serialized.clone())
-                .unwrap_or_else(|e| {
+            let deserialized: NodeKind =
+                serde_json::from_value(serialized.clone()).unwrap_or_else(|e| {
                     panic!(
                         "failed to deserialize NodeKind::{} from {}: {}",
                         kind.as_str(),
@@ -2866,7 +2865,8 @@ mod tests {
                 });
 
             assert_eq!(
-                kind, &deserialized,
+                kind,
+                &deserialized,
                 "round-trip mismatch for NodeKind::{}",
                 kind.as_str()
             );
@@ -3084,7 +3084,12 @@ mod tests {
         // task1: kind.type == "task", agentConfig is inside kind
         let task = nodes_by_id["task1"];
         assert!(
-            matches!(&task.kind, NodeKind::Task { agent_config: Some(_) }),
+            matches!(
+                &task.kind,
+                NodeKind::Task {
+                    agent_config: Some(_)
+                }
+            ),
             "task1.kind should be Task with agentConfig, got {:?}",
             task.kind.as_str()
         );
@@ -3154,13 +3159,13 @@ mod tests {
         // approval1, split1, collector1: no config fields
         assert!(matches!(&nodes_by_id["approval1"].kind, NodeKind::Approval));
         assert!(matches!(&nodes_by_id["split1"].kind, NodeKind::Split));
-        assert!(matches!(&nodes_by_id["collector1"].kind, NodeKind::Collector));
+        assert!(matches!(
+            &nodes_by_id["collector1"].kind,
+            NodeKind::Collector
+        ));
 
         // wait1: kind.type == "wait"
-        assert!(matches!(
-            &nodes_by_id["wait1"].kind,
-            NodeKind::Wait { .. }
-        ));
+        assert!(matches!(&nodes_by_id["wait1"].kind, NodeKind::Wait { .. }));
 
         // No legacy `type` / flat config fields should appear on the re-serialized node.
         for node in &normalized.workflow.nodes {
@@ -3282,10 +3287,8 @@ mod tests {
                 "edges": []
             });
 
-            let normalized =
-                normalize_workflow_value(json).unwrap_or_else(|error| {
-                    panic!("{case_name} migration must succeed: {error}")
-                });
+            let normalized = normalize_workflow_value(json)
+                .unwrap_or_else(|error| panic!("{case_name} migration must succeed: {error}"));
 
             assert_eq!(
                 normalized.workflow.version, 3,
@@ -3309,14 +3312,14 @@ mod tests {
                 "{case_name}: migrated node must not leak top-level type"
             );
             assert!(
-                serialized.get("captureConfig").is_none()
-                    && serialized.get("killConfig").is_none(),
+                serialized.get("captureConfig").is_none() && serialized.get("killConfig").is_none(),
                 "{case_name}: migrated node must not leak top-level config fields"
             );
 
-            let deserialized: WorkflowNode = serde_json::from_value(serialized).unwrap_or_else(
-                |error| panic!("{case_name}: migrated node must deserialize as v3: {error}"),
-            );
+            let deserialized: WorkflowNode =
+                serde_json::from_value(serialized).unwrap_or_else(|error| {
+                    panic!("{case_name}: migrated node must deserialize as v3: {error}")
+                });
             assert_eq!(
                 deserialized.kind, expected_kind,
                 "{case_name}: round-trip kind mismatch"

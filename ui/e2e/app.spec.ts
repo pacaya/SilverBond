@@ -15,8 +15,10 @@ test("shows completed history for a real approval run", async ({ page }) => {
       {
         id: "approval_1",
         name: "Approval 1",
-        type: "approval",
         prompt: "Ship this workflow?",
+        kind: {
+          type: "approval",
+        },
       },
     ],
     edges: [],

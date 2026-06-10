@@ -355,7 +355,19 @@ export interface RunEvent {
   [key: string]: unknown;
 }
 
-export interface InterruptedRun {
+export interface RunPaneObservability {
+  pane: string;
+  sessionName: string;
+  attachCommand: string;
+}
+
+export interface RunObservability {
+  sessionName?: string | null;
+  attachCommand?: string | null;
+  panes?: RunPaneObservability[];
+}
+
+export interface InterruptedRun extends RunObservability {
   runId: string;
   status: string;
   workflowName: string;

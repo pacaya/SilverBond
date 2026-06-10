@@ -15,14 +15,16 @@
     onRun: () => void;
     onAbort: () => void;
     onApproval: (approved: boolean, userInput: string) => void;
-    onInteractionResponse: (response: string) => void;
+    onInteractionResponse: (sessionId: string, response: string) => void;
   } = $props();
 
   let approvalText = $state("");
-  let interactionText = $state("");
+  /* Per-interaction draft answers, keyed by sessionId, so concurrent prompts
+   * don't share one input box (and answers don't bleed between cards). */
+  let interactionTexts = $state<Record<string, string>>({});
   let logContainer: HTMLDivElement | undefined = $state();
   let approvalCard: HTMLDivElement | undefined = $state();
-  let interactionCard: HTMLDivElement | undefined = $state();
+  let interactionsContainer: HTMLDivElement | undefined = $state();
 
   /* auto-scroll log panel to bottom */
   $effect(() => {
@@ -35,7 +37,7 @@
   /* auto-scroll approval/interaction card into view when it appears */
   $effect(() => {
     const el = (store.approval && approvalCard) ? approvalCard
-             : (store.interaction && interactionCard) ? interactionCard
+             : (store.interactions.length && interactionsContainer) ? interactionsContainer
              : null;
     el?.scrollIntoView({ behavior: "smooth" });
   });
@@ -105,57 +107,66 @@
     </div>
   {/if}
 
-  {#if store.interaction}
-    <div class="interactionCard" bind:this={interactionCard}>
-      <div class="interactionCard__header">
-        {#if store.interaction.interactionType === "destructive_warning"}
-          <strong class="interactionCard__warning">Destructive Action Detected</strong>
-        {:else if store.interaction.interactionType === "permission"}
-          <strong>Permission Request</strong>
-        {:else}
-          <strong>Agent Question</strong>
-        {/if}
-      </div>
-      <p>{store.interaction.description}</p>
-      {#if store.interaction.outputSoFar}
-        <pre>{store.interaction.outputSoFar}</pre>
-      {/if}
-      {#if store.interaction.interactionType === "question"}
-        <textarea
-          bind:value={interactionText}
-          placeholder="Type your response..."
-        ></textarea>
-        <div class="interactionCard__actions">
-          <button
-            class="button button--primary"
-            onclick={() => {
-              onInteractionResponse(interactionText);
-              interactionText = "";
-            }}
-          >
-            Submit
-          </button>
-        </div>
-      {:else}
-        <div class="interactionCard__actions">
-          <button
-            class="button button--ghost"
-            onclick={() => {
-              onInteractionResponse("n");
-            }}
-          >
-            Reject
-          </button>
-          <button
-            class="button button--primary"
-            onclick={() => {
-              onInteractionResponse("y");
-            }}
-          >
-            {store.interaction.interactionType === "destructive_warning" ? "Confirm" : "Approve"}
-          </button>
+  {#if store.interactions.length > 0}
+    <div class="interactions" bind:this={interactionsContainer}>
+      {#if store.interactions.length > 1}
+        <div class="interactions__count">
+          {store.interactions.length} agents are waiting for a response — answer in any order.
         </div>
       {/if}
+      {#each store.interactions as interaction (interaction.sessionId)}
+        <div class="interactionCard">
+          <div class="interactionCard__header">
+            {#if interaction.interactionType === "destructive_warning"}
+              <strong class="interactionCard__warning">Destructive Action Detected</strong>
+            {:else if interaction.interactionType === "permission"}
+              <strong>Permission Request</strong>
+            {:else}
+              <strong>Agent Question</strong>
+            {/if}
+          </div>
+          <p>{interaction.description}</p>
+          {#if interaction.outputSoFar}
+            <pre>{interaction.outputSoFar}</pre>
+          {/if}
+          {#if interaction.interactionType === "question"}
+            <textarea
+              bind:value={interactionTexts[interaction.sessionId]}
+              placeholder="Type your response..."
+            ></textarea>
+            <div class="interactionCard__actions">
+              <button
+                class="button button--primary"
+                onclick={() => {
+                  onInteractionResponse(interaction.sessionId, interactionTexts[interaction.sessionId] ?? "");
+                  delete interactionTexts[interaction.sessionId];
+                }}
+              >
+                Submit
+              </button>
+            </div>
+          {:else}
+            <div class="interactionCard__actions">
+              <button
+                class="button button--ghost"
+                onclick={() => {
+                  onInteractionResponse(interaction.sessionId, "n");
+                }}
+              >
+                Reject
+              </button>
+              <button
+                class="button button--primary"
+                onclick={() => {
+                  onInteractionResponse(interaction.sessionId, "y");
+                }}
+              >
+                {interaction.interactionType === "destructive_warning" ? "Confirm" : "Approve"}
+              </button>
+            </div>
+          {/if}
+        </div>
+      {/each}
     </div>
   {/if}
 </div>

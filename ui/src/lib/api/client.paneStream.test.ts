@@ -443,6 +443,72 @@ describe("streamPane client", () => {
     handle.close();
   });
 
+  it("7e. closes rejected before onopen give up as unavailable (pre-open path)", () => {
+    const onStatus = vi.fn();
+    const onError = vi.fn();
+    const handle = streamPane("run-1", "pane-0", {
+      onSnapshot: vi.fn(),
+      onData: vi.fn(),
+      onError,
+      onStatus,
+    });
+
+    // Reject every socket *before* it opens (openedAt stays null), e.g. an
+    // origin 403 / refused upgrade. PANE_FAILED_CONNECT_LIMIT is 5.
+    for (let i = 0; i < 4; i += 1) {
+      MockWebSocket.last().simulateClose(); // never simulateOpen()
+      vi.advanceTimersByTime(6000); // drain any backoff
+      expect(onStatus).not.toHaveBeenLastCalledWith("unavailable");
+    }
+
+    // 5th failed connect trips the cap and surfaces the terminal state.
+    MockWebSocket.last().simulateClose();
+
+    expect(onStatus).toHaveBeenLastCalledWith("unavailable");
+    expect(onError).toHaveBeenCalledWith("Pane unavailable");
+
+    const countAfterGiveUp = MockWebSocket.instances.length;
+    vi.advanceTimersByTime(10_000);
+    expect(MockWebSocket.instances).toHaveLength(countAfterGiveUp);
+
+    handle.close();
+  });
+
+  it("7f. a successful connection resets the failed-connect counter", () => {
+    const onStatus = vi.fn();
+    const onError = vi.fn();
+    const handle = streamPane("run-1", "pane-0", {
+      onSnapshot: vi.fn(),
+      onData: vi.fn(),
+      onError,
+      onStatus,
+    });
+
+    // Four pre-open rejections — one short of the cap.
+    for (let i = 0; i < 4; i += 1) {
+      MockWebSocket.last().simulateClose();
+      vi.advanceTimersByTime(6000);
+    }
+
+    // A healthy connection (open + first frame) resets the counter.
+    const healthy = MockWebSocket.last();
+    healthy.simulateOpen();
+    healthy.simulateMessage(frame("snapshot", 0, b64("ok")));
+    healthy.simulateClose();
+    vi.advanceTimersByTime(6000);
+
+    // Four more pre-open rejections must NOT trip the cap (counter was reset).
+    for (let i = 0; i < 4; i += 1) {
+      MockWebSocket.last().simulateClose();
+      vi.advanceTimersByTime(6000);
+    }
+
+    expect(onStatus).not.toHaveBeenCalledWith("unavailable");
+    expect(onError).not.toHaveBeenCalledWith("Pane unavailable");
+
+    handle.close();
+  });
+
   it("11. first seq after reconnect resets gap tracking (no spurious resync)", () => {
     const handle = streamPane("run-1", "pane-0", {
       onSnapshot: vi.fn(),

@@ -86,15 +86,17 @@ function echoRunAgentWorkflow(name: string): unknown {
       {
         id: "ra1",
         name: "Echo Agent",
-        type: "run_agent",
         prompt: "hello-from-e2e",
-        runAgentConfig: {
-          agent: "echo",
-          prompt: "hello-from-e2e",
-          // Short timeouts for fast test execution.
-          timeout: 20,
-          idleSeconds: 1.5,
-          killAfter: true,
+        kind: {
+          type: "run_agent",
+          runAgentConfig: {
+            agent: "echo",
+            prompt: "hello-from-e2e",
+            // Short timeouts for fast test execution.
+            timeout: 20,
+            idleSeconds: 1.5,
+            killAfter: true,
+          },
         },
       },
     ],
@@ -117,12 +119,14 @@ function spawnWorkflow(name: string): unknown {
       {
         id: "sp1",
         name: "Spawn Pane",
-        type: "spawn",
         prompt: "",
-        spawnConfig: {
-          // Use a shell command that prints output then stays alive.
-          command: "sh -c 'printf \"e2e-pane-ready\\n\"; sleep 60'",
-          name: "e2e-stream-test",
+        kind: {
+          type: "spawn",
+          spawnConfig: {
+            // Use a shell command that prints output then stays alive.
+            command: "sh -c 'printf \"e2e-pane-ready\\n\"; sleep 60'",
+            name: "e2e-stream-test",
+          },
         },
       },
     ],

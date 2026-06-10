@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -257,6 +258,41 @@ impl Database {
                 events.push(serde_json::from_str(&row?)?);
             }
             Ok(events)
+        })
+        .await?
+    }
+
+    pub async fn list_runs_with_tmux_sessions(
+        &self,
+    ) -> anyhow::Result<Vec<(String, RuntimeStatus, BTreeSet<String>)>> {
+        let path = self.path.clone();
+        spawn_blocking(move || -> anyhow::Result<Vec<(String, RuntimeStatus, BTreeSet<String>)>> {
+            let conn = open_connection(path.as_path())?;
+            let mut stmt = conn.prepare("SELECT run_id, status, state_json FROM runs")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?;
+            let mut runs = Vec::new();
+            for row in rows {
+                let (run_id, status, state_json) = row?;
+                let partial: PartialCheckpointTmuxSessions = serde_json::from_str(&state_json)
+                    .unwrap_or(PartialCheckpointTmuxSessions {
+                        tmux_sessions: BTreeSet::new(),
+                    });
+                if partial.tmux_sessions.is_empty() {
+                    continue;
+                }
+                runs.push((
+                    run_id,
+                    status_from_str(&status),
+                    partial.tmux_sessions,
+                ));
+            }
+            Ok(runs)
         })
         .await?
     }
@@ -642,6 +678,13 @@ fn open_connection(path: &Path) -> anyhow::Result<Connection> {
     Ok(conn)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PartialCheckpointTmuxSessions {
+    #[serde(default)]
+    tmux_sessions: BTreeSet<String>,
+}
+
 fn status_from_str(s: &str) -> RuntimeStatus {
     match s {
         "running" => RuntimeStatus::Running,
@@ -844,6 +887,7 @@ mod tests {
                 active_cursors: Vec::new(),
                 split_families: Default::default(),
                 collector_barriers: Default::default(),
+                tmux_sessions: Default::default(),
                 queued_approvals: Vec::new(),
                 loop_counters: Default::default(),
                 visit_counters: Default::default(),

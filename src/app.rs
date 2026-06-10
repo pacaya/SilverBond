@@ -64,6 +64,7 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct PaneStreamRegistry {
     pub(crate) inner: Arc<Mutex<HashMap<String, PaneStreamEntry>>>,
+    pub(crate) max_subscribers_per_pane: usize,
 }
 
 #[derive(Clone)]
@@ -76,6 +77,7 @@ impl Default for PaneStreamRegistry {
     fn default() -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            max_subscribers_per_pane: 32,
         }
     }
 }
@@ -93,6 +95,7 @@ impl PaneStreamRegistry {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn remove_if_sender(&self, target: &str, sender: &broadcast::Sender<Vec<u8>>) {
         let mut inner = self.inner.lock().await;
         let should_remove = inner
@@ -145,6 +148,7 @@ impl Application {
         let db = Database::new(paths.database_path.clone());
         db.init().await?;
         let runtime = RuntimeContext::new(db);
+        crate::runtime::reap_stale_tmux_sessions(&runtime).await?;
 
         let state = AppState {
             paths: paths.clone(),
