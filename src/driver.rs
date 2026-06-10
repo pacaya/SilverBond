@@ -29,14 +29,20 @@ pub enum InteractionKind {
 }
 
 impl InteractionKind {
+    fn registry_kind(&self) -> agents::InteractionKind {
+        match self {
+            Self::AutoRespond { .. } => agents::InteractionKind::AutoRespond,
+            Self::PermissionRequest => agents::InteractionKind::Permission,
+            Self::SubagentActive => agents::InteractionKind::SubagentActive,
+            Self::DestructiveWarning => agents::InteractionKind::DestructiveWarning,
+        }
+    }
+
     /// Event type string for serialization to the frontend.
     pub fn event_type(&self) -> &'static str {
-        match self {
-            Self::AutoRespond { .. } => "auto_respond",
-            Self::PermissionRequest => "permission",
-            Self::SubagentActive => "subagent_active",
-            Self::DestructiveWarning => "destructive_warning",
-        }
+        self.registry_kind()
+            .event_type()
+            .expect("SilverBond interaction kinds map to known registry kinds")
     }
 }
 
@@ -104,7 +110,7 @@ pub struct AgentCapabilities {
 }
 
 fn capabilities_from_registry(name: &str) -> Option<AgentCapabilities> {
-    let registry = agents::Registry::load().ok()?;
+    let registry = load_agent_registry().ok()?;
     registry.get(name).map(|spec| {
         let caps = &spec.capabilities;
         AgentCapabilities {
@@ -131,17 +137,29 @@ fn registry_capabilities_or(name: &str, fallback: AgentCapabilities) -> AgentCap
     capabilities_from_registry(name).unwrap_or(fallback)
 }
 
+pub(crate) fn load_agent_registry() -> anyhow::Result<agents::Registry> {
+    let (registry, warnings) = agents::Registry::load()?;
+    for warning in warnings {
+        tracing::warn!(
+            "[tmux-tools] agent registry warning [{}]: {}",
+            warning.agent,
+            warning.detail
+        );
+    }
+    Ok(registry)
+}
+
 fn registry_interaction_pattern(
     pattern: &agents::InteractionPatternSpec,
 ) -> Option<InteractionPattern> {
-    let kind = match pattern.kind.as_str() {
-        "permission" => InteractionKind::PermissionRequest,
-        "auto_respond" => InteractionKind::AutoRespond {
+    let kind = match &pattern.kind {
+        agents::InteractionKind::Permission => InteractionKind::PermissionRequest,
+        agents::InteractionKind::AutoRespond => InteractionKind::AutoRespond {
             response: pattern.response.clone().unwrap_or_default(),
         },
-        "subagent_active" => InteractionKind::SubagentActive,
-        "destructive_warning" => InteractionKind::DestructiveWarning,
-        _ => return None,
+        agents::InteractionKind::SubagentActive => InteractionKind::SubagentActive,
+        agents::InteractionKind::DestructiveWarning => InteractionKind::DestructiveWarning,
+        agents::InteractionKind::Unknown => return None,
     };
 
     Some(InteractionPattern {
@@ -153,7 +171,7 @@ fn registry_interaction_pattern(
 }
 
 pub fn agent_binary(name: &str) -> Option<String> {
-    agents::Registry::load()
+    load_agent_registry()
         .ok()
         .and_then(|registry| registry.get(name).map(|spec| spec.binary.clone()))
         .or_else(|| match name {
@@ -723,7 +741,7 @@ impl AgentDriver for RegistryProfileDriver {
     }
 
     fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
-        let registry = agents::Registry::load()?;
+        let registry = load_agent_registry()?;
         let profile = registry_access_profile(config);
         let (_binary, args) = registry.launch_argv(&self.name, Some(&profile))?;
         Ok(CommandArgs {
@@ -750,7 +768,7 @@ impl AgentDriver for RegistryProfileDriver {
     }
 
     fn interaction_patterns(&self) -> Vec<InteractionPattern> {
-        let Ok(registry) = agents::Registry::load() else {
+        let Ok(registry) = load_agent_registry() else {
             return vec![];
         };
         let Some(spec) = registry.get(&self.name) else {
@@ -773,7 +791,7 @@ pub fn get_driver(name: &str) -> Option<Box<dyn AgentDriver>> {
     match name {
         "claude" => Some(Box::new(ClaudeDriver)),
         "codex" => Some(Box::new(CodexDriver)),
-        _ => agents::Registry::load().ok().and_then(|registry| {
+        _ => load_agent_registry().ok().and_then(|registry| {
             registry
                 .get(name)
                 .map(|_| Box::new(RegistryProfileDriver::new(name)) as Box<dyn AgentDriver>)
@@ -783,7 +801,7 @@ pub fn get_driver(name: &str) -> Option<Box<dyn AgentDriver>> {
 
 /// Return every registered driver.
 pub fn all_drivers() -> Vec<Box<dyn AgentDriver>> {
-    let Ok(registry) = agents::Registry::load() else {
+    let Ok(registry) = load_agent_registry() else {
         return vec![Box::new(ClaudeDriver), Box::new(CodexDriver)];
     };
 
@@ -1418,13 +1436,13 @@ mod tests {
 
     #[test]
     fn registry_interaction_pattern_maps_auto_response() {
-        let pattern = registry_interaction_pattern(&agents::InteractionPatternSpec {
-            pattern: "Press Enter to continue".to_owned(),
-            kind: "auto_respond".to_owned(),
-            description: "Continue prompt".to_owned(),
-            response: Some("y".to_owned()),
-            send_enter: false,
-        })
+        let pattern = registry_interaction_pattern(&agents::InteractionPatternSpec::new(
+            "Press Enter to continue".to_owned(),
+            agents::InteractionKind::AutoRespond,
+            "Continue prompt".to_owned(),
+            Some("y".to_owned()),
+            false,
+        ))
         .unwrap();
 
         assert_eq!(

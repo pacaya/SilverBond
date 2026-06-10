@@ -14,7 +14,7 @@ use futures::future::BoxFuture;
 use regex::Regex;
 use serde_json::{Value, json};
 use tmux_tools_core::{
-    TmuxInvocation, agents,
+    TmuxInvocation,
     idle::{
         DEFAULT_READY_SCAN_LINES, DEFAULT_READY_STABLE_SECONDS, IdleConfig, IdleReason,
         wait_for_idle,
@@ -2032,7 +2032,7 @@ fn build_agent_command(
     agent_config: Option<&AgentConfig>,
 ) -> anyhow::Result<BuiltCommand> {
     let extra_args = cfg.map(|cfg| cfg.extra_args.as_slice()).unwrap_or(&[]);
-    let registry = agents::Registry::load()?;
+    let registry = driver::load_agent_registry()?;
 
     let (argv, env) = if let Some(agent_config) = agent_config {
         let drv =
@@ -2153,7 +2153,7 @@ fn ready_signal_for_pane(pane: &str) -> anyhow::Result<ReadySignal> {
             scan_lines: DEFAULT_READY_SCAN_LINES,
         });
     };
-    let registry = agents::Registry::load()?;
+    let registry = driver::load_agent_registry()?;
     let Some(agent) = registry.get(&agent_name) else {
         return Ok(ReadySignal {
             regex: None,
