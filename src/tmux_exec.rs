@@ -2668,7 +2668,8 @@ mod tests {
         }
         let cwd = temp.path().to_string_lossy();
         let wrapped = wrap_keep_open("true", &cwd);
-        let mut child = std::process::Command::new("zsh")
+        let mut command = std::process::Command::new("zsh");
+        command
             .arg("-lc")
             .arg(wrapped)
             .env("ZDOTDIR", temp.path())
@@ -2676,9 +2677,20 @@ mod tests {
             .env("PROMPT", "")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+            .stderr(std::process::Stdio::piped());
+        // Detach from any controlling terminal so the interactive follow-up shell reads
+        // commands from the stdin pipe instead of attempting tty/job-control reads. Without
+        // this, running the suite from a tmux pane (where the test process isn't the tty's
+        // foreground process group) makes zsh's tty read fail with EIO. setsid() on the forked,
+        // non-leader child always succeeds and reproduces the clean headless condition.
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = command.spawn().unwrap();
 
         let mut stdin = child.stdin.take().unwrap();
         use std::io::Write;

@@ -7,6 +7,8 @@
     onchange: (val: Record<string, unknown> | null) => void;
   } = $props();
 
+  // svelte-ignore state_referenced_locally -- intentional: jsonDraft is an editable draft
+  // seeded from value's initial snapshot; it deliberately diverges from value as the user types.
   let jsonDraft = $state(value ? JSON.stringify(value, null, 2) : "");
   let jsonError = $state("");
   let useCustomOverride = $state<boolean | null>(null);

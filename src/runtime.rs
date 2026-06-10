@@ -419,8 +419,6 @@ mod collector_barriers_serde {
 #[serde(rename_all = "camelCase")]
 pub struct CollectorBarrierState {
     #[serde(default)]
-    pub execution_epoch: u64,
-    #[serde(default)]
     pub required_inputs: Vec<String>,
     #[serde(default)]
     pub arrivals: BTreeMap<String, CollectorInputStatus>,
@@ -4919,7 +4917,6 @@ async fn handle_collector_entry(
         .collector_barriers
         .entry(barrier_key)
         .or_insert_with(|| CollectorBarrierState {
-            execution_epoch: checkpoint.execution_epoch,
             required_inputs: graph
                 .inbound_for(&node.id)
                 .iter()
@@ -5232,7 +5229,6 @@ async fn handle_terminal_cursor_status(
                 .collector_barriers
                 .entry(barrier_key)
                 .or_insert_with(|| CollectorBarrierState {
-                    execution_epoch: checkpoint.execution_epoch,
                     required_inputs: graph
                         .inbound_for(&target.collector_id)
                         .iter()

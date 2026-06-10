@@ -34,6 +34,8 @@
   const skipSources = ["previous_output", "context", "variable"];
 
   // Track last-committed JSON to avoid re-sync loops from our own onchange calls
+  // svelte-ignore state_referenced_locally -- intentional: seed the baseline from value's
+  // initial snapshot only; the $effect below handles all subsequent prop changes.
   let lastCommitted = $state(JSON.stringify(value));
 
   // Sync from prop to local state only when the external value actually changed

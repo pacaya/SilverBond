@@ -1223,6 +1223,7 @@ dependencies = [
  "http",
  "http-body-util",
  "include_dir",
+ "libc",
  "mime_guess",
  "regex",
  "rusqlite",
