@@ -8,10 +8,10 @@ use async_stream::stream;
 use axum::{
     Json, Router,
     extract::{
-        Path, Request, State,
+        Path, Query, Request, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     middleware::{self, Next},
     response::{
         IntoResponse, Response,
@@ -20,7 +20,11 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
-use futures::{SinkExt, Stream, StreamExt, stream::SplitSink};
+use futures::{
+    SinkExt, Stream, StreamExt,
+    future::{join_all, try_join_all},
+    stream::SplitSink,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tmux_tools_core::{
@@ -35,11 +39,14 @@ use tokio::{
 };
 
 use crate::{
-    app::{AppState, PaneStreamEntry},
-    model::{NodeKind, WorkflowNode, WorkflowV3, normalize_workflow_value, validate_workflow},
+    app::{AppState, PaneStreamEntry, SecurityConfig},
+    model::{
+        NodeKind, RunAsConfig, WorkflowNode, WorkflowV3, normalize_workflow_value,
+        validate_workflow,
+    },
     runtime::{
-        InterruptedRunSummary, NodeTestContext, PersistedRun, RuntimeCheckpoint, RuntimeStatus,
-        available_agents, check_cli, run_node_preview,
+        InterruptedRunSummary, NodeTestContext, PersistedRun, RunControlError, RuntimeCheckpoint,
+        RuntimeStatus, available_agents, check_cli, run_node_preview,
     },
     tmux_exec::build_tmux_invocation,
 };
@@ -128,16 +135,28 @@ pub fn router(state: AppState) -> Router {
         .route("/api/logs", get(list_logs))
         .route("/api/logs/{id}", get(get_log).delete(delete_log))
         .with_state(state)
+        .layer(middleware::from_fn(require_same_origin_mutation))
 }
 
 async fn require_allowed_stream_origin(request: Request, next: Next) -> Response {
-    match request
-        .headers()
-        .get(header::ORIGIN)
-        .and_then(|origin| origin.to_str().ok())
-    {
-        Some(origin) if is_allowed_origin(origin) => next.run(request).await,
-        _ => StatusCode::FORBIDDEN.into_response(),
+    let allowed = if is_websocket_upgrade(&request) {
+        has_allowed_origin(request.headers())
+    } else {
+        is_allowed_same_origin_or_origin(request.headers())
+    };
+
+    if allowed {
+        next.run(request).await
+    } else {
+        StatusCode::FORBIDDEN.into_response()
+    }
+}
+
+async fn require_same_origin_mutation(request: Request, next: Next) -> Response {
+    if request.method() == Method::GET || is_allowed_same_origin_or_origin(request.headers()) {
+        next.run(request).await
+    } else {
+        StatusCode::FORBIDDEN.into_response()
     }
 }
 
@@ -173,11 +192,11 @@ async fn capabilities() -> Result<Json<Value>, ApiError> {
     })))
 }
 
-fn run_tmux_invocation(workflow: &WorkflowV3) -> TmuxInvocation {
+fn run_tmux_invocation(workflow: &WorkflowV3, run_id: &str) -> TmuxInvocation {
     workflow
         .run_as
         .as_ref()
-        .map(build_tmux_invocation)
+        .map(|run_as| build_tmux_invocation(run_as, run_id))
         .unwrap_or_default()
 }
 
@@ -319,7 +338,7 @@ async fn resolve_run_session_name(
     run_id: &str,
     persisted: &PersistedRun,
 ) -> Option<String> {
-    let invocation = run_tmux_invocation(&persisted.workflow);
+    let invocation = run_tmux_invocation(&persisted.workflow, run_id);
     session_name_from_active_pane(
         state,
         run_id,
@@ -338,27 +357,27 @@ async fn run_observability_object(
     let Ok(Some(persisted)) = state.runtime.db.get_run(run_id).await else {
         return fields;
     };
-    let invocation = run_tmux_invocation(&persisted.workflow);
+    let invocation = run_tmux_invocation(&persisted.workflow, run_id);
     let mut pane_entries = state.runtime.registry.active_pane_entries(run_id).await;
     pane_entries.sort_by_key(|entry| entry.sequence);
 
-    let mut panes = Vec::new();
-    for entry in &pane_entries {
-        let Some(session_name) = session_name_from_pane_target(
+    let panes = join_all(pane_entries.iter().map(|entry| async {
+        let session_name = session_name_from_pane_target(
             &invocation,
             &entry.target,
             entry.session_name.as_deref(),
         )
-        .await
-        else {
-            continue;
-        };
-        panes.push(json!({
+        .await?;
+        Some(json!({
             "pane": entry.key,
             "sessionName": session_name,
             "attachCommand": build_attach_command(&invocation, &session_name),
-        }));
-    }
+        }))
+    }))
+    .await
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
 
     let (session_name, attach_command) = if let Some(last) = panes.last() {
         (
@@ -401,6 +420,22 @@ fn merge_run_observability(value: &mut Value, observability: serde_json::Map<Str
     object.extend(observability);
 }
 
+async fn run_action_response(state: &AppState, run_id: &str) -> Result<Value, ApiError> {
+    let persisted = state
+        .runtime
+        .db
+        .get_run(run_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    let mut response = json!({
+        "success": true,
+        "runId": run_id,
+        "streamToken": persisted.stream_token,
+    });
+    merge_run_observability(&mut response, run_observability_object(state, run_id).await);
+    Ok(response)
+}
+
 async fn enrich_interrupted_run(
     state: &AppState,
     run: InterruptedRunSummary,
@@ -422,7 +457,7 @@ async fn get_workflow(
     let workflow = state.workflows.get(&name).await?;
     match workflow {
         Some(workflow) => Ok(Json(serde_json::to_value(workflow)?)),
-        None => Err(ApiError::status(StatusCode::NOT_FOUND, "Not found")),
+        None => Err(ApiError::not_found("Not found")),
     }
 }
 
@@ -438,7 +473,7 @@ async fn save_workflow(
     Json(request): Json<SaveWorkflowRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let normalized = normalize_workflow_value(request.workflow)
-        .map_err(|error| ApiError::status(StatusCode::BAD_REQUEST, error.to_string()))?;
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let saved_name = state.workflows.save(&request.name, normalized).await?;
     Ok(Json(json!({ "success": true, "name": saved_name })))
 }
@@ -462,7 +497,7 @@ async fn validate_workflow_route(
     Json(request): Json<WorkflowPayloadRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let mut normalized = normalize_workflow_value(request.workflow)
-        .map_err(|error| ApiError::status(StatusCode::BAD_REQUEST, error.to_string()))?;
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     hydrate_saved_subflows(&state, &mut normalized.workflow).await?;
     let mut result = validate_workflow(normalized.workflow);
     result.notices = normalized.notices;
@@ -545,14 +580,11 @@ async fn test_node(Json(request): Json<TestStepRequest>) -> Result<Json<Value>, 
     let node_value = request
         .node
         .context("node is required")
-        .map_err(|error| ApiError::status(StatusCode::BAD_REQUEST, error.to_string()))?;
-    let node = node_from_value(node_value)
-        .map_err(|error| ApiError::status(StatusCode::BAD_REQUEST, error.to_string()))?;
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let node =
+        node_from_value(node_value).map_err(|error| ApiError::bad_request(error.to_string()))?;
     if !matches!(&node.kind, NodeKind::Task { .. }) {
-        return Err(ApiError::status(
-            StatusCode::BAD_REQUEST,
-            "Only task nodes can be tested",
-        ));
+        return Err(ApiError::bad_request("Only task nodes can be tested"));
     }
     let preview = run_node_preview(
         &node,
@@ -571,6 +603,8 @@ struct CreateRunRequest {
     variable_overrides: BTreeMap<String, String>,
     #[serde(default)]
     start_node_id: Option<String>,
+    #[serde(default)]
+    unlock_secret: Option<String>,
 }
 
 async fn create_run(
@@ -578,7 +612,7 @@ async fn create_run(
     Json(request): Json<CreateRunRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let mut normalized = normalize_workflow_value(request.workflow)
-        .map_err(|error| ApiError::status(StatusCode::BAD_REQUEST, error.to_string()))?;
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     hydrate_saved_subflows(&state, &mut normalized.workflow).await?;
     let validation = validate_workflow(normalized.workflow.clone());
     let errors = validation
@@ -588,7 +622,7 @@ async fn create_run(
         .cloned()
         .collect::<Vec<_>>();
     if !errors.is_empty() {
-        return Err(ApiError::json(
+        return Err(ApiError::validation_body(
             StatusCode::BAD_REQUEST,
             json!({
                 "error": "Validation failed",
@@ -596,6 +630,11 @@ async fn create_run(
             }),
         ));
     }
+    authorize_and_prepare_run_security(
+        &mut normalized.workflow,
+        &state.security,
+        request.unlock_secret.as_deref(),
+    )?;
     let run_id = state
         .runtime
         .start_run(
@@ -604,18 +643,88 @@ async fn create_run(
             request.start_node_id,
         )
         .await?;
-    let mut response = json!({ "success": true, "runId": run_id });
-    merge_run_observability(
-        &mut response,
-        run_observability_object(&state, &run_id).await,
-    );
-    Ok(Json(response))
+    Ok(Json(run_action_response(&state, &run_id).await?))
+}
+
+fn authorize_and_prepare_run_security(
+    workflow: &mut WorkflowV3,
+    security: &SecurityConfig,
+    unlock_secret: Option<&str>,
+) -> Result<(), ApiError> {
+    let launches_processes = workflow_launches_processes(workflow);
+    let uses_run_as_prefix = workflow.run_as.is_some();
+    if (launches_processes || uses_run_as_prefix)
+        && resolved_run_as_is_privileged(workflow.run_as.as_ref(), security.agent_user.as_deref())
+        && !security.verify_unlock_secret(unlock_secret)
+    {
+        return Err(privileged_unlock_required());
+    }
+
+    if launches_processes && workflow.run_as.is_none() {
+        if let Some(agent_user) = security.agent_user.as_deref() {
+            workflow.run_as = Some(RunAsConfig {
+                user: Some(agent_user.to_owned()),
+                command: None,
+                socket: None,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn privileged_unlock_required() -> ApiError {
+    ApiError::validation_body(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": "Privileged run requires unlock password.",
+            "code": "privileged_unlock_required",
+        }),
+    )
+}
+
+fn resolved_run_as_is_privileged(run_as: Option<&RunAsConfig>, agent_user: Option<&str>) -> bool {
+    match (run_as, agent_user) {
+        (None, Some(_)) => false,
+        (None, None) => true,
+        (Some(run_as), Some(agent_user)) => {
+            if run_as.command.is_some() {
+                return true;
+            }
+            match run_as.user.as_deref() {
+                Some(user) => user != agent_user,
+                None => true,
+            }
+        }
+        (Some(_), None) => true,
+    }
+}
+
+fn workflow_launches_processes(workflow: &WorkflowV3) -> bool {
+    workflow.nodes.iter().any(node_launches_process)
+        || workflow
+            .subflows
+            .values()
+            .any(|subflow| workflow_launches_processes(subflow))
+}
+
+fn node_launches_process(node: &WorkflowNode) -> bool {
+    matches!(
+        &node.kind,
+        NodeKind::Task { .. }
+            | NodeKind::Decide { .. }
+            | NodeKind::Spawn { .. }
+            | NodeKind::RunAgent { .. }
+    )
 }
 
 async fn stream_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
+    Query(query): Query<StreamTokenQuery>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
+    let token_candidates = query.token.into_iter().collect::<Vec<_>>();
+    require_run_stream_token(&state, &run_id, &token_candidates).await?;
     let replay = state.runtime.db.list_events(&run_id).await?;
     let receiver = state.runtime.registry.subscribe(&run_id).await;
     let stream = stream! {
@@ -653,24 +762,33 @@ async fn stream_run(
 pub async fn pane_stream_ws(
     State(state): State<AppState>,
     Path((run_id, pane)): Path<(String, String)>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    ws.on_upgrade(move |socket| async move {
-        let log_run_id = run_id.clone();
-        let log_pane = pane.clone();
-        let task = tokio::spawn(async move {
-            if let Err(error) = pane_stream_socket(socket, state, run_id, pane).await {
-                tracing::warn!(
-                    run_id = %log_run_id,
-                    pane = %log_pane,
-                    error = %error,
-                    "pane websocket stream ended with error"
-                );
-            }
-        });
-        let _ = task.await;
-    })
-    .into_response()
+    let token_candidates = websocket_stream_token_candidates(&headers);
+    let stream_token = match require_run_stream_token(&state, &run_id, &token_candidates).await {
+        Ok((_, token)) => token,
+        Err(error) => return error.into_response(),
+    };
+    ws.protocols([stream_token.clone()])
+        .on_upgrade(move |socket| async move {
+            let log_run_id = run_id.clone();
+            let log_pane = pane.clone();
+            let task = tokio::spawn(async move {
+                if let Err(error) =
+                    pane_stream_socket(socket, state, run_id, pane, stream_token).await
+                {
+                    tracing::warn!(
+                        run_id = %log_run_id,
+                        pane = %log_pane,
+                        error = %error,
+                        "pane websocket stream ended with error"
+                    );
+                }
+            });
+            let _ = task.await;
+        })
+        .into_response()
 }
 
 fn is_allowed_origin(origin: &str) -> bool {
@@ -680,19 +798,140 @@ fn is_allowed_origin(origin: &str) -> bool {
         || origin.starts_with("http://localhost:")
 }
 
+fn has_allowed_origin(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ORIGIN)
+        .and_then(|origin| origin.to_str().ok())
+        .is_some_and(is_allowed_origin)
+}
+
+fn sec_fetch_site(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("sec-fetch-site")
+        .and_then(|site| site.to_str().ok())
+        .map(str::trim)
+}
+
+fn is_same_origin_fetch_site(site: &str) -> bool {
+    site.eq_ignore_ascii_case("same-origin") || site.eq_ignore_ascii_case("none")
+}
+
+fn is_allowed_same_origin_or_origin(headers: &HeaderMap) -> bool {
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|origin| origin.to_str().ok())
+    {
+        if !is_allowed_origin(origin) {
+            return false;
+        }
+    }
+
+    if let Some(site) = sec_fetch_site(headers) {
+        if site.eq_ignore_ascii_case("cross-site") {
+            return false;
+        }
+        if is_same_origin_fetch_site(site) {
+            return true;
+        }
+    }
+
+    has_allowed_origin(headers)
+}
+
+fn is_websocket_upgrade(request: &Request) -> bool {
+    request
+        .headers()
+        .get(header::UPGRADE)
+        .and_then(|upgrade| upgrade.to_str().ok())
+        .is_some_and(|upgrade| upgrade.eq_ignore_ascii_case("websocket"))
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamTokenQuery {
+    token: Option<String>,
+}
+
+fn stream_token_forbidden() -> ApiError {
+    ApiError::validation_body(
+        StatusCode::FORBIDDEN,
+        json!({ "error": "stream token required" }),
+    )
+}
+
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let left = left.as_bytes();
+    let right = right.as_bytes();
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for idx in 0..max_len {
+        let left_byte = left.get(idx).copied().unwrap_or(0);
+        let right_byte = right.get(idx).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
+}
+
+fn websocket_stream_token_candidates(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all("sec-websocket-protocol")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+async fn require_run_stream_token(
+    state: &AppState,
+    run_id: &str,
+    candidates: &[String],
+) -> Result<(PersistedRun, String), ApiError> {
+    if candidates.is_empty() {
+        return Err(stream_token_forbidden());
+    }
+
+    let persisted = state
+        .runtime
+        .db
+        .get_run(run_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("run not found"))?;
+    let Some(stream_token) = candidates
+        .iter()
+        .find(|candidate| constant_time_eq(candidate, &persisted.stream_token))
+        .cloned()
+    else {
+        return Err(stream_token_forbidden());
+    };
+
+    Ok((persisted, stream_token))
+}
+
 async fn pane_stream_socket(
     mut socket: WebSocket,
     state: AppState,
     run_id: String,
     pane: String,
+    stream_token: String,
 ) -> anyhow::Result<()> {
-    let (pane_target, invocation) = match resolve_run_pane_context(&state, &run_id, &pane).await {
-        Ok(context) => context,
-        Err(error) => {
-            send_socket_error_and_close(&mut socket, 0, &error.to_string()).await;
-            return Ok(());
-        }
-    };
+    let (pane_target, invocation) =
+        match resolve_run_pane_context(&state, &run_id, &pane, &stream_token).await {
+            Ok(context) => context,
+            Err(error) => {
+                if matches!(error, PaneContextError::Internal(_)) {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        pane = %pane,
+                        error = ?error,
+                        "failed to resolve pane websocket context"
+                    );
+                }
+                send_socket_error_and_close(&mut socket, 0, error.client_message()).await;
+                return Ok(());
+            }
+        };
 
     let mut pane_receiver =
         match subscribe_pane_stream(&state, &run_id, &pane, &pane_target, &invocation).await {
@@ -820,14 +1059,19 @@ async fn resolve_run_pane_context(
     state: &AppState,
     run_id: &str,
     pane: &str,
-) -> anyhow::Result<(String, TmuxInvocation)> {
+    stream_token: &str,
+) -> Result<(String, TmuxInvocation), PaneContextError> {
     let persisted = state
         .runtime
         .db
         .get_run(run_id)
-        .await?
-        .context("run not found")?;
-    let invocation = run_tmux_invocation(&persisted.workflow);
+        .await
+        .map_err(PaneContextError::Internal)?
+        .ok_or(PaneContextError::RunNotFound)?;
+    if !constant_time_eq(stream_token, &persisted.stream_token) {
+        return Err(PaneContextError::Unauthorized);
+    }
+    let invocation = run_tmux_invocation(&persisted.workflow, run_id);
 
     if let Some(target) = state
         .runtime
@@ -851,9 +1095,31 @@ async fn resolve_run_pane_context(
         persisted.checkpoint.status,
         RuntimeStatus::Running | RuntimeStatus::Paused
     ) {
-        anyhow::bail!("run has no active pane matching {pane}");
+        return Err(PaneContextError::PaneUnavailable);
     }
-    anyhow::bail!("run has no pane matching {pane}");
+    Err(PaneContextError::PaneUnavailable)
+}
+
+#[derive(Debug, thiserror::Error)]
+enum PaneContextError {
+    #[error("run not found")]
+    RunNotFound,
+    #[error("unauthorized")]
+    Unauthorized,
+    #[error("pane unavailable")]
+    PaneUnavailable,
+    #[error(transparent)]
+    Internal(anyhow::Error),
+}
+
+impl PaneContextError {
+    fn client_message(&self) -> &'static str {
+        match self {
+            Self::RunNotFound => "run not found",
+            Self::Unauthorized => "unauthorized",
+            Self::PaneUnavailable | Self::Internal(_) => "pane unavailable",
+        }
+    }
 }
 
 async fn start_pane_stream(
@@ -1426,12 +1692,7 @@ async fn resume_run(
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     state.runtime.resume_run(&run_id).await?;
-    let mut response = json!({ "success": true, "runId": run_id });
-    merge_run_observability(
-        &mut response,
-        run_observability_object(&state, &run_id).await,
-    );
-    Ok(Json(response))
+    Ok(Json(run_action_response(&state, &run_id).await?))
 }
 
 async fn restart_run(
@@ -1439,12 +1700,7 @@ async fn restart_run(
     Path((run_id, node_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     let new_run_id = state.runtime.restart_from(&run_id, &node_id).await?;
-    let mut response = json!({ "success": true, "runId": new_run_id });
-    merge_run_observability(
-        &mut response,
-        run_observability_object(&state, &new_run_id).await,
-    );
-    Ok(Json(response))
+    Ok(Json(run_action_response(&state, &new_run_id).await?))
 }
 
 async fn dismiss_run(
@@ -1465,10 +1721,11 @@ async fn dismiss_run(
 
 async fn interrupted_runs(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let runs = state.runtime.db.list_interrupted_runs().await?;
-    let mut enriched = Vec::with_capacity(runs.len());
-    for run in runs {
-        enriched.push(enrich_interrupted_run(&state, run).await?);
-    }
+    let enriched = try_join_all(
+        runs.into_iter()
+            .map(|run| enrich_interrupted_run(&state, run)),
+    )
+    .await?;
     Ok(Json(json!(enriched)))
 }
 
@@ -1485,7 +1742,7 @@ async fn get_log(
     let log = state.runtime.db.get_log(&id).await?;
     match log {
         Some(log) => Ok(Json(log)),
-        None => Err(ApiError::status(StatusCode::NOT_FOUND, "Not found")),
+        None => Err(ApiError::not_found("Not found")),
     }
 }
 
@@ -1527,41 +1784,108 @@ fn node_from_value(value: Value) -> anyhow::Result<WorkflowNode> {
     }
 }
 
-#[derive(Debug)]
-struct ApiError {
-    status: StatusCode,
-    body: Value,
+#[derive(Debug, thiserror::Error)]
+enum ApiError {
+    #[error("{0}")]
+    NotFound(String),
+    #[error("{0}")]
+    Conflict(String),
+    #[error("{message}")]
+    Validation { status: StatusCode, message: String },
+    #[error("{message}")]
+    ValidationBody {
+        status: StatusCode,
+        message: String,
+        body: Value,
+    },
+    #[error("internal error")]
+    Internal(#[source] anyhow::Error),
 }
 
 impl ApiError {
-    fn status(status: StatusCode, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            body: json!({ "error": message.into() }),
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::NotFound(message.into())
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self::Conflict(message.into())
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::Validation {
+            status: StatusCode::BAD_REQUEST,
+            message: message.into(),
         }
     }
 
-    fn json(status: StatusCode, body: Value) -> Self {
-        Self { status, body }
+    fn unprocessable(message: impl Into<String>) -> Self {
+        Self::Validation {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: message.into(),
+        }
+    }
+
+    fn validation_body(status: StatusCode, body: Value) -> Self {
+        let message = body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("validation error")
+            .to_string();
+        Self::ValidationBody {
+            status,
+            message,
+            body,
+        }
+    }
+
+    fn internal(error: impl Into<anyhow::Error>) -> Self {
+        Self::Internal(error.into())
     }
 }
 
-impl<E> From<E> for ApiError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(value: E) -> Self {
-        let error = value.into();
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            body: json!({ "error": error.to_string() }),
+impl From<anyhow::Error> for ApiError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::internal(error)
+    }
+}
+
+impl From<serde_json::Error> for ApiError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::internal(error)
+    }
+}
+
+impl From<RunControlError> for ApiError {
+    fn from(error: RunControlError) -> Self {
+        match error {
+            RunControlError::RunNotFound | RunControlError::NoActiveInteraction => {
+                Self::not_found(error.to_string())
+            }
+            RunControlError::TerminalState | RunControlError::StaleInteractionSession => {
+                Self::conflict(error.to_string())
+            }
+            RunControlError::NodeNotFound => Self::unprocessable(error.to_string()),
+            RunControlError::Internal(error) => Self::internal(error),
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
-        (self.status, Json(self.body)).into_response()
+        let (status, body) = match self {
+            Self::NotFound(message) => (StatusCode::NOT_FOUND, json!({ "error": message })),
+            Self::Conflict(message) => (StatusCode::CONFLICT, json!({ "error": message })),
+            Self::Validation { status, message } => (status, json!({ "error": message })),
+            Self::ValidationBody { status, body, .. } => (status, body),
+            Self::Internal(error) => {
+                tracing::warn!(error = ?error, "internal API error");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": "internal error" }),
+                )
+            }
+        };
+        (status, Json(body)).into_response()
     }
 }
 
@@ -1577,7 +1901,10 @@ mod tests {
     use tokio::io::ReadBuf;
 
     use crate::{
-        app::{AppPaths, AppState, PaneStreamRegistry},
+        app::{
+            AppPaths, AppState, PaneStreamRegistry, SecurityConfig, sha256_unlock_password_hash,
+        },
+        model::{RunAsConfig, SplitFailurePolicy, WorkflowLimits, WorkflowNodeType},
         runtime::{
             AgentExecutionMetadata, ExecutionLog, NodeExecutionLog, NodeResult, RuntimeStatus,
         },
@@ -1623,6 +1950,245 @@ mod tests {
                 paths.database_path.clone(),
             )),
             pane_streams,
+            security: SecurityConfig::default(),
+        }
+    }
+
+    fn approval_workflow_with_run_as(command: Vec<String>) -> WorkflowV3 {
+        WorkflowV3 {
+            version: 3,
+            name: Some("observability-test".to_string()),
+            goal: "wait for approval".to_string(),
+            cwd: String::new(),
+            use_orchestrator: false,
+            run_as: Some(RunAsConfig {
+                user: None,
+                command: Some(command),
+                socket: Some("observability-test".to_string()),
+            }),
+            entry_node_id: "approve".to_string(),
+            variables: Vec::new(),
+            limits: WorkflowLimits {
+                max_total_steps: 5,
+                max_visits_per_node: 5,
+            },
+            nodes: vec![WorkflowNode {
+                id: "approve".to_string(),
+                name: "Approve".to_string(),
+                kind: WorkflowNodeType::Approval.into(),
+                agent: None,
+                prompt: "continue?".to_string(),
+                context_sources: Vec::new(),
+                response_format: None,
+                output_schema: None,
+                retry_count: None,
+                retry_delay: None,
+                timeout: None,
+                skip_condition: None,
+                loop_max_iterations: None,
+                loop_condition: None,
+                split_failure_policy: SplitFailurePolicy::BestEffortContinue,
+                cwd: None,
+                continue_session_from: None,
+            }],
+            edges: Vec::new(),
+            agent_defaults: BTreeMap::new(),
+            subflows: BTreeMap::new(),
+            ui: None,
+        }
+    }
+
+    fn approval_only_workflow() -> WorkflowV3 {
+        WorkflowV3 {
+            version: 3,
+            name: Some("approval-only".to_string()),
+            goal: "wait for approval".to_string(),
+            cwd: String::new(),
+            use_orchestrator: false,
+            run_as: None,
+            entry_node_id: "approve".to_string(),
+            variables: Vec::new(),
+            limits: WorkflowLimits {
+                max_total_steps: 5,
+                max_visits_per_node: 5,
+            },
+            nodes: vec![WorkflowNode {
+                id: "approve".to_string(),
+                name: "Approve".to_string(),
+                kind: WorkflowNodeType::Approval.into(),
+                agent: None,
+                prompt: "continue?".to_string(),
+                context_sources: Vec::new(),
+                response_format: None,
+                output_schema: None,
+                retry_count: None,
+                retry_delay: None,
+                timeout: None,
+                skip_condition: None,
+                loop_max_iterations: None,
+                loop_condition: None,
+                split_failure_policy: SplitFailurePolicy::BestEffortContinue,
+                cwd: None,
+                continue_session_from: None,
+            }],
+            edges: Vec::new(),
+            agent_defaults: BTreeMap::new(),
+            subflows: BTreeMap::new(),
+            ui: None,
+        }
+    }
+
+    fn approval_workflow_with_unreachable_task() -> WorkflowV3 {
+        let mut workflow = approval_only_workflow();
+        workflow.name = Some("privileged-process-test".to_string());
+        workflow.nodes.push(WorkflowNode {
+            id: "task".to_string(),
+            name: "Unreachable Task".to_string(),
+            kind: WorkflowNodeType::Task.into(),
+            agent: Some("codex".to_string()),
+            prompt: "do work".to_string(),
+            context_sources: Vec::new(),
+            response_format: None,
+            output_schema: None,
+            retry_count: None,
+            retry_delay: None,
+            timeout: None,
+            skip_condition: None,
+            loop_max_iterations: None,
+            loop_condition: None,
+            split_failure_policy: SplitFailurePolicy::BestEffortContinue,
+            cwd: None,
+            continue_session_from: None,
+        });
+        workflow
+    }
+
+    async fn create_test_state(security: SecurityConfig) -> (tempfile::TempDir, AppState) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::from_root(temp.path());
+        let db = Database::new(paths.database_path.clone());
+        db.init().await.unwrap();
+        let state = AppState {
+            paths: paths.clone(),
+            workflows: WorkflowStore::new(paths.workflows_dir.clone()),
+            templates: TemplateStore::new(paths.templates_dir.clone()),
+            runtime: crate::runtime::RuntimeContext::new(db),
+            pane_streams: PaneStreamRegistry::default(),
+            security,
+        };
+        (temp, state)
+    }
+
+    fn create_run_request(workflow: WorkflowV3, unlock_secret: Option<&str>) -> CreateRunRequest {
+        CreateRunRequest {
+            workflow: serde_json::to_value(workflow).unwrap(),
+            variable_overrides: BTreeMap::new(),
+            start_node_id: None,
+            unlock_secret: unlock_secret.map(str::to_owned),
+        }
+    }
+
+    fn assert_privileged_unlock_required(error: ApiError) {
+        let ApiError::ValidationBody { status, body, .. } = error else {
+            panic!("expected privileged unlock error, got {error:?}");
+        };
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body["code"], "privileged_unlock_required");
+    }
+
+    #[tokio::test]
+    async fn create_run_rejects_privileged_node_without_unlock_secret() {
+        let security = SecurityConfig {
+            agent_user: None,
+            unlock_password_hash: Some(sha256_unlock_password_hash("correct")),
+        };
+        let (_temp, state) = create_test_state(security).await;
+
+        let error = create_run(
+            State(state),
+            Json(create_run_request(
+                approval_workflow_with_unreachable_task(),
+                None,
+            )),
+        )
+        .await
+        .unwrap_err();
+
+        assert_privileged_unlock_required(error);
+    }
+
+    #[tokio::test]
+    async fn create_run_accepts_privileged_node_with_correct_unlock_secret() {
+        let security = SecurityConfig {
+            agent_user: None,
+            unlock_password_hash: Some(sha256_unlock_password_hash("correct")),
+        };
+        let (_temp, state) = create_test_state(security).await;
+
+        let Json(response) = create_run(
+            State(state),
+            Json(create_run_request(
+                approval_workflow_with_unreachable_task(),
+                Some("correct"),
+            )),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["success"], true);
+        assert!(
+            response["runId"]
+                .as_str()
+                .is_some_and(|run_id| !run_id.is_empty())
+        );
+        assert!(
+            response["streamToken"]
+                .as_str()
+                .is_some_and(|token| token.len() >= 32)
+        );
+    }
+
+    #[tokio::test]
+    async fn create_run_accepts_unprivileged_workflow_without_unlock_secret() {
+        let security = SecurityConfig {
+            agent_user: Some("agent".to_string()),
+            unlock_password_hash: Some(sha256_unlock_password_hash("correct")),
+        };
+        let (_temp, state) = create_test_state(security).await;
+
+        let Json(response) = create_run(
+            State(state),
+            Json(create_run_request(approval_only_workflow(), None)),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response["success"], true);
+        assert!(
+            response["runId"]
+                .as_str()
+                .is_some_and(|run_id| !run_id.is_empty())
+        );
+        assert!(
+            response["streamToken"]
+                .as_str()
+                .is_some_and(|token| token.len() >= 32)
+        );
+    }
+
+    async fn wait_for_pending_approval(db: &Database, run_id: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(persisted) = db.get_run(run_id).await.unwrap() {
+                if persisted.checkpoint.pending_approval.is_some() {
+                    return;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for run {run_id} to require approval"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -1661,6 +2227,110 @@ mod tests {
         let command = build_attach_command(&invocation, "my session");
         assert!(command.contains("'my session'") || command.contains("\"my session\""));
         assert!(!command.ends_with("my session"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn interrupted_runs_resolves_tmux_panes_concurrently() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::from_root(temp.path());
+        let db = Database::new(paths.database_path.clone());
+        db.init().await.unwrap();
+        let state = AppState {
+            paths: paths.clone(),
+            workflows: WorkflowStore::new(paths.workflows_dir.clone()),
+            templates: TemplateStore::new(paths.templates_dir.clone()),
+            runtime: crate::runtime::RuntimeContext::new(db.clone()),
+            pane_streams: PaneStreamRegistry::default(),
+            security: SecurityConfig::default(),
+        };
+
+        let script = temp.path().join("fake-tmux-prefix.sh");
+        let log = temp.path().join("display.log");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+log=$1
+delay=$2
+shift 2
+if [ "$1" = "zsh" ]; then
+  printf '%s\n' 'zshrc banner'
+  printf '%s\n' 'SBTMUX:fake-tmux'
+  exit 0
+fi
+printf '%s\n' "$*" >> "$log"
+sleep "$delay"
+target=""
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-t" ]; then
+    target=$arg
+  fi
+  previous=$arg
+done
+printf 'session-%s\n' "$target"
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let command = vec![
+            script.to_string_lossy().into_owned(),
+            log.to_string_lossy().into_owned(),
+            "0.8".to_string(),
+        ];
+        let first_run = state
+            .runtime
+            .start_run(
+                approval_workflow_with_run_as(command.clone()),
+                BTreeMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        let second_run = state
+            .runtime
+            .start_run(
+                approval_workflow_with_run_as(command),
+                BTreeMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        wait_for_pending_approval(&db, &first_run).await;
+        wait_for_pending_approval(&db, &second_run).await;
+        state
+            .runtime
+            .registry
+            .set_active_pane_with_session(&first_run, "pane-a", "%pane-a", None)
+            .await;
+        state
+            .runtime
+            .registry
+            .set_active_pane_with_session(&second_run, "pane-b", "%pane-b", None)
+            .await;
+
+        let started = Instant::now();
+        let Json(value) = interrupted_runs(State(state.clone())).await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(1400),
+            "interrupted_runs should resolve pane sessions concurrently; elapsed={elapsed:?}"
+        );
+        assert_eq!(value.as_array().map(Vec::len), Some(2));
+        let recorded = std::fs::read_to_string(log).unwrap();
+        assert_eq!(
+            recorded
+                .lines()
+                .filter(|line| line.contains("display-message"))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1723,6 +2393,61 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.key == "node2" && candidate.target == "%222")
         );
+    }
+
+    #[tokio::test]
+    async fn pane_context_errors_use_sanitized_client_messages() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::from_root(temp.path());
+        let db = Database::new(paths.database_path.clone());
+        db.init().await.unwrap();
+        let state = AppState {
+            paths: paths.clone(),
+            workflows: WorkflowStore::new(paths.workflows_dir.clone()),
+            templates: TemplateStore::new(paths.templates_dir.clone()),
+            runtime: crate::runtime::RuntimeContext::new(db.clone()),
+            pane_streams: PaneStreamRegistry::default(),
+            security: SecurityConfig::default(),
+        };
+
+        let missing_run_id = "run_secret_missing";
+        let missing = resolve_run_pane_context(&state, missing_run_id, "%secret-pane", "any-token")
+            .await
+            .unwrap_err();
+        assert!(matches!(missing, PaneContextError::RunNotFound));
+        assert_eq!(missing.client_message(), "run not found");
+        assert!(!missing.client_message().contains(missing_run_id));
+
+        let run_id = state
+            .runtime
+            .start_run(
+                approval_workflow_with_run_as(vec![
+                    "/tmp/secret-tmux-prefix".to_string(),
+                    "%secret-target".to_string(),
+                ]),
+                BTreeMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        wait_for_pending_approval(&db, &run_id).await;
+        let stream_token = db.get_run(&run_id).await.unwrap().unwrap().stream_token;
+
+        let pane_name = "%secret-pane";
+        let unauthorized = resolve_run_pane_context(&state, &run_id, pane_name, "wrong-token")
+            .await
+            .unwrap_err();
+        assert!(matches!(unauthorized, PaneContextError::Unauthorized));
+        assert_eq!(unauthorized.client_message(), "unauthorized");
+
+        let unavailable = resolve_run_pane_context(&state, &run_id, pane_name, &stream_token)
+            .await
+            .unwrap_err();
+        assert!(matches!(unavailable, PaneContextError::PaneUnavailable));
+        assert_eq!(unavailable.client_message(), "pane unavailable");
+        assert!(!unavailable.client_message().contains(&run_id));
+        assert!(!unavailable.client_message().contains(pane_name));
+        assert!(!unavailable.client_message().contains("%secret-target"));
     }
 
     #[tokio::test]

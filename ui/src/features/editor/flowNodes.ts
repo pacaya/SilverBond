@@ -1,6 +1,7 @@
 import clsx from "clsx";
 import type { Node } from "@xyflow/svelte";
 import type {
+  ValidationIssue,
   ValidationResponse,
   WorkflowDocument,
   WorkflowNodeType,
@@ -13,10 +14,28 @@ export interface ValidationFlags {
 
 export type ValidationIndex = Record<string, ValidationFlags>;
 
-export function buildValidationIndex(validation: ValidationResponse | null): ValidationIndex {
+/** Active editor scope: null at root, `subflow:<name>` when drilled into a subflow. */
+export function activeValidationScope(drillStack: string[]): string | null {
+  if (drillStack.length === 0) return null;
+  return `subflow:${drillStack[drillStack.length - 1]}`;
+}
+
+export function issueMatchesScope(
+  issue: ValidationIssue,
+  activeScope: string | null,
+): boolean {
+  const issueScope = issue.scope ?? null;
+  return issueScope === activeScope;
+}
+
+export function buildValidationIndex(
+  validation: ValidationResponse | null,
+  activeScope: string | null = null,
+): ValidationIndex {
   const issues = validation?.issues ?? [];
   return issues.reduce<ValidationIndex>((acc, issue) => {
     if (!issue.nodeId) return acc;
+    if (!issueMatchesScope(issue, activeScope)) return acc;
     const current = acc[issue.nodeId] ?? { error: false, warning: false };
     if (issue.severity === "error") current.error = true;
     if (issue.severity === "warning") current.warning = true;

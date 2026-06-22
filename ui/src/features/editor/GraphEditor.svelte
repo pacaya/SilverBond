@@ -11,7 +11,11 @@
     type Connection,
   } from "@xyflow/svelte";
   import clsx from "clsx";
-  import { buildFlowNodes, buildValidationIndex } from "@/features/editor/flowNodes";
+  import {
+    activeValidationScope,
+    buildFlowNodes,
+    buildValidationIndex,
+  } from "@/features/editor/flowNodes";
   import SubflowNode from "@/features/editor/SubflowNode.svelte";
   import { store } from "@/lib/stores/workflowStore.svelte";
   import type {
@@ -76,7 +80,8 @@
     }
   }
 
-  let validationIndex = $derived(buildValidationIndex(validation));
+  let activeScope = $derived(activeValidationScope(store.drillStack));
+  let validationIndex = $derived(buildValidationIndex(validation, activeScope));
 
   function toFlowEdges(): Edge[] {
     return activeWorkflow.edges.map((edge) => ({

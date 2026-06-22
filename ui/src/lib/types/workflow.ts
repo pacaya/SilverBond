@@ -286,6 +286,8 @@ export interface WorkflowDocument {
 export interface ValidationIssue {
   severity: "error" | "warning";
   nodeId?: string | null;
+  /** Subflow catalog scope for issues inside a subflow body (e.g. "subflow:broken"). */
+  scope?: string | null;
   message: string;
 }
 

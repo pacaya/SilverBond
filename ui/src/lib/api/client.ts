@@ -16,13 +16,39 @@ import type {
 export type RunActionResponse = {
   success: boolean;
   runId: string;
+  streamToken: string;
 } & RunObservability;
+
+export class ApiError extends Error {
+  status: number;
+  body: unknown;
+  code?: string;
+
+  constructor(message: string, status: number, body: unknown) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.body = body;
+    this.code = typeof body === "object" && body !== null && "code" in body
+      ? String((body as { code: unknown }).code)
+      : undefined;
+  }
+}
 
 async function apiFetch<T>(input: string, init?: RequestInit): Promise<T> {
   const response = await fetch(input, init);
   if (!response.ok) {
     const text = await response.text().catch(() => response.statusText);
-    throw new Error(text || `${response.status} ${response.statusText}`);
+    let body: unknown = text;
+    try {
+      body = text ? JSON.parse(text) : null;
+    } catch {
+      body = text;
+    }
+    const message = typeof body === "object" && body !== null && "error" in body
+      ? String((body as { error: unknown }).error)
+      : text || `${response.status} ${response.statusText}`;
+    throw new ApiError(message, response.status, body);
   }
   return (await response.json()) as T;
 }
@@ -53,9 +79,16 @@ export const api = {
     postJson<ValidationResponse>("/api/validate-workflow", { workflow }),
   testNode: (node: WorkflowDocument["nodes"][number], cwd: string, mockContext: NodeTestContext) =>
     postJson<NodeTestPreview>("/api/test-node", { node, cwd, mockContext }),
-  createRun: (workflow: WorkflowDocument, variableOverrides: Record<string, string>) =>
+  createRun: (
+    workflow: WorkflowDocument,
+    variableOverrides: Record<string, string>,
+    unlockSecret?: string,
+  ) =>
     postJson<RunActionResponse>("/api/runs", {
-      workflow, variableOverrides, startNodeId: workflow.entryNodeId || null,
+      workflow,
+      variableOverrides,
+      startNodeId: workflow.entryNodeId || null,
+      ...(unlockSecret !== undefined && { unlockSecret }),
     }),
   approveRun: (runId: string, approved: boolean, userInput: string) =>
     postJson<{ success: boolean }>(
@@ -90,9 +123,11 @@ export const api = {
 
 export async function streamRun(
   runId: string,
+  streamToken: string,
   onEvent: (event: RunEvent) => void,
 ): Promise<void> {
-  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/stream`);
+  const query = new URLSearchParams({ token: streamToken });
+  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/stream?${query}`);
   if (!response.ok || !response.body) {
     throw new Error(`Unable to open stream for run ${runId}`);
   }
@@ -186,6 +221,7 @@ function paneStreamUrl(runId: string, pane: string): string {
 export function streamPane(
   runId: string,
   pane: string,
+  streamToken: string,
   handlers: PaneStreamHandlers,
 ): PaneStreamHandle {
   const url = paneStreamUrl(runId, pane);
@@ -234,7 +270,7 @@ export function streamPane(
 
     let ws: WebSocket;
     try {
-      ws = new WebSocket(url);
+      ws = new WebSocket(url, [streamToken]);
     } catch (error) {
       handlers.onError?.(error instanceof Error ? error.message : "Unable to open pane stream");
       consecutiveFailedConnects += 1;

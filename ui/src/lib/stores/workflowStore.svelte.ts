@@ -183,6 +183,7 @@ class WorkflowStore {
   panelTab = $state<"output" | "history" | "reference" | "terminal">("output");
   dirty = $state(false);
   runId = $state<string | null>(null);
+  streamToken = $state<string | null>(null);
   running = $state(false);
   lines = $state<RunLine[]>([]);
   nodeStates = $state<Record<string, NodeRuntimeState>>({});
@@ -615,6 +616,7 @@ class WorkflowStore {
 
   resetRun() {
     this.runId = null;
+    this.streamToken = null;
     this.running = false;
     this.approval = null;
     this.interactions = [];
@@ -623,8 +625,17 @@ class WorkflowStore {
     this.runObservability = null;
   }
 
-  setRunState(patch: { runId?: string | null; running?: boolean; approval?: ApprovalState | null }) {
-    if (patch.runId !== undefined) this.runId = patch.runId;
+  setRunState(patch: {
+    runId?: string | null;
+    streamToken?: string | null;
+    running?: boolean;
+    approval?: ApprovalState | null;
+  }) {
+    if (patch.runId !== undefined) {
+      this.runId = patch.runId;
+      if (patch.runId === null && patch.streamToken === undefined) this.streamToken = null;
+    }
+    if (patch.streamToken !== undefined) this.streamToken = patch.streamToken;
     if (patch.running !== undefined) this.running = patch.running;
     if (patch.approval !== undefined) this.approval = patch.approval;
   }
@@ -634,8 +645,10 @@ class WorkflowStore {
     const panes = observability?.panes;
     if (panes?.length === 1) {
       this.selectedPane = panes[0].pane;
-    } else if ((panes?.length ?? 0) > 1 && this.selectedPane === "active") {
-      this.selectedPane = panes![0].pane;
+    } else if (panes && panes.length > 1) {
+      if (!panes.some((p) => p.pane === this.selectedPane)) {
+        this.selectedPane = panes[0]?.pane ?? "active";
+      }
     }
   }
 

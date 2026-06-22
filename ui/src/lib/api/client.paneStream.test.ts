@@ -47,6 +47,7 @@ class MockWebSocket {
   static CLOSED = WS_CLOSED;
 
   readonly url: string;
+  readonly protocols?: string | string[];
   readyState: number = WS_CONNECTING;
   readonly sent: string[] = [];
 
@@ -56,8 +57,9 @@ class MockWebSocket {
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
 
-  constructor(url: string) {
+  constructor(url: string, protocols?: string | string[]) {
     this.url = url;
+    this.protocols = protocols;
     MockWebSocket.instances.push(this);
   }
 
@@ -145,9 +147,20 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("streamPane client", () => {
+  it("passes the stream token as a WebSocket subprotocol", () => {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
+      onSnapshot: vi.fn(),
+      onData: vi.fn(),
+    });
+
+    expect(MockWebSocket.last().protocols).toEqual(["stream-token-1"]);
+
+    handle.close();
+  });
+
   it("1. snapshot frame decoded and forwarded to onSnapshot", () => {
     const onSnapshot = vi.fn();
-    const handle = streamPane("run-1", "pane-0", { onSnapshot, onData: vi.fn() });
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", { onSnapshot, onData: vi.fn() });
 
     const ws = MockWebSocket.last();
     ws.simulateOpen();
@@ -162,7 +175,7 @@ describe("streamPane client", () => {
 
   it("2. data frame decoded and forwarded to onData", () => {
     const onData = vi.fn();
-    const handle = streamPane("run-1", "pane-0", { onSnapshot: vi.fn(), onData });
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", { onSnapshot: vi.fn(), onData });
 
     const ws = MockWebSocket.last();
     ws.simulateOpen();
@@ -177,7 +190,7 @@ describe("streamPane client", () => {
   });
 
   it("3. gap in seq triggers a 'resync' message to the server", () => {
-    const handle = streamPane("run-1", "pane-0", {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
       onSnapshot: vi.fn(),
       onData: vi.fn(),
     });
@@ -195,7 +208,7 @@ describe("streamPane client", () => {
   it("3b. gap data is not forwarded again until a snapshot repaints", () => {
     const onSnapshot = vi.fn();
     const onData = vi.fn();
-    const handle = streamPane("run-1", "pane-0", { onSnapshot, onData });
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", { onSnapshot, onData });
 
     const ws = MockWebSocket.last();
     ws.simulateOpen();
@@ -218,7 +231,7 @@ describe("streamPane client", () => {
   });
 
   it("4. contiguous seq does NOT trigger resync", () => {
-    const handle = streamPane("run-1", "pane-0", {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
       onSnapshot: vi.fn(),
       onData: vi.fn(),
     });
@@ -236,7 +249,7 @@ describe("streamPane client", () => {
   });
 
   it("5. requestResync sends 'resync' while the socket is OPEN", () => {
-    const handle = streamPane("run-1", "pane-0", {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
       onSnapshot: vi.fn(),
       onData: vi.fn(),
     });
@@ -252,7 +265,7 @@ describe("streamPane client", () => {
 
   it("6. requestResync is a no-op when the socket is not OPEN", () => {
     // Socket stays in CONNECTING state (simulateOpen not called).
-    const handle = streamPane("run-1", "pane-0", {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
       onSnapshot: vi.fn(),
       onData: vi.fn(),
     });
@@ -267,7 +280,7 @@ describe("streamPane client", () => {
 
   it("7. unexpected close schedules a reconnect", () => {
     const onStatus = vi.fn();
-    const handle = streamPane("run-1", "pane-0", {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
       onSnapshot: vi.fn(),
       onData: vi.fn(),
       onStatus,
@@ -289,7 +302,7 @@ describe("streamPane client", () => {
   });
 
   it("7b. accept-then-close reconnects use growing backoff until a frame arrives", () => {
-    const handle = streamPane("run-1", "pane-0", {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
       onSnapshot: vi.fn(),
       onData: vi.fn(),
     });
@@ -317,7 +330,7 @@ describe("streamPane client", () => {
   it("7c. repeated accept-then-close cycles stop reconnecting as unavailable", () => {
     const onStatus = vi.fn();
     const onError = vi.fn();
-    const handle = streamPane("run-1", "pane-0", {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
       onSnapshot: vi.fn(),
       onData: vi.fn(),
       onError,
@@ -349,7 +362,7 @@ describe("streamPane client", () => {
   });
 
   it("7d. a healthy frame resets reconnect backoff to the base delay", () => {
-    const handle = streamPane("run-1", "pane-0", {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
       onSnapshot: vi.fn(),
       onData: vi.fn(),
     });
@@ -377,7 +390,7 @@ describe("streamPane client", () => {
 
   it("8. close() stops reconnection permanently", () => {
     const onStatus = vi.fn();
-    const handle = streamPane("run-1", "pane-0", {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
       onSnapshot: vi.fn(),
       onData: vi.fn(),
       onStatus,
@@ -399,7 +412,7 @@ describe("streamPane client", () => {
 
   it("8b. data frames queued on a closed socket are ignored", () => {
     const onData = vi.fn();
-    const handle = streamPane("run-1", "pane-0", { onSnapshot: vi.fn(), onData });
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", { onSnapshot: vi.fn(), onData });
 
     const ws = MockWebSocket.last();
     ws.simulateOpen();
@@ -411,7 +424,7 @@ describe("streamPane client", () => {
 
   it("9. error frame forwarded to onError with the error message", () => {
     const onError = vi.fn();
-    const handle = streamPane("run-1", "pane-0", {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
       onSnapshot: vi.fn(),
       onData: vi.fn(),
       onError,
@@ -430,7 +443,7 @@ describe("streamPane client", () => {
     const onSnapshot = vi.fn();
     const onData = vi.fn();
     const onError = vi.fn();
-    const handle = streamPane("run-1", "pane-0", { onSnapshot, onData, onError });
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", { onSnapshot, onData, onError });
 
     const ws = MockWebSocket.last();
     ws.simulateOpen();
@@ -446,7 +459,7 @@ describe("streamPane client", () => {
   it("7e. closes rejected before onopen give up as unavailable (pre-open path)", () => {
     const onStatus = vi.fn();
     const onError = vi.fn();
-    const handle = streamPane("run-1", "pane-0", {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
       onSnapshot: vi.fn(),
       onData: vi.fn(),
       onError,
@@ -477,7 +490,7 @@ describe("streamPane client", () => {
   it("7f. a successful connection resets the failed-connect counter", () => {
     const onStatus = vi.fn();
     const onError = vi.fn();
-    const handle = streamPane("run-1", "pane-0", {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
       onSnapshot: vi.fn(),
       onData: vi.fn(),
       onError,
@@ -510,7 +523,7 @@ describe("streamPane client", () => {
   });
 
   it("11. first seq after reconnect resets gap tracking (no spurious resync)", () => {
-    const handle = streamPane("run-1", "pane-0", {
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
       onSnapshot: vi.fn(),
       onData: vi.fn(),
     });

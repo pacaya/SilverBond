@@ -361,6 +361,9 @@ pub fn default_batch_max_concurrent() -> u32 {
     4
 }
 
+/// Upper bound for parallel_batch maxConcurrent at runtime (and in the editor).
+pub const MAX_PARALLEL_BATCH_CONCURRENT: u32 = 32;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchConfig {
@@ -858,6 +861,8 @@ pub struct ValidationIssue {
     pub severity: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     pub message: String,
 }
 
@@ -1124,6 +1129,7 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: None,
+            scope: None,
             message: format!(
                 "entryNodeId \"{}\" references a non-existent node.",
                 workflow.entry_node_id
@@ -1144,6 +1150,7 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
         issues.push(ValidationIssue {
             severity: "warning".to_string(),
             node_id: Some(node_id.clone()),
+            scope: None,
             message: format!("\"{}\" is unreachable from the entry node.", name),
         });
     }
@@ -1172,6 +1179,7 @@ fn validate_graph_body(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!("Duplicate node id \"{}\".", node.id),
             });
         }
@@ -1180,6 +1188,7 @@ fn validate_graph_body(
             issues.push(ValidationIssue {
                 severity: "warning".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" has an output schema but responseFormat is not json.",
                     node.name
@@ -1217,6 +1226,7 @@ fn validate_graph_body(
                     issues.push(ValidationIssue {
                         severity: "error".to_string(),
                         node_id: Some(node.id.clone()),
+                        scope: None,
                         message: format!("\"{}\" has no agent assigned.", node.name),
                     });
                 }
@@ -1225,6 +1235,7 @@ fn validate_graph_body(
                     issues.push(ValidationIssue {
                         severity: "warning".to_string(),
                         node_id: Some(node.id.clone()),
+                        scope: None,
                         message: format!("\"{}\" has an empty prompt.", node.name),
                     });
                 }
@@ -1252,6 +1263,7 @@ fn validate_graph_body(
                     issues.push(ValidationIssue {
                         severity: "error".to_string(),
                         node_id: Some(node.id.clone()),
+                        scope: None,
                         message: format!(
                             "\"{}\" spawn node requires an agent or command.",
                             node.name
@@ -1269,6 +1281,7 @@ fn validate_graph_body(
                     issues.push(ValidationIssue {
                         severity: "error".to_string(),
                         node_id: Some(node.id.clone()),
+                        scope: None,
                         message: format!("\"{}\" send node requires text or prompt.", node.name),
                     });
                 }
@@ -1296,6 +1309,7 @@ fn validate_graph_body(
                     issues.push(ValidationIssue {
                         severity: "error".to_string(),
                         node_id: Some(node.id.clone()),
+                        scope: None,
                         message: format!("\"{}\" run_agent node requires an agent.", node.name),
                     });
                 }
@@ -1307,6 +1321,7 @@ fn validate_graph_body(
                     issues.push(ValidationIssue {
                         severity: "warning".to_string(),
                         node_id: Some(node.id.clone()),
+                        scope: None,
                         message: format!("\"{}\" run_agent node has an empty prompt.", node.name),
                     });
                 }
@@ -1332,6 +1347,7 @@ fn validate_graph_body(
                 issues.push(ValidationIssue {
                     severity: "error".to_string(),
                     node_id: Some(node.id.clone()),
+                    scope: None,
                     message: format!("\"{}\" has more than one success edge.", node.name),
                 });
             }
@@ -1340,6 +1356,7 @@ fn validate_graph_body(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!("\"{}\" has more than one reject edge.", node.name),
             });
         }
@@ -1347,13 +1364,34 @@ fn validate_graph_body(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!("\"{}\" mixes branch and loop control edges.", node.name),
+            });
+        }
+        let loop_continue_edges = outgoing
+            .iter()
+            .filter(|edge| edge.outcome == WorkflowEdgeOutcome::LoopContinue)
+            .count();
+        let loop_exit_edges = outgoing
+            .iter()
+            .filter(|edge| edge.outcome == WorkflowEdgeOutcome::LoopExit)
+            .count();
+        if loop_continue_edges > 0 && loop_exit_edges == 0 {
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node.id.clone()),
+                scope: None,
+                message: format!(
+                    "\"{}\" has a loop_continue edge but no loop_exit edge.",
+                    node.name
+                ),
             });
         }
         if matches!(&node.kind, NodeKind::Approval) && branch_edges > 0 {
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "Approval node \"{}\" cannot branch via agent logic.",
                     node.name
@@ -1364,6 +1402,7 @@ fn validate_graph_body(
             issues.push(ValidationIssue {
                 severity: "warning".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" has a loop condition but responseFormat is not json.",
                     node.name
@@ -1383,6 +1422,7 @@ fn validate_graph_body(
             issues.push(ValidationIssue {
                 severity: "warning".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" has deterministic branch conditions but responseFormat is not json.",
                     node.name
@@ -1393,6 +1433,7 @@ fn validate_graph_body(
             issues.push(ValidationIssue {
                 severity: "warning".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!("\"{}\" is a terminal node.", node.name),
             });
         }
@@ -1408,6 +1449,7 @@ fn validate_graph_body(
             issues.push(ValidationIssue {
                 severity: "warning".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" is a {} node, so task execution fields are ignored.",
                     node.name, kind_label
@@ -1420,6 +1462,7 @@ fn validate_graph_body(
                 issues.push(ValidationIssue {
                     severity: "error".to_string(),
                     node_id: Some(node.id.clone()),
+                    scope: None,
                     message: format!(
                         "\"{}\" can only use success edges for split fan-out.",
                         node.name
@@ -1430,12 +1473,14 @@ fn validate_graph_body(
                 issues.push(ValidationIssue {
                     severity: "error".to_string(),
                     node_id: Some(node.id.clone()),
+                    scope: None,
                     message: format!("\"{}\" has no outbound split edges.", node.name),
                 });
             } else if success_edges < 2 {
                 issues.push(ValidationIssue {
                     severity: "warning".to_string(),
                     node_id: Some(node.id.clone()),
+                    scope: None,
                     message: format!("\"{}\" fans out to fewer than two branches.", node.name),
                 });
             }
@@ -1446,6 +1491,7 @@ fn validate_graph_body(
                 issues.push(ValidationIssue {
                     severity: "error".to_string(),
                     node_id: Some(node.id.clone()),
+                    scope: None,
                     message: format!("\"{}\" has no inbound branches to collect.", node.name),
                 });
             }
@@ -1453,6 +1499,7 @@ fn validate_graph_body(
                 issues.push(ValidationIssue {
                     severity: "error".to_string(),
                     node_id: Some(node.id.clone()),
+                    scope: None,
                     message: format!(
                         "\"{}\" must have exactly one outbound success edge.",
                         node.name
@@ -1463,6 +1510,7 @@ fn validate_graph_body(
                 issues.push(ValidationIssue {
                     severity: "error".to_string(),
                     node_id: Some(node.id.clone()),
+                    scope: None,
                     message: format!(
                         "\"{}\" can only use a success edge after collecting inputs.",
                         node.name
@@ -1477,6 +1525,7 @@ fn validate_graph_body(
                     issues.push(ValidationIssue {
                         severity: "error".to_string(),
                         node_id: Some(node.id.clone()),
+                        scope: None,
                         message: format!(
                             "\"{}\" has duplicate collector input key \"{}\".",
                             node.name, merge_key
@@ -1497,6 +1546,7 @@ fn validate_graph_body(
                     issues.push(ValidationIssue {
                         severity: "error".to_string(),
                         node_id: Some(node.id.clone()),
+                        scope: None,
                         message: format!(
                             "\"{}\" continues session from \"{}\" which is not an agent-running node.",
                             node.name, source_node.name
@@ -1510,6 +1560,7 @@ fn validate_graph_body(
                     issues.push(ValidationIssue {
                         severity: "error".to_string(),
                         node_id: Some(node.id.clone()),
+                        scope: None,
                         message: format!(
                             "\"{}\" continues session from \"{}\" but they use different agents ({} vs {}).",
                             node.name, source_node.name, current_agent, source_agent
@@ -1520,6 +1571,7 @@ fn validate_graph_body(
                 issues.push(ValidationIssue {
                     severity: "error".to_string(),
                     node_id: Some(node.id.clone()),
+                    scope: None,
                     message: format!(
                         "\"{}\" references unknown node \"{}\" for session continuation.",
                         node.name, source_id
@@ -1534,6 +1586,7 @@ fn validate_graph_body(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(edge.from.clone()),
+                scope: None,
                 message: format!("Duplicate edge id \"{}\".", edge.id),
             });
         }
@@ -1541,6 +1594,7 @@ fn validate_graph_body(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(edge.from.clone()),
+                scope: None,
                 message: format!("Edge \"{}\" references unknown source node.", edge.id),
             });
         }
@@ -1548,6 +1602,7 @@ fn validate_graph_body(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(edge.from.clone()),
+                scope: None,
                 message: format!("Edge \"{}\" references unknown target node.", edge.id),
             });
         }
@@ -1562,9 +1617,7 @@ fn scope_graph_body_issues(prefix: &str, issues: &mut [ValidationIssue]) {
     }
 
     for issue in issues {
-        if let Some(node_id) = issue.node_id.as_mut() {
-            *node_id = format!("{prefix}:{node_id}");
-        }
+        issue.scope = Some(prefix.to_string());
         issue.message = format!("{prefix}: {}", issue.message);
     }
 }
@@ -1583,12 +1636,14 @@ fn validate_run_as_config(run_as: Option<&RunAsConfig>, issues: &mut Vec<Validat
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: None,
+                scope: None,
                 message: "runAs.command must not be empty.".to_string(),
             });
         } else if command.iter().any(|token| token.trim().is_empty()) {
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: None,
+                scope: None,
                 message: "runAs.command must not contain blank tokens.".to_string(),
             });
         }
@@ -1599,12 +1654,14 @@ fn validate_run_as_config(run_as: Option<&RunAsConfig>, issues: &mut Vec<Validat
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: None,
+                scope: None,
                 message: "runAs.user must not be empty.".to_string(),
             });
         } else if user.chars().any(is_run_as_user_shell_metachar) {
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: None,
+                scope: None,
                 message: "runAs.user contains shell metacharacters.".to_string(),
             });
         }
@@ -1651,6 +1708,7 @@ fn validate_wait_timing_and_marker(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node_id.to_string()),
+            scope: None,
             message: format!(
                 "\"{}\" wait node with until mode requires a marker.",
                 node_name
@@ -1663,6 +1721,7 @@ fn validate_wait_timing_and_marker(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node_id.to_string()),
+                scope: None,
                 message: format!("\"{}\" has invalid wait marker regex: {}", node_name, error),
             });
         }
@@ -1678,6 +1737,7 @@ fn validate_wait_timing_and_marker(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node_id.to_string()),
+                scope: None,
                 message: format!(
                     "\"{}\" {} must be a finite non-negative number.",
                     node_name, field_name
@@ -1698,6 +1758,7 @@ fn validate_subflow_catalog(workflow: &WorkflowV3, issues: &mut Vec<ValidationIs
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: None,
+                scope: None,
                 message: format!(
                     "Subflow \"{}\" entryNodeId \"{}\" references a non-existent node.",
                     subflow_name, subflow.entry_node_id
@@ -1721,6 +1782,7 @@ fn validate_subflow_node_config(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!(
                 "\"{}\" {} node requires subflowConfig.workflowName.",
                 node.name,
@@ -1737,6 +1799,7 @@ fn validate_subflow_node_config(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!(
                 "\"{}\" references unknown subflow \"{}\".",
                 node.name, workflow_name
@@ -1754,6 +1817,7 @@ fn validate_subflow_node_config(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!(
                 "\"{}\" references subflow \"{}\" with missing entryNodeId \"{}\".",
                 node.name, workflow_name, subflow.entry_node_id
@@ -1771,6 +1835,7 @@ fn validate_subflow_node_config(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!(
                 "\"{}\" references subflow \"{}\" which must expose exactly one exit node; found {}.",
                 node.name,
@@ -1791,6 +1856,7 @@ fn validate_subflow_node_config(
                 issues.push(ValidationIssue {
                     severity: "error".to_string(),
                     node_id: Some(node.id.clone()),
+                    scope: None,
                     message: format!(
                         "\"{}\" subflow exitNodeId \"{}\" must be terminal.",
                         node.name, exit_node_id
@@ -1801,6 +1867,7 @@ fn validate_subflow_node_config(
             None => issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" subflow exitNodeId \"{}\" references a non-existent node.",
                     node.name, exit_node_id
@@ -1811,6 +1878,7 @@ fn validate_subflow_node_config(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!(
                 "\"{}\" subflowConfig.exitNodeId is required unless the referenced subflow has exactly one terminal node.",
                 node.name
@@ -1822,6 +1890,7 @@ fn validate_subflow_node_config(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!("\"{}\" subflow maxDepth must be at least 1.", node.name),
         });
     }
@@ -1837,6 +1906,7 @@ fn validate_subflow_node_config(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" subflow node has an input binding with an empty name or source.",
                     node.name
@@ -1847,6 +1917,7 @@ fn validate_subflow_node_config(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" subflow node has duplicate input binding \"{}\".",
                     node.name, input.name
@@ -1857,6 +1928,7 @@ fn validate_subflow_node_config(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" binds unknown subflow variable \"{}\".",
                     node.name, input.name
@@ -1870,6 +1942,7 @@ fn validate_subflow_node_config(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" does not bind required subflow input \"{}\".",
                     node.name, variable.name
@@ -1954,6 +2027,7 @@ fn detect_subflow_cycle(
                 issues.push(ValidationIssue {
                     severity: "warning".to_string(),
                     node_id: Some(node_id.clone()),
+                    scope: None,
                     message: format!(
                         "Subflow call cycle detected: {}. maxDepth ({}) bounds recursion at runtime.",
                         signature, max_depth
@@ -1977,6 +2051,7 @@ fn validate_decide_node_config(
         issues.push(ValidationIssue {
             severity: "warning".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!("\"{}\" decide node has an empty prompt.", node.name),
         });
     }
@@ -1987,6 +2062,7 @@ fn validate_decide_node_config(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" decide node has an input binding with an empty name or source.",
                     node.name
@@ -1997,6 +2073,7 @@ fn validate_decide_node_config(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" decide node has duplicate input binding \"{}\".",
                     node.name, input.name
@@ -2009,6 +2086,7 @@ fn validate_decide_node_config(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!(
                 "\"{}\" decide node requires at least one outcome.",
                 node.name
@@ -2028,6 +2106,7 @@ fn validate_decide_node_config(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!("\"{}\" decide node has an empty outcome label.", node.name),
             });
             continue;
@@ -2036,6 +2115,7 @@ fn validate_decide_node_config(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" decide node has duplicate outcome \"{}\".",
                     node.name, outcome
@@ -2046,6 +2126,7 @@ fn validate_decide_node_config(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" decide outcome \"{}\" does not match an outgoing branch edge label.",
                     node.name, outcome
@@ -2062,6 +2143,7 @@ fn validate_decide_node_config(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!(
                 "\"{}\" decide node must have one outgoing branch edge per outcome.",
                 node.name
@@ -2077,6 +2159,7 @@ fn validate_decide_node_config(
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
+                scope: None,
                 message: format!(
                     "\"{}\" decide node branch edge \"{}\" requires a label matching an outcome.",
                     node.name, edge.id
@@ -2096,6 +2179,7 @@ fn validate_batch_node_config(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!(
                 "\"{}\" parallel_batch node requires itemsBinding.",
                 node.name
@@ -2106,6 +2190,7 @@ fn validate_batch_node_config(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!("\"{}\" parallel_batch node requires itemVar.", node.name),
         });
     }
@@ -2113,12 +2198,14 @@ fn validate_batch_node_config(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!("\"{}\" parallel_batch node requires bodyEntry.", node.name),
         });
     } else if graph.node_map.get(config.body_entry.as_str()).is_none() {
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!(
                 "\"{}\" parallel_batch bodyEntry \"{}\" references a non-existent node.",
                 node.name, config.body_entry
@@ -2129,6 +2216,7 @@ fn validate_batch_node_config(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!(
                 "\"{}\" parallel_batch maxConcurrent must be at least 1.",
                 node.name
@@ -2143,6 +2231,7 @@ fn validate_batch_node_config(
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
+            scope: None,
             message: format!(
                 "\"{}\" parallel_batch collectorVar cannot be empty when set.",
                 node.name
@@ -2174,6 +2263,14 @@ pub fn compute_graph_metadata(workflow: &WorkflowV3) -> GraphMetadata {
     while let Some(node_id) = queue.pop_front() {
         if !reachable.insert(node_id.clone()) {
             continue;
+        }
+        if let Some(node) = graph.node_map.get(node_id.as_str()) {
+            if let NodeKind::ParallelBatch { batch_config } = &node.kind {
+                let body_entry = batch_config.body_entry.clone();
+                if !body_entry.trim().is_empty() {
+                    queue.push_back(body_entry);
+                }
+            }
         }
         for edge in graph.outgoing_for(&node_id) {
             queue.push_back(edge.to.clone());
@@ -3633,7 +3730,8 @@ mod tests {
         assert!(
             result.issues.iter().any(|issue| {
                 issue.severity == "error"
-                    && issue.node_id.as_deref() == Some("subflow:broken:decide")
+                    && issue.node_id.as_deref() == Some("decide")
+                    && issue.scope.as_deref() == Some("subflow:broken")
                     && issue.message.contains("subflow:broken")
                     && issue
                         .message
@@ -3645,7 +3743,8 @@ mod tests {
         assert!(
             result.issues.iter().any(|issue| {
                 issue.severity == "error"
-                    && issue.node_id.as_deref() == Some("subflow:broken:decide")
+                    && issue.node_id.as_deref() == Some("decide")
+                    && issue.scope.as_deref() == Some("subflow:broken")
                     && issue.message.contains("subflow:broken")
                     && issue.message.contains("references unknown target node")
             }),
@@ -4092,5 +4191,72 @@ mod tests {
             "multi-agent-plan-implementation.json has validation errors: {:?}",
             errors
         );
+    }
+
+    #[test]
+    fn compute_graph_metadata_includes_parallel_batch_body_entry() {
+        let batch = WorkflowNode {
+            id: "batch".to_string(),
+            name: "Batch".to_string(),
+            kind: NodeKind::ParallelBatch {
+                batch_config: BatchConfig {
+                    items_binding: "items".to_string(),
+                    max_concurrent: 2,
+                    item_var: "item".to_string(),
+                    body_entry: "body".to_string(),
+                    collector_var: None,
+                },
+            },
+            agent: None,
+            prompt: String::new(),
+            context_sources: Vec::new(),
+            response_format: None,
+            output_schema: None,
+            retry_count: None,
+            retry_delay: None,
+            timeout: None,
+            skip_condition: None,
+            loop_max_iterations: None,
+            loop_condition: None,
+            split_failure_policy: SplitFailurePolicy::BestEffortContinue,
+            cwd: None,
+            continue_session_from: None,
+        };
+        let body = node("body", "Body", WorkflowNodeType::Task);
+        let after = node("after", "After", WorkflowNodeType::Task);
+        let wf = workflow(
+            vec![batch, body, after],
+            vec![success_edge("batch_after", "batch", "after", None)],
+            "batch",
+        );
+
+        let meta = compute_graph_metadata(&wf);
+        assert!(meta.reachable_node_ids.contains(&"body".to_string()));
+        assert!(!meta.unreachable_node_ids.contains(&"body".to_string()));
+    }
+
+    #[test]
+    fn validates_loop_continue_requires_loop_exit() {
+        let gate = node("gate", "Gate", WorkflowNodeType::Task);
+        let result = validate_workflow(workflow(
+            vec![gate, node("done", "Done", WorkflowNodeType::Task)],
+            vec![WorkflowEdge {
+                id: "gate_continue".to_string(),
+                from: "gate".to_string(),
+                to: "gate".to_string(),
+                outcome: WorkflowEdgeOutcome::LoopContinue,
+                label: Some("again".to_string()),
+                branch_id: None,
+                condition: None,
+            }],
+            "gate",
+        ));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue
+                    .message
+                    .contains("loop_continue edge but no loop_exit edge")
+        }));
     }
 }

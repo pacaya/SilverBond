@@ -40,6 +40,8 @@ use crate::{
 pub(crate) struct TmuxNodeRunner;
 
 const IDLE_ESCALATE_SECS: f64 = 30.0;
+const TMUX_LOOKUP_SENTINEL: &str = "SBTMUX:";
+const TMUX_LOOKUP_COMMAND: &str = r#"print -r -- "SBTMUX:$(command -v tmux)""#;
 
 impl TmuxNodeRunner {
     pub(crate) fn new() -> Self {
@@ -62,7 +64,7 @@ impl PaneCleanupTarget {
     }
 }
 
-pub fn build_tmux_invocation(run_as: &RunAsConfig) -> TmuxInvocation {
+pub fn build_tmux_invocation(run_as: &RunAsConfig, run_id: &str) -> TmuxInvocation {
     let prefix = if let Some(command) = &run_as.command {
         command.clone()
     } else if let Some(user) = &run_as.user {
@@ -80,7 +82,7 @@ pub fn build_tmux_invocation(run_as: &RunAsConfig) -> TmuxInvocation {
     let socket = run_as
         .socket
         .clone()
-        .unwrap_or_else(|| "silverbond".to_string());
+        .unwrap_or_else(|| format!("silverbond-{run_id}"));
     let tmux_bin = resolve_tmux_bin(&prefix);
 
     TmuxInvocation {
@@ -91,30 +93,52 @@ pub fn build_tmux_invocation(run_as: &RunAsConfig) -> TmuxInvocation {
 }
 
 fn resolve_tmux_bin(prefix: &[String]) -> String {
-    let output = if let Some((program, args)) = prefix.split_first() {
-        Command::new(program)
-            .args(args)
-            .args(["zsh", "-lic", "command -v tmux"])
-            .output()
+    resolve_tmux_bin_with_timeout(prefix, tmux::DEFAULT_TMUX_COMMAND_TIMEOUT)
+}
+
+fn resolve_tmux_bin_with_timeout(prefix: &[String], timeout: Duration) -> String {
+    let mut command = if let Some((program, args)) = prefix.split_first() {
+        let mut command = Command::new(program);
+        command.args(args);
+        command
     } else {
         Command::new("zsh")
-            .args(["-lic", "command -v tmux"])
-            .output()
     };
 
-    let Ok(output) = output else {
+    if prefix.is_empty() {
+        // Keep `-i`: zsh only sources .zshrc for interactive shells, and
+        // operator tooling PATHs often live there. The sentinel parse below
+        // keeps rc stdout banners from corrupting the resolved path.
+        command.args(["-lic", TMUX_LOOKUP_COMMAND]);
+    } else {
+        // Keep `-i`: zsh only sources .zshrc for interactive shells, and
+        // run_as tooling PATHs often live there. The sentinel parse below
+        // keeps rc stdout banners from corrupting the resolved path.
+        command.args(["zsh", "-lic", TMUX_LOOKUP_COMMAND]);
+    }
+
+    let Ok(output) = tmux::command_output_with_timeout(command, timeout) else {
         return "tmux".to_string();
     };
     if !output.status.success() {
         return "tmux".to_string();
     }
 
-    let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if resolved.is_empty() {
-        "tmux".to_string()
-    } else {
-        resolved
+    parse_tmux_lookup_output(&output.stdout).unwrap_or_else(|| "tmux".to_string())
+}
+
+fn parse_tmux_lookup_output(stdout: &[u8]) -> Option<String> {
+    let output = String::from_utf8_lossy(stdout);
+    let mut matches = output.lines().filter_map(|line| {
+        line.strip_prefix(TMUX_LOOKUP_SENTINEL)
+            .map(str::trim)
+            .filter(|resolved| !resolved.is_empty())
+    });
+    let resolved = matches.next()?;
+    if matches.next().is_some() {
+        return None;
     }
+    Some(resolved.to_string())
 }
 
 impl NodeRunner for TmuxNodeRunner {
@@ -477,7 +501,7 @@ impl ActivePaneRegistration {
 /// Only ever entered from a `tokio::task::spawn_blocking` blocking-pool thread where
 /// `Handle::block_on` is safe.
 #[derive(Clone)]
-struct InteractionEscalation {
+pub(crate) struct InteractionEscalation {
     ctx: RuntimeContext,
     run_id: String,
     handle: tokio::runtime::Handle,
@@ -485,7 +509,7 @@ struct InteractionEscalation {
 }
 
 impl InteractionEscalation {
-    fn new(ctx: RuntimeContext, run_id: String, abort_flag: Option<Arc<AtomicBool>>) -> Self {
+    pub(crate) fn new(ctx: RuntimeContext, run_id: String, abort_flag: Option<Arc<AtomicBool>>) -> Self {
         Self {
             ctx,
             run_id,
@@ -703,7 +727,8 @@ fn execute_kill(
         .or_else(|| previous_value(&previous, &["paneId", "pane_id", "target"]));
 
     if let Some(session) = session.filter(|s| !s.trim().is_empty()) {
-        tmux::run_checked(&["kill-session", "-t", session])?;
+        let session = stable_session_name(session);
+        tmux::run_checked(&["kill-session", "-t", &session])?;
         if let Some(active_pane) = active_pane {
             active_pane.clear_key();
         }
@@ -914,7 +939,7 @@ fn run_agent_interactive(
             timeout_duration,
             idle_seconds,
             ready_stable_seconds,
-            agent_cfg.auto_approve,
+            false,
             subagent_timeout,
             &interaction_patterns,
             &destructive_regexes,
@@ -1055,6 +1080,7 @@ pub(crate) fn run_tmux_oneshot(
     cwd: &str,
     config: Option<&AgentConfig>,
     inv: Option<TmuxInvocation>,
+    interaction: Option<&InteractionEscalation>,
 ) -> anyhow::Result<NodeResult> {
     let run = || {
         run_agent_interactive(
@@ -1066,7 +1092,7 @@ pub(crate) fn run_tmux_oneshot(
             config,
             None,
             None,
-            None,
+            interaction,
         )
     };
 
@@ -1085,7 +1111,7 @@ pub(crate) fn list_silverbond_tmux_sessions() -> anyhow::Result<Vec<String>> {
     Ok(output
         .lines()
         .map(str::trim)
-        .filter(|name| !name.is_empty() && name.starts_with("silverbond-"))
+        .filter(|name| !name.is_empty() && name.starts_with(SILVERBOND_SESSION_PREFIX))
         .map(str::to_string)
         .collect())
 }
@@ -1333,6 +1359,8 @@ fn wait_for_agent_ready_interactive(
     let ready_signal = ready_signal_for_pane(pane)?;
     let start = Instant::now();
     let mut deadline = start + timeout;
+    let max_total_timeout = timeout.max(subagent_timeout * 10);
+    let absolute_deadline = start + max_total_timeout;
     let mut capture = capture_visible_stripped(pane).unwrap_or_default();
     let mut last_seen = capture.clone();
     let mut progress = CaptureProgress::new(&capture, start);
@@ -1388,8 +1416,11 @@ fn wait_for_agent_ready_interactive(
                     continue;
                 }
                 InteractionKind::SubagentActive => {
-                    deadline = Instant::now() + subagent_timeout;
-                    continue;
+                    let reset_at = Instant::now();
+                    deadline = reset_at + subagent_timeout;
+                    if reset_at < absolute_deadline {
+                        continue;
+                    }
                 }
                 InteractionKind::PermissionRequest => {
                     let is_destructive = destructive_regexes
@@ -1433,7 +1464,7 @@ fn wait_for_agent_ready_interactive(
             return Ok(InteractiveReadyResult::Ready(reason));
         }
 
-        if now >= deadline {
+        if now >= deadline || now >= absolute_deadline {
             return Ok(InteractiveReadyResult::Ready(IdleReason::TimedOut));
         }
 
@@ -1465,9 +1496,12 @@ fn poll_agent_interactive(
     let stale_threshold = stale_timeout_secs
         .map(|seconds| seconds as f64)
         .unwrap_or(IDLE_ESCALATE_SECS);
-    let mut deadline = Instant::now() + timeout;
+    let start = Instant::now();
+    let mut deadline = start + timeout;
+    let max_total_timeout = timeout.max(subagent_timeout * 10);
+    let absolute_deadline = start + max_total_timeout;
     let mut last_seen = before.to_owned();
-    let mut progress = CaptureProgress::new(before, Instant::now());
+    let mut progress = CaptureProgress::new(before, start);
     let mut handled_matches = Vec::new();
     let mut handled_destructive_matches = HandledDestructiveMatches::default();
     let mut idle_since: Option<Instant> = None;
@@ -1535,8 +1569,11 @@ fn poll_agent_interactive(
                     continue;
                 }
                 InteractionKind::SubagentActive => {
-                    deadline = Instant::now() + subagent_timeout;
-                    continue;
+                    let reset_at = Instant::now();
+                    deadline = reset_at + subagent_timeout;
+                    if reset_at < absolute_deadline {
+                        continue;
+                    }
                 }
                 InteractionKind::PermissionRequest => {
                     let is_destructive = destructive_regexes
@@ -1602,7 +1639,7 @@ fn poll_agent_interactive(
             }
         }
 
-        if now >= deadline {
+        if now >= deadline || now >= absolute_deadline {
             return Ok(InteractivePollResult::TimedOut(InteractiveCapture {
                 output: output_so_far,
                 final_capture: capture,
@@ -1971,7 +2008,9 @@ fn spawn_pane(
             build_agent_command(agent, cfg, agent_config)
         })?;
     let session_name = session_override
-        .or_else(|| cfg.and_then(|cfg| cfg.session_name.clone()))
+        .as_deref()
+        .or_else(|| cfg.and_then(|cfg| cfg.session_name.as_deref()))
+        .map(stable_session_name)
         .unwrap_or_else(|| unique_session_name(cfg.and_then(|cfg| cfg.name.as_deref())));
     let work_dir = cfg
         .and_then(|cfg| cfg.cwd.as_deref())
@@ -2325,13 +2364,32 @@ fn duration_string(duration: Duration) -> String {
     format!("{:.1}", duration.as_secs_f64())
 }
 
+const SILVERBOND_SESSION_PREFIX: &str = "silverbond-";
+
+fn stable_session_name(name: &str) -> String {
+    normalized_session_name(Some(name), None)
+}
+
 fn unique_session_name(name: Option<&str>) -> String {
     let suffix = uuid::Uuid::now_v7().simple().to_string();
+    normalized_session_name(name, Some(&suffix))
+}
+
+fn normalized_session_name(name: Option<&str>, suffix: Option<&str>) -> String {
     let base = name
         .map(sanitize_tmux_name)
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "run".to_owned());
-    format!("silverbond-{base}-{suffix}")
+    let prefixed = if base.starts_with(SILVERBOND_SESSION_PREFIX) {
+        base
+    } else {
+        format!("{SILVERBOND_SESSION_PREFIX}{base}")
+    };
+    if let Some(suffix) = suffix.filter(|value| !value.is_empty()) {
+        format!("{prefixed}-{suffix}")
+    } else {
+        prefixed
+    }
 }
 
 fn sanitize_tmux_name(value: &str) -> String {
@@ -2455,11 +2513,11 @@ mod tests {
     use super::*;
     use crate::model::RunAsConfig;
 
-    /// build_tmux_invocation: no user/command → empty prefix, socket defaults to "silverbond".
+    /// build_tmux_invocation: no explicit socket → socket defaults to the run id.
     #[test]
-    fn build_invocation_defaults_to_silverbond_socket() {
+    fn build_invocation_defaults_to_run_scoped_socket() {
         let cfg = RunAsConfig::default();
-        let inv = build_tmux_invocation(&cfg);
+        let inv = build_tmux_invocation(&cfg, "run_123");
         assert!(
             inv.prefix.is_empty(),
             "expected empty prefix for default RunAsConfig, got {:?}",
@@ -2467,8 +2525,8 @@ mod tests {
         );
         assert_eq!(
             inv.socket.as_deref(),
-            Some("silverbond"),
-            "socket should default to \"silverbond\""
+            Some("silverbond-run_123"),
+            "socket should default to a run-scoped silverbond socket"
         );
     }
 
@@ -2485,13 +2543,13 @@ mod tests {
             user: None,
             socket: None,
         };
-        let inv = build_tmux_invocation(&cfg);
+        let inv = build_tmux_invocation(&cfg, "run_command");
         assert_eq!(
             inv.prefix,
             vec!["docker", "exec", "-it", "sandbox"],
             "command should be used verbatim as prefix"
         );
-        assert_eq!(inv.socket.as_deref(), Some("silverbond"));
+        assert_eq!(inv.socket.as_deref(), Some("silverbond-run_command"));
     }
 
     /// build_tmux_invocation: `user` field synthesizes `["sudo", "-u", <user>, "-H", "--"]`.
@@ -2502,13 +2560,13 @@ mod tests {
             command: None,
             socket: None,
         };
-        let inv = build_tmux_invocation(&cfg);
+        let inv = build_tmux_invocation(&cfg, "run_user");
         assert_eq!(
             inv.prefix,
             vec!["sudo", "-u", "agent", "-H", "--"],
             "user should synthesize sudo prefix"
         );
-        assert_eq!(inv.socket.as_deref(), Some("silverbond"));
+        assert_eq!(inv.socket.as_deref(), Some("silverbond-run_user"));
     }
 
     /// build_tmux_invocation: explicit socket overrides the default.
@@ -2519,7 +2577,7 @@ mod tests {
             command: None,
             socket: Some("my-socket".to_string()),
         };
-        let inv = build_tmux_invocation(&cfg);
+        let inv = build_tmux_invocation(&cfg, "run_explicit");
         assert_eq!(inv.socket.as_deref(), Some("my-socket"));
     }
 
@@ -2531,11 +2589,53 @@ mod tests {
             user: Some("agent".to_string()),
             socket: None,
         };
-        let inv = build_tmux_invocation(&cfg);
+        let inv = build_tmux_invocation(&cfg, "run_precedence");
         assert_eq!(
             inv.prefix,
             vec!["custom"],
             "command should take precedence over user"
+        );
+    }
+
+    #[test]
+    fn resolve_tmux_bin_sentinel_parse_ignores_stdout_banners() {
+        let output = b"Welcome from zshrc\nSBTMUX:/opt/homebrew/bin/tmux\n";
+
+        assert_eq!(
+            parse_tmux_lookup_output(output).as_deref(),
+            Some("/opt/homebrew/bin/tmux")
+        );
+    }
+
+    #[test]
+    fn resolve_tmux_bin_sentinel_parse_treats_empty_lookup_as_not_found() {
+        let output = b"Welcome from zshrc\nSBTMUX:\n";
+
+        assert_eq!(parse_tmux_lookup_output(output), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_tmux_bin_timeout_falls_back_to_tmux() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("blocking-tmux-lookup.sh");
+        std::fs::write(&script, "#!/bin/sh\nsleep 5\n").unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let started = Instant::now();
+        let resolved = resolve_tmux_bin_with_timeout(
+            &[script.to_string_lossy().into_owned()],
+            Duration::from_millis(50),
+        );
+
+        assert_eq!(resolved, "tmux");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "blocking tmux lookup should return promptly"
         );
     }
 
@@ -2569,6 +2669,63 @@ mod tests {
                 "burst-generated unnamed tmux sessions must be unique"
             );
         }
+    }
+
+    #[test]
+    fn stable_session_name_sanitizes_prefixes_and_is_idempotent() {
+        assert_eq!(stable_session_name("Reviewer A!"), "silverbond-Reviewer-A");
+        assert_eq!(
+            stable_session_name("silverbond-Reviewer-A"),
+            "silverbond-Reviewer-A"
+        );
+        assert_eq!(stable_session_name("!!!"), "silverbond-run");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_pane_normalizes_explicit_session_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-spawn-prefix.sh");
+        let log = temp.path().join("tmux-spawn-args.log");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\nshift\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"new-session\" ]; then printf '%%spawned-pane\\n'; fi\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![
+                script.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+            ],
+            socket: Some("spawn-test-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+        let cfg = SpawnConfig {
+            command: Some("true".to_string()),
+            session_name: Some("Reviewer A!".to_string()),
+            ..Default::default()
+        };
+
+        let spawned = tmux_tools_core::with_invocation(invocation, || {
+            spawn_pane(Some(&cfg), None, "", None, None, None)
+        })
+        .unwrap();
+
+        assert_eq!(spawned.session_name, "silverbond-Reviewer-A");
+        let recorded =
+            std::fs::read_to_string(log).expect("fake tmux prefix should record spawn args");
+        let args = recorded.lines().collect::<Vec<_>>();
+        assert!(
+            args.windows(5)
+                .any(|window| window == ["new-session", "-d", "-s", "silverbond-Reviewer-A", "-P"]),
+            "explicit session name should be normalized before tmux spawn; args={args:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -2862,6 +3019,239 @@ mod tests {
         )
         .unwrap();
         assert_eq!(reply, "y");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn continuous_subagent_markers_are_bounded_by_absolute_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-subagent-timeout-prefix.sh");
+        let state = temp.path().join("capture-count");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+state="$1"
+shift
+if [ "$1" = "tmux" ]; then shift; fi
+if [ "$1" = "-L" ]; then shift 2; fi
+cmd="$1"
+
+case "$cmd" in
+  display-message)
+    printf '\037\037\037\037\n'
+    ;;
+  capture-pane)
+    count=0
+    if [ -f "$state" ]; then count=$(cat "$state"); fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$state"
+    suffix=""
+    i=0
+    while [ "$i" -lt "$count" ]; do
+      suffix="${suffix}x"
+      i=$((i + 1))
+    done
+    printf 'Task prompt\nSubagent active %s\n' "$suffix"
+    ;;
+  send-keys)
+    ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![
+                script.to_string_lossy().into_owned(),
+                state.to_string_lossy().into_owned(),
+            ],
+            socket: Some("subagent-timeout-test-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+        let interaction_patterns = vec![CompiledInteractionPattern {
+            regex: Regex::new(r"Subagent active x+").unwrap(),
+            kind: InteractionKind::SubagentActive,
+            description: "Subagent active".to_string(),
+            send_enter: true,
+        }];
+        let abort = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let abort_worker = Arc::clone(&abort);
+        let finished_worker = Arc::clone(&finished);
+        let abort_thread = std::thread::spawn(move || {
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(5)
+                && !finished_worker.load(Ordering::SeqCst)
+            {
+                sleep(Duration::from_millis(10));
+            }
+            if !finished_worker.load(Ordering::SeqCst) {
+                abort_worker.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let started = Instant::now();
+        let result = tmux_tools_core::with_invocation(invocation, || {
+            poll_agent_interactive(
+                "%subagent-test",
+                "Task prompt\n",
+                "Task prompt",
+                Duration::from_millis(10),
+                60.0,
+                0.0,
+                None,
+                None,
+                false,
+                Duration::from_millis(5),
+                None,
+                &interaction_patterns,
+                &[],
+                None,
+                Some(&abort),
+            )
+        })
+        .unwrap();
+        finished.store(true, Ordering::SeqCst);
+        abort_thread.join().unwrap();
+
+        assert!(
+            matches!(result, InteractivePollResult::TimedOut(_)),
+            "continuous SubagentActive matches should hit the absolute deadline before the abort guard"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "absolute deadline should bound total polling time"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_approve_is_only_used_after_workflow_prompt_is_sent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-auto-approve-prefix.sh");
+        let log = temp.path().join("send-log");
+        let phase = temp.path().join("phase");
+        let prompt = temp.path().join("prompt");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+log="$1"
+phase="$2"
+prompt_file="$3"
+shift 3
+if [ "$1" = "tmux" ]; then shift; fi
+if [ "$1" = "-L" ]; then shift 2; fi
+cmd="$1"
+
+case "$cmd" in
+  new-session)
+    printf '%%auto-approve-test\n'
+    ;;
+  display-message)
+    printf '\037codex\037\037\037\n'
+    ;;
+  set-option|kill-session|kill-pane)
+    ;;
+  capture-pane)
+    if [ -f "$phase" ]; then
+      cat "$prompt_file"
+      printf '\nAllow this action now [y/n]\nDONE\n'
+    else
+      printf 'Startup banner\nAllow this action [y/n]\n'
+    fi
+    ;;
+  send-keys)
+    shift
+    literal=""
+    previous=""
+    for arg in "$@"; do
+      if [ "$previous" = "--" ]; then
+        literal="$arg"
+        break
+      fi
+      previous="$arg"
+    done
+    if [ -n "$literal" ]; then
+      printf '%s\n' "$literal" >> "$log"
+      case "$literal" in
+        y|n) ;;
+        *)
+          printf '%s\n' "$literal" > "$prompt_file"
+          printf 'sent\n' > "$phase"
+          ;;
+      esac
+    else
+      printf 'ENTER\n' >> "$log"
+    fi
+    ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![
+                script.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+                phase.to_string_lossy().into_owned(),
+                prompt.to_string_lossy().into_owned(),
+            ],
+            socket: Some("auto-approve-phase-test-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+        let run_cfg = RunAgentConfig {
+            timeout: Some(2),
+            idle_seconds: Some(0.01),
+            ready_stable_seconds: Some(0.0),
+            until: Some("DONE".to_string()),
+            ..RunAgentConfig::default()
+        };
+        let agent_cfg = AgentConfig {
+            auto_approve: true,
+            ..AgentConfig::default()
+        };
+
+        let result = tmux_tools_core::with_invocation(invocation, || {
+            run_agent_interactive(
+                "codex".to_string(),
+                "Workflow prompt".to_string(),
+                temp.path().to_string_lossy().into_owned(),
+                Some(2),
+                Some(&run_cfg),
+                Some(&agent_cfg),
+                None,
+                None,
+                None,
+            )
+        })
+        .unwrap();
+        assert!(
+            result.success,
+            "fake post-prompt DONE marker should complete"
+        );
+
+        let sent = std::fs::read_to_string(log).unwrap();
+        let decisions = sent
+            .lines()
+            .filter(|line| *line == "y" || *line == "n")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decisions,
+            vec!["n", "y"],
+            "startup permission prompts should not use auto-approve, but post-prompt prompts should"
+        );
     }
 
     #[test]

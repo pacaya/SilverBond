@@ -29,6 +29,7 @@
   import PromptTextarea from "@/lib/components/PromptTextarea.svelte";
   import { buildSuggestions } from "@/lib/utils/templateSuggestions";
   import { sectionHasValues, SECTION_IDS } from "@/lib/utils/sectionUtils";
+  import { activeValidationScope, issueMatchesScope } from "@/features/editor/flowNodes";
   import NodeHeader from "./NodeHeader.svelte";
   import AddSectionMenu from "./AddSectionMenu.svelte";
   import ConditionBuilder from "./ConditionBuilder.svelte";
@@ -201,12 +202,14 @@
     return `${fromName} → ${toName}`;
   });
   let issues = $derived(validation?.issues ?? []);
+  let activeScope = $derived(activeValidationScope(store.drillStack));
   let promptSuggestions = $derived(
     selectedNode ? buildSuggestions(activeWorkflow, selectedNode.id) : [],
   );
 
   const DEFAULT_RUN_AGENT_CONFIG: RunAgentConfig = { killAfter: true };
   const DEFAULT_DECIDE_CONFIG: DecideConfig = { prompt: "", inputs: [], outcomes: [] };
+  const MAX_BATCH_CONCURRENT = 32;
   const DEFAULT_BATCH_CONFIG: BatchConfig = {
     itemsBinding: "",
     maxConcurrent: 4,
@@ -598,7 +601,9 @@
 {/snippet}
 
 {#if selectedNode}
-  {@const nodeIssues = issues.filter((i) => i.nodeId === selectedNode.id)}
+  {@const nodeIssues = issues.filter(
+    (i) => i.nodeId === selectedNode.id && issueMatchesScope(i, activeScope),
+  )}
   <div class="inspector inspector--withFooter">
     <!-- Compact Header -->
     <NodeHeader node={selectedNode} workflow={activeWorkflow} />
@@ -1152,7 +1157,13 @@
               type="number"
               min="1"
               value={bc.maxConcurrent}
-              oninput={(e) => updateBatch("maxConcurrent", numOrUndef((e.target as HTMLInputElement).value) ?? 1)}
+              oninput={(e) => {
+                const raw = numOrUndef((e.target as HTMLInputElement).value) ?? 1;
+                updateBatch(
+                  "maxConcurrent",
+                  Math.max(1, Math.min(MAX_BATCH_CONCURRENT, raw)),
+                );
+              }}
             />
           </label>
           <label class="field">

@@ -1,6 +1,26 @@
 import { beforeEach, describe, expect, it } from "vitest";
-import { buildFlowNodes, buildValidationIndex } from "@/features/editor/flowNodes";
+import {
+  activeValidationScope,
+  buildFlowNodes,
+  buildValidationIndex,
+} from "@/features/editor/flowNodes";
 import { store } from "@/lib/stores/workflowStore.svelte";
+import type { ValidationResponse, WorkflowDocument } from "@/lib/types/workflow";
+
+function testWorkflow(overrides: Partial<WorkflowDocument> = {}): WorkflowDocument {
+  return {
+    version: 3,
+    goal: "",
+    cwd: "",
+    useOrchestrator: false,
+    entryNodeId: "",
+    variables: [],
+    limits: { maxTotalSteps: 50, maxVisitsPerNode: 10 },
+    nodes: [],
+    edges: [],
+    ...overrides,
+  };
+}
 
 describe("buildFlowNodes", () => {
   beforeEach(() => {
@@ -54,5 +74,72 @@ describe("buildFlowNodes", () => {
     expect(collectorNode.responseFormat).toBeNull();
     expect(nodes[0].style).toContain("border-left: 4px solid rgba(249, 115, 22, 0.78)");
     expect(nodes[1].style).toContain("border-left: 4px solid rgba(45, 212, 191, 0.72)");
+  });
+});
+
+describe("buildValidationIndex", () => {
+  it("highlights subflow-scoped issues when drilled into that subflow", () => {
+    const subflowDoc = testWorkflow({
+      name: "broken",
+      entryNodeId: "decide",
+      nodes: [
+        {
+          id: "decide",
+          name: "Route",
+          prompt: "",
+          kind: { type: "decide", decideConfig: { prompt: "", inputs: [], outcomes: [] } },
+        },
+      ],
+    });
+    const root = testWorkflow({
+      name: "root",
+      entryNodeId: "call",
+      nodes: [
+        {
+          id: "call",
+          name: "Call",
+          prompt: "",
+          kind: {
+            type: "call",
+            subflowConfig: { workflowName: "broken", inputs: [], maxDepth: 10 },
+          },
+        },
+      ],
+      subflows: { broken: subflowDoc },
+    });
+    const validation: ValidationResponse = {
+      workflow: root,
+      graph: {
+        reachableNodeIds: [],
+        unreachableNodeIds: [],
+        deadEndNodeIds: [],
+      },
+      issues: [
+        {
+          severity: "error",
+          nodeId: "decide",
+          scope: "subflow:broken",
+          message: 'subflow:broken: "Route" is missing outgoing edges.',
+        },
+      ],
+    };
+
+    const rootIndex = buildValidationIndex(validation, activeValidationScope([]));
+    expect(rootIndex.decide).toBeUndefined();
+
+    const drilledIndex = buildValidationIndex(
+      validation,
+      activeValidationScope(["broken"]),
+    );
+    expect(drilledIndex.decide).toEqual({ error: true, warning: false });
+
+    const nodes = buildFlowNodes(
+      subflowDoc,
+      validation,
+      drilledIndex,
+      {},
+      null,
+    );
+    expect(nodes[0].class).toContain("graphNode--error");
   });
 });

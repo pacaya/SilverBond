@@ -9,9 +9,11 @@
 
   let {
     runId,
+    streamToken,
     workflow,
   }: {
     runId: string | null;
+    streamToken: string | null;
     workflow: WorkflowDocument | null;
   } = $props();
 
@@ -124,6 +126,7 @@
    * effect also tears down the previous socket so we never double-stream. */
   $effect(() => {
     const activeRunId = runId;
+    const activeStreamToken = streamToken;
     const pane = store.selectedPane;
     if (!ready || !term) return;
 
@@ -133,7 +136,7 @@
     const liveTerm = term;
     liveTerm.reset();
 
-    if (!activeRunId) {
+    if (!activeRunId || !activeStreamToken) {
       store.setPaneStatus("idle");
       store.setPaneError("");
       return;
@@ -141,7 +144,7 @@
 
     store.setPaneError("");
     store.setPaneStatus("connecting");
-    handle = streamPane(activeRunId, pane, {
+    handle = streamPane(activeRunId, pane, activeStreamToken, {
       onSnapshot: (bytes) => {
         // Full repaint: clear local buffer, then write the colored capture.
         liveTerm.reset();

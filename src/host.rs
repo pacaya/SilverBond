@@ -123,7 +123,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::app::{AppPaths, ApplicationConfig};
+    use crate::app::{AppPaths, ApplicationConfig, SecurityConfig};
 
     #[tokio::test]
     async fn starts_host_on_ephemeral_port_and_serves_health() {
@@ -132,6 +132,7 @@ mod tests {
             application: ApplicationConfig {
                 paths: AppPaths::from_root(temp.path()),
                 seed_bundled_templates: true,
+                security: SecurityConfig::default(),
             },
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
         })

@@ -36,7 +36,9 @@ use crate::{
     util::{djb2, now_iso, slugify_filename},
 };
 
-use model::DEFAULT_AGENT;
+use model::{DEFAULT_AGENT, MAX_PARALLEL_BATCH_CONCURRENT};
+
+const STAGNATION_WINDOW: usize = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -407,7 +409,9 @@ mod collector_barriers_serde {
         }
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<CollectorBarrierKey, CollectorBarrierState>, D::Error>
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<BTreeMap<CollectorBarrierKey, CollectorBarrierState>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -419,7 +423,7 @@ mod collector_barriers_serde {
 #[serde(rename_all = "camelCase")]
 pub struct CollectorBarrierState {
     #[serde(default)]
-    pub required_inputs: Vec<String>,
+    pub required_inputs: BTreeSet<String>,
     #[serde(default)]
     pub arrivals: BTreeMap<String, CollectorInputStatus>,
     #[serde(default)]
@@ -589,8 +593,14 @@ pub struct RuntimeCheckpoint {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedRun {
+    #[serde(default = "new_stream_token")]
+    pub stream_token: String,
     pub checkpoint: RuntimeCheckpoint,
     pub workflow: WorkflowV3,
+}
+
+pub fn new_stream_token() -> String {
+    Uuid::new_v4().simple().to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -645,6 +655,22 @@ pub struct AgentSpec {
     pub name: String,
     pub binary: String,
     pub capabilities: AgentCapabilities,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RunControlError {
+    #[error("run not found")]
+    RunNotFound,
+    #[error("run is in terminal state")]
+    TerminalState,
+    #[error("node not found in workflow")]
+    NodeNotFound,
+    #[error("no active interaction for this run")]
+    NoActiveInteraction,
+    #[error("interaction session is stale")]
+    StaleInteractionSession,
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
 }
 
 pub(crate) trait NodeRunner: Send + Sync {
@@ -876,21 +902,21 @@ impl RunRegistry {
         run_id: &str,
         session_id: &str,
         response: String,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), RunControlError> {
         let active = self
             .inner
             .lock()
             .await
             .get(run_id)
             .cloned()
-            .context("no active interaction for this run")?;
+            .ok_or(RunControlError::NoActiveInteraction)?;
         let sender = active.interaction_senders.lock().await.remove(session_id);
         let Some(sender) = sender else {
-            anyhow::bail!("no active interaction for this run and session");
+            return Err(RunControlError::StaleInteractionSession);
         };
-        sender
-            .send(response)
-            .map_err(|_| anyhow::anyhow!("interaction receiver dropped"))?;
+        sender.send(response).map_err(|_| {
+            RunControlError::Internal(anyhow::anyhow!("interaction receiver dropped"))
+        })?;
         Ok(())
     }
 
@@ -1133,6 +1159,7 @@ impl RuntimeContext {
             build_initial_checkpoint(&workflow, &run_id, variable_overrides, start_node_id);
         self.db
             .upsert_run(&PersistedRun {
+                stream_token: new_stream_token(),
                 checkpoint: checkpoint.clone(),
                 workflow: workflow.clone(),
             })
@@ -1145,20 +1172,19 @@ impl RuntimeContext {
         Ok(run_id)
     }
 
-    pub async fn resume_run(&self, run_id: &str) -> anyhow::Result<()> {
+    pub async fn resume_run(&self, run_id: &str) -> Result<(), RunControlError> {
         let persisted = self
             .db
             .get_run(run_id)
-            .await?
-            .context("No checkpoint found for this run")?;
-        anyhow::ensure!(
-            matches!(
-                persisted.checkpoint.status,
-                RuntimeStatus::Running | RuntimeStatus::Paused
-            ),
-            "Run is in terminal state: {:?}",
-            persisted.checkpoint.status
-        );
+            .await
+            .map_err(RunControlError::Internal)?
+            .ok_or(RunControlError::RunNotFound)?;
+        if !matches!(
+            persisted.checkpoint.status,
+            RuntimeStatus::Running | RuntimeStatus::Paused
+        ) {
+            return Err(RunControlError::TerminalState);
+        }
         self.registry.register(run_id).await;
         let ctx = self.clone();
         tokio::spawn(async move {
@@ -1167,21 +1193,25 @@ impl RuntimeContext {
         Ok(())
     }
 
-    pub async fn restart_from(&self, run_id: &str, node_id: &str) -> anyhow::Result<String> {
+    pub async fn restart_from(
+        &self,
+        run_id: &str,
+        node_id: &str,
+    ) -> Result<String, RunControlError> {
         let persisted = self
             .db
             .get_run(run_id)
-            .await?
-            .context("No checkpoint found for this run")?;
-        anyhow::ensure!(
-            persisted
-                .workflow
-                .nodes
-                .iter()
-                .any(|node| node.id == node_id),
-            "Node \"{}\" not found in workflow",
-            node_id
-        );
+            .await
+            .map_err(RunControlError::Internal)?
+            .ok_or(RunControlError::RunNotFound)?;
+        if !persisted
+            .workflow
+            .nodes
+            .iter()
+            .any(|node| node.id == node_id)
+        {
+            return Err(RunControlError::NodeNotFound);
+        }
 
         let descendants = collect_descendants(&persisted.workflow, node_id);
         let mut checkpoint = persisted.checkpoint.clone();
@@ -1253,17 +1283,20 @@ impl RuntimeContext {
         let new_run_id = checkpoint.run_id.clone();
         self.db
             .upsert_run(&PersistedRun {
+                stream_token: new_stream_token(),
                 checkpoint: checkpoint.clone(),
                 workflow: persisted.workflow.clone(),
             })
-            .await?;
+            .await
+            .map_err(RunControlError::Internal)?;
         self.db
             .mark_run_status(
                 run_id,
                 RuntimeStatus::Restarted,
                 Some("restarted".to_string()),
             )
-            .await?;
+            .await
+            .map_err(RunControlError::Internal)?;
         self.registry.register(&new_run_id).await;
 
         let ctx = self.clone();
@@ -1294,7 +1327,7 @@ impl RuntimeContext {
         run_id: &str,
         session_id: &str,
         response: String,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), RunControlError> {
         self.registry
             .resolve_interaction(run_id, session_id, response)
             .await
@@ -1444,6 +1477,7 @@ pub async fn run_node_preview(
             &cwd_string,
             Some(&config_clone),
             None,
+            None,
         )
     })
     .await
@@ -1568,6 +1602,125 @@ fn merge_key_for_edge(edge: &WorkflowEdge) -> String {
     edge.label.clone().unwrap_or_else(|| edge.from.clone())
 }
 
+fn collector_required_inputs(graph: &WorkflowGraph<'_>, collector_id: &str) -> BTreeSet<String> {
+    let mut required_inputs = BTreeSet::new();
+    for edge in graph.inbound_for(collector_id) {
+        let merge_key = merge_key_for_edge(edge);
+        if !required_inputs.insert(merge_key.clone()) {
+            tracing::warn!(
+                collector_id = %collector_id,
+                edge_id = %edge.id,
+                merge_key = %merge_key,
+                "duplicate collector input key in barrier configuration"
+            );
+        }
+    }
+    required_inputs
+}
+
+fn new_collector_barrier_state(
+    graph: &WorkflowGraph<'_>,
+    collector_id: &str,
+) -> CollectorBarrierState {
+    CollectorBarrierState {
+        required_inputs: collector_required_inputs(graph, collector_id),
+        arrivals: BTreeMap::new(),
+        waiting_cursor_ids: Vec::new(),
+        released: false,
+    }
+}
+
+fn reset_released_collector_barrier(
+    barrier: &mut CollectorBarrierState,
+    graph: &WorkflowGraph<'_>,
+    collector_id: &str,
+) {
+    if !barrier.released {
+        return;
+    }
+    barrier.required_inputs = collector_required_inputs(graph, collector_id);
+    barrier.arrivals.clear();
+    barrier.waiting_cursor_ids.clear();
+    barrier.released = false;
+}
+
+fn evict_idle_split_families(checkpoint: &mut RuntimeCheckpoint, allow_force_failed: bool) {
+    let active_cursor_ids = checkpoint
+        .active_cursors
+        .iter()
+        .map(|cursor| cursor.cursor_id.as_str())
+        .collect::<HashSet<_>>();
+    checkpoint.split_families.retain(|_, family| {
+        if family.force_failed && !allow_force_failed {
+            return true;
+        }
+        family
+            .member_cursor_ids
+            .iter()
+            .any(|member_id| active_cursor_ids.contains(member_id.as_str()))
+    });
+}
+
+fn collector_barrier_is_idle(
+    checkpoint: &RuntimeCheckpoint,
+    barrier_key: &CollectorBarrierKey,
+    barrier: &CollectorBarrierState,
+) -> bool {
+    if !barrier.released {
+        return false;
+    }
+    !checkpoint.active_cursors.iter().any(|cursor| {
+        cursor.state == CursorRuntimeState::WaitingCollector
+            && cursor.node_id == barrier_key.collector_id
+            && CollectorBarrierKey::from_cursor(
+                cursor,
+                &barrier_key.collector_id,
+                barrier_key.execution_epoch,
+            ) == *barrier_key
+    })
+}
+
+fn evict_idle_collector_barriers(checkpoint: &mut RuntimeCheckpoint) {
+    let idle_keys = checkpoint
+        .collector_barriers
+        .iter()
+        .filter(|(key, barrier)| collector_barrier_is_idle(checkpoint, key, barrier))
+        .map(|(key, _)| key.clone())
+        .collect::<Vec<_>>();
+    for key in idle_keys {
+        checkpoint.collector_barriers.remove(&key);
+    }
+}
+
+fn evict_idle_runtime_maps(checkpoint: &mut RuntimeCheckpoint) {
+    evict_idle_split_families(checkpoint, false);
+    evict_idle_collector_barriers(checkpoint);
+}
+
+fn insert_collector_arrival(
+    barrier: &mut CollectorBarrierState,
+    collector_id: &str,
+    merge_key: String,
+    arrival: CollectorInputStatus,
+) {
+    use std::collections::btree_map::Entry;
+
+    match barrier.arrivals.entry(merge_key) {
+        Entry::Vacant(entry) => {
+            entry.insert(arrival);
+        }
+        Entry::Occupied(entry) => {
+            tracing::warn!(
+                collector_id = %collector_id,
+                merge_key = %entry.key(),
+                existing_edge_id = %entry.get().edge_id,
+                duplicate_edge_id = %arrival.edge_id,
+                "duplicate collector input arrival for merge key; ignoring duplicate"
+            );
+        }
+    }
+}
+
 fn collector_barrier_scope(cursor: &CursorState) -> &str {
     if let Some(frame) = cursor.call_stack.last() {
         if frame.frame_id.is_empty() {
@@ -1580,14 +1733,49 @@ fn collector_barrier_scope(cursor: &CursorState) -> &str {
     }
 }
 
-/// Pre-scan workflow nodes: collect node IDs referenced by `continue_session_from` so
-/// those nodes run with persistent sessions (ephemeral_session = false).
-fn build_session_persistence_set(workflow: &WorkflowV3) -> HashSet<String> {
-    workflow
-        .nodes
-        .iter()
-        .filter_map(|n| n.continue_session_from.clone())
+/// Collect active-scope node IDs referenced by pending `continue_session_from` edges so
+/// those source nodes keep their panes alive for later continuation.
+fn build_session_persistence_set(
+    graph: &WorkflowGraph<'_>,
+    completed_results: &BTreeMap<String, NodeResult>,
+) -> HashSet<String> {
+    graph
+        .node_map
+        .values()
+        .filter_map(|node| {
+            if completed_results.contains_key(&node.id) {
+                None
+            } else {
+                node.continue_session_from.clone()
+            }
+        })
         .collect()
+}
+
+fn collect_session_persistence_nodes(workflow: &WorkflowV3, retained: &mut HashSet<String>) {
+    retained.extend(
+        workflow
+            .nodes
+            .iter()
+            .filter_map(|node| node.continue_session_from.clone()),
+    );
+    for subflow in workflow.subflows.values() {
+        collect_session_persistence_nodes(subflow, retained);
+    }
+}
+
+fn build_terminal_session_persistence_set(workflow: &WorkflowV3) -> HashSet<String> {
+    let mut retained = HashSet::new();
+    collect_session_persistence_nodes(workflow, &mut retained);
+    retained
+}
+
+fn scoped_workflow_cwd(active_workflow: &WorkflowV3, root_cwd: &str) -> String {
+    if active_workflow.cwd.is_empty() {
+        root_cwd.to_string()
+    } else {
+        active_workflow.cwd.clone()
+    }
 }
 
 fn is_runner_node_kind(kind: &NodeKind) -> bool {
@@ -1796,7 +1984,10 @@ fn build_initial_checkpoint(
     }
 }
 
-fn rehydrate_checkpoint_for_execution(workflow: &WorkflowV3, checkpoint: &mut RuntimeCheckpoint) {
+fn rehydrate_checkpoint_for_execution(
+    workflow: &WorkflowV3,
+    checkpoint: &mut RuntimeCheckpoint,
+) -> Option<PendingApproval> {
     if checkpoint.execution_epoch == 0 {
         checkpoint.execution_epoch = 1;
     }
@@ -1843,9 +2034,40 @@ fn rehydrate_checkpoint_for_execution(workflow: &WorkflowV3, checkpoint: &mut Ru
             .iter()
             .any(|cursor| cursor.state == CursorRuntimeState::WaitingApproval)
     {
-        checkpoint.pending_approval = None;
+        return checkpoint.pending_approval.take();
     }
     update_checkpoint_summary(workflow, checkpoint);
+    None
+}
+
+async fn drop_inconsistent_pending_approval(
+    ctx: &RuntimeContext,
+    checkpoint: &mut RuntimeCheckpoint,
+    pending: PendingApproval,
+) -> anyhow::Result<()> {
+    tracing::warn!(
+        run_id = %checkpoint.run_id,
+        node_id = %pending.node_id,
+        cursor_id = %pending.cursor_id,
+        "dropping pending_approval due to inconsistent persisted state"
+    );
+    emit_event(
+        ctx,
+        &checkpoint.run_id,
+        RuntimeEvent::new("workflow_warn")
+            .with(
+                "message",
+                format!(
+                    "Dropped pending approval on node \"{}\" due to inconsistent persisted state",
+                    pending.node_name
+                ),
+            )
+            .with("nodeId", pending.node_id.clone())
+            .with("cursorId", pending.cursor_id.clone()),
+    )
+    .await?;
+    checkpoint.pending_approval = None;
+    Ok(())
 }
 
 fn update_checkpoint_summary(workflow: &WorkflowV3, checkpoint: &mut RuntimeCheckpoint) {
@@ -1970,6 +2192,19 @@ fn scoped_output_hash_key(cursor: &CursorState, node_id: &str) -> String {
     parts.join("::")
 }
 
+fn record_output_hash(
+    output_hashes: &mut BTreeMap<String, Vec<u32>>,
+    key: String,
+    output: &str,
+) -> bool {
+    let hashes = output_hashes.entry(key).or_default();
+    hashes.push(djb2(output));
+    if hashes.len() > STAGNATION_WINDOW {
+        hashes.drain(0..hashes.len() - STAGNATION_WINDOW);
+    }
+    hashes.len() == STAGNATION_WINDOW && hashes.windows(2).all(|pair| pair[0] == pair[1])
+}
+
 fn parallel_batch_checkpoint_key(cursor: &CursorState, node_id: &str) -> String {
     let mut parts = cursor
         .call_stack
@@ -2061,17 +2296,22 @@ async fn execute_workflow(
     mut checkpoint: RuntimeCheckpoint,
     resumed: bool,
 ) -> anyhow::Result<()> {
-    let run_inv =
-        resolve_workflow_invocation(ctx.run_invocation.clone(), workflow.run_as.clone()).await?;
+    let run_id = checkpoint.run_id.clone();
+    let run_inv = resolve_workflow_invocation(
+        ctx.run_invocation.clone(),
+        workflow.run_as.clone(),
+        run_id.clone(),
+    )
+    .await?;
     let ctx = RuntimeContext {
         run_invocation: run_inv,
         ..ctx
     };
 
-    rehydrate_checkpoint_for_execution(&workflow, &mut checkpoint);
+    if let Some(pending) = rehydrate_checkpoint_for_execution(&workflow, &mut checkpoint) {
+        drop_inconsistent_pending_approval(&ctx, &mut checkpoint, pending).await?;
+    }
     let start_instant = std::time::Instant::now();
-    let run_id = checkpoint.run_id.clone();
-    let session_persistence_nodes = build_session_persistence_set(&workflow);
     let mut running_tasks = JoinSet::new();
     let mut active_approval: Option<ActiveApprovalWait> = None;
 
@@ -2182,23 +2422,24 @@ async fn execute_workflow(
                 checkpoint.active_cursors[index].state = CursorRuntimeState::Running;
             }
             let dispatch_cursor = cursor_snapshot(&checkpoint, &cursor_id).unwrap_or(cursor);
+            let active_workflow = workflow_for_cursor(&workflow, &dispatch_cursor)?;
+            let all_results = all_results_for_cursor(&checkpoint, &dispatch_cursor);
+            let var_map = var_map_for_cursor(&checkpoint, &dispatch_cursor);
+            let session_persistence_nodes =
+                build_session_persistence_set(&active_graph, &all_results);
             let run_ctx = CursorTaskExecutionContext {
                 run_id: run_id.clone(),
-                workflow_goal: workflow_for_cursor(&workflow, &dispatch_cursor)?
-                    .goal
-                    .clone(),
-                workflow_nodes_len: workflow_for_cursor(&workflow, &dispatch_cursor)?
-                    .nodes
-                    .len(),
-                cwd: checkpoint.cwd.clone(),
-                use_orchestrator: checkpoint.use_orchestrator,
+                workflow_goal: active_workflow.goal.clone(),
+                workflow_nodes_len: active_workflow.nodes.len(),
+                cwd: scoped_workflow_cwd(active_workflow, &checkpoint.cwd),
+                use_orchestrator: active_workflow.use_orchestrator,
                 total_executed: checkpoint.total_executed,
-                all_results: all_results_for_cursor(&checkpoint, &dispatch_cursor),
-                var_map: var_map_for_cursor(&checkpoint, &dispatch_cursor),
+                all_results,
+                var_map,
                 shared: Arc::new(RunConstantData {
                     inbound_map: build_inbound_source_map(&active_graph),
-                    agent_defaults: workflow.agent_defaults.clone(),
-                    session_persistence_nodes: session_persistence_nodes.clone(),
+                    agent_defaults: active_workflow.agent_defaults.clone(),
+                    session_persistence_nodes,
                 }),
             };
             running_tasks.spawn(run_cursor_task(
@@ -2253,33 +2494,43 @@ async fn execute_workflow(
             let wait = active_approval
                 .as_mut()
                 .expect("approval state should exist");
+            let mut wait_changed = false;
             tokio::select! {
                 task = running_tasks.join_next() => {
                     if let Some(task) = task {
                         apply_join_result(&ctx, &workflow, &mut checkpoint, task).await?;
+                        wait_changed = true;
                     }
                 }
                 decision = &mut wait.receiver => {
                     let decision = decision.ok();
                     if let Some(wait) = active_approval.take() {
                         handle_approval_resolution(&ctx, &workflow, &mut checkpoint, wait.cursor_id, decision).await?;
+                        wait_changed = true;
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {}
             }
+            if wait_changed {
+                update_checkpoint_summary(&workflow, &mut checkpoint);
+                persist_checkpoint(&ctx, &workflow, &mut checkpoint).await?;
+            }
         } else {
+            let mut wait_changed = false;
             tokio::select! {
                 task = running_tasks.join_next() => {
                     if let Some(task) = task {
                         apply_join_result(&ctx, &workflow, &mut checkpoint, task).await?;
+                        wait_changed = true;
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(250)) => {}
             }
+            if wait_changed {
+                update_checkpoint_summary(&workflow, &mut checkpoint);
+                persist_checkpoint(&ctx, &workflow, &mut checkpoint).await?;
+            }
         }
-
-        update_checkpoint_summary(&workflow, &mut checkpoint);
-        persist_checkpoint(&ctx, &workflow, &mut checkpoint).await?;
     }
 
     finalize_run(&ctx, &workflow, checkpoint, start_instant.elapsed()).await
@@ -2607,18 +2858,25 @@ async fn handle_skipped_task(
 async fn resolve_workflow_invocation(
     existing: Option<TmuxInvocation>,
     run_as: Option<model::RunAsConfig>,
+    run_id: String,
 ) -> anyhow::Result<Option<TmuxInvocation>> {
-    resolve_workflow_invocation_with(existing, run_as, crate::tmux_exec::build_tmux_invocation)
-        .await
+    resolve_workflow_invocation_with(
+        existing,
+        run_as,
+        run_id,
+        crate::tmux_exec::build_tmux_invocation,
+    )
+    .await
 }
 
 async fn resolve_workflow_invocation_with<F>(
     existing: Option<TmuxInvocation>,
     run_as: Option<model::RunAsConfig>,
+    run_id: String,
     build: F,
 ) -> anyhow::Result<Option<TmuxInvocation>>
 where
-    F: FnOnce(&model::RunAsConfig) -> TmuxInvocation + Send + 'static,
+    F: FnOnce(&model::RunAsConfig, &str) -> TmuxInvocation + Send + 'static,
 {
     if existing.is_some() {
         return Ok(existing);
@@ -2627,7 +2885,7 @@ where
         return Ok(None);
     };
 
-    tokio::task::spawn_blocking(move || build(&run_as))
+    tokio::task::spawn_blocking(move || build(&run_as, &run_id))
         .await
         .context("tmux invocation resolver task panicked")
         .map(Some)
@@ -2875,7 +3133,7 @@ async fn restore_pending_approval(
         })
         .map(|cursor| cursor.cursor_id.clone())
     else {
-        checkpoint.pending_approval = None;
+        drop_inconsistent_pending_approval(ctx, checkpoint, pending).await?;
         return Ok(());
     };
     let (sender, receiver) = oneshot::channel();
@@ -2989,7 +3247,9 @@ async fn run_cursor_task(
                 .with("nodeName", node.name.clone()),
         )
         .await?;
-        let orchestrator = run_orchestrator_refinement(
+        let orchestrator_result = run_orchestrator_refinement(
+            &ctx,
+            &run_ctx.run_id,
             &run_ctx.workflow_goal,
             &node,
             &resolved_prompt,
@@ -2997,37 +3257,44 @@ async fn run_cursor_task(
             run_ctx.total_executed.saturating_sub(1),
             run_ctx.workflow_nodes_len,
             &run_ctx.cwd,
-            ctx.run_invocation.clone(),
         )
-        .await?;
-        if orchestrator.success && !orchestrator.output.is_empty() {
-            refined_prompt = Some(orchestrator.output.clone());
-            emit_event(
-                &ctx,
-                &run_ctx.run_id,
-                RuntimeEvent::new("orchestrator_done")
-                    .with("cursorId", cursor.cursor_id.clone())
-                    .with("nodeId", node.id.clone())
-                    .with("originalPrompt", resolved_prompt.clone())
-                    .with("refinedPrompt", orchestrator.output.clone())
-                    .with("duration", orchestrator.duration.clone()),
-            )
-            .await?;
-            resolved_prompt = orchestrator.output.clone();
-        } else {
-            emit_event(
-                &ctx,
-                &run_ctx.run_id,
-                RuntimeEvent::new("orchestrator_warn")
-                    .with("cursorId", cursor.cursor_id.clone())
-                    .with("nodeId", node.id.clone())
-                    .with(
-                        "message",
-                        "Orchestrator refinement failed — using original prompt",
-                    )
-                    .with("error", orchestrator.stderr),
-            )
-            .await?;
+        .await;
+        match orchestrator_result {
+            Ok(orchestrator) if orchestrator.success && !orchestrator.output.is_empty() => {
+                refined_prompt = Some(orchestrator.output.clone());
+                emit_event(
+                    &ctx,
+                    &run_ctx.run_id,
+                    RuntimeEvent::new("orchestrator_done")
+                        .with("cursorId", cursor.cursor_id.clone())
+                        .with("nodeId", node.id.clone())
+                        .with("originalPrompt", resolved_prompt.clone())
+                        .with("refinedPrompt", orchestrator.output.clone())
+                        .with("duration", orchestrator.duration.clone()),
+                )
+                .await?;
+                resolved_prompt = orchestrator.output.clone();
+            }
+            Ok(orchestrator) => {
+                emit_orchestrator_warn(
+                    &ctx,
+                    &run_ctx.run_id,
+                    &cursor.cursor_id,
+                    &node.id,
+                    orchestrator.stderr,
+                )
+                .await?;
+            }
+            Err(error) => {
+                emit_orchestrator_warn(
+                    &ctx,
+                    &run_ctx.run_id,
+                    &cursor.cursor_id,
+                    &node.id,
+                    error.to_string(),
+                )
+                .await?;
+            }
         }
     }
 
@@ -3171,17 +3438,53 @@ async fn run_decide_node(
     let prompt_for_task = resolved_prompt.clone();
     let inv = ctx.run_invocation.clone();
     let agent_config_clone = agent_config.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let abort_signal = ctx.registry.abort_signal(&run_ctx.run_id).await;
+    let abort_flag = abort_signal.as_ref().map(|(flag, _)| flag.clone());
+    let abort_notify = abort_signal.map(|(_, notify)| notify);
+    let interaction = abort_flag.as_ref().map(|_| {
+        crate::tmux_exec::InteractionEscalation::new(
+            ctx.clone(),
+            run_ctx.run_id.clone(),
+            abort_flag.clone(),
+        )
+    });
+    let interaction_for_blocking = interaction.clone();
+    let agent_join = tokio::task::spawn_blocking(move || {
         crate::tmux_exec::run_tmux_oneshot(
             &agent,
             &prompt_for_task,
             &cwd,
             Some(&agent_config_clone),
             inv,
+            interaction_for_blocking.as_ref(),
         )
-    })
-    .await
-    .context("join error in decide node")??;
+    });
+    let result = if let Some(abort_notify) = abort_notify {
+        let abort_notified = abort_notify.notified();
+        tokio::pin!(abort_notified);
+        tokio::select! {
+            joined = agent_join => joined.context("join error in decide node")??,
+            _ = &mut abort_notified => NodeResult {
+                success: false,
+                output: String::new(),
+                stderr: "Agent run aborted".to_string(),
+                exit_code: -15,
+                duration: format!("{:.1}", start.elapsed().as_secs_f64()),
+                agent: "llm".to_string(),
+                prompt: config.prompt.clone(),
+                metadata: AgentExecutionMetadata {
+                    error_type: Some("aborted".to_owned()),
+                    ..Default::default()
+                },
+                resolved_prompt: Some(resolved_prompt.clone()),
+                ..Default::default()
+            },
+        }
+    } else {
+        agent_join
+            .await
+            .context("join error in decide node")??
+    };
     let response = result.output;
     let duration = format!("{:.1}", start.elapsed().as_secs_f64());
     let parsed_response = parse_decide_structured_response(&node, &response);
@@ -3577,6 +3880,19 @@ async fn apply_join_result(
     }
 
     if !task_result.result.success {
+        if ctx.registry.is_aborted(&checkpoint.run_id).await
+            || task_result
+                .result
+                .metadata
+                .error_type
+                .as_deref()
+                .is_some_and(|error_type| error_type == "aborted")
+        {
+            checkpoint.status = RuntimeStatus::Aborted;
+            checkpoint.execution_log.terminal_reason = Some("aborted".to_string());
+            checkpoint.active_cursors.clear();
+            return Ok(());
+        }
         let status = if task_result.result.exit_code == -2 {
             CursorTerminalStatus::Timeout
         } else {
@@ -3596,12 +3912,11 @@ async fn apply_join_result(
         return Ok(());
     }
 
-    let output_hashes = checkpoint.output_hashes.entry(output_hash_key).or_default();
-    output_hashes.push(djb2(&task_result.result.output));
-    if output_hashes.len() >= 3
-        && output_hashes[output_hashes.len() - 1] == output_hashes[output_hashes.len() - 2]
-        && output_hashes[output_hashes.len() - 2] == output_hashes[output_hashes.len() - 3]
-    {
+    if record_output_hash(
+        &mut checkpoint.output_hashes,
+        output_hash_key,
+        &task_result.result.output,
+    ) {
         emit_event(
             ctx,
             &checkpoint.run_id,
@@ -3611,8 +3926,8 @@ async fn apply_join_result(
                 .with(
                     "message",
                     format!(
-                        "Node \"{}\" produced identical output 3 times consecutively — aborting (stagnation detected).",
-                        task_result.node.name
+                        "Node \"{}\" produced identical output {} times consecutively — aborting (stagnation detected).",
+                        task_result.node.name, STAGNATION_WINDOW
                     ),
                 ),
         )
@@ -3916,6 +4231,7 @@ async fn finish_cursor(
     if let Some(index) = find_cursor_index(checkpoint, cursor_id) {
         checkpoint.active_cursors.remove(index);
     }
+    evict_idle_runtime_maps(checkpoint);
     Ok(())
 }
 
@@ -4112,7 +4428,9 @@ async fn handle_parallel_batch_node(
         };
         read_batch_items(&binding_context, &config.items_binding)?
     };
-    let max_concurrent = config.max_concurrent.max(1) as usize;
+    let max_concurrent = config
+        .max_concurrent
+        .clamp(1, MAX_PARALLEL_BATCH_CONCURRENT) as usize;
     let body_node = graph
         .node_map
         .get(config.body_entry.as_str())
@@ -4150,10 +4468,13 @@ async fn handle_parallel_batch_node(
             .insert(batch_key.clone(), item_results_by_index.clone());
     }
 
+    let session_persistence_nodes = build_session_persistence_set(graph, &base_all_results);
+    let scoped_cwd = scoped_workflow_cwd(workflow, &checkpoint.cwd);
+    let scoped_use_orchestrator = workflow.use_orchestrator;
     let shared = Arc::new(RunConstantData {
         inbound_map,
         agent_defaults: workflow.agent_defaults.clone(),
-        session_persistence_nodes: build_session_persistence_set(workflow),
+        session_persistence_nodes,
     });
     let mut pending_items = items
         .iter()
@@ -4164,6 +4485,7 @@ async fn handle_parallel_batch_node(
     let mut running = JoinSet::new();
     let run_id = checkpoint.run_id.clone();
     let mut batch_aborted = ctx.registry.is_aborted(&run_id).await;
+    let abort_notify = ctx.registry.abort_signal(&run_id).await.map(|(_, notify)| notify);
 
     while !batch_aborted && running.len() < max_concurrent {
         let Some((item_index, item_value)) = pending_items.pop_front() else {
@@ -4175,6 +4497,8 @@ async fn handle_parallel_batch_node(
             workflow,
             checkpoint,
             shared.clone(),
+            scoped_cwd.clone(),
+            scoped_use_orchestrator,
             base_all_results.clone(),
             base_var_map.clone(),
             parent_cursor.clone(),
@@ -4188,7 +4512,20 @@ async fn handle_parallel_batch_node(
     }
 
     while !batch_aborted {
-        let Some(joined) = running.join_next().await else {
+        let joined = if let Some(ref abort_notify) = abort_notify {
+            let abort_notified = abort_notify.notified();
+            tokio::pin!(abort_notified);
+            tokio::select! {
+                joined = running.join_next() => joined,
+                _ = &mut abort_notified => {
+                    batch_aborted = true;
+                    None
+                }
+            }
+        } else {
+            running.join_next().await
+        };
+        let Some(joined) = joined else {
             break;
         };
         let item_result = match joined {
@@ -4228,6 +4565,8 @@ async fn handle_parallel_batch_node(
                 workflow,
                 checkpoint,
                 shared.clone(),
+                scoped_cwd.clone(),
+                scoped_use_orchestrator,
                 base_all_results.clone(),
                 base_var_map.clone(),
                 parent_cursor.clone(),
@@ -4436,6 +4775,8 @@ async fn spawn_batch_item_task(
     workflow: &WorkflowV3,
     checkpoint: &RuntimeCheckpoint,
     shared: Arc<RunConstantData>,
+    cwd: String,
+    use_orchestrator: bool,
     base_all_results: BTreeMap<String, NodeResult>,
     mut base_var_map: BTreeMap<String, String>,
     parent_cursor: CursorState,
@@ -4480,8 +4821,8 @@ async fn spawn_batch_item_task(
         run_id: checkpoint.run_id.clone(),
         workflow_goal: workflow.goal.clone(),
         workflow_nodes_len: workflow.nodes.len(),
-        cwd: checkpoint.cwd.clone(),
-        use_orchestrator: checkpoint.use_orchestrator,
+        cwd,
+        use_orchestrator,
         total_executed: checkpoint.total_executed,
         all_results: base_all_results,
         var_map: base_var_map.clone(),
@@ -4916,17 +5257,11 @@ async fn handle_collector_entry(
     let barrier = checkpoint
         .collector_barriers
         .entry(barrier_key)
-        .or_insert_with(|| CollectorBarrierState {
-            required_inputs: graph
-                .inbound_for(&node.id)
-                .iter()
-                .map(|edge| merge_key_for_edge(edge))
-                .collect(),
-            arrivals: BTreeMap::new(),
-            waiting_cursor_ids: Vec::new(),
-            released: false,
-        });
-    barrier.arrivals.insert(
+        .or_insert_with(|| new_collector_barrier_state(graph, &node.id));
+    reset_released_collector_barrier(barrier, graph, &node.id);
+    insert_collector_arrival(
+        barrier,
+        &node.id,
         merge_key.clone(),
         CollectorInputStatus {
             source_node_id: incoming_edge.from.clone(),
@@ -5191,6 +5526,7 @@ async fn release_collectors_if_ready(
             .await?;
         }
     }
+    evict_idle_runtime_maps(checkpoint);
     Ok(())
 }
 
@@ -5228,20 +5564,13 @@ async fn handle_terminal_cursor_status(
             let barrier = checkpoint
                 .collector_barriers
                 .entry(barrier_key)
-                .or_insert_with(|| CollectorBarrierState {
-                    required_inputs: graph
-                        .inbound_for(&target.collector_id)
-                        .iter()
-                        .map(|edge| merge_key_for_edge(edge))
-                        .collect(),
-                    arrivals: BTreeMap::new(),
-                    waiting_cursor_ids: Vec::new(),
-                    released: false,
-                });
-            barrier
-                .arrivals
-                .entry(merge_key_for_edge(&target.inbound_edge))
-                .or_insert_with(|| CollectorInputStatus {
+                .or_insert_with(|| new_collector_barrier_state(graph, &target.collector_id));
+            reset_released_collector_barrier(barrier, graph, &target.collector_id);
+            insert_collector_arrival(
+                barrier,
+                &target.collector_id,
+                merge_key_for_edge(&target.inbound_edge),
+                CollectorInputStatus {
                     source_node_id: target.inbound_edge.from.clone(),
                     edge_id: target.inbound_edge.id.clone(),
                     edge_label: target.inbound_edge.label.clone(),
@@ -5252,7 +5581,8 @@ async fn handle_terminal_cursor_status(
                     stderr: result.stderr.clone(),
                     exit_code: result.exit_code,
                     parsed_output: result.parsed_output.clone(),
-                });
+                },
+            );
         }
 
         let mut fail_run = cursor.split_family_ids.is_empty();
@@ -5384,11 +5714,29 @@ async fn select_next_decision(
                 reason: chosen_label.to_string(),
             });
         }
-        anyhow::bail!(
-            "decide node \"{}\" selected outcome \"{}\" with no matching branch edge",
-            node.name,
-            chosen_label
-        );
+        emit_event(
+            ctx,
+            &checkpoint.run_id,
+            RuntimeEvent::new("workflow_error")
+                .with("cursorId", cursor_id.to_string())
+                .with("nodeId", node.id.clone())
+                .with(
+                    "message",
+                    format!(
+                        "decide node \"{}\" selected outcome \"{}\" with no matching branch edge",
+                        node.name, chosen_label
+                    ),
+                ),
+        )
+        .await?;
+        return Ok(NextDecision {
+            next_edge: default_success,
+            control_type: "success".to_string(),
+            reason: format!(
+                "decide outcome \"{}\" has no matching branch edge",
+                chosen_label
+            ),
+        });
     }
 
     if let Some(loop_continue) = loop_continue {
@@ -5404,6 +5752,25 @@ async fn select_next_decision(
                     .with("maxIterations", max_iterations),
             )
             .await?;
+            if loop_exit.is_none() {
+                emit_event(
+                    ctx,
+                    &checkpoint.run_id,
+                    RuntimeEvent::new("workflow_error")
+                        .with("cursorId", cursor_id.to_string())
+                        .with("nodeId", node.id.clone())
+                        .with(
+                            "message",
+                            format!(
+                                "Loop node \"{}\" reached max iterations ({}) with no loop_exit edge.",
+                                node.name, max_iterations
+                            ),
+                        ),
+                )
+                .await?;
+                checkpoint.status = RuntimeStatus::Failed;
+                checkpoint.execution_log.terminal_reason = Some("failed".to_string());
+            }
             return Ok(NextDecision {
                 next_edge: loop_exit,
                 control_type: "loop_exit".to_string(),
@@ -5467,13 +5834,13 @@ async fn select_next_decision(
                 .map(|edge| (*edge).clone())
                 .or(chosen);
         }
-        if chosen.is_none() && checkpoint.use_orchestrator {
+        if chosen.is_none() && workflow.use_orchestrator {
             let orchestration = run_orchestrator_branch(
                 &workflow.goal,
                 node,
                 &result.output,
                 &branch_edges,
-                &checkpoint.cwd,
+                &scoped_workflow_cwd(workflow, &checkpoint.cwd),
                 ctx.run_invocation.clone(),
             )
             .await?;
@@ -5538,6 +5905,8 @@ async fn finalize_run(
     } else if checkpoint.execution_log.terminal_reason.is_none() {
         checkpoint.status = RuntimeStatus::Completed;
     }
+    evict_idle_split_families(&mut checkpoint, true);
+    evict_idle_collector_barriers(&mut checkpoint);
     if matches!(checkpoint.status, RuntimeStatus::Completed) {
         checkpoint.execution_log.terminal_reason = Some("completed".to_string());
     }
@@ -5552,46 +5921,54 @@ async fn finalize_run(
         .or_else(|| Some("completed".to_string()));
 
     let log_id = build_log_id(&checkpoint.execution_log.workflow_name);
-    ctx.db
-        .save_execution_log(&log_id, &checkpoint.execution_log)
+    let persistence_result: anyhow::Result<()> = async {
+        ctx.db
+            .save_execution_log(&log_id, &checkpoint.execution_log)
+            .await?;
+        emit_event(
+            ctx,
+            &run_id,
+            RuntimeEvent::new("log_saved")
+                .with("logId", log_id.clone())
+                .with("filename", format!("{}.json", log_id)),
+        )
         .await?;
-    emit_event(
-        ctx,
-        &run_id,
-        RuntimeEvent::new("log_saved")
-            .with("logId", log_id.clone())
-            .with("filename", format!("{}.json", log_id)),
-    )
-    .await?;
 
-    checkpoint.current_node_id = None;
-    checkpoint.current_node_name = None;
-    checkpoint.pending_approval = None;
-    checkpoint.updated_at = now_iso();
-    ctx.db
-        .upsert_run(&PersistedRun {
-            checkpoint: checkpoint.clone(),
-            workflow: workflow.clone(),
-        })
+        checkpoint.current_node_id = None;
+        checkpoint.current_node_name = None;
+        checkpoint.pending_approval = None;
+        checkpoint.updated_at = now_iso();
+        if !ctx.db.update_run_checkpoint(&checkpoint).await? {
+            ctx.db
+                .upsert_run(&PersistedRun {
+                    stream_token: new_stream_token(),
+                    checkpoint: checkpoint.clone(),
+                    workflow: workflow.clone(),
+                })
+                .await?;
+        }
+        emit_event(
+            ctx,
+            &run_id,
+            RuntimeEvent::new("done")
+                .with(
+                    "aborted",
+                    matches!(checkpoint.status, RuntimeStatus::Aborted),
+                )
+                .with("status", checkpoint.status),
+        )
         .await?;
-    emit_event(
-        ctx,
-        &run_id,
-        RuntimeEvent::new("done")
-            .with(
-                "aborted",
-                matches!(checkpoint.status, RuntimeStatus::Aborted),
-            )
-            .with("status", checkpoint.status),
-    )
-    .await?;
+        Ok(())
+    }
+    .await;
+
     cleanup_terminal_active_panes(ctx, &run_id, workflow).await;
     ctx.registry.clear(&run_id).await;
-    Ok(())
+    persistence_result
 }
 
 async fn cleanup_terminal_active_panes(ctx: &RuntimeContext, run_id: &str, workflow: &WorkflowV3) {
-    let persistence_keys = build_session_persistence_set(workflow);
+    let persistence_keys = build_terminal_session_persistence_set(workflow);
     let targets = ctx
         .registry
         .active_pane_cleanup_targets_except_keys(run_id, &persistence_keys)
@@ -5623,13 +6000,7 @@ async fn cleanup_terminal_active_panes(ctx: &RuntimeContext, run_id: &str, workf
         for session in &killed_sessions {
             persisted.checkpoint.tmux_sessions.remove(session);
         }
-        let _ = ctx
-            .db
-            .upsert_run(&PersistedRun {
-                checkpoint: persisted.checkpoint,
-                workflow: persisted.workflow,
-            })
-            .await;
+        let _ = ctx.db.update_run_checkpoint(&persisted.checkpoint).await;
     }
 }
 
@@ -5646,25 +6017,26 @@ pub(crate) async fn register_tmux_session(
         .tmux_sessions
         .insert(session_name.to_string())
     {
-        db.upsert_run(&persisted).await?;
+        db.update_run_checkpoint(&persisted.checkpoint).await?;
     }
     Ok(())
 }
 
-pub async fn reap_stale_tmux_sessions(ctx: &RuntimeContext) -> anyhow::Result<()> {
-    let live_sessions = match tokio::task::spawn_blocking(crate::tmux_exec::list_silverbond_tmux_sessions).await
-    {
-        Ok(Ok(sessions)) => sessions,
-        Ok(Err(error)) => return Err(error),
-        Err(error) => return Err(error.into()),
-    };
-    if live_sessions.is_empty() {
-        return Ok(());
-    }
+fn tmux_invocation_key(invocation: &TmuxInvocation) -> (Vec<String>, Option<String>, String) {
+    (
+        invocation.prefix.clone(),
+        invocation.socket.clone(),
+        invocation.tmux_bin.clone(),
+    )
+}
 
+pub async fn reap_stale_tmux_sessions(ctx: &RuntimeContext) -> anyhow::Result<()> {
     let checkpoint_runs = ctx.db.list_runs_with_tmux_sessions().await?;
     let active_run_ids = ctx.registry.active_run_ids().await;
-    let mut terminal_session_runs = HashMap::<String, String>::new();
+    let mut terminal_sessions_by_invocation = HashMap::<
+        (Vec<String>, Option<String>, String),
+        (TmuxInvocation, HashMap<String, String>),
+    >::new();
     for (run_id, status, sessions) in checkpoint_runs {
         if matches!(
             status,
@@ -5673,24 +6045,61 @@ pub async fn reap_stale_tmux_sessions(ctx: &RuntimeContext) -> anyhow::Result<()
                 | RuntimeStatus::Aborted
                 | RuntimeStatus::Restarted
         ) {
+            if active_run_ids.contains(&run_id) {
+                continue;
+            }
+            let Some(persisted) = ctx.db.get_run(&run_id).await? else {
+                continue;
+            };
+            let invocation = resolve_workflow_invocation(
+                None,
+                persisted.workflow.run_as.clone(),
+                run_id.clone(),
+            )
+            .await?
+            .unwrap_or_default();
+            let key = tmux_invocation_key(&invocation);
+            let entry = terminal_sessions_by_invocation
+                .entry(key)
+                .or_insert_with(|| (invocation, HashMap::new()));
             for session in sessions {
-                terminal_session_runs.insert(session, run_id.clone());
+                entry.1.insert(session, run_id.clone());
             }
         }
     }
 
-    for session in live_sessions {
-        let Some(run_id) = terminal_session_runs.get(&session) else {
-            continue;
+    for (_, (invocation, terminal_session_runs)) in terminal_sessions_by_invocation {
+        let live_sessions = match tokio::task::spawn_blocking({
+            let invocation = invocation.clone();
+            move || {
+                tmux_tools_core::with_invocation(invocation, || {
+                    crate::tmux_exec::list_silverbond_tmux_sessions()
+                })
+            }
+        })
+        .await
+        {
+            Ok(Ok(sessions)) => sessions,
+            Ok(Err(error)) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
-        if active_run_ids.contains(run_id) {
+        if live_sessions.is_empty() {
             continue;
         }
-        let session = session.clone();
-        let _ = tokio::task::spawn_blocking(move || {
-            crate::tmux_exec::kill_tmux_session(&session);
-        })
-        .await;
+
+        for session in live_sessions {
+            if !terminal_session_runs.contains_key(&session) {
+                continue;
+            }
+            let session = session.clone();
+            let invocation = invocation.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                tmux_tools_core::with_invocation(invocation, || {
+                    crate::tmux_exec::kill_tmux_session(&session);
+                });
+            })
+            .await;
+        }
     }
 
     Ok(())
@@ -5725,8 +6134,12 @@ async fn persist_checkpoint(
     checkpoint: &mut RuntimeCheckpoint,
 ) -> anyhow::Result<()> {
     checkpoint.updated_at = now_iso();
+    if ctx.db.update_run_checkpoint(checkpoint).await? {
+        return Ok(());
+    }
     ctx.db
         .upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
             checkpoint: checkpoint.clone(),
             workflow: workflow.clone(),
         })
@@ -6062,7 +6475,31 @@ impl Drop for PendingInteractionGuard {
     }
 }
 
+async fn emit_orchestrator_warn(
+    ctx: &RuntimeContext,
+    run_id: &str,
+    cursor_id: &str,
+    node_id: &str,
+    error: String,
+) -> anyhow::Result<()> {
+    emit_event(
+        ctx,
+        run_id,
+        RuntimeEvent::new("orchestrator_warn")
+            .with("cursorId", cursor_id)
+            .with("nodeId", node_id)
+            .with(
+                "message",
+                "Orchestrator refinement failed — using original prompt",
+            )
+            .with("error", error),
+    )
+    .await
+}
+
 async fn run_orchestrator_refinement(
+    ctx: &RuntimeContext,
+    _run_id: &str,
     goal: &str,
     node: &WorkflowNode,
     original_prompt: &str,
@@ -6070,7 +6507,6 @@ async fn run_orchestrator_refinement(
     step_index: u32,
     total_steps: usize,
     cwd: &str,
-    inv: Option<TmuxInvocation>,
 ) -> anyhow::Result<NodeResult> {
     let prompt = format!(
         "You are an AI orchestrator managing a multi-step agentic workflow.\n\nWORKFLOW GOAL: {goal}\nCURRENT STEP: {} of {} — \"{}\"\nORIGINAL PROMPT: {original_prompt}\nPREVIOUS OUTPUT: {}\n\nRewrite or refine the prompt for this step to make it as effective as possible given the workflow goal and the previous output. Keep it if it is already optimal.\nRespond with ONLY the final prompt text. No explanation, no markdown, no preamble.",
@@ -6086,8 +6522,9 @@ async fn run_orchestrator_refinement(
     let agent = DEFAULT_AGENT.to_string();
     let owned_prompt = prompt.clone();
     let owned_cwd = cwd.to_string();
+    let inv = ctx.run_invocation.clone();
     tokio::task::spawn_blocking(move || {
-        crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None, inv)
+        crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None, inv, None)
     })
     .await
     .context("join error in orchestrator")?
@@ -6120,7 +6557,7 @@ async fn run_orchestrator_branch(
     let owned_prompt = prompt.clone();
     let owned_cwd = cwd.to_string();
     tokio::task::spawn_blocking(move || {
-        crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None, inv)
+        crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None, inv, None)
     })
     .await
     .context("join error in orchestrator")?
@@ -6133,20 +6570,21 @@ mod tests {
         collections::{HashMap, VecDeque},
         fs,
         path::{Path, PathBuf},
-        sync::Arc,
+        sync::{Arc, Mutex as StdMutex},
         time::{Duration, Instant},
     };
 
     use serde_json::{Value, json};
     use tempfile::TempDir;
+    use tracing_subscriber::layer::SubscriberExt;
 
     use crate::{
         driver::{AccessMode, AgentConfig, ReasoningLevel, get_driver},
         model::{
             AgentDefaults, AgentNodeConfig, BatchConfig, InputBinding, NodeKind,
-            SplitFailurePolicy, SubflowConfig, WorkflowEdge, WorkflowEdgeOutcome, WorkflowLimits,
-            WorkflowNode, WorkflowNodeType, WorkflowV3, WorkflowVariable, normalize_workflow_value,
-            resolve_agent_config,
+            SplitFailurePolicy, StructuredCondition, SubflowConfig, WorkflowEdge,
+            WorkflowEdgeOutcome, WorkflowLimits, WorkflowNode, WorkflowNodeType, WorkflowV3,
+            WorkflowVariable, normalize_workflow_value, resolve_agent_config,
         },
         storage::Database,
     };
@@ -6155,6 +6593,40 @@ mod tests {
 
     thread_local! {
         static ASYNC_WORKER_MARKER: Cell<bool> = const { Cell::new(false) };
+    }
+
+    #[derive(Clone, Default)]
+    struct WarningCapture {
+        warnings: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[derive(Default)]
+    struct WarningVisitor {
+        fields: Vec<String>,
+    }
+
+    impl tracing::field::Visit for WarningVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields.push(format!("{}={:?}", field.name(), value));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for WarningCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            let mut visitor = WarningVisitor::default();
+            event.record(&mut visitor);
+            self.warnings.lock().unwrap().push(visitor.fields.join(" "));
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -6192,6 +6664,11 @@ mod tests {
 
         fn with_delay(mut self, delay_ms: u64) -> Self {
             self.delay_ms = delay_ms;
+            self
+        }
+
+        fn with_parsed_output(mut self, parsed_output: Value) -> Self {
+            self.parsed_output = Some(parsed_output);
             self
         }
     }
@@ -6380,6 +6857,169 @@ mod tests {
                     agent: "mock".to_string(),
                     prompt: prompt.clone(),
                     resolved_prompt: Some(prompt),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct CapturedRun {
+        node_id: String,
+        cwd: String,
+        config: Option<AgentConfig>,
+    }
+
+    #[derive(Clone)]
+    struct CapturingRunner {
+        captures: Arc<Mutex<Vec<CapturedRun>>>,
+    }
+
+    impl CapturingRunner {
+        fn new() -> Self {
+            Self {
+                captures: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        async fn captures(&self) -> Vec<CapturedRun> {
+            self.captures.lock().await.clone()
+        }
+    }
+
+    impl NodeRunner for CapturingRunner {
+        fn run(
+            &self,
+            _agent: String,
+            prompt: String,
+            _cwd: String,
+            _timeout_secs: Option<u64>,
+            _config: Option<AgentConfig>,
+        ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+            Box::pin(async move { Err(anyhow::anyhow!("unexpected basic run for {prompt}")) })
+        }
+
+        fn run_node_with_interaction(
+            &self,
+            node: WorkflowNode,
+            _agent: String,
+            prompt: String,
+            cwd: String,
+            _timeout_secs: Option<u64>,
+            config: Option<AgentConfig>,
+            _previous_output: String,
+            _ctx: RuntimeContext,
+            _run_id: String,
+            _cursor_id: String,
+        ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+            let captures = self.captures.clone();
+            Box::pin(async move {
+                captures.lock().await.push(CapturedRun {
+                    node_id: node.id.clone(),
+                    cwd: cwd.clone(),
+                    config: config.clone(),
+                });
+                Ok(NodeResult {
+                    success: true,
+                    output: format!("{} done", node.id),
+                    exit_code: 0,
+                    duration: "0".to_string(),
+                    agent: "mock".to_string(),
+                    prompt: prompt.clone(),
+                    resolved_prompt: Some(prompt),
+                    ..Default::default()
+                })
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct ContinuationPaneRunner {
+        captures: Arc<Mutex<Vec<CapturedRun>>>,
+    }
+
+    impl ContinuationPaneRunner {
+        fn new() -> Self {
+            Self {
+                captures: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        async fn captures(&self) -> Vec<CapturedRun> {
+            self.captures.lock().await.clone()
+        }
+    }
+
+    impl NodeRunner for ContinuationPaneRunner {
+        fn run(
+            &self,
+            _agent: String,
+            prompt: String,
+            _cwd: String,
+            _timeout_secs: Option<u64>,
+            _config: Option<AgentConfig>,
+        ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+            Box::pin(async move { Err(anyhow::anyhow!("unexpected basic run for {prompt}")) })
+        }
+
+        fn run_node_with_interaction(
+            &self,
+            node: WorkflowNode,
+            _agent: String,
+            prompt: String,
+            cwd: String,
+            _timeout_secs: Option<u64>,
+            config: Option<AgentConfig>,
+            _previous_output: String,
+            ctx: RuntimeContext,
+            run_id: String,
+            cursor_id: String,
+        ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
+            let captures = self.captures.clone();
+            Box::pin(async move {
+                captures.lock().await.push(CapturedRun {
+                    node_id: node.id.clone(),
+                    cwd,
+                    config: config.clone(),
+                });
+
+                let key = active_pane_key(&cursor_id, &node.id);
+                let pane = if let Some(source_id) = node.continue_session_from.as_deref() {
+                    let source_key = active_pane_key(&cursor_id, source_id);
+                    ctx.registry
+                        .resolve_active_pane(&run_id, &source_key)
+                        .await
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "continueSessionFrom source node \"{}\" does not have an active tmux pane",
+                                source_id
+                            )
+                        })?
+                } else {
+                    format!("pane-{}", node.id)
+                };
+
+                ctx.registry.set_active_pane(&run_id, &key, &pane).await;
+                if config
+                    .as_ref()
+                    .map(|config| config.ephemeral_session)
+                    .unwrap_or(true)
+                {
+                    ctx.registry.clear_active_pane(&run_id, &key).await;
+                }
+
+                Ok(NodeResult {
+                    success: true,
+                    output: pane.clone(),
+                    exit_code: 0,
+                    duration: "0".to_string(),
+                    agent: "mock".to_string(),
+                    prompt: prompt.clone(),
+                    resolved_prompt: Some(prompt),
+                    metadata: AgentExecutionMetadata {
+                        agent_session_id: Some(pane),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 })
             })
@@ -6736,18 +7376,26 @@ mod tests {
             socket: Some("run-as-socket".to_string()),
         };
 
-        let resolved = resolve_workflow_invocation_with(None, Some(run_as), |run_as| {
-            let ran_inline = ASYNC_WORKER_MARKER.with(|marker| marker.get());
-            assert!(
-                !ran_inline,
-                "runAs tmux invocation resolution ran inline on the async worker"
-            );
-            TmuxInvocation {
-                prefix: run_as.command.clone().unwrap_or_default(),
-                socket: run_as.socket.clone(),
-                tmux_bin: "tmux-from-builder".to_string(),
-            }
-        })
+        let resolved = resolve_workflow_invocation_with(
+            None,
+            Some(run_as),
+            "run_blocking".to_string(),
+            |run_as, run_id| {
+                let ran_inline = ASYNC_WORKER_MARKER.with(|marker| marker.get());
+                assert!(
+                    !ran_inline,
+                    "runAs tmux invocation resolution ran inline on the async worker"
+                );
+                TmuxInvocation {
+                    prefix: run_as.command.clone().unwrap_or_default(),
+                    socket: run_as
+                        .socket
+                        .clone()
+                        .or_else(|| Some(format!("silverbond-{run_id}"))),
+                    tmux_bin: "tmux-from-builder".to_string(),
+                }
+            },
+        )
         .await
         .unwrap()
         .unwrap();
@@ -6798,7 +7446,7 @@ mod tests {
         socket: &str,
     ) -> (TmuxInvocation, PathBuf) {
         let (run_as, log) = fake_run_as_config(temp, stem, socket);
-        let inv = crate::tmux_exec::build_tmux_invocation(&run_as);
+        let inv = crate::tmux_exec::build_tmux_invocation(&run_as, stem);
         let _ = fs::remove_file(&log);
 
         (inv, log)
@@ -7074,6 +7722,74 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_tmux_reaper_uses_persisted_run_invocation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db.clone());
+
+        let socket = "stale-run-socket";
+        let session = "silverbond-Stale-Session";
+        let script = temp.path().join("tmux-reaper-prefix.sh");
+        let log = temp.path().join("tmux-reaper-args.log");
+        fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\nsession=\"$2\"\nshift 2\nif [ \"$1\" = \"zsh\" ]; then printf 'tmux\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n' \"$session\"; fi\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let mut workflow = workflow_from_parts("work", vec![task_node("work", "Work", "")], vec![]);
+        workflow.run_as = Some(model::RunAsConfig {
+            command: Some(vec![
+                script.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+                session.to_string(),
+            ]),
+            user: None,
+            socket: Some(socket.to_string()),
+        });
+        let run_id = "run_stale_reaper";
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.status = RuntimeStatus::Completed;
+        checkpoint.tmux_sessions.insert(session.to_string());
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            checkpoint,
+            workflow,
+        })
+        .await
+        .unwrap();
+
+        reap_stale_tmux_sessions(&ctx).await.unwrap();
+
+        let recorded = fs::read_to_string(log).expect("fake tmux prefix should record reaper args");
+        let args = recorded.lines().collect::<Vec<_>>();
+        assert!(
+            args.windows(6).any(|window| window
+                == [
+                    "tmux",
+                    "-L",
+                    socket,
+                    "list-sessions",
+                    "-F",
+                    "#{session_name}"
+                ]),
+            "reaper should list sessions under the persisted invocation; args={args:?}"
+        );
+        assert!(
+            args.windows(6)
+                .any(|window| window == ["tmux", "-L", socket, "kill-session", "-t", session]),
+            "reaper should kill stale sessions under the persisted invocation; args={args:?}"
+        );
+    }
+
     async fn wait_for_run<F>(db: &Database, run_id: &str, mut predicate: F) -> PersistedRun
     where
         F: FnMut(&PersistedRun) -> bool,
@@ -7216,6 +7932,7 @@ mod tests {
         workflow.run_as = Some(run_as);
         let checkpoint = build_initial_checkpoint(&workflow, "run_decide", BTreeMap::new(), None);
         db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
             checkpoint: checkpoint.clone(),
             workflow: workflow.clone(),
         })
@@ -7256,6 +7973,7 @@ mod tests {
         );
         refinement_db
             .upsert_run(&PersistedRun {
+                stream_token: new_stream_token(),
                 checkpoint: refinement_checkpoint.clone(),
                 workflow: refinement_workflow.clone(),
             })
@@ -7351,6 +8069,39 @@ mod tests {
             .unwrap();
         let persisted = db.get_run(&run_id).await.unwrap();
         assert!(persisted.is_some());
+    }
+
+    #[test]
+    fn output_hash_history_is_capped_to_stagnation_window() {
+        let key = "node".to_string();
+        let mut hashes = BTreeMap::new();
+
+        assert!(!record_output_hash(&mut hashes, key.clone(), "one"));
+        assert!(!record_output_hash(&mut hashes, key.clone(), "two"));
+        assert!(!record_output_hash(&mut hashes, key.clone(), "three"));
+        assert!(!record_output_hash(&mut hashes, key.clone(), "four"));
+        assert_eq!(
+            hashes.get(&key).unwrap(),
+            &vec![djb2("two"), djb2("three"), djb2("four")]
+        );
+
+        let mut stagnant_hashes = BTreeMap::new();
+        assert!(!record_output_hash(
+            &mut stagnant_hashes,
+            key.clone(),
+            "same"
+        ));
+        assert!(!record_output_hash(
+            &mut stagnant_hashes,
+            key.clone(),
+            "same"
+        ));
+        assert!(record_output_hash(
+            &mut stagnant_hashes,
+            key.clone(),
+            "same"
+        ));
+        assert_eq!(stagnant_hashes.get(&key).unwrap().len(), STAGNATION_WINDOW);
     }
 
     #[test]
@@ -7692,6 +8443,127 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn finalize_run_cleans_registry_on_persistence_error() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("silverbond.db");
+        let db = Database::new(db_path.clone());
+        db.init().await.unwrap();
+        let (invocation, _kill_log, kill_marker) = fake_tmux_kill_invocation(&temp);
+        let mut runtime = RuntimeContext::new(db.clone());
+        runtime.run_invocation = Some(invocation);
+        let workflow = workflow_from_parts(
+            "finalize_err",
+            vec![task_node("work", "Work", "register pane")],
+            Vec::new(),
+        );
+        let run_id = "run_finalize_persist_err";
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.status = RuntimeStatus::Completed;
+        runtime.registry.register(run_id).await;
+        runtime
+            .registry
+            .set_active_pane(run_id, &active_pane_key("cursor", "work"), "%err-pane")
+            .await;
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            checkpoint: checkpoint.clone(),
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+
+        {
+            use rusqlite::Connection;
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute("DROP TABLE logs", []).unwrap();
+        }
+
+        let result = finalize_run(
+            &runtime,
+            &workflow,
+            checkpoint,
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(result.is_err(), "expected persistence to fail: {result:?}");
+        wait_for_path(&kill_marker).await;
+        assert!(
+            !runtime.registry.active_run_ids().await.contains(run_id),
+            "registry entry should be cleared even when persistence fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_warns_when_pending_approval_has_no_waiting_cursor() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([(
+                "after".to_string(),
+                vec![ScriptedStep::success("done")],
+            )])),
+        );
+        let workflow = workflow_from_parts(
+            "approve",
+            vec![
+                approval_node("gate", "Gate", "approve?"),
+                task_node("after", "After", "after"),
+            ],
+            vec![success_edge("gate_after", "gate", "after", None)],
+        );
+        let run_id = "run_inconsistent_approval";
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.status = RuntimeStatus::Paused;
+        checkpoint.pending_approval = Some(PendingApproval {
+            cursor_id: "cursor-1".to_string(),
+            node_id: "gate".to_string(),
+            node_name: "Gate".to_string(),
+            prompt: "approve?".to_string(),
+            last_output: String::new(),
+        });
+        checkpoint.active_cursors = vec![CursorState {
+            cursor_id: "cursor-1".to_string(),
+            node_id: "gate".to_string(),
+            execution_epoch: checkpoint.execution_epoch,
+            parent_cursor_id: None,
+            incoming_edge_id: None,
+            incoming_node_id: None,
+            split_family_ids: Vec::new(),
+            last_output: String::new(),
+            loop_counters: BTreeMap::new(),
+            visit_counters: BTreeMap::new(),
+            var_map: BTreeMap::new(),
+            call_stack: Vec::new(),
+            last_branch_origin_id: None,
+            last_branch_choice: None,
+            cancel_requested: false,
+            state: CursorRuntimeState::Runnable,
+        }];
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            checkpoint,
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+
+        runtime.resume_run(run_id).await.unwrap();
+        let events = wait_for_event(&db, run_id, "workflow_warn").await;
+        let warn = events
+            .iter()
+            .find(|event| event.kind == "workflow_warn")
+            .expect("expected workflow_warn when pending approval disagrees with cursor state");
+        assert_eq!(warn.data.get("nodeId").and_then(Value::as_str), Some("gate"));
+        assert_eq!(
+            warn.data.get("cursorId").and_then(Value::as_str),
+            Some("cursor-1")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn abort_kills_active_panes_before_draining_running_tasks() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
@@ -7823,6 +8695,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn split_and_collector_maps_evict_after_completion_without_restart() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                (
+                    "branch-a".to_string(),
+                    vec![ScriptedStep::success("alpha output").with_delay(30)],
+                ),
+                (
+                    "branch-b".to_string(),
+                    vec![ScriptedStep::success("beta output").with_delay(5)],
+                ),
+                ("after".to_string(), vec![ScriptedStep::success("done")]),
+            ])),
+        );
+        let workflow = workflow_from_parts(
+            "split",
+            vec![
+                split_node("split", SplitFailurePolicy::BestEffortContinue),
+                task_node("branch_a", "Branch A", "branch-a"),
+                task_node("branch_b", "Branch B", "branch-b"),
+                collector_node("collector"),
+                task_node("after", "After", "after"),
+            ],
+            vec![
+                success_edge("split_a", "split", "branch_a", Some("alpha")),
+                success_edge("split_b", "split", "branch_b", Some("beta")),
+                success_edge("join_a", "branch_a", "collector", Some("alpha")),
+                success_edge("join_b", "branch_b", "collector", Some("beta")),
+                success_edge("after_edge", "collector", "after", None),
+            ],
+        );
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let after_collector = wait_for_run(&db, &run_id, |persisted| {
+            persisted.checkpoint.all_results.contains_key("collector")
+                && persisted.checkpoint.collector_barriers.is_empty()
+                && persisted.checkpoint.split_families.is_empty()
+        })
+        .await;
+        assert!(after_collector.checkpoint.split_families.is_empty());
+        assert!(after_collector.checkpoint.collector_barriers.is_empty());
+
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        assert!(persisted.checkpoint.split_families.is_empty());
+        assert!(persisted.checkpoint.collector_barriers.is_empty());
+    }
+
+    #[tokio::test]
     async fn parallel_batch_fans_out_three_items_with_cap_two() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
@@ -7884,6 +8812,136 @@ mod tests {
         assert_eq!(collected.as_array().unwrap().len(), 3);
     }
 
+    #[cfg(unix)]
+    fn fake_tmux_blocking_oneshot_invocation(temp: &TempDir) -> (TmuxInvocation, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = temp.path().join("tmux-decide-prefix.sh");
+        let log = temp.path().join("tmux-decide-args.log");
+        let marker = temp.path().join("tmux-decide-killed");
+        fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\nmarker=\"$2\"\nshift 2\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\ncase \"$1\" in\n  new-session)\n    printf '%%decide-pane\\n'\n    ;;\n  capture-pane)\n    printf '\\n'\n    ;;\n  kill-session|kill-pane)\n    touch \"$marker\"\n    ;;\nesac\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        (
+            TmuxInvocation {
+                prefix: vec![
+                    script.to_string_lossy().into_owned(),
+                    log.to_string_lossy().into_owned(),
+                    marker.to_string_lossy().into_owned(),
+                ],
+                socket: Some("decide-abort-socket".to_string()),
+                tmux_bin: "tmux".to_string(),
+            },
+            log,
+            marker,
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn decide_abort_returns_promptly_and_kills_pane() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let (invocation, kill_log, kill_marker) = fake_tmux_blocking_oneshot_invocation(&temp);
+        let mut runtime = RuntimeContext::with_runner(db.clone(), Arc::new(EchoRunner));
+        runtime.run_invocation = Some(invocation);
+
+        let mut decide = task_node("decide", "Decide", "");
+        decide.kind = NodeKind::Decide {
+            decide_config: model::DecideConfig {
+                inputs: Vec::new(),
+                prompt: "Choose an outcome".to_string(),
+                model: None,
+                outcomes: vec!["approve".to_string()],
+            },
+        };
+        decide.agent = None;
+
+        let workflow = workflow_from_parts("decide", vec![decide], vec![]);
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        wait_for_event(&db, &run_id, "node_start").await;
+
+        let abort_started = Instant::now();
+        runtime.abort_run(&run_id).await.unwrap();
+        let persisted =
+            tokio::time::timeout(Duration::from_secs(2), wait_for_terminal_run(&db, &run_id))
+                .await
+                .expect("decide abort did not reach a terminal state promptly");
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Aborted);
+        assert!(
+            abort_started.elapsed() < Duration::from_millis(500),
+            "decide abort waited too long: {:?}",
+            abort_started.elapsed()
+        );
+        wait_for_path(&kill_marker).await;
+        let recorded =
+            fs::read_to_string(kill_log).expect("fake tmux should record decide abort cleanup");
+        assert!(
+            recorded.contains("kill-session") || recorded.contains("kill-pane"),
+            "decide abort should kill the oneshot pane; args={recorded}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn orchestrator_refinement_err_falls_back_to_original_prompt() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let (run_as, _) = fake_run_as_config(&temp, "orch-fail", "orch-socket");
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                (
+                    "first prompt".to_string(),
+                    vec![ScriptedStep::success("previous output")],
+                ),
+                (
+                    "second prompt".to_string(),
+                    vec![ScriptedStep::success("second done")],
+                ),
+            ])),
+        );
+
+        let mut workflow = workflow_from_parts(
+            "first",
+            vec![
+                task_node("first", "First", "first prompt"),
+                task_node("second", "Second", "second prompt"),
+            ],
+            vec![success_edge("first_second", "first", "second", None)],
+        );
+        workflow.use_orchestrator = true;
+        workflow.cwd = temp.path().to_string_lossy().into_owned();
+        workflow.run_as = Some(run_as);
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        assert_eq!(
+            persisted.checkpoint.all_results["second"].output,
+            "second done"
+        );
+        let events = db.list_events(&run_id).await.unwrap();
+        assert!(events.iter().any(|event| event.kind == "orchestrator_warn"));
+        assert!(!events.iter().any(|event| event.kind == "workflow_error"));
+    }
+
     #[tokio::test]
     async fn parallel_batch_abort_cancels_pending_items_after_next_completion() {
         let temp = TempDir::new().unwrap();
@@ -7894,7 +8952,7 @@ mod tests {
             Arc::new(ScriptedRunner::new([
                 (
                     "work a".to_string(),
-                    vec![ScriptedStep::success("done a").with_delay(300)],
+                    vec![ScriptedStep::success("done a").with_delay(2000)],
                 ),
                 (
                     "work b".to_string(),
@@ -7934,15 +8992,16 @@ mod tests {
 
         assert_eq!(persisted.checkpoint.status, RuntimeStatus::Aborted);
         assert!(
-            abort_started.elapsed() < Duration::from_millis(750),
-            "parallel_batch abort waited for the whole batch"
+            abort_started.elapsed() < Duration::from_millis(500),
+            "parallel_batch abort waited for the whole batch: {:?}",
+            abort_started.elapsed()
         );
         assert!(!persisted.checkpoint.all_results.contains_key("after"));
         let batch = persisted.checkpoint.all_results.get("batch").unwrap();
         let parsed = batch.parsed_output.as_ref().unwrap();
         assert_eq!(parsed["summary"]["total"], json!(4));
-        assert_eq!(parsed["summary"]["succeeded"], json!(1));
-        assert_eq!(parsed["summary"]["cancelled"], json!(3));
+        assert_eq!(parsed["summary"]["succeeded"], json!(0));
+        assert_eq!(parsed["summary"]["cancelled"], json!(4));
         assert_eq!(
             parsed["items"]
                 .as_array()
@@ -7950,7 +9009,7 @@ mod tests {
                 .iter()
                 .filter(|item| item["cancelled"] == json!(true))
                 .count(),
-            3
+            4
         );
 
         let events = db.list_events(&run_id).await.unwrap();
@@ -8015,6 +9074,7 @@ mod tests {
             )]),
         );
         db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
             checkpoint,
             workflow: workflow.clone(),
         })
@@ -8183,6 +9243,152 @@ mod tests {
         assert_eq!(
             persisted.checkpoint.all_results["after"].output,
             "root sees {{var:batch_results}}"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_session_from_inside_subflow_keeps_source_pane_active() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runner = ContinuationPaneRunner::new();
+        let runtime = RuntimeContext::with_runner(db.clone(), Arc::new(runner.clone()));
+
+        let source = task_node("source", "Source", "source prompt");
+        let mut continuation = task_node("continuation", "Continuation", "continue prompt");
+        continuation.continue_session_from = Some("source".to_string());
+        let subflow = workflow_from_parts(
+            "source",
+            vec![source, continuation],
+            vec![success_edge(
+                "source_continuation",
+                "source",
+                "continuation",
+                None,
+            )],
+        );
+        let mut workflow = workflow_from_parts(
+            "call",
+            vec![call_node(
+                "call",
+                "session_subflow",
+                "continuation",
+                Vec::new(),
+            )],
+            Vec::new(),
+        );
+        workflow
+            .subflows
+            .insert("session_subflow".to_string(), Box::new(subflow));
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        assert_eq!(
+            persisted.checkpoint.all_results["call"].output,
+            "pane-source"
+        );
+        let captures = runner.captures().await;
+        let source_config = captures
+            .iter()
+            .find(|capture| capture.node_id == "source")
+            .and_then(|capture| capture.config.as_ref())
+            .expect("source node should have been captured with config");
+        assert!(
+            !source_config.ephemeral_session,
+            "subflow source node referenced by continueSessionFrom must stay persistent"
+        );
+    }
+
+    #[tokio::test]
+    async fn subflow_dispatch_uses_subflow_scoped_cwd_defaults_and_orchestrator() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runner = CapturingRunner::new();
+        let runtime = RuntimeContext::with_runner(db.clone(), Arc::new(runner.clone()));
+
+        let mut subflow = workflow_from_parts(
+            "batch",
+            vec![
+                parallel_batch_node("batch", "items", 2, "item", "body", None),
+                task_node("body", "Body", "body {{var:item}}"),
+                task_node("after", "After", "after {{previous_output}}"),
+            ],
+            vec![success_edge("batch_after", "batch", "after", None)],
+        );
+        subflow.cwd = "/repo-sub".to_string();
+        subflow.use_orchestrator = false;
+        subflow.variables = vec![WorkflowVariable {
+            name: "items".to_string(),
+            default: json!(["a", "b"]).to_string(),
+        }];
+        subflow.agent_defaults.insert(
+            "mock".to_string(),
+            AgentDefaults {
+                model: Some("sub-model".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mut workflow = workflow_from_parts(
+            "call",
+            vec![call_node("call", "scoped_subflow", "after", Vec::new())],
+            Vec::new(),
+        );
+        workflow.cwd = "/repo-root".to_string();
+        workflow.use_orchestrator = true;
+        workflow.agent_defaults.insert(
+            "mock".to_string(),
+            AgentDefaults {
+                model: Some("root-model".to_string()),
+                ..Default::default()
+            },
+        );
+        workflow
+            .subflows
+            .insert("scoped_subflow".to_string(), Box::new(subflow));
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        let captures = runner.captures().await;
+        assert_eq!(
+            captures
+                .iter()
+                .filter(|capture| capture.node_id == "body")
+                .count(),
+            2
+        );
+        let after = captures
+            .iter()
+            .find(|capture| capture.node_id == "after")
+            .expect("subflow after task should have run");
+        for capture in captures
+            .iter()
+            .filter(|capture| capture.node_id == "body" || capture.node_id == "after")
+        {
+            let config = capture.config.as_ref().expect("agent config should exist");
+            assert_eq!(capture.cwd, "/repo-sub");
+            assert_eq!(config.cwd, "/repo-sub");
+            assert_eq!(config.model.as_deref(), Some("sub-model"));
+        }
+
+        assert_eq!(after.cwd, "/repo-sub");
+        let events = db.list_events(&run_id).await.unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.kind == "orchestrator_start"),
+            "subflow useOrchestrator=false must override root useOrchestrator=true"
         );
     }
 
@@ -8545,6 +9751,170 @@ mod tests {
             })
             .count();
         assert_eq!(collector_releases, 2);
+    }
+
+    #[tokio::test]
+    async fn collector_barrier_resets_when_loop_reenters_collector() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let mut gate = task_node("gate", "Gate", "again");
+        gate.loop_condition = Some(StructuredCondition {
+            field: "again".to_string(),
+            operator: "==".to_string(),
+            value: "true".to_string(),
+        });
+        gate.loop_max_iterations = Some(2);
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                (
+                    "left".to_string(),
+                    vec![
+                        ScriptedStep::success("left first").with_delay(5),
+                        ScriptedStep::success("left second").with_delay(5),
+                    ],
+                ),
+                (
+                    "right".to_string(),
+                    vec![
+                        ScriptedStep::success("right first").with_delay(10),
+                        ScriptedStep::success("right second").with_delay(10),
+                    ],
+                ),
+                (
+                    "again".to_string(),
+                    vec![
+                        ScriptedStep::success("loop first")
+                            .with_parsed_output(json!({"again": true})),
+                        ScriptedStep::success("loop second")
+                            .with_parsed_output(json!({"again": true})),
+                    ],
+                ),
+                ("done".to_string(), vec![ScriptedStep::success("done")]),
+            ])),
+        );
+        let workflow = workflow_from_parts(
+            "split",
+            vec![
+                split_node("split", SplitFailurePolicy::BestEffortContinue),
+                task_node("left", "Left", "left"),
+                task_node("right", "Right", "right"),
+                collector_node("collector"),
+                gate,
+                task_node("done", "Done", "done"),
+            ],
+            vec![
+                success_edge("split_left", "split", "left", Some("left")),
+                success_edge("split_right", "split", "right", Some("right")),
+                success_edge("left_collect", "left", "collector", Some("left")),
+                success_edge("right_collect", "right", "collector", Some("right")),
+                success_edge("collector_gate", "collector", "gate", None),
+                WorkflowEdge {
+                    id: "gate_continue".to_string(),
+                    from: "gate".to_string(),
+                    to: "split".to_string(),
+                    outcome: WorkflowEdgeOutcome::LoopContinue,
+                    label: Some("again".to_string()),
+                    branch_id: None,
+                    condition: None,
+                },
+                WorkflowEdge {
+                    id: "gate_exit".to_string(),
+                    from: "gate".to_string(),
+                    to: "done".to_string(),
+                    outcome: WorkflowEdgeOutcome::LoopExit,
+                    label: Some("done".to_string()),
+                    branch_id: None,
+                    condition: None,
+                },
+            ],
+        );
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        assert!(persisted.checkpoint.all_results.contains_key("done"));
+        let events = db.list_events(&run_id).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "collector_released")
+                .count(),
+            2
+        );
+        assert!(!events.iter().any(|event| {
+            event.kind == "workflow_error"
+                && event.data.get("message")
+                    == Some(&json!("Collector is blocked waiting on missing inputs."))
+        }));
+    }
+
+    #[tokio::test]
+    async fn duplicate_collector_merge_key_warns_for_start_run_callers() {
+        let capture = WarningCapture::default();
+        let warnings = capture.warnings.clone();
+        let subscriber = tracing_subscriber::registry().with(capture);
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                (
+                    "left".to_string(),
+                    vec![ScriptedStep::success("left output").with_delay(5)],
+                ),
+                (
+                    "right".to_string(),
+                    vec![ScriptedStep::success("right output").with_delay(10)],
+                ),
+                (
+                    "after".to_string(),
+                    vec![
+                        ScriptedStep::success("done first"),
+                        ScriptedStep::success("done second"),
+                    ],
+                ),
+            ])),
+        );
+        let workflow = workflow_from_parts(
+            "split",
+            vec![
+                split_node("split", SplitFailurePolicy::BestEffortContinue),
+                task_node("left", "Left", "left"),
+                task_node("right", "Right", "right"),
+                collector_node("collector"),
+                task_node("after", "After", "after"),
+            ],
+            vec![
+                success_edge("split_left", "split", "left", Some("left")),
+                success_edge("split_right", "split", "right", Some("right")),
+                success_edge("left_collect", "left", "collector", Some("dup")),
+                success_edge("right_collect", "right", "collector", Some("dup")),
+                success_edge("collector_after", "collector", "after", None),
+            ],
+        );
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        let warnings = warnings.lock().unwrap().join("\n");
+        assert!(
+            warnings.contains("duplicate collector input key in barrier configuration"),
+            "expected duplicate collector warning, got {warnings}"
+        );
+        assert!(warnings.contains("collector"));
+        assert!(warnings.contains("dup"));
     }
 
     #[tokio::test]
@@ -9028,10 +10398,46 @@ mod tests {
             ui: None,
         };
 
-        let set = super::build_session_persistence_set(&wf);
+        let graph = wf.graph();
+        let set = super::build_session_persistence_set(&graph, &BTreeMap::new());
         assert!(set.contains("n1"), "n1 should need persistent session");
         assert!(set.contains("n2"), "n2 should need persistent session");
         assert!(!set.contains("n3"), "n3 is not referenced by anyone");
+    }
+
+    #[test]
+    fn build_session_persistence_set_ignores_completed_continuations() {
+        let n1 = task_node("n1", "Step 1", "prompt1");
+        let mut n2 = task_node("n2", "Step 2", "prompt2");
+        n2.continue_session_from = Some("n1".to_string());
+
+        let wf = WorkflowV3 {
+            version: 3,
+            name: None,
+            goal: "test".to_string(),
+            cwd: "/tmp".to_string(),
+            use_orchestrator: false,
+            run_as: None,
+            entry_node_id: "n1".to_string(),
+            variables: Vec::new(),
+            limits: WorkflowLimits {
+                max_total_steps: 10,
+                max_visits_per_node: 5,
+            },
+            nodes: vec![n1, n2],
+            edges: vec![],
+            agent_defaults: BTreeMap::new(),
+            subflows: BTreeMap::new(),
+            ui: None,
+        };
+        let completed = BTreeMap::from([("n2".to_string(), NodeResult::default())]);
+
+        let graph = wf.graph();
+        let set = super::build_session_persistence_set(&graph, &completed);
+        assert!(
+            set.is_empty(),
+            "completed continuation nodes should no longer keep sources alive"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -9291,7 +10697,8 @@ mod tests {
             ui: None,
         };
 
-        let set = super::build_session_persistence_set(&wf);
+        let graph = wf.graph();
+        let set = super::build_session_persistence_set(&graph, &BTreeMap::new());
         assert!(set.is_empty());
     }
 
@@ -9991,5 +11398,125 @@ mod tests {
             persisted.checkpoint.all_results["consolidate"].output,
             "consolidated"
         );
+    }
+
+    #[tokio::test]
+    async fn loop_cap_without_exit_marks_run_failed() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([(
+                "loop".to_string(),
+                vec![ScriptedStep::success("iter")],
+            )])),
+        );
+        let mut gate = task_node("gate", "Gate", "loop");
+        gate.loop_max_iterations = Some(1);
+        let workflow = workflow_from_parts(
+            "gate",
+            vec![gate, task_node("done", "Done", "done")],
+            vec![WorkflowEdge {
+                id: "gate_continue".to_string(),
+                from: "gate".to_string(),
+                to: "gate".to_string(),
+                outcome: WorkflowEdgeOutcome::LoopContinue,
+                label: Some("again".to_string()),
+                branch_id: None,
+                condition: None,
+            }],
+        );
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Failed);
+        let events = db.list_events(&run_id).await.unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "workflow_error"
+                && event
+                    .data
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|message| message.contains("no loop_exit edge"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn decide_missing_branch_edge_degrades_instead_of_bailing() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::with_runner(db.clone(), Arc::new(EchoRunner));
+
+        let mut decide = task_node("decide", "Decide", "");
+        decide.kind = NodeKind::Decide {
+            decide_config: crate::model::DecideConfig {
+                inputs: Vec::new(),
+                prompt: "pick".to_string(),
+                model: None,
+                outcomes: vec!["yes".to_string()],
+            },
+        };
+        decide.agent = None;
+
+        let workflow = workflow_from_parts(
+            "decide",
+            vec![decide, task_node("after", "After", "after")],
+            vec![success_edge("decide_after", "decide", "after", None)],
+        );
+        let mut checkpoint =
+            build_initial_checkpoint(&workflow, "run_decide", BTreeMap::new(), None);
+        let graph = workflow.graph();
+        let node = workflow.nodes[0].clone();
+        let cursor_id = checkpoint.active_cursors[0].cursor_id.clone();
+        let result = NodeResult {
+            success: true,
+            output: "missing".to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+            duration: "0".to_string(),
+            agent: "llm".to_string(),
+            prompt: String::new(),
+            raw_output: None,
+            parsed_output: None,
+            parse_error: None,
+            resolved_prompt: None,
+            stale: false,
+            preserved_from_run_id: None,
+            metadata: Default::default(),
+        };
+
+        let decision = select_next_decision(
+            &ctx,
+            &workflow,
+            &graph,
+            &mut checkpoint,
+            &cursor_id,
+            &node,
+            &result,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(decision.control_type, "success");
+        assert_eq!(
+            decision.next_edge.as_ref().map(|edge| edge.to.as_str()),
+            Some("after")
+        );
+        let events = db.list_events(&checkpoint.run_id).await.unwrap();
+        assert!(events.iter().any(|event| {
+            event.kind == "workflow_error"
+                && event
+                    .data
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .is_some_and(|message| message.contains("no matching branch edge"))
+        }));
     }
 }

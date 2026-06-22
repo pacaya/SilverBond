@@ -119,6 +119,7 @@ describe("PaneTerminal", () => {
     render(PaneTerminal, {
       props: {
         runId: "run-1",
+        streamToken: "stream-token-1",
         workflow: dualReviewWorkflow,
       },
     });
@@ -132,5 +133,11 @@ describe("PaneTerminal", () => {
     expect(reviewerA.value).toBe("reviewer-a");
     expect(reviewerB.value).toBe("reviewer-b");
     expect(options.queryByRole("option", { name: "Split Reviewers" })).not.toBeInTheDocument();
+    expect(streamPaneMock).toHaveBeenCalledWith(
+      "run-1",
+      "active",
+      "stream-token-1",
+      expect.any(Object),
+    );
   });
 });

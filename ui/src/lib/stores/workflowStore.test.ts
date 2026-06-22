@@ -332,13 +332,43 @@ describe("workflowStore", () => {
     expect(store.workflow!.entryNodeId).toBe(store.workflow!.nodes[0].id);
   });
 
+  it("corrects stale selectedPane when observability panes change across runs", () => {
+    store.selectPane("cursor:old-node");
+    expect(store.selectedPane).toBe("cursor:old-node");
+
+    store.setRunObservability({
+      panes: [
+        { pane: "cursor:new-a", sessionName: "sess-a", attachCommand: "tmux attach -t sess-a" },
+        { pane: "cursor:new-b", sessionName: "sess-b", attachCommand: "tmux attach -t sess-b" },
+      ],
+    });
+
+    expect(store.selectedPane).toBe("cursor:new-a");
+  });
+
+  it("preserves selectedPane when it is still in incoming observability panes", () => {
+    store.selectPane("cursor:new-b");
+
+    store.setRunObservability({
+      panes: [
+        { pane: "cursor:new-a", sessionName: "sess-a", attachCommand: "tmux attach -t sess-a" },
+        { pane: "cursor:new-b", sessionName: "sess-b", attachCommand: "tmux attach -t sess-b" },
+      ],
+    });
+
+    expect(store.selectedPane).toBe("cursor:new-b");
+  });
+
   it("resets selectedPane to active on resetRun", () => {
     store.selectPane("node_abc");
+    store.setRunState({ runId: "run-1", streamToken: "stream-token-1" });
     expect(store.selectedPane).toBe("node_abc");
+    expect(store.streamToken).toBe("stream-token-1");
 
     store.resetRun();
 
     expect(store.selectedPane).toBe("active");
+    expect(store.streamToken).toBeNull();
   });
 
   it("resets selectedPane to active on setWorkflow", () => {

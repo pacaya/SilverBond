@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use axum::{Router, routing::get};
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::{
@@ -34,6 +35,7 @@ impl AppPaths {
 pub struct ApplicationConfig {
     pub paths: AppPaths,
     pub seed_bundled_templates: bool,
+    pub security: SecurityConfig,
 }
 
 impl ApplicationConfig {
@@ -41,6 +43,7 @@ impl ApplicationConfig {
         Self {
             paths: AppPaths::from_root(root),
             seed_bundled_templates: false,
+            security: SecurityConfig::default(),
         }
     }
 
@@ -48,8 +51,75 @@ impl ApplicationConfig {
         let root = std::env::var_os("SILVERBOND_ROOT")
             .map(PathBuf::from)
             .unwrap_or(std::env::current_dir()?);
-        Ok(Self::from_root(root))
+        let mut config = Self::from_root(root);
+        config.security = SecurityConfig::from_environment();
+        Ok(config)
     }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SecurityConfig {
+    pub agent_user: Option<String>,
+    pub unlock_password_hash: Option<String>,
+}
+
+impl SecurityConfig {
+    pub fn from_environment() -> Self {
+        Self {
+            agent_user: env_config_value("SILVERBOND_AGENT_USER"),
+            unlock_password_hash: env_config_value("SILVERBOND_UNLOCK_PASSWORD_HASH"),
+        }
+    }
+
+    pub fn verify_unlock_secret(&self, secret: Option<&str>) -> bool {
+        let (Some(secret), Some(hash)) = (secret, self.unlock_password_hash.as_deref()) else {
+            return false;
+        };
+        verify_sha256_unlock_hash(secret, hash)
+    }
+}
+
+pub fn sha256_unlock_password_hash(secret: &str) -> String {
+    let digest = Sha256::digest(secret.as_bytes());
+    format!("sha256:{}", hex_lower(&digest))
+}
+
+fn env_config_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn verify_sha256_unlock_hash(secret: &str, hash: &str) -> bool {
+    let Some(expected_hex) = hash.strip_prefix("sha256:") else {
+        return false;
+    };
+    if expected_hex.len() != 64 || !expected_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    constant_time_eq(
+        sha256_unlock_password_hash(secret).as_bytes(),
+        format!("sha256:{}", expected_hex.to_ascii_lowercase()).as_bytes(),
+    )
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= usize::from(*a ^ *b);
+    }
+    diff == 0
 }
 
 #[derive(Clone)]
@@ -59,6 +129,7 @@ pub struct AppState {
     pub templates: TemplateStore,
     pub runtime: RuntimeContext,
     pub pane_streams: PaneStreamRegistry,
+    pub security: SecurityConfig,
 }
 
 #[derive(Clone)]
@@ -156,6 +227,7 @@ impl Application {
             templates,
             runtime,
             pane_streams: PaneStreamRegistry::default(),
+            security: config.security,
         };
 
         Ok(Self { state, paths })

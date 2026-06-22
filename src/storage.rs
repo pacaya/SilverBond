@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use include_dir::{Dir, include_dir};
@@ -13,14 +13,24 @@ use tokio::task::spawn_blocking;
 use crate::{
     model::{NormalizedWorkflow, WorkflowV3, normalize_workflow_value},
     runtime::{
-        ExecutionLog, InterruptedRunSummary, LogListItem, PersistedRun, RuntimeEvent, RuntimeStatus,
+        ExecutionLog, InterruptedRunSummary, LogListItem, PersistedRun, RuntimeCheckpoint,
+        RuntimeEvent, RuntimeStatus, new_stream_token,
     },
     util::{ensure_dir, now_iso, safe_name},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Database {
     path: Arc<PathBuf>,
+    connection: Arc<Mutex<Option<Connection>>>,
+}
+
+impl std::fmt::Debug for Database {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Database")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -76,6 +86,7 @@ impl Database {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: Arc::new(path.into()),
+            connection: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -85,15 +96,14 @@ impl Database {
 
     pub async fn init(&self) -> anyhow::Result<()> {
         let path = self.path.clone();
+        let connection = self.connection.clone();
         spawn_blocking(move || -> anyhow::Result<()> {
-            if let Some(parent) = path.parent() {
-                ensure_dir(parent)?;
-            }
-            let conn = open_connection(path.as_path())?;
-            conn.execute_batch(
-                r#"
+            with_connection(&connection, path.as_path(), |conn| {
+                conn.execute_batch(
+                    r#"
                 CREATE TABLE IF NOT EXISTS runs (
                     run_id TEXT PRIMARY KEY,
+                    stream_token TEXT,
                     status TEXT NOT NULL,
                     workflow_name TEXT NOT NULL,
                     current_node_id TEXT,
@@ -126,8 +136,10 @@ impl Database {
                     data_json TEXT NOT NULL
                 );
             "#,
-            )?;
-            Ok(())
+                )?;
+                ensure_runs_stream_token_column(conn)?;
+                Ok(())
+            })
         })
         .await??;
         Ok(())
@@ -135,15 +147,16 @@ impl Database {
 
     pub async fn upsert_run(&self, persisted: &PersistedRun) -> anyhow::Result<()> {
         let path = self.path.clone();
+        let connection = self.connection.clone();
         let persisted = persisted.clone();
         spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = open_connection(path.as_path())?;
-            conn.execute(
-                r#"
+            with_connection(&connection, path.as_path(), |conn| {
+                conn.execute(
+                    r#"
                 INSERT INTO runs (
-                    run_id, status, workflow_name, current_node_id, current_node_name, total_executed,
+                    run_id, stream_token, status, workflow_name, current_node_id, current_node_name, total_executed,
                     started_at, updated_at, pending_approval_json, state_json, workflow_json, terminal_reason
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                 ON CONFLICT(run_id) DO UPDATE SET
                     status = excluded.status,
                     workflow_name = excluded.workflow_name,
@@ -154,56 +167,114 @@ impl Database {
                     updated_at = excluded.updated_at,
                     pending_approval_json = excluded.pending_approval_json,
                     state_json = excluded.state_json,
-                    workflow_json = excluded.workflow_json,
                     terminal_reason = excluded.terminal_reason
                 "#,
-                params![
-                    persisted.checkpoint.run_id,
-                    status_as_str(&persisted.checkpoint.status),
-                    persisted.checkpoint.workflow_name,
-                    persisted.checkpoint.current_node_id,
-                    persisted.checkpoint.current_node_name,
-                    persisted.checkpoint.total_executed,
-                    persisted.checkpoint.started_at,
-                    persisted.checkpoint.updated_at,
-                    persisted
-                        .checkpoint
-                        .pending_approval
-                        .as_ref()
-                        .map(serde_json::to_string)
-                        .transpose()?,
-                    serde_json::to_string(&persisted.checkpoint)?,
-                    serde_json::to_string(&persisted.workflow)?,
-                    persisted.checkpoint.execution_log.terminal_reason,
-                ],
-            )?;
-            Ok(())
+                    params![
+                        persisted.checkpoint.run_id,
+                        persisted.stream_token,
+                        status_as_str(&persisted.checkpoint.status),
+                        persisted.checkpoint.workflow_name,
+                        persisted.checkpoint.current_node_id,
+                        persisted.checkpoint.current_node_name,
+                        persisted.checkpoint.total_executed,
+                        persisted.checkpoint.started_at,
+                        persisted.checkpoint.updated_at,
+                        persisted
+                            .checkpoint
+                            .pending_approval
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()?,
+                        serde_json::to_string(&persisted.checkpoint)?,
+                        serde_json::to_string(&persisted.workflow)?,
+                        persisted.checkpoint.execution_log.terminal_reason,
+                    ],
+                )?;
+                Ok(())
+            })
         })
         .await??;
         Ok(())
     }
 
+    pub async fn update_run_checkpoint(
+        &self,
+        checkpoint: &RuntimeCheckpoint,
+    ) -> anyhow::Result<bool> {
+        let path = self.path.clone();
+        let connection = self.connection.clone();
+        let checkpoint = checkpoint.clone();
+        spawn_blocking(move || -> anyhow::Result<bool> {
+            with_connection(&connection, path.as_path(), |conn| {
+                let updated = conn.execute(
+                    r#"
+                    UPDATE runs SET
+                        status = ?2,
+                        workflow_name = ?3,
+                        current_node_id = ?4,
+                        current_node_name = ?5,
+                        total_executed = ?6,
+                        started_at = ?7,
+                        updated_at = ?8,
+                        pending_approval_json = ?9,
+                        state_json = ?10,
+                        terminal_reason = ?11
+                    WHERE run_id = ?1
+                    "#,
+                    params![
+                        checkpoint.run_id,
+                        status_as_str(&checkpoint.status),
+                        checkpoint.workflow_name,
+                        checkpoint.current_node_id,
+                        checkpoint.current_node_name,
+                        checkpoint.total_executed,
+                        checkpoint.started_at,
+                        checkpoint.updated_at,
+                        checkpoint
+                            .pending_approval
+                            .as_ref()
+                            .map(serde_json::to_string)
+                            .transpose()?,
+                        serde_json::to_string(&checkpoint)?,
+                        checkpoint.execution_log.terminal_reason,
+                    ],
+                )?;
+                Ok(updated > 0)
+            })
+        })
+        .await?
+    }
+
     pub async fn get_run(&self, run_id: &str) -> anyhow::Result<Option<PersistedRun>> {
         let path = self.path.clone();
+        let connection = self.connection.clone();
         let run_id = run_id.to_string();
         spawn_blocking(move || -> anyhow::Result<Option<PersistedRun>> {
-            let conn = open_connection(path.as_path())?;
-            let row = conn
-                .query_row(
-                    "SELECT state_json, workflow_json FROM runs WHERE run_id = ?1",
-                    params![run_id],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()?;
-            let Some((state_json, workflow_json)) = row else {
-                return Ok(None);
-            };
-            let workflow_value: Value = serde_json::from_str(&workflow_json)?;
-            let workflow = normalize_workflow_value(workflow_value)?.workflow;
-            Ok(Some(PersistedRun {
-                checkpoint: serde_json::from_str(&state_json)?,
-                workflow,
-            }))
+            with_connection(&connection, path.as_path(), |conn| {
+                let row = conn
+                    .query_row(
+                        "SELECT stream_token, state_json, workflow_json FROM runs WHERE run_id = ?1",
+                        params![run_id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((stream_token, state_json, workflow_json)) = row else {
+                    return Ok(None);
+                };
+                let workflow_value: Value = serde_json::from_str(&workflow_json)?;
+                let workflow = normalize_workflow_value(workflow_value)?.workflow;
+                Ok(Some(PersistedRun {
+                    stream_token,
+                    checkpoint: serde_json::from_str(&state_json)?,
+                    workflow,
+                }))
+            })
         })
         .await?
     }
@@ -215,15 +286,17 @@ impl Database {
         terminal_reason: Option<String>,
     ) -> anyhow::Result<()> {
         let path = self.path.clone();
+        let connection = self.connection.clone();
         let run_id = run_id.to_string();
         let status = status_as_str(&status).to_string();
         spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = open_connection(path.as_path())?;
-            conn.execute(
-                "UPDATE runs SET status = ?2, terminal_reason = ?3, updated_at = ?4 WHERE run_id = ?1",
-                params![run_id, status, terminal_reason, now_iso()],
-            )?;
-            Ok(())
+            with_connection(&connection, path.as_path(), |conn| {
+                conn.execute(
+                    "UPDATE runs SET status = ?2, terminal_reason = ?3, updated_at = ?4 WHERE run_id = ?1",
+                    params![run_id, status, terminal_reason, now_iso()],
+                )?;
+                Ok(())
+            })
         })
         .await??;
         Ok(())
@@ -231,15 +304,17 @@ impl Database {
 
     pub async fn append_event(&self, run_id: &str, event: &RuntimeEvent) -> anyhow::Result<()> {
         let path = self.path.clone();
+        let connection = self.connection.clone();
         let run_id = run_id.to_string();
         let event = event.clone();
         spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = open_connection(path.as_path())?;
-            conn.execute(
-                "INSERT INTO run_events (run_id, event_json, created_at) VALUES (?1, ?2, ?3)",
-                params![run_id, serde_json::to_string(&event)?, now_iso()],
-            )?;
-            Ok(())
+            with_connection(&connection, path.as_path(), |conn| {
+                conn.execute(
+                    "INSERT INTO run_events (run_id, event_json, created_at) VALUES (?1, ?2, ?3)",
+                    params![run_id, serde_json::to_string(&event)?, now_iso()],
+                )?;
+                Ok(())
+            })
         })
         .await??;
         Ok(())
@@ -247,17 +322,20 @@ impl Database {
 
     pub async fn list_events(&self, run_id: &str) -> anyhow::Result<Vec<RuntimeEvent>> {
         let path = self.path.clone();
+        let connection = self.connection.clone();
         let run_id = run_id.to_string();
         spawn_blocking(move || -> anyhow::Result<Vec<RuntimeEvent>> {
-            let conn = open_connection(path.as_path())?;
-            let mut stmt = conn
-                .prepare("SELECT event_json FROM run_events WHERE run_id = ?1 ORDER BY id ASC")?;
-            let rows = stmt.query_map(params![run_id], |row| row.get::<_, String>(0))?;
-            let mut events = Vec::new();
-            for row in rows {
-                events.push(serde_json::from_str(&row?)?);
-            }
-            Ok(events)
+            with_connection(&connection, path.as_path(), |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT event_json FROM run_events WHERE run_id = ?1 ORDER BY id ASC",
+                )?;
+                let rows = stmt.query_map(params![run_id], |row| row.get::<_, String>(0))?;
+                let mut events = Vec::new();
+                for row in rows {
+                    events.push(serde_json::from_str(&row?)?);
+                }
+                Ok(events)
+            })
         })
         .await?
     }
@@ -266,100 +344,105 @@ impl Database {
         &self,
     ) -> anyhow::Result<Vec<(String, RuntimeStatus, BTreeSet<String>)>> {
         let path = self.path.clone();
-        spawn_blocking(move || -> anyhow::Result<Vec<(String, RuntimeStatus, BTreeSet<String>)>> {
-            let conn = open_connection(path.as_path())?;
-            let mut stmt = conn.prepare("SELECT run_id, status, state_json FROM runs")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })?;
-            let mut runs = Vec::new();
-            for row in rows {
-                let (run_id, status, state_json) = row?;
-                let partial: PartialCheckpointTmuxSessions = serde_json::from_str(&state_json)
-                    .unwrap_or(PartialCheckpointTmuxSessions {
-                        tmux_sessions: BTreeSet::new(),
-                    });
-                if partial.tmux_sessions.is_empty() {
-                    continue;
-                }
-                runs.push((
-                    run_id,
-                    status_from_str(&status),
-                    partial.tmux_sessions,
-                ));
-            }
-            Ok(runs)
-        })
+        let connection = self.connection.clone();
+        spawn_blocking(
+            move || -> anyhow::Result<Vec<(String, RuntimeStatus, BTreeSet<String>)>> {
+                with_connection(&connection, path.as_path(), |conn| {
+                    let mut stmt = conn.prepare("SELECT run_id, status, state_json FROM runs")?;
+                    let rows = stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?;
+                    let mut runs = Vec::new();
+                    for row in rows {
+                        let (run_id, status, state_json) = row?;
+                        let partial: PartialCheckpointTmuxSessions = serde_json::from_str(
+                            &state_json,
+                        )
+                        .unwrap_or(PartialCheckpointTmuxSessions {
+                            tmux_sessions: BTreeSet::new(),
+                        });
+                        if partial.tmux_sessions.is_empty() {
+                            continue;
+                        }
+                        runs.push((run_id, status_from_str(&status), partial.tmux_sessions));
+                    }
+                    Ok(runs)
+                })
+            },
+        )
         .await?
     }
 
     pub async fn list_interrupted_runs(&self) -> anyhow::Result<Vec<InterruptedRunSummary>> {
         let path = self.path.clone();
+        let connection = self.connection.clone();
         spawn_blocking(move || -> anyhow::Result<Vec<InterruptedRunSummary>> {
-            let conn = open_connection(path.as_path())?;
-            let mut stmt = conn.prepare(
-                "SELECT run_id, status, workflow_name, current_node_id, current_node_name, \
+            with_connection(&connection, path.as_path(), |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT run_id, status, workflow_name, current_node_id, current_node_name, \
                  total_executed, started_at, updated_at, pending_approval_json \
                  FROM runs WHERE status IN ('running', 'paused') ORDER BY updated_at DESC",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, u32>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                ))
-            })?;
-            let mut runs = Vec::new();
-            for row in rows {
-                let (
-                    run_id,
-                    status,
-                    workflow_name,
-                    current_node_id,
-                    current_node_name,
-                    total_executed,
-                    started_at,
-                    updated_at,
-                    pending_approval_json,
-                ) = row?;
-                let pending_approval = pending_approval_json
-                    .map(|json| serde_json::from_str(&json))
-                    .transpose()?;
-                runs.push(InterruptedRunSummary {
-                    run_id,
-                    status: status_from_str(&status),
-                    workflow_name,
-                    current_node_id,
-                    current_node_name,
-                    total_executed,
-                    started_at,
-                    updated_at,
-                    pending_approval,
-                });
-            }
-            Ok(runs)
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, u32>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                    ))
+                })?;
+                let mut runs = Vec::new();
+                for row in rows {
+                    let (
+                        run_id,
+                        status,
+                        workflow_name,
+                        current_node_id,
+                        current_node_name,
+                        total_executed,
+                        started_at,
+                        updated_at,
+                        pending_approval_json,
+                    ) = row?;
+                    let pending_approval = pending_approval_json
+                        .map(|json| serde_json::from_str(&json))
+                        .transpose()?;
+                    runs.push(InterruptedRunSummary {
+                        run_id,
+                        status: status_from_str(&status),
+                        workflow_name,
+                        current_node_id,
+                        current_node_name,
+                        total_executed,
+                        started_at,
+                        updated_at,
+                        pending_approval,
+                    });
+                }
+                Ok(runs)
+            })
         })
         .await?
     }
 
     pub async fn save_execution_log(&self, id: &str, log: &ExecutionLog) -> anyhow::Result<()> {
         let path = self.path.clone();
+        let connection = self.connection.clone();
         let id = safe_name(id)?;
         let log_value = serde_json::to_value(log)?;
         spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = open_connection(path.as_path())?;
-            conn.execute(
-                r#"
+            with_connection(&connection, path.as_path(), |conn| {
+                conn.execute(
+                    r#"
                 INSERT INTO logs (
                     id, filename, workflow_name, goal, start_time, end_time, total_duration, aborted, run_id, data_json
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
@@ -390,8 +473,9 @@ impl Database {
                     log_value.get("runId").and_then(Value::as_str),
                     serde_json::to_string(&log_value)?,
                 ],
-            )?;
-            Ok(())
+                )?;
+                Ok(())
+            })
         })
         .await??;
         Ok(())
@@ -399,126 +483,130 @@ impl Database {
 
     pub async fn list_logs(&self) -> anyhow::Result<Vec<LogListItem>> {
         let path = self.path.clone();
+        let connection = self.connection.clone();
         spawn_blocking(move || -> anyhow::Result<Vec<LogListItem>> {
-            let conn = open_connection(path.as_path())?;
-            let mut stmt = conn.prepare(
-                "SELECT id, filename, workflow_name, goal, start_time, end_time, total_duration, aborted, run_id, data_json FROM logs ORDER BY start_time DESC",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, i64>(7)?,
-                    row.get::<_, Option<String>>(8)?,
-                    row.get::<_, String>(9)?,
-                ))
-            })?;
-            let mut logs = Vec::new();
-            for row in rows {
-                let (id, filename, workflow_name, goal, start_time, end_time, total_duration, aborted, run_id, data_json) =
-                    row?;
-                let data_value: Value = serde_json::from_str(&data_json)?;
-                let node_execs = data_value
-                    .get("nodeExecutions")
-                    .and_then(Value::as_array);
-                let node_execution_count = node_execs.map(Vec::len).unwrap_or(0);
-                let (total_cost, total_in, total_out, succeeded, failed) =
-                    if let Some(execs) = node_execs {
-                        let mut cost = 0.0f64;
-                        let mut has_cost = false;
-                        let mut input = 0u64;
-                        let mut output = 0u64;
-                        let mut has_tokens = false;
-                        let mut ok = 0usize;
-                        let mut err = 0usize;
-                        for e in execs {
-                            if let Some(c) = e.get("costUsd").and_then(Value::as_f64) {
-                                cost += c;
-                                has_cost = true;
+            with_connection(&connection, path.as_path(), |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, filename, workflow_name, goal, start_time, end_time, total_duration, aborted, run_id, data_json FROM logs ORDER BY start_time DESC",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, String>(9)?,
+                    ))
+                })?;
+                let mut logs = Vec::new();
+                for row in rows {
+                    let (id, filename, workflow_name, goal, start_time, end_time, total_duration, aborted, run_id, data_json) =
+                        row?;
+                    let data_value: Value = serde_json::from_str(&data_json)?;
+                    let node_execs = data_value.get("nodeExecutions").and_then(Value::as_array);
+                    let node_execution_count = node_execs.map(Vec::len).unwrap_or(0);
+                    let (total_cost, total_in, total_out, succeeded, failed) =
+                        if let Some(execs) = node_execs {
+                            let mut cost = 0.0f64;
+                            let mut has_cost = false;
+                            let mut input = 0u64;
+                            let mut output = 0u64;
+                            let mut has_tokens = false;
+                            let mut ok = 0usize;
+                            let mut err = 0usize;
+                            for e in execs {
+                                if let Some(c) = e.get("costUsd").and_then(Value::as_f64) {
+                                    cost += c;
+                                    has_cost = true;
+                                }
+                                if let Some(t) = e.get("inputTokens").and_then(Value::as_u64) {
+                                    input += t;
+                                    has_tokens = true;
+                                }
+                                if let Some(t) = e.get("outputTokens").and_then(Value::as_u64) {
+                                    output += t;
+                                    has_tokens = true;
+                                }
+                                if e.get("success").and_then(Value::as_bool).unwrap_or(false) {
+                                    ok += 1;
+                                } else {
+                                    err += 1;
+                                }
                             }
-                            if let Some(t) = e.get("inputTokens").and_then(Value::as_u64) {
-                                input += t;
-                                has_tokens = true;
-                            }
-                            if let Some(t) = e.get("outputTokens").and_then(Value::as_u64) {
-                                output += t;
-                                has_tokens = true;
-                            }
-                            if e.get("success").and_then(Value::as_bool).unwrap_or(false) {
-                                ok += 1;
-                            } else {
-                                err += 1;
-                            }
-                        }
-                        (
-                            if has_cost { Some(cost) } else { None },
-                            if has_tokens { Some(input) } else { None },
-                            if has_tokens { Some(output) } else { None },
-                            ok,
-                            err,
-                        )
-                    } else {
-                        (None, None, None, 0, 0)
-                    };
-                logs.push(LogListItem {
-                    id,
-                    filename,
-                    workflow_name,
-                    goal,
-                    start_time,
-                    end_time,
-                    total_duration,
-                    node_execution_count,
-                    decision_count: data_value
-                        .get("decisions")
-                        .and_then(Value::as_array)
-                        .map(Vec::len)
-                        .unwrap_or(0),
-                    aborted: aborted == 1,
-                    run_id,
-                    total_cost_usd: total_cost,
-                    total_input_tokens: total_in,
-                    total_output_tokens: total_out,
-                    nodes_succeeded: succeeded,
-                    nodes_failed: failed,
-                });
-            }
-            Ok(logs)
+                            (
+                                if has_cost { Some(cost) } else { None },
+                                if has_tokens { Some(input) } else { None },
+                                if has_tokens { Some(output) } else { None },
+                                ok,
+                                err,
+                            )
+                        } else {
+                            (None, None, None, 0, 0)
+                        };
+                    logs.push(LogListItem {
+                        id,
+                        filename,
+                        workflow_name,
+                        goal,
+                        start_time,
+                        end_time,
+                        total_duration,
+                        node_execution_count,
+                        decision_count: data_value
+                            .get("decisions")
+                            .and_then(Value::as_array)
+                            .map(Vec::len)
+                            .unwrap_or(0),
+                        aborted: aborted == 1,
+                        run_id,
+                        total_cost_usd: total_cost,
+                        total_input_tokens: total_in,
+                        total_output_tokens: total_out,
+                        nodes_succeeded: succeeded,
+                        nodes_failed: failed,
+                    });
+                }
+                Ok(logs)
+            })
         })
         .await?
     }
 
     pub async fn get_log(&self, id: &str) -> anyhow::Result<Option<Value>> {
         let path = self.path.clone();
+        let connection = self.connection.clone();
         let id = safe_name(id)?;
         spawn_blocking(move || -> anyhow::Result<Option<Value>> {
-            let conn = open_connection(path.as_path())?;
-            let data_json = conn
-                .query_row(
-                    "SELECT data_json FROM logs WHERE id = ?1",
-                    params![id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            Ok(data_json
-                .map(|value| serde_json::from_str(&value))
-                .transpose()?)
+            with_connection(&connection, path.as_path(), |conn| {
+                let data_json = conn
+                    .query_row(
+                        "SELECT data_json FROM logs WHERE id = ?1",
+                        params![id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                Ok(data_json
+                    .map(|value| serde_json::from_str(&value))
+                    .transpose()?)
+            })
         })
         .await?
     }
 
     pub async fn delete_log(&self, id: &str) -> anyhow::Result<()> {
         let path = self.path.clone();
+        let connection = self.connection.clone();
         let id = safe_name(id)?;
         spawn_blocking(move || -> anyhow::Result<()> {
-            let conn = open_connection(path.as_path())?;
-            conn.execute("DELETE FROM logs WHERE id = ?1", params![id])?;
-            Ok(())
+            with_connection(&connection, path.as_path(), |conn| {
+                conn.execute("DELETE FROM logs WHERE id = ?1", params![id])?;
+                Ok(())
+            })
         })
         .await??;
         Ok(())
@@ -671,11 +759,68 @@ fn value_str<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
+fn with_connection<T>(
+    connection: &Arc<Mutex<Option<Connection>>>,
+    path: &Path,
+    operation: impl FnOnce(&Connection) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut guard = connection
+        .lock()
+        .map_err(|_| anyhow::anyhow!("database connection mutex poisoned"))?;
+    if guard.is_none() {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            ensure_dir(parent)?;
+        }
+        *guard = Some(open_connection(path)?);
+    }
+    let conn = guard
+        .as_ref()
+        .expect("database connection should be initialized");
+    operation(conn)
+}
+
 fn open_connection(path: &Path) -> anyhow::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(conn)
+}
+
+fn ensure_runs_stream_token_column(conn: &Connection) -> anyhow::Result<()> {
+    let has_stream_token = {
+        let mut stmt = conn.prepare("PRAGMA table_info(runs)")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut found = false;
+        for column in columns {
+            if column? == "stream_token" {
+                found = true;
+                break;
+            }
+        }
+        found
+    };
+
+    if !has_stream_token {
+        conn.execute("ALTER TABLE runs ADD COLUMN stream_token TEXT", [])?;
+    }
+
+    let run_ids = {
+        let mut stmt = conn
+            .prepare("SELECT run_id FROM runs WHERE stream_token IS NULL OR stream_token = ''")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for run_id in run_ids {
+        conn.execute(
+            "UPDATE runs SET stream_token = ?2 WHERE run_id = ?1",
+            params![run_id, new_stream_token()],
+        )?;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -874,6 +1019,7 @@ mod tests {
         let db = Database::new(temp.path().join("silverbond.db"));
         db.init().await.unwrap();
         let persisted = PersistedRun {
+            stream_token: "test-stream-token".to_string(),
             checkpoint: crate::runtime::RuntimeCheckpoint {
                 run_id: "r1".to_string(),
                 status: RuntimeStatus::Running,
@@ -923,6 +1069,26 @@ mod tests {
             workflow: sample_workflow(),
         };
         db.upsert_run(&persisted).await.unwrap();
-        assert!(db.get_run("r1").await.unwrap().is_some());
+        let loaded = db.get_run("r1").await.unwrap().unwrap();
+        assert_eq!(loaded.workflow, persisted.workflow);
+        assert_eq!(loaded.stream_token, persisted.stream_token);
+
+        let mut changed = persisted.clone();
+        changed.stream_token = "changed-stream-token".to_string();
+        changed.workflow.name = Some("changed".to_string());
+        changed.checkpoint.total_executed = 7;
+        db.upsert_run(&changed).await.unwrap();
+        let loaded = db.get_run("r1").await.unwrap().unwrap();
+        assert_eq!(loaded.checkpoint.total_executed, 7);
+        assert_eq!(loaded.workflow, persisted.workflow);
+        assert_eq!(loaded.stream_token, persisted.stream_token);
+
+        let mut checkpoint = loaded.checkpoint;
+        checkpoint.total_executed = 8;
+        db.update_run_checkpoint(&checkpoint).await.unwrap();
+        let loaded = db.get_run("r1").await.unwrap().unwrap();
+        assert_eq!(loaded.checkpoint.total_executed, 8);
+        assert_eq!(loaded.workflow, persisted.workflow);
+        assert_eq!(loaded.stream_token, persisted.stream_token);
     }
 }

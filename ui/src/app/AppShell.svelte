@@ -1,6 +1,6 @@
 <script lang="ts">
   import { createQuery, createMutation, useQueryClient } from "@tanstack/svelte-query";
-  import { api, streamRun, type RunActionResponse } from "@/lib/api/client";
+  import { ApiError, api, streamRun, type RunActionResponse } from "@/lib/api/client";
   import {
     createEmptyWorkflow,
     duplicateWorkflowForEditing,
@@ -177,6 +177,22 @@
     setTimeout(() => { runMessage = ""; }, 3000);
   }
 
+  async function createRunWithUnlock(targetWorkflow: WorkflowDocument) {
+    const variableOverrides = collectVariableOverrides(targetWorkflow);
+    try {
+      return await api.createRun(targetWorkflow, variableOverrides);
+    } catch (err) {
+      if (!(err instanceof ApiError) || err.code !== "privileged_unlock_required") {
+        throw err;
+      }
+      const unlockSecret = window.prompt("Unlock password");
+      if (unlockSecret === null) {
+        throw new Error("Run cancelled");
+      }
+      return api.createRun(targetWorkflow, variableOverrides, unlockSecret);
+    }
+  }
+
   async function startRun(targetWorkflow: WorkflowDocument) {
     store.clearLines();
     store.setPanelTab("output");
@@ -184,10 +200,10 @@
     runStartTime = Date.now();
     let hadError = false;
     try {
-      const payload = await api.createRun(targetWorkflow, collectVariableOverrides(targetWorkflow));
+      const payload = await createRunWithUnlock(targetWorkflow);
       store.setRunObservability(observabilityFromPayload(payload));
-      store.setRunState({ runId: payload.runId, running: true });
-      await streamRun(payload.runId, (event) => store.applyRunEvent(event));
+      store.setRunState({ runId: payload.runId, streamToken: payload.streamToken, running: true });
+      await streamRun(payload.runId, payload.streamToken, (event) => store.applyRunEvent(event));
     } catch (err) {
       hadError = true;
       store.setError(`Run failed: ${err instanceof Error ? err.message : "Unknown error"}`);
@@ -202,13 +218,14 @@
   async function resumeRun(runId: string) {
     store.setPanelTab("output");
     store.clearLines();
-    store.setRunState({ running: true, runId });
+    store.setRunState({ running: true });
     runStartTime = Date.now();
     let hadError = false;
     try {
       const payload = await api.resumeRun(runId);
       store.setRunObservability(observabilityFromPayload(payload));
-      await streamRun(payload.runId, (event) => store.applyRunEvent(event));
+      store.setRunState({ runId: payload.runId, streamToken: payload.streamToken, running: true });
+      await streamRun(payload.runId, payload.streamToken, (event) => store.applyRunEvent(event));
     } catch (err) {
       hadError = true;
       store.setError(`Resume failed: ${err instanceof Error ? err.message : "Unknown error"}`);
@@ -223,13 +240,14 @@
   async function restartFromNode(runId: string, nodeId: string) {
     store.setPanelTab("output");
     store.clearLines();
-    store.setRunState({ running: true, runId });
+    store.setRunState({ running: true });
     runStartTime = Date.now();
     let hadError = false;
     try {
       const payload = await api.restartFromNode(runId, nodeId);
       store.setRunObservability(observabilityFromPayload(payload));
-      await streamRun(payload.runId, (event) => store.applyRunEvent(event));
+      store.setRunState({ runId: payload.runId, streamToken: payload.streamToken, running: true });
+      await streamRun(payload.runId, payload.streamToken, (event) => store.applyRunEvent(event));
     } catch (err) {
       hadError = true;
       store.setError(`Restart failed: ${err instanceof Error ? err.message : "Unknown error"}`);
@@ -451,7 +469,7 @@
         }}
       />
     {:else if store.panelTab === "terminal"}
-      <PaneTerminal runId={store.runId} workflow={store.workflow} />
+      <PaneTerminal runId={store.runId} streamToken={store.streamToken} workflow={store.workflow} />
     {:else if store.panelTab === "history"}
       <HistoryPanel
         onResume={(runId) => resumeRun(runId)}

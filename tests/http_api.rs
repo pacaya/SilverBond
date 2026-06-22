@@ -7,14 +7,22 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use silverbond::{
     api,
-    app::{AppPaths, AppState, PaneStreamRegistry},
-    runtime::RuntimeContext,
+    app::{AppPaths, AppState, PaneStreamRegistry, SecurityConfig, sha256_unlock_password_hash},
+    runtime::{PersistedRun, RuntimeContext, RuntimeStatus},
     storage::{Database, TemplateStore, WorkflowStore},
 };
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+const SEC_FETCH_SITE: &str = "sec-fetch-site";
+
 async fn test_router() -> (TempDir, Router) {
+    let (temp, router, _) = test_router_with_db().await;
+    (temp, router)
+}
+
+async fn test_router_with_db() -> (TempDir, Router, Database) {
     let temp = TempDir::new().unwrap();
     let paths = AppPaths::from_root(temp.path());
     std::fs::create_dir_all(&paths.workflows_dir).unwrap();
@@ -27,10 +35,14 @@ async fn test_router() -> (TempDir, Router) {
         paths: paths.clone(),
         workflows: WorkflowStore::new(paths.workflows_dir.clone()),
         templates: TemplateStore::new(paths.templates_dir.clone()),
-        runtime: RuntimeContext::new(db),
+        runtime: RuntimeContext::new(db.clone()),
         pane_streams: PaneStreamRegistry::default(),
+        security: SecurityConfig {
+            agent_user: None,
+            unlock_password_hash: Some(sha256_unlock_password_hash("test-unlock")),
+        },
     };
-    (temp, api::router(state))
+    (temp, api::router(state), db)
 }
 
 async fn json_response(router: &Router, request: Request<Body>) -> (StatusCode, Value) {
@@ -52,6 +64,92 @@ async fn response_status(router: &Router, request: Request<Body>) -> StatusCode 
     status
 }
 
+async fn wait_for_run<F>(db: &Database, run_id: &str, mut predicate: F) -> PersistedRun
+where
+    F: FnMut(&PersistedRun) -> bool,
+{
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(persisted) = db.get_run(run_id).await.unwrap() {
+            if predicate(&persisted) {
+                return persisted;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for run {run_id}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn echo_workflow() -> Value {
+    json!({
+        "version": 3,
+        "name": "Echo Finish",
+        "goal": "Finish",
+        "cwd": "",
+        "useOrchestrator": false,
+        "entryNodeId": "n1",
+        "variables": [],
+        "limits": { "maxTotalSteps": 5, "maxVisitsPerNode": 5 },
+        "nodes": [
+            {
+                "id": "n1",
+                "name": "Echo",
+                "agent": "echo",
+                "prompt": "done",
+                "kind": { "type": "task" }
+            }
+        ],
+        "edges": []
+    })
+}
+
+async fn create_terminal_echo_run(router: &Router, db: &Database) -> (String, String) {
+    let (status, create) = json_response(
+        router,
+        Request::builder()
+            .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
+            .uri("/api/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "workflow": echo_workflow(),
+                    "unlockSecret": "test-unlock"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{create:?}");
+    let run_id = create["runId"].as_str().unwrap().to_string();
+    let stream_token = create["streamToken"].as_str().unwrap().to_string();
+    assert!(stream_token.len() >= 32);
+
+    let persisted = wait_for_run(db, &run_id, |persisted| {
+        matches!(
+            persisted.checkpoint.status,
+            RuntimeStatus::Completed | RuntimeStatus::Failed | RuntimeStatus::Aborted
+        )
+    })
+    .await;
+    assert_eq!(persisted.stream_token, stream_token);
+    (run_id, stream_token)
+}
+
+fn assert_body_omits(body: &Value, fragments: &[&str]) {
+    let text = body.to_string();
+    for fragment in fragments {
+        assert!(
+            !text.contains(fragment),
+            "response body {text} should not contain {fragment}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn exposes_health() {
     let (_temp, router) = test_router().await;
@@ -70,14 +168,28 @@ async fn exposes_health() {
 }
 
 #[tokio::test]
-async fn streaming_routes_require_allowed_origin() {
-    let (_temp, router) = test_router().await;
+async fn streaming_routes_allow_same_origin_sse_and_require_ws_origin() {
+    let (_temp, router, db) = test_router_with_db().await;
+    let (run_id, stream_token) = create_terminal_echo_run(&router, &db).await;
 
     let status = response_status(
         &router,
         Request::builder()
             .method("GET")
-            .uri("/api/runs/missing/stream")
+            .uri(format!("/api/runs/{run_id}/stream?token={stream_token}"))
+            .header(SEC_FETCH_SITE, "same-origin")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let status = response_status(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/runs/{run_id}/stream?token={stream_token}"))
+            .header(SEC_FETCH_SITE, "cross-site")
             .body(Body::empty())
             .unwrap(),
     )
@@ -88,7 +200,7 @@ async fn streaming_routes_require_allowed_origin() {
         &router,
         Request::builder()
             .method("GET")
-            .uri("/api/runs/missing/stream")
+            .uri(format!("/api/runs/{run_id}/stream?token={stream_token}"))
             .header("origin", "https://evil.com")
             .body(Body::empty())
             .unwrap(),
@@ -100,7 +212,7 @@ async fn streaming_routes_require_allowed_origin() {
         &router,
         Request::builder()
             .method("GET")
-            .uri("/api/runs/missing/stream")
+            .uri(format!("/api/runs/{run_id}/stream?token={stream_token}"))
             .header("origin", "http://127.0.0.1:3333")
             .body(Body::empty())
             .unwrap(),
@@ -113,6 +225,10 @@ async fn streaming_routes_require_allowed_origin() {
         Request::builder()
             .method("GET")
             .uri("/api/runs/missing/panes/active/stream")
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
             .body(Body::empty())
             .unwrap(),
     )
@@ -125,11 +241,330 @@ async fn streaming_routes_require_allowed_origin() {
             .method("GET")
             .uri("/api/runs/missing/panes/active/stream")
             .header("origin", "https://evil.com")
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
             .body(Body::empty())
             .unwrap(),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn run_stream_requires_matching_stream_token() {
+    let (_temp, router, db) = test_router_with_db().await;
+    let (run_id, stream_token) = create_terminal_echo_run(&router, &db).await;
+
+    let status = response_status(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/runs/{run_id}/stream"))
+            .header(SEC_FETCH_SITE, "same-origin")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let status = response_status(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/runs/{run_id}/stream?token=wrong-token"))
+            .header(SEC_FETCH_SITE, "same-origin")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let status = response_status(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/runs/{run_id}/stream?token={stream_token}"))
+            .header(SEC_FETCH_SITE, "same-origin")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn mutating_run_control_routes_reject_cross_site_requests() {
+    let (_temp, router) = test_router().await;
+
+    let status = response_status(
+        &router,
+        Request::builder()
+            .method("POST")
+            .uri("/api/runs/missing/abort")
+            .header(SEC_FETCH_SITE, "cross-site")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let status = response_status(
+        &router,
+        Request::builder()
+            .method("POST")
+            .uri("/api/runs/missing/restart-from/node-1")
+            .header("origin", "https://evil.com")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn run_control_routes_return_typed_client_errors() {
+    let (_temp, router, db) = test_router_with_db().await;
+    let missing_run_id = "run_secret_missing";
+
+    let (status, body) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
+            .uri(format!("/api/runs/{missing_run_id}/resume"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "run not found");
+    assert_body_omits(&body, &[missing_run_id]);
+
+    let (status, body) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
+            .uri(format!(
+                "/api/runs/{missing_run_id}/restart-from/missing-node"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "run not found");
+    assert_body_omits(&body, &[missing_run_id, "missing-node"]);
+
+    let stale_session_id = "session_secret_stale";
+    let (status, body) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
+            .uri(format!("/api/runs/{missing_run_id}/respond-interaction"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "sessionId": stale_session_id,
+                    "response": "continue"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "no active interaction for this run");
+    assert_body_omits(&body, &[missing_run_id, stale_session_id]);
+
+    let (status, body) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
+            .uri(format!("/api/runs/{missing_run_id}/abort"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["success"], true);
+
+    let approval_workflow = json!({
+        "version": 3,
+        "name": "Approval Only",
+        "goal": "Approve",
+        "cwd": "",
+        "useOrchestrator": false,
+        "entryNodeId": "a1",
+        "variables": [],
+        "limits": { "maxTotalSteps": 5, "maxVisitsPerNode": 5 },
+        "nodes": [
+            {
+                "id": "a1",
+                "name": "Approval",
+                "prompt": "Approve?",
+                "kind": { "type": "approval" }
+            }
+        ],
+        "edges": []
+    });
+    let (status, create) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
+            .uri("/api/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "workflow": approval_workflow })).unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{create:?}");
+    let active_run_id = create["runId"].as_str().unwrap().to_string();
+    wait_for_run(&db, &active_run_id, |persisted| {
+        persisted.checkpoint.pending_approval.is_some()
+    })
+    .await;
+
+    let (status, body) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
+            .uri(format!("/api/runs/{active_run_id}/respond-interaction"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "sessionId": stale_session_id,
+                    "response": "continue"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "interaction session is stale");
+    assert_body_omits(&body, &[&active_run_id, stale_session_id]);
+
+    let echo_workflow = json!({
+        "version": 3,
+        "name": "Echo Finish",
+        "goal": "Finish",
+        "cwd": "",
+        "useOrchestrator": false,
+        "entryNodeId": "n1",
+        "variables": [],
+        "limits": { "maxTotalSteps": 5, "maxVisitsPerNode": 5 },
+        "nodes": [
+            {
+                "id": "n1",
+                "name": "Echo",
+                "agent": "echo",
+                "prompt": "done",
+                "kind": { "type": "task" }
+            }
+        ],
+        "edges": []
+    });
+    let (status, create) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
+            .uri("/api/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "workflow": echo_workflow,
+                    "unlockSecret": "test-unlock"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{create:?}");
+    let terminal_run_id = create["runId"].as_str().unwrap().to_string();
+    wait_for_run(&db, &terminal_run_id, |persisted| {
+        matches!(
+            persisted.checkpoint.status,
+            RuntimeStatus::Completed | RuntimeStatus::Failed | RuntimeStatus::Aborted
+        )
+    })
+    .await;
+
+    let (status, body) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
+            .uri(format!("/api/runs/{terminal_run_id}/resume"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "run is in terminal state");
+    assert_body_omits(&body, &[&terminal_run_id]);
+
+    let missing_node_id = "secret-node-target";
+    let (status, body) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
+            .uri(format!(
+                "/api/runs/{terminal_run_id}/restart-from/{missing_node_id}"
+            ))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(body["error"], "node not found in workflow");
+    assert_body_omits(&body, &[&terminal_run_id, missing_node_id]);
+}
+
+#[tokio::test]
+async fn internal_http_errors_use_fixed_client_body() {
+    let temp = TempDir::new().unwrap();
+    let paths = AppPaths::from_root(temp.path());
+    std::fs::write(temp.path().join(".silverbond"), b"not a directory").unwrap();
+    let db = Database::new(paths.database_path.clone());
+    let state = AppState {
+        paths: paths.clone(),
+        workflows: WorkflowStore::new(paths.workflows_dir.clone()),
+        templates: TemplateStore::new(paths.templates_dir.clone()),
+        runtime: RuntimeContext::new(db),
+        pane_streams: PaneStreamRegistry::default(),
+        security: SecurityConfig::default(),
+    };
+    let router = api::router(state);
+    let run_id = "run_secret_internal";
+
+    let (status, body) = json_response(
+        &router,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/runs/{run_id}/events"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["error"], "internal error");
+    assert_body_omits(
+        &body,
+        &[run_id, paths.database_path.to_string_lossy().as_ref()],
+    );
 }
 
 #[tokio::test]
@@ -168,6 +603,7 @@ async fn validates_and_saves_workflows() {
         &router,
         Request::builder()
             .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
             .uri("/api/validate-workflow")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -187,6 +623,7 @@ async fn validates_and_saves_workflows() {
         &router,
         Request::builder()
             .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
             .uri("/api/workflows")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -232,6 +669,7 @@ async fn rejects_legacy_workflow_payloads() {
         &router,
         Request::builder()
             .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
             .uri("/api/validate-workflow")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -252,6 +690,7 @@ async fn rejects_legacy_workflow_payloads() {
         &router,
         Request::builder()
             .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
             .uri("/api/runs")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -279,6 +718,7 @@ async fn test_node_accepts_v3_task_node() {
         &router,
         Request::builder()
             .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
             .uri("/api/test-node")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -312,6 +752,7 @@ async fn test_node_rejects_non_preview_node_payloads() {
         &router,
         Request::builder()
             .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
             .uri("/api/test-node")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -349,6 +790,7 @@ async fn test_node_rejects_non_preview_node_payloads() {
         &router,
         Request::builder()
             .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
             .uri("/api/test-node")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -420,6 +862,7 @@ async fn validates_workflow_with_agent_config() {
         &router,
         Request::builder()
             .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
             .uri("/api/validate-workflow")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -592,6 +1035,7 @@ async fn creates_and_approves_runs() {
         &router,
         Request::builder()
             .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
             .uri("/api/runs")
             .header("content-type", "application/json")
             .body(Body::from(
@@ -627,6 +1071,7 @@ async fn creates_and_approves_runs() {
         &router,
         Request::builder()
             .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
             .uri(format!("/api/runs/{}/approve", run_id))
             .header("content-type", "application/json")
             .body(Body::from(

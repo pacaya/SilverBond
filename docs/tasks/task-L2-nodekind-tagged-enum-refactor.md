@@ -1,10 +1,10 @@
 # Task L2 — Migrate `WorkflowNode` to a tagged `NodeKind` enum (standalone `version: 3` PR)
 
 > **Origin:** Finding **L2** from `docs/local/feature-tmux-panes-code-review.md` (branch
-> `feature/tmux-panes`). Explicitly **deferred** out of the tmux-panes branch during
+> `feature/tmux-panes`). **⚠️ Status: Superseded** — Explicitly **deferred** out of the tmux-panes branch during
 > `fix-code-review` because it is a **breaking wire-format change** that must not be folded into an
 > unrelated feature branch. This document is the developer-ready spec to implement it as its **own
-> PR**.
+> PR**. *(Superseded: landed in `feature/tmux-panes`; see Status below.)*
 >
 > **Severity:** LOW — maintenance / code-quality, *not* a runtime bug. `validate_workflow`
 > (`src/model.rs`) runs before execution (`src/api.rs`) and hard-errors the missing-config case, so
@@ -17,6 +17,18 @@
 > run that closed M1–M7/L1 has since landed on `src/runtime.rs` and `src/tmux_exec.rs`, so anchors in
 > those files have drifted. `src/model.rs` and `ui/src/lib/types/workflow.ts` were **not** touched by
 > that run. **Locate code by symbol/grep, not by trusting these line numbers.**
+
+## Status
+
+**⚠️ Status: Superseded** — The "separate PR" / "out of scope for tmux-panes" mandate in the blockquote
+above and in Out of scope below is superseded. This refactor was intentionally landed in
+`feature/tmux-panes` (commit `25f421b`) because:
+
+- The feature is structurally coupled to the new `NodeKind` shape (`Capture`/`Kill` pane ops are
+  variants; runtime dispatch matches `node.kind`).
+- `CLAUDE.md` line 29 mandates canonical `version: 3` as the project-wide standard, making the
+  original "premature breaking change" concern moot.
+- Existing round-trip and v2→v3 migration tests cover the bundled breaking change.
 
 ---
 
@@ -113,8 +125,9 @@ commit.
 
 - Any behavioral change to workflow execution semantics — this is a pure representation refactor.
 - The unrelated below-the-cut cleanups noted in the review (dead code, duplication, efficiency).
-- Folding this into the `feature/tmux-panes` branch — it must be its **own PR** off the appropriate
-  base, because of the breaking wire change.
+- **⚠️ Status: Superseded** — Folding this into the `feature/tmux-panes` branch — it must be its **own
+  PR** off the appropriate base, because of the breaking wire change. *(Landed in `feature/tmux-panes`
+  instead; see Status above.)*
 
 ## Notes for the implementing agent
 
