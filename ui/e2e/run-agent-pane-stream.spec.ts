@@ -25,6 +25,7 @@ import type { Page } from "@playwright/test";
 // ---------------------------------------------------------------------------
 
 const BASE = "http://127.0.0.1:3333";
+const E2E_UNLOCK_SECRET = process.env.SILVERBOND_E2E_UNLOCK_SECRET ?? "test-unlock";
 
 /** POST /api/runs and return the runId. Throws on non-2xx. */
 async function createRun(
@@ -33,7 +34,7 @@ async function createRun(
   variableOverrides: Record<string, string> = {},
 ): Promise<string> {
   const resp = await page.request.post(`${BASE}/api/runs`, {
-    data: { workflow, variableOverrides },
+    data: { workflow, variableOverrides, unlockSecret: E2E_UNLOCK_SECRET },
   });
   if (!resp.ok()) {
     const body = await resp.text();

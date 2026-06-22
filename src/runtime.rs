@@ -1752,24 +1752,6 @@ fn build_session_persistence_set(
         .collect()
 }
 
-fn collect_session_persistence_nodes(workflow: &WorkflowV3, retained: &mut HashSet<String>) {
-    retained.extend(
-        workflow
-            .nodes
-            .iter()
-            .filter_map(|node| node.continue_session_from.clone()),
-    );
-    for subflow in workflow.subflows.values() {
-        collect_session_persistence_nodes(subflow, retained);
-    }
-}
-
-fn build_terminal_session_persistence_set(workflow: &WorkflowV3) -> HashSet<String> {
-    let mut retained = HashSet::new();
-    collect_session_persistence_nodes(workflow, &mut retained);
-    retained
-}
-
 fn scoped_workflow_cwd(active_workflow: &WorkflowV3, root_cwd: &str) -> String {
     if active_workflow.cwd.is_empty() {
         root_cwd.to_string()
@@ -2573,14 +2555,14 @@ async fn fail_workflow_after_error(
     duration: Duration,
 ) -> anyhow::Result<()> {
     let message = error.to_string();
-    emit_event(
+    let _ = emit_event(
         ctx,
         run_id,
         RuntimeEvent::new("workflow_error").with("message", message),
     )
-    .await?;
+    .await;
 
-    let persisted = ctx.db.get_run(run_id).await?;
+    let persisted = ctx.db.get_run(run_id).await.ok().flatten();
     let (mut checkpoint, workflow) = persisted
         .map(|persisted| (persisted.checkpoint, persisted.workflow))
         .unwrap_or((fallback_checkpoint, workflow));
@@ -5921,6 +5903,7 @@ async fn finalize_run(
         .or_else(|| Some("completed".to_string()));
 
     let log_id = build_log_id(&checkpoint.execution_log.workflow_name);
+    let completed_results = checkpoint.all_results.clone();
     let persistence_result: anyhow::Result<()> = async {
         ctx.db
             .save_execution_log(&log_id, &checkpoint.execution_log)
@@ -5962,16 +5945,26 @@ async fn finalize_run(
     }
     .await;
 
-    cleanup_terminal_active_panes(ctx, &run_id, workflow).await;
+    cleanup_terminal_active_panes(ctx, &run_id, workflow, &completed_results).await;
     ctx.registry.clear(&run_id).await;
     persistence_result
 }
 
-async fn cleanup_terminal_active_panes(ctx: &RuntimeContext, run_id: &str, workflow: &WorkflowV3) {
-    let persistence_keys = build_terminal_session_persistence_set(workflow);
+async fn cleanup_terminal_active_panes(
+    ctx: &RuntimeContext,
+    run_id: &str,
+    workflow: &WorkflowV3,
+    completed_results: &BTreeMap<String, NodeResult>,
+) {
+    let pending_continuation_keys =
+        build_session_persistence_set(&workflow.graph(), completed_results);
+    debug_assert!(
+        pending_continuation_keys.is_empty(),
+        "terminal cleanup requires no pending continuation panes"
+    );
     let targets = ctx
         .registry
-        .active_pane_cleanup_targets_except_keys(run_id, &persistence_keys)
+        .active_pane_cleanup_targets_except_keys(run_id, &HashSet::new())
         .await;
     if targets.is_empty() {
         return;
@@ -8443,6 +8436,63 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn fail_workflow_backstop_cleans_registry_on_prelude_persistence_error() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("silverbond.db");
+        let db = Database::new(db_path.clone());
+        db.init().await.unwrap();
+        let (invocation, _kill_log, kill_marker) = fake_tmux_kill_invocation(&temp);
+        let mut runtime = RuntimeContext::new(db.clone());
+        runtime.run_invocation = Some(invocation);
+        let workflow = workflow_from_parts(
+            "backstop_prelude_err",
+            vec![task_node("work", "Work", "register pane")],
+            Vec::new(),
+        );
+        let run_id = "run_backstop_prelude_err";
+        let checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        runtime.registry.register(run_id).await;
+        runtime
+            .registry
+            .set_active_pane(run_id, &active_pane_key("cursor", "work"), "%prelude-err-pane")
+            .await;
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            checkpoint: checkpoint.clone(),
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+
+        {
+            use rusqlite::Connection;
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute("DROP TABLE run_events", []).unwrap();
+            conn.execute("DROP TABLE logs", []).unwrap();
+        }
+
+        let result = fail_workflow_after_error(
+            &runtime,
+            workflow,
+            checkpoint,
+            run_id,
+            anyhow::anyhow!("forced workflow failure"),
+            Duration::from_millis(1),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "expected finalize persistence to fail after best-effort prelude: {result:?}"
+        );
+        wait_for_path(&kill_marker).await;
+        assert!(
+            !runtime.registry.active_run_ids().await.contains(run_id),
+            "backstop should clear registry even when prelude persistence fails"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn finalize_run_cleans_registry_on_persistence_error() {
         let temp = TempDir::new().unwrap();
         let db_path = temp.path().join("silverbond.db");
@@ -9301,6 +9351,76 @@ mod tests {
         assert!(
             !source_config.ephemeral_session,
             "subflow source node referenced by continueSessionFrom must stay persistent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_cleanup_kills_consumed_continue_session_source_pane() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let (invocation, kill_log, kill_marker) = fake_tmux_kill_invocation(&temp);
+        let mut runtime = RuntimeContext::new(db.clone());
+        runtime.run_invocation = Some(invocation);
+
+        let source = task_node("source", "Source", "source prompt");
+        let mut continuation = task_node("continuation", "Continuation", "continue prompt");
+        continuation.continue_session_from = Some("source".to_string());
+        let workflow = workflow_from_parts(
+            "chain",
+            vec![source, continuation],
+            vec![success_edge(
+                "source_continuation",
+                "source",
+                "continuation",
+                None,
+            )],
+        );
+        let run_id = "run_terminal_continue_cleanup";
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.status = RuntimeStatus::Completed;
+        checkpoint.active_cursors.clear();
+        checkpoint
+            .all_results
+            .insert("source".to_string(), NodeResult::default());
+        checkpoint
+            .all_results
+            .insert("continuation".to_string(), NodeResult::default());
+        runtime.registry.register(run_id).await;
+        runtime
+            .registry
+            .set_active_pane(
+                run_id,
+                &active_pane_key("cursor", "source"),
+                "%continue-source-pane",
+            )
+            .await;
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            checkpoint: checkpoint.clone(),
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+
+        finalize_run(
+            &runtime,
+            &workflow,
+            checkpoint,
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+
+        wait_for_path(&kill_marker).await;
+        wait_for_registry_empty(&runtime.registry, &run_id).await;
+        let recorded = fs::read_to_string(kill_log)
+            .expect("fake tmux should record consumed continuation source cleanup");
+        assert!(recorded.contains("kill-pane"));
+        assert!(
+            recorded.contains("%continue-source-pane"),
+            "consumed continueSessionFrom source pane should be killed at terminal cleanup"
         );
     }
 

@@ -23,6 +23,14 @@ async fn test_router() -> (TempDir, Router) {
 }
 
 async fn test_router_with_db() -> (TempDir, Router, Database) {
+    test_router_with_security(SecurityConfig {
+        agent_user: None,
+        unlock_password_hash: Some(sha256_unlock_password_hash("test-unlock")),
+    })
+    .await
+}
+
+async fn test_router_with_security(security: SecurityConfig) -> (TempDir, Router, Database) {
     let temp = TempDir::new().unwrap();
     let paths = AppPaths::from_root(temp.path());
     std::fs::create_dir_all(&paths.workflows_dir).unwrap();
@@ -37,10 +45,7 @@ async fn test_router_with_db() -> (TempDir, Router, Database) {
         templates: TemplateStore::new(paths.templates_dir.clone()),
         runtime: RuntimeContext::new(db.clone()),
         pane_streams: PaneStreamRegistry::default(),
-        security: SecurityConfig {
-            agent_user: None,
-            unlock_password_hash: Some(sha256_unlock_password_hash("test-unlock")),
-        },
+        security,
     };
     (temp, api::router(state), db)
 }
@@ -165,6 +170,31 @@ async fn exposes_health() {
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(health["ok"], true);
+}
+
+#[tokio::test]
+async fn create_run_with_default_security_reports_unlock_not_configured() {
+    let (_temp, router, _db) = test_router_with_security(SecurityConfig::default()).await;
+
+    let (status, body) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
+            .uri("/api/runs")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({ "workflow": echo_workflow() })).unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["code"], "unlock_not_configured");
+    let message = body["error"].as_str().unwrap();
+    assert!(message.contains("SILVERBOND_UNLOCK_PASSWORD_HASH"));
+    assert!(message.contains("SILVERBOND_AGENT_USER"));
 }
 
 #[tokio::test]

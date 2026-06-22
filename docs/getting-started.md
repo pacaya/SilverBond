@@ -59,9 +59,18 @@ just tauri-build    # Package as native desktop app
 
 ## Environment Variables
 
+Process-launching workflows must be configured through one of two paths before they can start:
+
+- Consent path: set `SILVERBOND_UNLOCK_PASSWORD_HASH` to a `sha256:<hex>` password hash. The UI asks for that password once at run start before allowing operator-privilege execution.
+- Containment path: set `SILVERBOND_AGENT_USER` to a real low-privilege OS user. Workflows without an explicit `runAs` run agents as that user without an unlock prompt.
+
+These variables apply to `just server`, production builds, and the packaged desktop app. With neither variable set, SilverBond rejects process-launching runs with guidance instead of asking for an unlock password that cannot verify.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SILVERBOND_ROOT` | Current working directory | Override the application root directory |
+| `SILVERBOND_UNLOCK_PASSWORD_HASH` | Unset | `sha256:<hex>` hash for the operator unlock password used to authorize privileged process-launching runs |
+| `SILVERBOND_AGENT_USER` | Unset | Low-privilege OS user that receives default process-launching agent runs without an unlock prompt |
 | `RUST_LOG` | `silverbond=info,tower_http=info` | Tracing log filter |
 
 ## Directory Structure

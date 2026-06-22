@@ -56,6 +56,12 @@ By default the standalone app stores workflows, templates, and SQLite state unde
 working directory. Set `SILVERBOND_ROOT=/path/to/root` before `just server` to use a different
 local app root.
 
+Process-launching workflows also need a run-security configuration before they can start. For
+operator-consented runs, set `SILVERBOND_UNLOCK_PASSWORD_HASH` to a `sha256:<hex>` password hash and
+enter that password once when starting the run. For sandboxed runs, set `SILVERBOND_AGENT_USER` to a
+real low-privilege OS user so agents launch under that account without an unlock prompt. The same
+environment variables apply when launching the packaged desktop app.
+
 The Tauri shell (`just tauri-dev`) starts the same Rust HTTP/SSE runtime on an ephemeral localhost
 port and opens the web UI against that URL. In Tauri mode, app data lives under the platform
 app-data directory and bundled templates are seeded on first launch.

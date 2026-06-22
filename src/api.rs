@@ -657,6 +657,9 @@ fn authorize_and_prepare_run_security(
         && resolved_run_as_is_privileged(workflow.run_as.as_ref(), security.agent_user.as_deref())
         && !security.verify_unlock_secret(unlock_secret)
     {
+        if security.unlock_password_hash.is_none() {
+            return Err(unlock_not_configured());
+        }
         return Err(privileged_unlock_required());
     }
 
@@ -671,6 +674,16 @@ fn authorize_and_prepare_run_security(
     }
 
     Ok(())
+}
+
+fn unlock_not_configured() -> ApiError {
+    ApiError::validation_body(
+        StatusCode::FORBIDDEN,
+        json!({
+            "error": "Privileged run unlock is not configured. Set SILVERBOND_UNLOCK_PASSWORD_HASH to require an unlock password, or set SILVERBOND_AGENT_USER to run agents as a low-privilege user.",
+            "code": "unlock_not_configured",
+        }),
+    )
 }
 
 fn privileged_unlock_required() -> ApiError {

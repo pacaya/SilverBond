@@ -6,7 +6,7 @@ use std::{
 };
 
 use silverbond::{
-    app::{AppPaths, ApplicationConfig},
+    app::{AppPaths, ApplicationConfig, SecurityConfig},
     host::{ApplicationHost, HostConfig},
 };
 use anyhow::Context;
@@ -37,6 +37,7 @@ fn main() {
                     application: ApplicationConfig {
                         paths: AppPaths::from_root(app_data_dir),
                         seed_bundled_templates: true,
+                        security: SecurityConfig::from_environment(),
                     },
                     bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
                 })

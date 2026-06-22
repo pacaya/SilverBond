@@ -182,6 +182,11 @@
     try {
       return await api.createRun(targetWorkflow, variableOverrides);
     } catch (err) {
+      if (err instanceof ApiError && err.code === "unlock_not_configured") {
+        throw new Error(
+          "Agent runs need security configuration. Set SILVERBOND_UNLOCK_PASSWORD_HASH or SILVERBOND_AGENT_USER before starting a process-launching workflow.",
+        );
+      }
       if (!(err instanceof ApiError) || err.code !== "privileged_unlock_required") {
         throw err;
       }
