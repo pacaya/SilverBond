@@ -5958,10 +5958,13 @@ async fn cleanup_terminal_active_panes(
 ) {
     let pending_continuation_keys =
         build_session_persistence_set(&workflow.graph(), completed_results);
-    debug_assert!(
-        pending_continuation_keys.is_empty(),
-        "terminal cleanup requires no pending continuation panes"
-    );
+    if !pending_continuation_keys.is_empty() {
+        tracing::warn!(
+            run_id = %run_id,
+            pending_continuation_keys = ?pending_continuation_keys,
+            "terminal cleanup encountered unconsumed continuation panes; cleaning up unconditionally"
+        );
+    }
     let targets = ctx
         .registry
         .active_pane_cleanup_targets_except_keys(run_id, &HashSet::new())
