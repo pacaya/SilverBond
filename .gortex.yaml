@@ -1,0 +1,3 @@
+embedding:
+  enabled: true                # default — pass `false` to disable
+  provider: local
