@@ -1,12 +1,12 @@
-# Workflow Schema Reference (v3)
+# Workflow Schema Reference (v4)
 
-SilverBond uses a graph-native workflow schema. The only accepted format is version `3`. Legacy formats are rejected at validation time.
+SilverBond uses a graph-native workflow schema. The canonical format is version `4`. Legacy versions `2` and `3` are accepted as migration inputs and are silently upgraded to version `4` during normalization — they are not rejected at validation time.
 
 ## Top-Level Document
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "name": "My Workflow",
   "goal": "What this workflow should accomplish",
   "cwd": "/path/to/working/directory",
@@ -31,7 +31,7 @@ SilverBond uses a graph-native workflow schema. The only accepted format is vers
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `version` | `number` | Yes | Must be `3` |
+| `version` | `number` | Yes | Must be `4` for new workflows; versions `2` and `3` are accepted as migration inputs |
 | `name` | `string` | No | Display name of the workflow |
 | `goal` | `string` | Yes | High-level description of what the workflow achieves |
 | `cwd` | `string` | No | Default working directory for agent execution |

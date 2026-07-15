@@ -1627,7 +1627,7 @@ mod tests {
             .unwrap();
 
         let legacy_workflow = serde_json::json!({
-            "version": 4,
+            "version": 3,
             "goal": "legacy run",
             "cwd": "/tmp",
             "useOrchestrator": false,
@@ -1673,6 +1673,74 @@ mod tests {
         let stored_workflow: Value = serde_json::from_str(&stored_workflow_json).unwrap();
         assert_eq!(stored_workflow["version"], 4);
         assert_eq!(stored_workflow["nodes"][0]["kind"]["type"], "decide");
+        assert!(stored_workflow["nodes"][0].get("type").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_run_leaves_canonical_v4_workflow_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        db.upsert_run(&sample_persisted_run("current-run"))
+            .await
+            .unwrap();
+
+        let current_workflow = serde_json::json!({
+            "version": 4,
+            "goal": "current run",
+            "cwd": "/tmp",
+            "useOrchestrator": false,
+            "entryNodeId": "decide",
+            "variables": [],
+            "limits": { "maxTotalSteps": 10, "maxVisitsPerNode": 5 },
+            "nodes": [{
+                "id": "decide",
+                "name": "Pick",
+                "kind": {
+                    "type": "decide",
+                    "decideConfig": {
+                        "prompt": "Pick one",
+                        "outcomes": ["yes"]
+                    }
+                }
+            }],
+            "edges": []
+        });
+        let canonical_json = serde_json::to_string(&current_workflow).unwrap();
+        with_connection(&db.connection, db.path(), |conn| {
+            conn.execute(
+                "UPDATE runs SET workflow_json = ?2 WHERE run_id = ?1",
+                params!["current-run", canonical_json.clone()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = db.get_run("current-run").await.unwrap().unwrap();
+        assert_eq!(loaded.workflow.version, 4);
+        assert!(matches!(
+            &loaded.workflow.nodes[0].kind,
+            crate::model::NodeKind::Decide { decide_config }
+                if decide_config.outcomes == vec!["yes".to_string()]
+        ));
+
+        let stored_workflow_json = with_connection(&db.connection, db.path(), |conn| {
+            Ok(conn.query_row(
+                "SELECT workflow_json FROM runs WHERE run_id = ?1",
+                params!["current-run"],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .unwrap();
+        let stored_workflow: Value = serde_json::from_str(&stored_workflow_json).unwrap();
+        assert_eq!(stored_workflow["version"], 4);
+        assert_eq!(stored_workflow["goal"], "current run");
+        assert_eq!(stored_workflow["entryNodeId"], "decide");
+        assert_eq!(stored_workflow["nodes"][0]["kind"]["type"], "decide");
+        assert_eq!(
+            stored_workflow["nodes"][0]["kind"]["decideConfig"]["outcomes"],
+            serde_json::json!(["yes"])
+        );
         assert!(stored_workflow["nodes"][0].get("type").is_none());
     }
 }

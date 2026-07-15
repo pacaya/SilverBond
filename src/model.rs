@@ -2655,7 +2655,7 @@ mod tests {
         entry_node_id: &str,
     ) -> WorkflowV3 {
         WorkflowV3 {
-            version: 3,
+            version: WORKFLOW_SCHEMA_VERSION,
             name: Some("test".to_string()),
             goal: "goal".to_string(),
             cwd: String::new(),
@@ -2686,7 +2686,7 @@ mod tests {
     #[test]
     fn validates_missing_entry_node() {
         let result = validate_workflow(WorkflowV3 {
-            version: 3,
+            version: WORKFLOW_SCHEMA_VERSION,
             name: None,
             goal: String::new(),
             cwd: String::new(),
@@ -2976,7 +2976,7 @@ mod tests {
     fn existing_workflow_json_loads_without_new_fields() {
         // Verify that a v3 workflow without any new fields deserializes fine
         let json = json!({
-            "version": 3,
+            "version": 4,
             "goal": "test",
             "cwd": "/tmp",
             "useOrchestrator": false,
@@ -3773,7 +3773,7 @@ mod tests {
     #[test]
     fn legacy_output_schema_deserialized_as_json_schema() {
         let json = json!({
-            "version": 3,
+            "version": 4,
             "goal": "test",
             "cwd": "/tmp",
             "useOrchestrator": false,
@@ -3809,7 +3809,7 @@ mod tests {
             "additionalProperties": false
         });
         let json = json!({
-            "version": 3,
+            "version": 4,
             "goal": "test",
             "cwd": "/tmp",
             "useOrchestrator": false,
@@ -3917,7 +3917,7 @@ mod tests {
     #[test]
     fn parses_minimal_run_agent_node() {
         let value = json!({
-            "version": 3,
+            "version": 4,
             "goal": "Run one agent",
             "entryNodeId": "run",
             "nodes": [{
@@ -4464,7 +4464,7 @@ mod tests {
     #[test]
     fn run_as_config_round_trips_with_camel_case_keys() {
         let workflow = WorkflowV3 {
-            version: 3,
+            version: WORKFLOW_SCHEMA_VERSION,
             name: Some("run-as-test".to_string()),
             goal: "test".to_string(),
             cwd: "/tmp".to_string(),
@@ -4516,7 +4516,7 @@ mod tests {
     #[test]
     fn run_as_command_variant_round_trips() {
         let workflow = WorkflowV3 {
-            version: 3,
+            version: WORKFLOW_SCHEMA_VERSION,
             name: None,
             goal: String::new(),
             cwd: String::new(),

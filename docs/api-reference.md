@@ -20,7 +20,7 @@ Returns runtime capabilities including supported agents and their features.
 **Response:**
 ```json
 {
-  "workflowVersion": 3,
+  "workflowVersion": 4,
   "supportedNodeTypes": ["task", "approval", "split", "collector"],
   "supportedEdgeOutcomes": ["success", "reject", "branch", "loop_continue", "loop_exit"],
   "features": {
@@ -83,7 +83,7 @@ Save a workflow. Creates or overwrites.
 ```json
 {
   "name": "My Workflow",
-  "workflow": { "version": 3, ... }
+  "workflow": { "version": 4, ... }
 }
 ```
 
@@ -112,7 +112,7 @@ Validate a workflow and return issues with graph analysis.
 
 **Request body:**
 ```json
-{ "version": 3, "entryNodeId": "n1", "nodes": [...], "edges": [...] }
+{ "version": 4, "entryNodeId": "n1", "nodes": [...], "edges": [...] }
 ```
 
 **Response:**
@@ -156,7 +156,7 @@ Start a new workflow run.
 **Request body:**
 ```json
 {
-  "workflow": { "version": 3, ... },
+  "workflow": { "version": 4, ... },
   "variableOverrides": { "topic": "quantum computing" }
 }
 ```

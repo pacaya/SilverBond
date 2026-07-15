@@ -11873,7 +11873,7 @@ mod tests {
             "SB_RESPONSE_DONE_decide\n"
         );
 
-        let response = crate::tmux_exec::extract_after_prompt_with_sentinels(
+        let (response, _) = crate::tmux_exec::extract_after_prompt_with_sentinels(
             "ready\n",
             capture,
             prompt,

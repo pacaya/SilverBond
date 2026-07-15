@@ -1460,6 +1460,7 @@ fn wait_for_agent_ready_interactive(
             dispatch_pattern_match(
                 pane,
                 &capture,
+                0,
                 first_poll || has_new_text,
                 interaction_patterns,
                 destructive_regexes,
@@ -1534,7 +1535,7 @@ fn poll_agent_interactive(
 
     loop {
         if abort_requested(abort_flag) {
-            let output_so_far =
+            let (output_so_far, _) =
                 extract_after_prompt_with_markers(before, &last_seen, prompt, capture_markers);
             return Ok(InteractivePollResult::Aborted(InteractiveCapture {
                 output: output_so_far,
@@ -1545,7 +1546,7 @@ fn poll_agent_interactive(
         let capture = match capture_visible_stripped(pane) {
             Ok(capture) => capture,
             Err(_err) if abort_requested(abort_flag) => {
-                let output_so_far =
+                let (output_so_far, _) =
                     extract_after_prompt_with_markers(before, &last_seen, prompt, capture_markers);
                 return Ok(InteractivePollResult::Aborted(InteractiveCapture {
                     output: output_so_far,
@@ -1565,16 +1566,17 @@ fn poll_agent_interactive(
             last_seen = capture.clone();
             idle_since = None;
         }
-        let output_so_far =
+        let (output_so_far, response_start) =
             extract_after_prompt_with_markers(before, &capture, prompt, capture_markers);
 
         // Cumulative over the visible pane; a line that scrolls fully off-screen is still out of scope.
-        // Scan `capture` (not prompt-stripped `output_so_far`) so the S4 cursor stays in the same
-        // coordinate system as `common_prefix_len` reanchoring — matching `wait_for_agent_ready_interactive`.
+        // Keep the S4 cursor in capture coordinates for `common_prefix_len` reanchoring, while
+        // flooring semantic scans at the agent response so echoed prompt text cannot trigger them.
         if matches!(
             dispatch_pattern_match(
                 pane,
                 &capture,
+                response_start,
                 has_new_text,
                 interaction_patterns,
                 destructive_regexes,
@@ -1773,6 +1775,7 @@ enum Dispatch {
 fn dispatch_pattern_match(
     pane: &str,
     scan_buffer: &str,
+    response_start: usize,
     should_check_patterns: bool,
     interaction_patterns: &[CompiledInteractionPattern],
     destructive_regexes: &[Regex],
@@ -1784,11 +1787,10 @@ fn dispatch_pattern_match(
     cursor: &mut usize,
     deadline: &mut Instant,
 ) -> anyhow::Result<Dispatch> {
-    if let Some(destructive_match) = next_unhandled_destructive_match(
-        destructive_regexes,
-        scan_buffer,
-        handled_destructive,
-    ) {
+    let response_buffer = &scan_buffer[response_start..];
+    if let Some(destructive_match) =
+        next_unhandled_destructive_match(destructive_regexes, response_buffer, handled_destructive)
+    {
         handled_destructive.record(destructive_match);
         let reply = escalate_or_fallback(
             interaction,
@@ -1803,8 +1805,11 @@ fn dispatch_pattern_match(
     }
 
     if should_check_patterns
-        && let Some((idx, new_cursor)) =
-            next_unhandled_pattern_match(interaction_patterns, scan_buffer, *cursor)
+        && let Some((idx, new_cursor)) = next_unhandled_pattern_match(
+            interaction_patterns,
+            scan_buffer,
+            (*cursor).max(response_start),
+        )
     {
         *cursor = new_cursor;
         let pattern = &interaction_patterns[idx];
@@ -1824,7 +1829,7 @@ fn dispatch_pattern_match(
             InteractionKind::PermissionRequest => {
                 let is_destructive = destructive_regexes
                     .iter()
-                    .any(|regex| regex.is_match(scan_buffer));
+                    .any(|regex| regex.is_match(response_buffer));
                 let reply = permission_request_reply(
                     interaction,
                     pane,
@@ -2540,7 +2545,7 @@ fn shell_quote(value: &str) -> String {
 }
 
 pub(crate) fn extract_after_prompt(before: &str, after: &str, prompt_text: &str) -> String {
-    extract_after_prompt_with_sentinels(before, after, prompt_text, None, None)
+    extract_after_prompt_with_sentinels(before, after, prompt_text, None, None).0
 }
 
 fn extract_after_prompt_with_markers(
@@ -2548,7 +2553,7 @@ fn extract_after_prompt_with_markers(
     after: &str,
     prompt_text: &str,
     markers: Option<&PromptCaptureMarkers>,
-) -> String {
+) -> (String, usize) {
     extract_after_prompt_with_sentinels(
         before,
         after,
@@ -2564,7 +2569,7 @@ pub(crate) fn extract_after_prompt_with_sentinels(
     prompt_text: &str,
     prompt_end_marker: Option<&str>,
     response_end_marker: Option<&str>,
-) -> String {
+) -> (String, usize) {
     if let Some(prompt_end_marker) = prompt_end_marker {
         if let Some(start) = marker_line_end(after, prompt_end_marker) {
             let answer_region = &after[start..];
@@ -2574,13 +2579,13 @@ pub(crate) fn extract_after_prompt_with_sentinels(
             } else {
                 answer_region
             };
-            return answer_region.to_owned();
+            return (answer_region.to_owned(), start);
         }
     }
 
     if let Some(response_end_marker) = response_end_marker {
         if let Some(end) = marker_line_start(after, response_end_marker) {
-            return after[..end].to_owned();
+            return (after[..end].to_owned(), 0);
         }
     }
 
@@ -2603,8 +2608,8 @@ pub(crate) fn extract_after_prompt_with_sentinels(
 
     first_new_match_end
         .or(last_match_end)
-        .map(|index| after[index..].to_owned())
-        .unwrap_or_else(|| after.to_owned())
+        .map(|index| (after[index..].to_owned(), index))
+        .unwrap_or_else(|| (after.to_owned(), 0))
 }
 
 fn marker_line_end(text: &str, marker: &str) -> Option<usize> {
@@ -4141,6 +4146,108 @@ exit 0
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn poll_loop_ignores_interaction_literals_in_echoed_prompt() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-poll-prompt-region-prefix.sh");
+        let log = temp.path().join("send-log");
+        let prompt = "Explain rm -rf and Allow this action? [y/n] without running anything";
+        std::fs::write(
+            &script,
+            format!(
+                r#"#!/bin/sh
+log="$1"
+shift
+if [ "$1" = "tmux" ]; then shift; fi
+if [ "$1" = "-L" ]; then shift 2; fi
+cmd="$1"
+
+case "$cmd" in
+  display-message)
+    printf '\037codex\037\037\037\n'
+    ;;
+  capture-pane)
+    printf 'ready\n{prompt}\nNo action is needed.\nDONE\n'
+    ;;
+  send-keys)
+    shift
+    literal=""
+    previous=""
+    for arg in "$@"; do
+      if [ "$previous" = "--" ]; then
+        literal="$arg"
+        break
+      fi
+      previous="$arg"
+    done
+    if [ -n "$literal" ]; then
+      printf '%s\n' "$literal" >> "$log"
+    fi
+    ;;
+esac
+exit 0
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![
+                script.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+            ],
+            socket: Some("poll-prompt-region-test-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+        let interaction_patterns = vec![CompiledInteractionPattern {
+            regex: Regex::new(r"Allow this action\? \[y/n\]").unwrap(),
+            kind: InteractionKind::PermissionRequest,
+            description: "Tool permission prompt".to_string(),
+            send_enter: false,
+        }];
+        let destructive_regexes = vec![Regex::new(r"rm\s+-rf").unwrap()];
+        let started = Instant::now();
+        let timeout = Duration::from_secs(5);
+        let result = tmux_tools_core::with_invocation(invocation, || {
+            poll_agent_interactive(
+                "%poll-prompt-region-test",
+                "ready\n",
+                prompt,
+                started,
+                started + timeout,
+                started + timeout,
+                60.0,
+                0.0,
+                Some("DONE"),
+                None,
+                true,
+                Duration::from_secs(60),
+                None,
+                &interaction_patterns,
+                &destructive_regexes,
+                None,
+                None,
+            )
+        })
+        .unwrap();
+
+        assert!(
+            matches!(result, InteractivePollResult::Completed(_)),
+            "poll loop should complete for a response with no interaction request"
+        );
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap_or_default(),
+            "",
+            "interaction literals in the echoed prompt must not trigger an automatic reply"
+        );
+    }
+
     #[test]
     fn markerless_visual_idle_is_not_interactive_completion() {
         assert!(!is_interactive_completion_reason(IdleReason::Idle));
@@ -4227,7 +4334,7 @@ exit 0
             "SB_RESPONSE_DONE_test\n"
         );
 
-        let output = extract_after_prompt_with_sentinels(
+        let (output, response_start) = extract_after_prompt_with_sentinels(
             before,
             after,
             prompt,
@@ -4236,6 +4343,7 @@ exit 0
         );
 
         assert_eq!(output.trim(), "reject");
+        assert_eq!(response_start, 56);
         assert!(!output.contains("- approve"));
     }
 
@@ -4255,7 +4363,7 @@ exit 0
             "SB_RESPONSE_DONE_test\n"
         );
 
-        let output = extract_after_prompt_with_sentinels(
+        let (output, response_start) = extract_after_prompt_with_sentinels(
             before,
             after,
             prompt,
@@ -4264,6 +4372,23 @@ exit 0
         );
 
         assert_eq!(output.trim(), "approve");
+        assert_eq!(response_start, 58);
         assert!(!output.contains("reject"));
+    }
+
+    #[test]
+    fn extract_after_prompt_with_only_response_sentinel_starts_at_capture_origin() {
+        let after = concat!("visible response\n", "SB_RESPONSE_DONE_test\n");
+
+        let (output, response_start) = extract_after_prompt_with_sentinels(
+            "scrolled away\n",
+            after,
+            "scrolled away prompt",
+            Some("SB_PROMPT_END_missing"),
+            Some("SB_RESPONSE_DONE_test"),
+        );
+
+        assert_eq!(output, "visible response\n");
+        assert_eq!(response_start, 0);
     }
 }
