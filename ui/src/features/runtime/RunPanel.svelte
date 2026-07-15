@@ -25,11 +25,21 @@
   let logContainer: HTMLDivElement | undefined = $state();
   let approvalCard: HTMLDivElement | undefined = $state();
   let interactionsContainer: HTMLDivElement | undefined = $state();
+  let stickToBottom = $state(true);
 
-  /* auto-scroll log panel to bottom */
+  const SCROLL_BOTTOM_THRESHOLD = 32;
+
+  function handleLogScroll() {
+    if (!logContainer) return;
+    const distance =
+      logContainer.scrollHeight - logContainer.scrollTop - logContainer.clientHeight;
+    stickToBottom = distance <= SCROLL_BOTTOM_THRESHOLD;
+  }
+
+  /* auto-scroll log panel to bottom when the user is already at the bottom */
   $effect(() => {
     const _len = store.lines.length;
-    if (logContainer) {
+    if (logContainer && stickToBottom) {
       logContainer.scrollTop = logContainer.scrollHeight;
     }
   });
@@ -59,7 +69,7 @@
     </div>
   </div>
 
-  <div class="runPanel__log" bind:this={logContainer}>
+  <div class="runPanel__log" bind:this={logContainer} onscroll={handleLogScroll}>
     {#if store.lines.length === 0}
       <div class="runPanel__empty">Press Run to execute and see output here.</div>
     {:else}

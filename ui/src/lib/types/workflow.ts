@@ -335,6 +335,7 @@ export interface RuntimeCapabilities {
       available: boolean;
       path?: string;
       capabilities: AgentCapabilities;
+      accessProfiles?: string[];
     }
   >;
 }
@@ -486,6 +487,136 @@ export function createEmptyWorkflow(): WorkflowDocument {
   };
 }
 
+const LEGACY_NODE_CONFIG_FIELDS = [
+  "agentConfig",
+  "decideConfig",
+  "batchConfig",
+  "parallelBatchConfig",
+  "subflowConfig",
+  "spawnConfig",
+  "sendConfig",
+  "waitConfig",
+  "captureConfig",
+  "killConfig",
+  "runAgentConfig",
+] as const;
+
+type LegacyWorkflowNode = Omit<WorkflowNode, "kind"> & {
+  kind?: NodeKind | null;
+  type?: string;
+} & Partial<Record<(typeof LEGACY_NODE_CONFIG_FIELDS)[number], unknown>>;
+
+function moveV2ConfigField(
+  node: Record<string, unknown>,
+  kind: Record<string, unknown>,
+  from: string,
+  to: string,
+): void {
+  if (!(from in node)) {
+    return;
+  }
+  const value = node[from];
+  delete node[from];
+  if (value != null) {
+    kind[to] = value;
+  }
+}
+
+function moveV2BatchConfigField(
+  node: Record<string, unknown>,
+  kind: Record<string, unknown>,
+): void {
+  let value: unknown;
+  if ("batchConfig" in node) {
+    value = node.batchConfig;
+    delete node.batchConfig;
+  } else if ("parallelBatchConfig" in node) {
+    value = node.parallelBatchConfig;
+    delete node.parallelBatchConfig;
+  }
+  if (value != null) {
+    kind.batchConfig = value;
+  }
+}
+
+/** Mirrors backend `migrate_v2_node_to_v3_kind` for client-side ingress normalization. */
+export function normalizeWorkflowNode(node: WorkflowNode): WorkflowNode {
+  const raw = node as LegacyWorkflowNode;
+  if (raw.kind != null && typeof raw.kind === "object") {
+    return node;
+  }
+
+  if (typeof raw.type !== "string") {
+    return { ...raw, kind: { type: "task" } };
+  }
+
+  const nodeType = raw.type;
+  const next = { ...raw } as Record<string, unknown>;
+  delete next.type;
+
+  const kind: Record<string, unknown> = { type: nodeType };
+
+  switch (nodeType) {
+    case "task":
+      moveV2ConfigField(next, kind, "agentConfig", "agentConfig");
+      break;
+    case "approval":
+    case "split":
+    case "collector":
+      break;
+    case "decide":
+      moveV2ConfigField(next, kind, "decideConfig", "decideConfig");
+      break;
+    case "parallel_batch":
+      moveV2BatchConfigField(next, kind);
+      break;
+    case "subflow":
+    case "call":
+      moveV2ConfigField(next, kind, "subflowConfig", "subflowConfig");
+      break;
+    case "spawn":
+      moveV2ConfigField(next, kind, "spawnConfig", "spawnConfig");
+      break;
+    case "send":
+      moveV2ConfigField(next, kind, "sendConfig", "sendConfig");
+      break;
+    case "wait":
+      moveV2ConfigField(next, kind, "waitConfig", "waitConfig");
+      break;
+    case "capture":
+      moveV2ConfigField(next, kind, "captureConfig", "captureConfig");
+      if (!("captureConfig" in kind)) {
+        kind.captureConfig = {};
+      }
+      break;
+    case "kill":
+      moveV2ConfigField(next, kind, "killConfig", "killConfig");
+      if (!("killConfig" in kind)) {
+        kind.killConfig = {};
+      }
+      break;
+    case "run_agent":
+      moveV2ConfigField(next, kind, "runAgentConfig", "runAgentConfig");
+      moveV2ConfigField(next, kind, "agentConfig", "agentConfig");
+      break;
+    default:
+      break;
+  }
+
+  for (const field of LEGACY_NODE_CONFIG_FIELDS) {
+    delete next[field];
+  }
+
+  return { ...next, kind: kind as NodeKind } as WorkflowNode;
+}
+
+export function normalizeWorkflowNodes(workflow: WorkflowDocument): WorkflowDocument {
+  return {
+    ...workflow,
+    nodes: workflow.nodes.map(normalizeWorkflowNode),
+  };
+}
+
 export function ensureCanvas(workflow: WorkflowDocument): WorkflowDocument {
   if (workflow.ui?.canvas) {
     return workflow;
@@ -520,7 +651,7 @@ export function createEdgeId(): string {
 }
 
 export function duplicateWorkflowForEditing(workflow: WorkflowDocument): WorkflowDocument {
-  return ensureCanvas(cloneWorkflow(workflow));
+  return ensureCanvas(normalizeWorkflowNodes(cloneWorkflow(workflow)));
 }
 
 export function remapWorkflowIds(workflow: WorkflowDocument): WorkflowDocument {

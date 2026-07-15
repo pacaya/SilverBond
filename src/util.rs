@@ -2,6 +2,17 @@ use std::path::Path;
 
 use chrono::Utc;
 
+pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for idx in 0..max_len {
+        let left_byte = left.get(idx).copied().unwrap_or(0);
+        let right_byte = right.get(idx).copied().unwrap_or(0);
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
+}
+
 pub fn safe_name(name: &str) -> anyhow::Result<String> {
     let trimmed = name.trim();
     anyhow::ensure!(!trimmed.is_empty(), "name is required");

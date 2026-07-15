@@ -3,7 +3,9 @@
 //! Each agent backend (Claude, Codex, etc.) is represented by an [`AgentDriver`] implementation
 //! that knows how to build CLI arguments for interactive PTY sessions and parse agent output.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,20 +31,14 @@ pub enum InteractionKind {
 }
 
 impl InteractionKind {
-    fn registry_kind(&self) -> agents::InteractionKind {
-        match self {
-            Self::AutoRespond { .. } => agents::InteractionKind::AutoRespond,
-            Self::PermissionRequest => agents::InteractionKind::Permission,
-            Self::SubagentActive => agents::InteractionKind::SubagentActive,
-            Self::DestructiveWarning => agents::InteractionKind::DestructiveWarning,
-        }
-    }
-
     /// Event type string for serialization to the frontend.
     pub fn event_type(&self) -> &'static str {
-        self.registry_kind()
-            .event_type()
-            .expect("SilverBond interaction kinds map to known registry kinds")
+        match self {
+            Self::AutoRespond { .. } => "auto_respond",
+            Self::PermissionRequest => "permission",
+            Self::SubagentActive => "subagent_active",
+            Self::DestructiveWarning => "destructive_warning",
+        }
     }
 }
 
@@ -137,7 +133,59 @@ fn registry_capabilities_or(name: &str, fallback: AgentCapabilities) -> AgentCap
     capabilities_from_registry(name).unwrap_or(fallback)
 }
 
+/// Fingerprint of the user `agents.toml` used to invalidate the registry cache.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AgentsConfigFingerprint {
+    Missing,
+    Present { mtime: SystemTime, len: u64 },
+}
+
+fn agents_config_path() -> Option<PathBuf> {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config"))
+        })?;
+
+    Some(config_home.join("tmux-tools").join("agents.toml"))
+}
+
+fn agents_config_fingerprint(path: &Path) -> std::io::Result<AgentsConfigFingerprint> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(AgentsConfigFingerprint::Present {
+            mtime: meta.modified()?,
+            len: meta.len(),
+        }),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(AgentsConfigFingerprint::Missing)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn current_agents_config_fingerprint() -> anyhow::Result<AgentsConfigFingerprint> {
+    match agents_config_path() {
+        Some(path) => Ok(agents_config_fingerprint(&path)?),
+        None => Ok(AgentsConfigFingerprint::Missing),
+    }
+}
+
+static AGENT_REGISTRY_CACHE: OnceLock<Mutex<Option<(AgentsConfigFingerprint, agents::Registry)>>> =
+    OnceLock::new();
+
 pub(crate) fn load_agent_registry() -> anyhow::Result<agents::Registry> {
+    let fingerprint = current_agents_config_fingerprint()?;
+    let cache = AGENT_REGISTRY_CACHE.get_or_init(|| Mutex::new(None));
+
+    if let Ok(guard) = cache.lock() {
+        if let Some((cached_fingerprint, cached_registry)) = guard.as_ref() {
+            if *cached_fingerprint == fingerprint {
+                return Ok(cached_registry.clone());
+            }
+        }
+    }
+
     let (registry, warnings) = agents::Registry::load()?;
     for warning in warnings {
         tracing::warn!(
@@ -146,6 +194,11 @@ pub(crate) fn load_agent_registry() -> anyhow::Result<agents::Registry> {
             warning.detail
         );
     }
+
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((fingerprint, registry.clone()));
+    }
+
     Ok(registry)
 }
 
@@ -180,13 +233,61 @@ pub fn agent_binary(name: &str) -> Option<String> {
         })
 }
 
-fn registry_access_profile(config: &AgentConfig) -> String {
-    match config.access_mode {
+fn access_mode_profile_name(mode: &AccessMode) -> &'static str {
+    match mode {
         AccessMode::ReadOnly => "read-only",
         AccessMode::Edit | AccessMode::Execute => "workspace-write",
         AccessMode::Unrestricted => "full-access",
     }
-    .to_string()
+}
+
+/// Access-profile keys declared for an agent in the tmux-tools registry.
+pub fn agent_access_profile_names(name: &str) -> Vec<String> {
+    let Ok(registry) = load_agent_registry() else {
+        return Vec::new();
+    };
+    let Some(spec) = registry.get(name) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = spec.access_profiles.keys().cloned().collect();
+    names.sort_unstable();
+    names
+}
+
+fn resolve_registry_access_profile(
+    registry: &agents::Registry,
+    agent: &str,
+    config: &AgentConfig,
+) -> anyhow::Result<String> {
+    let spec = registry
+        .get(agent)
+        .ok_or_else(|| anyhow::anyhow!("unknown agent {agent}"))?;
+    let mapped = access_mode_profile_name(&config.access_mode);
+    if spec.access_profiles.contains_key(mapped) {
+        Ok(mapped.to_string())
+    } else if spec.access_profiles.contains_key("default") {
+        Ok("default".to_string())
+    } else {
+        anyhow::bail!(
+            "agent {agent} has no access profile {mapped} and no default profile"
+        );
+    }
+}
+
+fn validate_registry_config_fields(
+    config: &AgentConfig,
+    caps: &AgentCapabilities,
+) -> anyhow::Result<()> {
+    if config.model.is_some() && !caps.model_selection {
+        anyhow::bail!("agent does not support model selection");
+    }
+    if config.system_prompt.is_some() && !caps.system_prompt {
+        anyhow::bail!("agent does not support system prompt");
+    }
+    if config.allowed_tools.is_some() && !caps.tool_allowlist {
+        anyhow::bail!("agent does not support tool allowlist");
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -742,7 +843,8 @@ impl AgentDriver for RegistryProfileDriver {
 
     fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
         let registry = load_agent_registry()?;
-        let profile = registry_access_profile(config);
+        validate_registry_config_fields(config, &self.capabilities())?;
+        let profile = resolve_registry_access_profile(&registry, &self.name, config)?;
         let (_binary, args) = registry.launch_argv(&self.name, Some(&profile))?;
         Ok(CommandArgs {
             args,
@@ -1435,6 +1537,61 @@ mod tests {
     }
 
     #[test]
+    fn agent_access_profile_names_includes_known_agents() {
+        let profiles = agent_access_profile_names("agy");
+        assert!(profiles.contains(&"default".to_string()));
+        assert!(profiles.contains(&"workspace-write".to_string()));
+        assert!(!profiles.contains(&"read-only".to_string()));
+    }
+
+    #[test]
+    fn registry_profile_agy_read_only_falls_back_to_default() {
+        let driver = RegistryProfileDriver::new("agy");
+        let config = AgentConfig {
+            access_mode: AccessMode::ReadOnly,
+            ..default_config()
+        };
+        let cmd = driver.build_session_args(&config).unwrap();
+        assert!(!args_contain(
+            &cmd.args,
+            "--dangerously-skip-permissions"
+        ));
+    }
+
+    #[test]
+    fn registry_profile_agy_unrestricted_uses_full_access_profile() {
+        let driver = RegistryProfileDriver::new("agy");
+        let config = AgentConfig {
+            access_mode: AccessMode::Unrestricted,
+            ..default_config()
+        };
+        let cmd = driver.build_session_args(&config).unwrap();
+        assert!(args_contain(&cmd.args, "--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn registry_profile_rejects_unsupported_model() {
+        let driver = RegistryProfileDriver::new("agy");
+        let config = AgentConfig {
+            model: Some("gpt-4".into()),
+            ..default_config()
+        };
+        let err = driver.build_session_args(&config).unwrap_err();
+        assert!(err.to_string().contains("model selection"));
+    }
+
+    #[test]
+    fn registry_profile_rejects_unsupported_system_prompt() {
+        let driver = RegistryProfileDriver::new("cursor");
+        let config = AgentConfig {
+            system_prompt: Some("be helpful".into()),
+            ..default_config()
+        };
+        let err = driver.build_session_args(&config).unwrap_err();
+        assert!(err.to_string().contains("system prompt"));
+    }
+
+    #[test]
     fn registry_interaction_pattern_maps_auto_response() {
         let pattern = registry_interaction_pattern(&agents::InteractionPatternSpec::new(
             "Press Enter to continue".to_owned(),
@@ -1454,5 +1611,31 @@ mod tests {
         assert_eq!(pattern.pattern, "Press Enter to continue");
         assert_eq!(pattern.description, "Continue prompt");
         assert!(!pattern.send_enter);
+    }
+
+    #[test]
+    fn builtin_regex_patterns_compile() {
+        use regex::Regex;
+
+        for pattern in shared_destructive_patterns() {
+            assert!(
+                Regex::new(pattern).is_ok(),
+                "shared destructive pattern failed to compile: {pattern}"
+            );
+        }
+
+        for (driver_name, patterns) in [
+            ("claude", ClaudeDriver.interaction_patterns()),
+            ("codex", CodexDriver.interaction_patterns()),
+        ] {
+            for pattern in patterns {
+                assert!(
+                    Regex::new(&pattern.pattern).is_ok(),
+                    "interaction pattern for {driver_name} failed to compile ({}): {}",
+                    pattern.description,
+                    pattern.pattern
+                );
+            }
+        }
     }
 }

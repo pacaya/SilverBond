@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::path::Path;
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -6,8 +7,11 @@ use serde_json::{Map, Value};
 
 use crate::driver::{AccessMode, AgentConfig, ReasoningLevel, ToolToggles};
 
-pub const WORKFLOW_SCHEMA_VERSION: u32 = 3;
+pub const WORKFLOW_SCHEMA_VERSION: u32 = 4;
 const LEGACY_WORKFLOW_SCHEMA_VERSION: u64 = 2;
+const FLAT_NODE_WORKFLOW_SCHEMA_VERSION: u64 = 3;
+pub(crate) const MAX_WORKFLOW_SUBFLOWS: usize = 1_024;
+pub(crate) const MAX_SUBFLOW_CALL_EDGES: usize = 4_096;
 
 // ---------------------------------------------------------------------------
 // Orchestrator configuration
@@ -407,19 +411,23 @@ pub struct SpawnConfig {
     pub session_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
 pub struct SendConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub target: Option<String>,
-    #[serde(default)]
     pub text: String,
-    #[serde(default = "default_true")]
     pub enter: bool,
 }
 
-fn default_true() -> bool {
-    true
+impl Default for SendConfig {
+    fn default() -> Self {
+        Self {
+            target: None,
+            text: String::new(),
+            enter: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -483,35 +491,48 @@ pub struct KillConfig {
     pub session_name: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, rename_all = "camelCase")]
 pub struct RunAgentConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub access: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub idle_seconds: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_stable_seconds: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub until: Option<String>,
-    #[serde(default = "default_run_agent_kill_after")]
     pub kill_after: bool,
 }
 
-fn default_run_agent_kill_after() -> bool {
-    true
+impl Default for RunAgentConfig {
+    fn default() -> Self {
+        Self {
+            agent: None,
+            prompt: None,
+            cwd: None,
+            access: None,
+            extra_args: Vec::new(),
+            name: None,
+            timeout: None,
+            idle_seconds: None,
+            ready_stable_seconds: None,
+            until: None,
+            kill_after: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -622,11 +643,11 @@ pub enum NodeKind {
         wait_config: WaitConfig,
     },
     Capture {
-        #[serde(rename = "captureConfig")]
+        #[serde(default, rename = "captureConfig", skip_serializing_if = "is_default")]
         capture_config: CaptureConfig,
     },
     Kill {
-        #[serde(rename = "killConfig")]
+        #[serde(default, rename = "killConfig", skip_serializing_if = "is_default")]
         kill_config: KillConfig,
     },
     RunAgent {
@@ -753,7 +774,7 @@ impl From<WorkflowNodeType> for NodeKind {
 pub struct WorkflowNode {
     pub id: String,
     pub name: String,
-    /// Workflow schema v3 persists node kind in this exact nested, internally
+    /// Workflow schema v4 persists node kind in this exact nested, internally
     /// tagged shape:
     /// `{ "id": "...", "name": "...", "kind": { "type": "task", "agentConfig": { ... } }, "agent": "claude", "prompt": "..." }`.
     /// Variant-specific config fields such as `decideConfig`, `batchConfig`,
@@ -936,20 +957,11 @@ impl<'a> WorkflowGraph<'a> {
 pub fn normalize_workflow_value(value: Value) -> anyhow::Result<NormalizedWorkflow> {
     let mut value = value;
     let mut notices = Vec::new();
-    let version = value
-        .get("version")
-        .and_then(Value::as_u64)
-        .context("workflow version is required")?;
-    match version {
-        LEGACY_WORKFLOW_SCHEMA_VERSION => {
-            migrate_workflow_value_v2_to_v3(&mut value)?;
-            notices.push("Migrated workflow schema from version 2 to version 3.".to_string());
-        }
-        version if version == WORKFLOW_SCHEMA_VERSION as u64 => {}
-        version => anyhow::bail!(
-            "Only workflow versions 2 and 3 are supported. Received version {}.",
-            version
-        ),
+    let version = migrate_workflow_value_to_v4(&mut value)?;
+    if version != WORKFLOW_SCHEMA_VERSION as u64 {
+        notices.push(format!(
+            "Migrated workflow schema from version {version} to version {WORKFLOW_SCHEMA_VERSION}."
+        ));
     }
     let workflow: WorkflowV3 =
         serde_json::from_value(value).context("failed to deserialize workflow")?;
@@ -970,11 +982,23 @@ pub fn ensure_defaults(mut workflow: WorkflowV3) -> WorkflowV3 {
     workflow
 }
 
-fn migrate_workflow_value_v2_to_v3(value: &mut Value) -> anyhow::Result<()> {
+fn migrate_workflow_value_to_v4(value: &mut Value) -> anyhow::Result<u64> {
+    let version = value
+        .get("version")
+        .and_then(Value::as_u64)
+        .context("workflow version is required")?;
+    match version {
+        LEGACY_WORKFLOW_SCHEMA_VERSION | FLAT_NODE_WORKFLOW_SCHEMA_VERSION => {}
+        version if version == WORKFLOW_SCHEMA_VERSION as u64 => {}
+        version => anyhow::bail!(
+            "Only workflow versions 2, 3, and 4 are supported. Received version {}.",
+            version
+        ),
+    }
+
     let workflow = value
         .as_object_mut()
         .context("workflow must be a JSON object")?;
-    workflow.insert("version".to_string(), Value::from(WORKFLOW_SCHEMA_VERSION));
 
     migrate_v2_nodes_to_v3_kind(workflow)?;
 
@@ -983,18 +1007,13 @@ fn migrate_workflow_value_v2_to_v3(value: &mut Value) -> anyhow::Result<()> {
             .as_object_mut()
             .context("workflow subflows must be a JSON object")?;
         for (name, subflow) in subflows {
-            let version = subflow
-                .get("version")
-                .and_then(Value::as_u64)
-                .with_context(|| format!("subflow \"{}\" workflow version is required", name))?;
-            if version == LEGACY_WORKFLOW_SCHEMA_VERSION {
-                migrate_workflow_value_v2_to_v3(subflow)
-                    .with_context(|| format!("failed to migrate subflow \"{}\"", name))?;
-            }
+            migrate_workflow_value_to_v4(subflow)
+                .with_context(|| format!("failed to migrate subflow \"{}\"", name))?;
         }
     }
 
-    Ok(())
+    workflow.insert("version".to_string(), Value::from(WORKFLOW_SCHEMA_VERSION));
+    Ok(version)
 }
 
 fn migrate_v2_nodes_to_v3_kind(workflow: &mut Map<String, Value>) -> anyhow::Result<()> {
@@ -1005,7 +1024,12 @@ fn migrate_v2_nodes_to_v3_kind(workflow: &mut Map<String, Value>) -> anyhow::Res
         .as_array_mut()
         .context("workflow nodes must be a JSON array")?;
     for node in nodes {
-        migrate_v2_node_to_v3_kind(node)?;
+        let node_object = node
+            .as_object()
+            .context("workflow node must be a JSON object")?;
+        if !node_object.contains_key("kind") && node_object.contains_key("type") {
+            migrate_v2_node_to_v3_kind(node)?;
+        }
     }
     Ok(())
 }
@@ -1113,8 +1137,35 @@ fn move_v2_batch_config_field(node: &mut Map<String, Value>, kind: &mut Map<Stri
     }
 }
 
+fn validate_absolute_cwd(
+    cwd: &str,
+    label: &str,
+    node_id: Option<&str>,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    if cwd.is_empty() {
+        return;
+    }
+    if !Path::new(cwd).is_absolute() {
+        issues.push(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: node_id.map(ToString::to_string),
+            scope: None,
+            message: format!("{label} must be an absolute path (got \"{cwd}\")."),
+        });
+    }
+}
+
 pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
     let workflow = ensure_defaults(workflow);
+    if let Err(issue) = validate_workflow_input_bounds(&workflow) {
+        return ValidationResult {
+            workflow,
+            notices: Vec::new(),
+            issues: vec![issue],
+            graph: GraphMetadata::default(),
+        };
+    }
     let mut issues = Vec::new();
 
     validate_run_as_config(workflow.run_as.as_ref(), &mut issues);
@@ -1163,6 +1214,43 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
     }
 }
 
+pub(crate) fn validate_workflow_input_bounds(workflow: &WorkflowV3) -> Result<(), ValidationIssue> {
+    let subflow_count = workflow.subflows.len();
+    if subflow_count > MAX_WORKFLOW_SUBFLOWS {
+        return Err(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: None,
+            scope: None,
+            message: format!(
+                "Workflow contains {subflow_count} subflows; at most {MAX_WORKFLOW_SUBFLOWS} are allowed."
+            ),
+        });
+    }
+
+    let call_edge_count = std::iter::once(workflow)
+        .chain(workflow.subflows.values().map(Box::as_ref))
+        .flat_map(|candidate| &candidate.nodes)
+        .filter(|node| match &node.kind {
+            NodeKind::Subflow { subflow_config } | NodeKind::Call { subflow_config } => {
+                !subflow_config.workflow_name.trim().is_empty()
+            }
+            _ => false,
+        })
+        .count();
+    if call_edge_count > MAX_SUBFLOW_CALL_EDGES {
+        return Err(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: None,
+            scope: None,
+            message: format!(
+                "Workflow contains {call_edge_count} subflow call edges; at most {MAX_SUBFLOW_CALL_EDGES} are allowed."
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 fn validate_graph_body(
     workflow: &WorkflowV3,
     subflows: &BTreeMap<String, Box<WorkflowV3>>,
@@ -1170,6 +1258,16 @@ fn validate_graph_body(
     issues: &mut Vec<ValidationIssue>,
 ) {
     let issue_start = issues.len();
+
+    if !workflow.cwd.is_empty() {
+        let label = if prefix.is_empty() {
+            "Workflow cwd".to_string()
+        } else {
+            format!("{prefix} cwd")
+        };
+        validate_absolute_cwd(&workflow.cwd, &label, None, issues);
+    }
+
     let graph = workflow.graph();
     let mut seen_nodes = BTreeSet::new();
     let mut seen_edges = BTreeSet::new();
@@ -1194,6 +1292,31 @@ fn validate_graph_body(
                     node.name
                 ),
             });
+        }
+
+        if let Some(cwd) = &node.cwd {
+            validate_absolute_cwd(
+                cwd,
+                &format!("\"{}\" cwd", node.name),
+                Some(&node.id),
+                issues,
+            );
+        }
+
+        if let Some(skip) = &node.skip_condition {
+            if skip.kind == "regex" {
+                if let Err(error) = regex_engine::Regex::new(&skip.value) {
+                    issues.push(ValidationIssue {
+                        severity: "error".to_string(),
+                        node_id: Some(node.id.clone()),
+                        scope: None,
+                        message: format!(
+                            "\"{}\" has invalid skip condition regex: {}",
+                            node.name, error
+                        ),
+                    });
+                }
+            }
         }
 
         let outgoing = graph.outgoing_for(&node.id);
@@ -1270,6 +1393,14 @@ fn validate_graph_body(
                         ),
                     });
                 }
+                if let Some(cwd) = &spawn_config.cwd {
+                    validate_absolute_cwd(
+                        cwd,
+                        &format!("\"{}\" spawn cwd", node.name),
+                        Some(&node.id),
+                        issues,
+                    );
+                }
             }
             NodeKind::Send { send_config } => {
                 let text = if send_config.text.is_empty() {
@@ -1324,6 +1455,14 @@ fn validate_graph_body(
                         scope: None,
                         message: format!("\"{}\" run_agent node has an empty prompt.", node.name),
                     });
+                }
+                if let Some(cwd) = &run_agent_config.cwd {
+                    validate_absolute_cwd(
+                        cwd,
+                        &format!("\"{}\" run_agent cwd", node.name),
+                        Some(&node.id),
+                        issues,
+                    );
                 }
                 validate_wait_timing_and_marker(
                     &node.id,
@@ -1965,10 +2104,37 @@ fn validate_subflow_call_cycles(workflow: &WorkflowV3, issues: &mut Vec<Validati
         collect_subflow_calls(name, subflow, &mut graph);
     }
 
-    let mut emitted = BTreeSet::new();
-    for start in graph.keys() {
-        let mut stack = Vec::new();
-        detect_subflow_cycle(start, &graph, &mut stack, &mut emitted, issues);
+    for component in subflow_strongly_connected_components(&graph) {
+        let members = component.iter().cloned().collect::<BTreeSet<_>>();
+        let self_loop = component.len() == 1
+            && graph
+                .get(&component[0])
+                .is_some_and(|edges| edges.iter().any(|(callee, _, _)| callee == &component[0]));
+        if component.len() == 1 && !self_loop {
+            continue;
+        }
+
+        let (node_id, max_depth) = component
+            .iter()
+            .find_map(|caller| {
+                graph.get(caller).and_then(|edges| {
+                    edges
+                        .iter()
+                        .find(|(callee, _, _)| members.contains(callee))
+                        .map(|(_, node_id, max_depth)| (node_id, max_depth))
+                })
+            })
+            .expect("a cyclic component must contain an internal call edge");
+        issues.push(ValidationIssue {
+            severity: "warning".to_string(),
+            node_id: Some(node_id.clone()),
+            scope: None,
+            message: format!(
+                "Subflow call cycle detected among subflows {{{}}}. maxDepth ({}) bounds recursion at runtime.",
+                component.join(", "),
+                max_depth
+            ),
+        });
     }
 }
 
@@ -1977,6 +2143,7 @@ fn collect_subflow_calls(
     workflow: &WorkflowV3,
     graph: &mut BTreeMap<String, Vec<(String, String, u32)>>,
 ) {
+    graph.entry(workflow_name.to_string()).or_default();
     for node in &workflow.nodes {
         let config = match &node.kind {
             NodeKind::Subflow { subflow_config } | NodeKind::Call { subflow_config } => {
@@ -2007,38 +2174,108 @@ fn collect_subflow_calls(
     }
 }
 
-fn detect_subflow_cycle(
-    current: &str,
+fn subflow_strongly_connected_components(
     graph: &BTreeMap<String, Vec<(String, String, u32)>>,
-    stack: &mut Vec<String>,
-    emitted: &mut BTreeSet<String>,
-    issues: &mut Vec<ValidationIssue>,
-) {
-    let Some(edges) = graph.get(current) else {
-        return;
-    };
-    stack.push(current.to_string());
-    for (callee, node_id, max_depth) in edges {
-        if let Some(position) = stack.iter().position(|name| name == callee) {
-            let mut cycle = stack[position..].to_vec();
-            cycle.push(callee.clone());
-            let signature = cycle.join(" -> ");
-            if emitted.insert(signature.clone()) {
-                issues.push(ValidationIssue {
-                    severity: "warning".to_string(),
-                    node_id: Some(node_id.clone()),
-                    scope: None,
-                    message: format!(
-                        "Subflow call cycle detected: {}. maxDepth ({}) bounds recursion at runtime.",
-                        signature, max_depth
-                    ),
-                });
-            }
+) -> Vec<Vec<String>> {
+    // Tarjan's SCC algorithm with explicit DFS frames avoids native recursion.
+    struct DfsFrame {
+        vertex: String,
+        next_edge: usize,
+        parent: Option<String>,
+    }
+
+    let mut vertices = BTreeSet::new();
+    for (caller, edges) in graph {
+        vertices.insert(caller.clone());
+        vertices.extend(edges.iter().map(|(callee, _, _)| callee.clone()));
+    }
+
+    let mut next_index = 0_usize;
+    let mut indices = BTreeMap::new();
+    let mut lowlinks = BTreeMap::new();
+    let mut component_stack = Vec::new();
+    let mut on_component_stack = BTreeSet::new();
+    let mut components = Vec::new();
+
+    for start in vertices {
+        if indices.contains_key(&start) {
             continue;
         }
-        detect_subflow_cycle(callee, graph, stack, emitted, issues);
+
+        indices.insert(start.clone(), next_index);
+        lowlinks.insert(start.clone(), next_index);
+        next_index += 1;
+        component_stack.push(start.clone());
+        on_component_stack.insert(start.clone());
+
+        let mut dfs_stack = vec![DfsFrame {
+            vertex: start,
+            next_edge: 0,
+            parent: None,
+        }];
+        while !dfs_stack.is_empty() {
+            let next = {
+                let frame = dfs_stack.last_mut().expect("stack is not empty");
+                let next = graph
+                    .get(&frame.vertex)
+                    .and_then(|edges| edges.get(frame.next_edge))
+                    .map(|(callee, _, _)| callee.clone());
+                frame.next_edge += usize::from(next.is_some());
+                next
+            };
+
+            if let Some(callee) = next {
+                if !indices.contains_key(&callee) {
+                    let parent = dfs_stack.last().expect("stack is not empty").vertex.clone();
+                    indices.insert(callee.clone(), next_index);
+                    lowlinks.insert(callee.clone(), next_index);
+                    next_index += 1;
+                    component_stack.push(callee.clone());
+                    on_component_stack.insert(callee.clone());
+                    dfs_stack.push(DfsFrame {
+                        vertex: callee,
+                        next_edge: 0,
+                        parent: Some(parent),
+                    });
+                } else if on_component_stack.contains(&callee) {
+                    let current = &dfs_stack.last().expect("stack is not empty").vertex;
+                    let callee_index = indices[&callee];
+                    let current_lowlink = lowlinks
+                        .get_mut(current)
+                        .expect("active vertex has a lowlink");
+                    *current_lowlink = (*current_lowlink).min(callee_index);
+                }
+            } else {
+                let finished = dfs_stack.pop().expect("stack is not empty");
+                if let Some(parent) = finished.parent {
+                    let finished_lowlink = lowlinks[&finished.vertex];
+                    let parent_lowlink = lowlinks
+                        .get_mut(&parent)
+                        .expect("parent vertex has a lowlink");
+                    *parent_lowlink = (*parent_lowlink).min(finished_lowlink);
+                }
+
+                if lowlinks[&finished.vertex] == indices[&finished.vertex] {
+                    let mut component = Vec::new();
+                    loop {
+                        let member = component_stack
+                            .pop()
+                            .expect("component root is on the stack");
+                        on_component_stack.remove(&member);
+                        let is_root = member == finished.vertex;
+                        component.push(member);
+                        if is_root {
+                            break;
+                        }
+                    }
+                    component.sort();
+                    components.push(component);
+                }
+            }
+        }
     }
-    stack.pop();
+
+    components
 }
 
 fn validate_decide_node_config(
@@ -2787,9 +3024,9 @@ mod tests {
 
         let normalized = normalize_workflow_value(json).unwrap();
 
-        assert_eq!(normalized.workflow.version, 3);
+        assert_eq!(normalized.workflow.version, 4);
         assert!(normalized.notices.iter().any(|notice| {
-            notice.contains("Migrated workflow schema from version 2 to version 3")
+            notice.contains("Migrated workflow schema from version 2 to version 4")
         }));
         assert!(matches!(
             &normalized.workflow.nodes[0].kind,
@@ -2799,25 +3036,98 @@ mod tests {
     }
 
     #[test]
-    fn capture_config_presence_is_structural() {
+    fn v3_flat_node_shape_migrates_structurally_to_v4() {
         let json = json!({
             "version": 3,
             "goal": "test",
             "cwd": "/tmp",
             "useOrchestrator": false,
-            "entryNodeId": "capture",
+            "entryNodeId": "decide",
             "variables": [],
             "limits": { "maxTotalSteps": 10, "maxVisitsPerNode": 5 },
             "nodes": [{
-                "id": "capture",
-                "name": "Capture",
-                "kind": { "type": "capture" }
+                "id": "decide",
+                "name": "Pick",
+                "type": "decide",
+                "decideConfig": {
+                    "prompt": "Pick one",
+                    "outcomes": ["yes"]
+                }
             }],
             "edges": []
         });
 
-        let error = normalize_workflow_value(json).unwrap_err();
-        assert!(error.to_string().contains("failed to deserialize workflow"));
+        let normalized = normalize_workflow_value(json).unwrap();
+
+        assert_eq!(normalized.workflow.version, 4);
+        assert!(matches!(
+            &normalized.workflow.nodes[0].kind,
+            NodeKind::Decide { decide_config }
+                if decide_config.outcomes == vec!["yes".to_string()]
+        ));
+    }
+
+    #[test]
+    fn send_node_without_config_defaults_to_enter() {
+        let node: WorkflowNode = serde_json::from_value(json!({
+            "id": "send",
+            "name": "Send",
+            "kind": { "type": "send" }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            node.kind,
+            NodeKind::Send { send_config } if send_config.enter
+        ));
+    }
+
+    #[test]
+    fn run_agent_node_without_config_defaults_to_kill_after() {
+        let node: WorkflowNode = serde_json::from_value(json!({
+            "id": "run-agent",
+            "name": "Run agent",
+            "kind": { "type": "run_agent" }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            node.kind,
+            NodeKind::RunAgent {
+                run_agent_config,
+                ..
+            } if run_agent_config.kill_after
+        ));
+    }
+
+    #[test]
+    fn capture_node_without_config_defaults() {
+        let node: WorkflowNode = serde_json::from_value(json!({
+            "id": "capture",
+            "name": "Capture",
+            "kind": { "type": "capture" }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            node.kind,
+            NodeKind::Capture { capture_config } if capture_config == CaptureConfig::default()
+        ));
+    }
+
+    #[test]
+    fn kill_node_without_config_defaults() {
+        let node: WorkflowNode = serde_json::from_value(json!({
+            "id": "kill",
+            "name": "Kill",
+            "kind": { "type": "kill" }
+        }))
+        .unwrap();
+
+        assert!(matches!(
+            node.kind,
+            NodeKind::Kill { kill_config } if kill_config == KillConfig::default()
+        ));
     }
 
     // -----------------------------------------------------------------------
@@ -3157,16 +3467,16 @@ mod tests {
 
         let normalized = normalize_workflow_value(json).expect("migration must succeed");
 
-        // Schema bumped to 3
+        // Schema bumped to 4
         assert_eq!(
-            normalized.workflow.version, 3,
-            "migrated workflow must be version 3"
+            normalized.workflow.version, 4,
+            "migrated workflow must be version 4"
         );
         assert!(
             normalized
                 .notices
                 .iter()
-                .any(|n| n.contains("Migrated workflow schema from version 2 to version 3")),
+                .any(|n| n.contains("Migrated workflow schema from version 2 to version 4")),
             "expected migration notice, got: {:?}",
             normalized.notices
         );
@@ -3388,8 +3698,8 @@ mod tests {
                 .unwrap_or_else(|error| panic!("{case_name} migration must succeed: {error}"));
 
             assert_eq!(
-                normalized.workflow.version, 3,
-                "{case_name}: migrated workflow must be version 3"
+                normalized.workflow.version, 4,
+                "{case_name}: migrated workflow must be version 4"
             );
 
             let node = normalized
@@ -3755,29 +4065,114 @@ mod tests {
 
     #[test]
     fn warns_on_subflow_call_cycles() {
-        let mut call = node("call", "Recursive Call", WorkflowNodeType::Call);
-        call.kind = NodeKind::Call {
+        let mut call_beta = node("call-beta", "Call Beta", WorkflowNodeType::Call);
+        call_beta.kind = NodeKind::Call {
             subflow_config: SubflowConfig {
-                workflow_name: "recursive".to_string(),
-                exit_node_id: Some("call".to_string()),
+                workflow_name: "beta".to_string(),
+                exit_node_id: Some("call-alpha".to_string()),
                 inputs: Vec::new(),
                 max_depth: 3,
             },
         };
-        let recursive = workflow(vec![call], vec![], "call");
+        let alpha = workflow(vec![call_beta], vec![], "call-beta");
+
+        let mut call_alpha = node("call-alpha", "Call Alpha", WorkflowNodeType::Call);
+        call_alpha.kind = NodeKind::Call {
+            subflow_config: SubflowConfig {
+                workflow_name: "alpha".to_string(),
+                exit_node_id: Some("call-beta".to_string()),
+                inputs: Vec::new(),
+                max_depth: 5,
+            },
+        };
+        let beta = workflow(vec![call_alpha], vec![], "call-alpha");
+
         let mut parent = workflow(
             vec![node("start", "Start", WorkflowNodeType::Task)],
             vec![],
             "start",
         );
-        parent
-            .subflows
-            .insert("recursive".to_string(), Box::new(recursive));
+        parent.subflows.insert("alpha".to_string(), Box::new(alpha));
+        parent.subflows.insert("beta".to_string(), Box::new(beta));
+
+        let result = validate_workflow(parent);
+
+        let cycle_warnings = result
+            .issues
+            .iter()
+            .filter(|issue| issue.message.contains("Subflow call cycle detected"))
+            .collect::<Vec<_>>();
+        assert_eq!(cycle_warnings.len(), 1, "got {cycle_warnings:?}");
+        assert_eq!(cycle_warnings[0].severity, "warning");
+        assert!(
+            cycle_warnings[0].message.contains("subflows {alpha, beta}"),
+            "got {}",
+            cycle_warnings[0].message
+        );
+    }
+
+    #[test]
+    fn rejects_workflows_exceeding_subflow_count_limit() {
+        let mut parent = workflow(
+            vec![node("start", "Start", WorkflowNodeType::Task)],
+            vec![],
+            "start",
+        );
+        for index in 0..1_025 {
+            let node_id = format!("node-{index}");
+            parent.subflows.insert(
+                format!("subflow-{index}"),
+                Box::new(workflow(
+                    vec![node(&node_id, "Step", WorkflowNodeType::Task)],
+                    vec![],
+                    &node_id,
+                )),
+            );
+        }
 
         let result = validate_workflow(parent);
 
         assert!(result.issues.iter().any(|issue| {
-            issue.severity == "warning" && issue.message.contains("Subflow call cycle detected")
+            issue.severity == "error"
+                && issue
+                    .message
+                    .contains("contains 1025 subflows; at most 1024 are allowed")
+        }));
+    }
+
+    #[test]
+    fn rejects_workflows_exceeding_subflow_call_edge_limit() {
+        let mut calls = Vec::new();
+        for index in 0..4_097 {
+            let node_id = format!("call-{index}");
+            let mut call = node(&node_id, "Call Target", WorkflowNodeType::Call);
+            call.kind = NodeKind::Call {
+                subflow_config: SubflowConfig {
+                    workflow_name: "target".to_string(),
+                    exit_node_id: Some("target".to_string()),
+                    inputs: Vec::new(),
+                    max_depth: default_max_call_depth(),
+                },
+            };
+            calls.push(call);
+        }
+        let mut parent = workflow(calls, vec![], "call-0");
+        parent.subflows.insert(
+            "target".to_string(),
+            Box::new(workflow(
+                vec![node("target", "Target", WorkflowNodeType::Task)],
+                vec![],
+                "target",
+            )),
+        );
+
+        let result = validate_workflow(parent);
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue
+                    .message
+                    .contains("contains 4097 subflow call edges; at most 4096 are allowed")
         }));
     }
 

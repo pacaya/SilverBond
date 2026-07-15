@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 use tmux_tools_core::{
     TmuxInvocation,
     idle::{
-        DEFAULT_READY_SCAN_LINES, DEFAULT_READY_STABLE_SECONDS, IdleConfig, IdleReason,
-        wait_for_idle,
+        DEFAULT_READY_SCAN_LINES, DEFAULT_READY_STABLE_SECONDS, IdleConfig, IdleOutcome,
+        IdleReason, wait_for_idle,
     },
     names, target, tmux,
 };
@@ -30,8 +30,8 @@ use crate::{
     },
     pty_output::strip_ansi,
     runtime::{
-        AgentExecutionMetadata, NodeResult, NodeRunner, RuntimeContext, active_pane_key,
-        register_tmux_session,
+        AgentExecutionMetadata, NodeResult, NodeRunner, PANE_ALIAS_KEYS, RuntimeContext,
+        active_pane_key, register_tmux_session,
     },
     storage::Database,
 };
@@ -40,6 +40,7 @@ use crate::{
 pub(crate) struct TmuxNodeRunner;
 
 const IDLE_ESCALATE_SECS: f64 = 30.0;
+const INTERACTIVE_POLL_MIN_REMAINING: Duration = Duration::from_secs(1);
 const TMUX_LOOKUP_SENTINEL: &str = "SBTMUX:";
 const TMUX_LOOKUP_COMMAND: &str = r#"print -r -- "SBTMUX:$(command -v tmux)""#;
 
@@ -387,6 +388,84 @@ impl Drop for SessionGuard {
     }
 }
 
+/// RAII guard for agent pane spawn/reuse and kill-after teardown.
+struct PaneGuard<'a> {
+    pane_id: String,
+    session_name: Option<String>,
+    kill_after: bool,
+    active_pane: Option<&'a ActivePaneRegistration>,
+}
+
+impl<'a> PaneGuard<'a> {
+    fn acquire(
+        spawn_cfg: &SpawnConfig,
+        effective_agent: &str,
+        effective_cwd: &str,
+        config: Option<&AgentConfig>,
+        cfg: Option<&RunAgentConfig>,
+        active_pane: Option<&'a ActivePaneRegistration>,
+        continue_session_from: Option<&str>,
+    ) -> anyhow::Result<Self> {
+        let reused_pane = resolve_reused_pane(active_pane, continue_session_from)?;
+        let (pane_id, session_name, reused) = if let Some(pane_id) = reused_pane {
+            if let Some(active_pane) = active_pane {
+                active_pane.set(&pane_id);
+            }
+            (pane_id, None, true)
+        } else {
+            let spawned = spawn_pane(
+                Some(spawn_cfg),
+                Some(effective_agent),
+                effective_cwd,
+                config,
+                None,
+                None,
+            )?;
+            if let Some(active_pane) = active_pane {
+                active_pane.register_owned_target(&spawned.pane_id, Some(&spawned.session_name));
+                active_pane.set_with_session(&spawned.pane_id, Some(&spawned.session_name));
+            }
+            (spawned.pane_id, Some(spawned.session_name), false)
+        };
+        Ok(Self {
+            pane_id,
+            session_name,
+            kill_after: should_kill_after(cfg, config, reused),
+            active_pane,
+        })
+    }
+
+    fn pane_id(&self) -> &str {
+        &self.pane_id
+    }
+
+    #[cfg(test)]
+    fn disarm(&mut self) {
+        self.kill_after = false;
+    }
+
+    #[cfg(test)]
+    fn session_name(&self) -> Option<&str> {
+        self.session_name.as_deref()
+    }
+}
+
+impl Drop for PaneGuard<'_> {
+    fn drop(&mut self) {
+        if !self.kill_after {
+            return;
+        }
+        if let Some(session_name) = self.session_name.as_deref() {
+            let _ = tmux::run(&["kill-session", "-t", session_name]);
+        } else {
+            let _ = tmux::run(&["kill-pane", "-t", &self.pane_id]);
+        }
+        if let Some(active_pane) = self.active_pane {
+            active_pane.clear_key();
+        }
+    }
+}
+
 /// Returns true when called from within a Tokio async task (not a `spawn_blocking` thread).
 fn in_current_task() -> bool {
     tokio::task::try_id().is_some()
@@ -433,10 +512,6 @@ impl ActivePaneRegistration {
         let key = self.key.clone();
         let target = target.to_string();
         let session_name = session_name.map(str::to_string);
-        debug_assert!(
-            !in_current_task(),
-            "Handle::block_on may only be called from spawn_blocking thread"
-        );
         self.handle.block_on(async move {
             registry
                 .set_active_pane_with_session(&run_id, &key, &target, session_name.clone())
@@ -447,14 +522,38 @@ impl ActivePaneRegistration {
         });
     }
 
+    fn register_owned_target(&self, pane_id: &str, session_name: Option<&str>) {
+        let registry = self.registry.clone();
+        let run_id = self.run_id.clone();
+        let pane_id = pane_id.to_string();
+        let session_name = session_name.map(str::to_string);
+        self.handle.block_on(async move {
+            registry
+                .register_owned_tmux_target(&run_id, &pane_id, session_name.as_deref())
+                .await;
+        });
+    }
+
+    fn owns_pane(&self, pane_id: &str) -> bool {
+        let registry = self.registry.clone();
+        let run_id = self.run_id.clone();
+        let pane_id = pane_id.to_string();
+        self.handle
+            .block_on(async move { registry.owns_tmux_pane(&run_id, &pane_id).await })
+    }
+
+    fn owns_session(&self, session_name: &str) -> bool {
+        let registry = self.registry.clone();
+        let run_id = self.run_id.clone();
+        let session_name = session_name.to_string();
+        self.handle
+            .block_on(async move { registry.owns_tmux_session(&run_id, &session_name).await })
+    }
+
     fn clear_key(&self) {
         let registry = self.registry.clone();
         let run_id = self.run_id.clone();
         let key = self.key.clone();
-        debug_assert!(
-            !in_current_task(),
-            "Handle::block_on may only be called from spawn_blocking thread"
-        );
         self.handle.block_on(async move {
             registry.clear_active_pane(&run_id, &key).await;
         });
@@ -464,10 +563,6 @@ impl ActivePaneRegistration {
         let registry = self.registry.clone();
         let run_id = self.run_id.clone();
         let target = target.to_string();
-        debug_assert!(
-            !in_current_task(),
-            "Handle::block_on may only be called from spawn_blocking thread"
-        );
         self.handle.block_on(async move {
             registry.clear_active_pane_target(&run_id, &target).await;
         });
@@ -478,10 +573,6 @@ impl ActivePaneRegistration {
         let run_id = self.run_id.clone();
         let same_cursor_key = active_pane_key(&self.cursor_id, key);
         let fallback_key = key.to_string();
-        debug_assert!(
-            !in_current_task(),
-            "Handle::block_on may only be called from spawn_blocking thread"
-        );
         self.handle.block_on(async move {
             if let Some(target) = registry
                 .resolve_active_pane(&run_id, &same_cursor_key)
@@ -585,6 +676,7 @@ fn execute_spawn(
         .unwrap_or(default_cwd);
     let spawned = spawn_pane(Some(cfg), agent.as_deref(), cwd, None, None, None)?;
     if let Some(active_pane) = active_pane {
+        active_pane.register_owned_target(&spawned.pane_id, Some(&spawned.session_name));
         active_pane.set_with_session(&spawned.pane_id, Some(&spawned.session_name));
     }
     let parsed = json!({
@@ -610,7 +702,7 @@ fn execute_send(
     active_pane: Option<&ActivePaneRegistration>,
 ) -> anyhow::Result<NodeResult> {
     let start = Instant::now();
-    let pane = resolve_pane_target(cfg.target.as_deref(), previous_output)?;
+    let pane = resolve_pane_target(cfg.target.as_deref(), previous_output, active_pane)?;
     if let Some(active_pane) = active_pane {
         active_pane.set(&pane);
     }
@@ -644,12 +736,13 @@ fn execute_wait(
     active_pane: Option<&ActivePaneRegistration>,
 ) -> anyhow::Result<NodeResult> {
     let start = Instant::now();
-    let pane = resolve_pane_target(cfg.target.as_deref(), previous_output)?;
+    let pane = resolve_pane_target(cfg.target.as_deref(), previous_output, active_pane)?;
     if let Some(active_pane) = active_pane {
         active_pane.set(&pane);
     }
-    let outcome = wait_for_mode(&pane, &cfg, timeout_secs)?;
-    let success = outcome.reason != IdleReason::TimedOut;
+    let waited = wait_for_mode(&pane, &cfg, timeout_secs)?;
+    let outcome = waited.outcome;
+    let success = waited.success;
     let parsed = json!({
         "paneId": pane,
         "reason": outcome.reason.as_str(),
@@ -664,10 +757,16 @@ fn execute_wait(
         start.elapsed(),
     );
     if !success {
-        result.stderr = "Timed out waiting for tmux pane".to_owned();
-        result.exit_code = -2;
-        result.metadata.outcome = Some(NodeOutcome::ErrorTimeout);
-        result.metadata.error_type = Some("timeout".to_owned());
+        if outcome.reason == IdleReason::TimedOut {
+            result.stderr = "Timed out waiting for tmux pane".to_owned();
+            result.exit_code = -2;
+            result.metadata.outcome = Some(NodeOutcome::ErrorTimeout);
+            result.metadata.error_type = Some("timeout".to_owned());
+        } else {
+            result.stderr =
+                "Tmux pane became idle before matching the configured wait marker".to_owned();
+            result.metadata.error_type = Some("tmux".to_owned());
+        }
     }
     Ok(result)
 }
@@ -679,7 +778,7 @@ fn execute_capture(
     active_pane: Option<&ActivePaneRegistration>,
 ) -> anyhow::Result<NodeResult> {
     let start = Instant::now();
-    let pane = resolve_pane_target(cfg.target.as_deref(), previous_output)?;
+    let pane = resolve_pane_target(cfg.target.as_deref(), previous_output, active_pane)?;
     if let Some(active_pane) = active_pane {
         active_pane.set(&pane);
     }
@@ -724,10 +823,13 @@ fn execute_kill(
     let target = cfg
         .target
         .as_deref()
-        .or_else(|| previous_value(&previous, &["paneId", "pane_id", "target"]));
+        .or_else(|| previous_value(&previous, &PANE_ALIAS_KEYS));
 
     if let Some(session) = session.filter(|s| !s.trim().is_empty()) {
         let session = stable_session_name(session);
+        if active_pane.is_some_and(|active_pane| !active_pane.owns_session(&session)) {
+            anyhow::bail!("tmux session target {session:?} is not owned by this run");
+        }
         tmux::run_checked(&["kill-session", "-t", &session])?;
         if let Some(active_pane) = active_pane {
             active_pane.clear_key();
@@ -742,7 +844,7 @@ fn execute_kill(
         ));
     }
 
-    let pane = resolve_pane_target(target, previous_output)?;
+    let pane = resolve_pane_target(target, previous_output, active_pane)?;
     tmux::run_checked(&["kill-pane", "-t", &pane])?;
     if let Some(active_pane) = active_pane {
         active_pane.clear_target(&pane);
@@ -873,22 +975,28 @@ fn run_agent_interactive(
     let interaction_patterns = drv
         .interaction_patterns()
         .into_iter()
-        .filter_map(|pattern| {
-            Regex::new(&pattern.pattern)
-                .ok()
-                .map(|regex| CompiledInteractionPattern {
-                    regex,
-                    kind: pattern.kind,
-                    description: pattern.description,
-                    send_enter: pattern.send_enter,
-                })
+        .map(|pattern| {
+            let regex = Regex::new(&pattern.pattern).with_context(|| {
+                format!(
+                    "invalid interaction pattern regex for {}: {}",
+                    pattern.description, pattern.pattern
+                )
+            })?;
+            Ok(CompiledInteractionPattern {
+                regex,
+                kind: pattern.kind,
+                description: pattern.description,
+                send_enter: pattern.send_enter,
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let destructive_regexes = drv
         .destructive_blocklist()
         .iter()
-        .filter_map(|pattern| Regex::new(pattern).ok())
-        .collect::<Vec<_>>();
+        .map(|pattern| {
+            Regex::new(pattern).with_context(|| format!("invalid destructive blocklist regex: {pattern}"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
 
     let spawn_cfg = SpawnConfig {
         agent: Some(effective_agent.clone()),
@@ -901,26 +1009,16 @@ fn run_agent_interactive(
         ..Default::default()
     };
 
-    let reused_pane = resolve_reused_pane(active_pane, continue_session_from)?;
-    let (pane_id, session_name, reused) = if let Some(pane_id) = reused_pane {
-        if let Some(active_pane) = active_pane {
-            active_pane.set(&pane_id);
-        }
-        (pane_id, None, true)
-    } else {
-        let spawned = spawn_pane(
-            Some(&spawn_cfg),
-            Some(&effective_agent),
-            &effective_cwd,
-            config,
-            None,
-            None,
-        )?;
-        if let Some(active_pane) = active_pane {
-            active_pane.set_with_session(&spawned.pane_id, Some(&spawned.session_name));
-        }
-        (spawned.pane_id, Some(spawned.session_name), false)
-    };
+    let guard = PaneGuard::acquire(
+        &spawn_cfg,
+        &effective_agent,
+        &effective_cwd,
+        config,
+        cfg,
+        active_pane,
+        continue_session_from,
+    )?;
+    let pane_id = guard.pane_id();
 
     let subagent_timeout = agent_cfg
         .orchestrator
@@ -933,141 +1031,134 @@ fn run_agent_interactive(
         .as_ref()
         .and_then(|orchestrator| orchestrator.stale_timeout_secs);
 
-    let result = (|| {
-        let ready = wait_for_agent_ready_interactive(
-            &pane_id,
-            timeout_duration,
-            idle_seconds,
-            ready_stable_seconds,
-            false,
-            subagent_timeout,
-            &interaction_patterns,
-            &destructive_regexes,
-            interaction,
-            abort_flag,
-        )?;
-        match ready {
-            InteractiveReadyResult::Ready(IdleReason::TimedOut) => {
-                return Ok(failed_result(
-                    "Timed out waiting for tmux agent readiness",
-                    -2,
-                    &effective_agent,
-                    &effective_prompt,
-                    start.elapsed(),
-                    Some(pane_id.clone()),
-                    Some(NodeOutcome::ErrorTimeout),
-                ));
-            }
-            InteractiveReadyResult::Aborted => {
-                return Ok(aborted_result(
-                    &effective_agent,
-                    &effective_prompt,
-                    start.elapsed(),
-                    Some(pane_id.clone()),
-                    None,
-                ));
-            }
-            InteractiveReadyResult::Ready(_) => {}
+    let run_deadline = start + timeout_duration;
+    let max_total_timeout = timeout_duration.max(subagent_timeout * 10);
+    let absolute_deadline = start + max_total_timeout;
+
+    let ready = wait_for_agent_ready_interactive(
+        pane_id,
+        start,
+        run_deadline,
+        absolute_deadline,
+        idle_seconds,
+        ready_stable_seconds,
+        false,
+        subagent_timeout,
+        &interaction_patterns,
+        &destructive_regexes,
+        interaction,
+        abort_flag,
+    )?;
+    match ready {
+        InteractiveReadyResult::Ready(IdleReason::TimedOut) => {
+            return Ok(failed_result(
+                "Timed out waiting for tmux agent readiness",
+                -2,
+                &effective_agent,
+                &effective_prompt,
+                start.elapsed(),
+                Some(pane_id.to_owned()),
+                Some(NodeOutcome::ErrorTimeout),
+            ));
         }
-
-        let capture_markers = PromptCaptureMarkers::new();
-        let prompt_to_send = wrap_prompt_for_capture_markers(&effective_prompt, &capture_markers);
-        let before = capture_visible_stripped(&pane_id)?;
-        send_text(&pane_id, &prompt_to_send, true)?;
-
-        let polled = poll_agent_interactive(
-            &pane_id,
-            &before,
-            &effective_prompt,
-            timeout_duration,
-            idle_seconds,
-            ready_stable_seconds,
-            cfg.and_then(|cfg| cfg.until.as_deref()),
-            Some(&capture_markers),
-            agent_cfg.auto_approve,
-            subagent_timeout,
-            stale_timeout_secs,
-            &interaction_patterns,
-            &destructive_regexes,
-            interaction,
-            abort_flag,
-        )?;
-
-        let response = match polled {
-            InteractivePollResult::Completed(response) => response,
-            InteractivePollResult::TimedOut(response) => {
-                let mut result = failed_result(
-                    "Timeout waiting for agent response",
-                    -1,
-                    &effective_agent,
-                    &effective_prompt,
-                    start.elapsed(),
-                    Some(pane_id.clone()),
-                    Some(NodeOutcome::ErrorTimeout),
-                );
-                result.output = response.output;
-                result.raw_output = Some(response.final_capture);
-                result.metadata.error_type = Some("timeout".to_owned());
-                return Ok(result);
-            }
-            InteractivePollResult::Aborted(response) => {
-                return Ok(aborted_result(
-                    &effective_agent,
-                    &effective_prompt,
-                    start.elapsed(),
-                    Some(pane_id.clone()),
-                    Some(response),
-                ));
-            }
-        };
-
-        let cost = drv
-            .cost_command()
-            .and_then(|command| query_agent_command(&pane_id, command).ok())
-            .and_then(|output| drv.parse_cost_response(&output));
-        let context_pct = drv
-            .context_command()
-            .and_then(|command| query_agent_command(&pane_id, command).ok())
-            .and_then(|output| drv.parse_context_response(&output))
-            .and_then(|info| info.used_percentage);
-
-        Ok(NodeResult {
-            success: true,
-            output: response.output.clone(),
-            stderr: String::new(),
-            exit_code: 0,
-            duration: duration_string(start.elapsed()),
-            agent: effective_agent.clone(),
-            prompt: effective_prompt.clone(),
-            raw_output: Some(response.final_capture),
-            metadata: AgentExecutionMetadata {
-                outcome: Some(NodeOutcome::Success),
-                agent_session_id: Some(pane_id.clone()),
-                cost_usd: cost.as_ref().and_then(|info| info.total_cost_usd),
-                input_tokens: cost.as_ref().and_then(|info| info.input_tokens),
-                output_tokens: cost.as_ref().and_then(|info| info.output_tokens),
-                thinking_tokens: cost.as_ref().and_then(|info| info.thinking_tokens),
-                cache_read_tokens: cost.as_ref().and_then(|info| info.cache_read_tokens),
-                cache_write_tokens: cost.as_ref().and_then(|info| info.cache_write_tokens),
-                context_used_pct: context_pct,
-                ..Default::default()
-            },
-            ..Default::default()
-        })
-    })();
-
-    if should_kill_after(cfg, config, reused) {
-        if let Some(session_name) = session_name.as_deref() {
-            let _ = tmux::run(&["kill-session", "-t", session_name]);
-        } else {
-            let _ = tmux::run(&["kill-pane", "-t", &pane_id]);
+        InteractiveReadyResult::Aborted => {
+            return Ok(aborted_result(
+                &effective_agent,
+                &effective_prompt,
+                start.elapsed(),
+                Some(pane_id.to_owned()),
+                None,
+            ));
         }
-        if let Some(active_pane) = active_pane {
-            active_pane.clear_key();
-        }
+        InteractiveReadyResult::Ready(_) => {}
     }
 
-    result
+    let capture_markers = PromptCaptureMarkers::new();
+    let prompt_to_send = wrap_prompt_for_capture_markers(&effective_prompt, &capture_markers);
+    let before = capture_visible_stripped(pane_id)?;
+    send_text(pane_id, &prompt_to_send, true)?;
+
+    let polled = poll_agent_interactive(
+        pane_id,
+        &before,
+        &effective_prompt,
+        start,
+        run_deadline,
+        absolute_deadline,
+        idle_seconds,
+        ready_stable_seconds,
+        cfg.and_then(|cfg| cfg.until.as_deref()),
+        Some(&capture_markers),
+        agent_cfg.auto_approve,
+        subagent_timeout,
+        stale_timeout_secs,
+        &interaction_patterns,
+        &destructive_regexes,
+        interaction,
+        abort_flag,
+    )?;
+
+    let response = match polled {
+        InteractivePollResult::Completed(response) => response,
+        InteractivePollResult::TimedOut(response) => {
+            let mut result = failed_result(
+                "Timeout waiting for agent response",
+                -1,
+                &effective_agent,
+                &effective_prompt,
+                start.elapsed(),
+                Some(pane_id.to_owned()),
+                Some(NodeOutcome::ErrorTimeout),
+            );
+            result.output = response.output;
+            result.raw_output = Some(response.final_capture);
+            result.metadata.error_type = Some("timeout".to_owned());
+            return Ok(result);
+        }
+        InteractivePollResult::Aborted(response) => {
+            return Ok(aborted_result(
+                &effective_agent,
+                &effective_prompt,
+                start.elapsed(),
+                Some(pane_id.to_owned()),
+                Some(response),
+            ));
+        }
+    };
+
+    let cost = drv
+        .cost_command()
+        .and_then(|command| query_agent_command(pane_id, command).ok())
+        .and_then(|output| drv.parse_cost_response(&output));
+    let context_pct = drv
+        .context_command()
+        .and_then(|command| query_agent_command(pane_id, command).ok())
+        .and_then(|output| drv.parse_context_response(&output))
+        .and_then(|info| info.used_percentage);
+
+    Ok(NodeResult {
+        success: true,
+        output: response.output.clone(),
+        stderr: String::new(),
+        exit_code: 0,
+        duration: duration_string(start.elapsed()),
+        agent: effective_agent.clone(),
+        prompt: effective_prompt.clone(),
+        raw_output: Some(response.final_capture),
+        metadata: AgentExecutionMetadata {
+            outcome: Some(NodeOutcome::Success),
+            agent_session_id: Some(pane_id.to_owned()),
+            cost_usd: cost.as_ref().and_then(|info| info.total_cost_usd),
+            input_tokens: cost.as_ref().and_then(|info| info.input_tokens),
+            output_tokens: cost.as_ref().and_then(|info| info.output_tokens),
+            thinking_tokens: cost.as_ref().and_then(|info| info.thinking_tokens),
+            cache_read_tokens: cost.as_ref().and_then(|info| info.cache_read_tokens),
+            cache_write_tokens: cost.as_ref().and_then(|info| info.cache_write_tokens),
+            context_used_pct: context_pct,
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }
 
 /// Run a single classifier/one-shot prompt through an interactive tmux agent pane.
@@ -1116,8 +1207,8 @@ pub(crate) fn list_silverbond_tmux_sessions() -> anyhow::Result<Vec<String>> {
         .collect())
 }
 
-pub(crate) fn kill_tmux_session(session_name: &str) {
-    let _ = tmux::run(&["kill-session", "-t", session_name]);
+pub(crate) fn kill_tmux_session(session_name: &str) -> bool {
+    tmux::run(&["kill-session", "-t", session_name]).is_ok()
 }
 
 pub(crate) fn cleanup_panes(targets: &[PaneCleanupTarget]) -> anyhow::Result<()> {
@@ -1169,116 +1260,67 @@ fn run_agent_sequence(
         spawn_cfg.command = Some(format!("printf '%s\\n' {}", shell_quote(&effective_prompt)));
     }
 
-    let reused_pane = resolve_reused_pane(active_pane, continue_session_from)?;
-    let (pane_id, session_name, reused) = if let Some(pane_id) = reused_pane {
-        if let Some(active_pane) = active_pane {
-            active_pane.set(&pane_id);
-        }
-        (pane_id, None, true)
-    } else {
-        let spawned = spawn_pane(
-            Some(&spawn_cfg),
-            Some(&effective_agent),
-            &effective_cwd,
-            config,
-            None,
-            None,
-        )?;
-        if let Some(active_pane) = active_pane {
-            active_pane.set_with_session(&spawned.pane_id, Some(&spawned.session_name));
-        }
-        (spawned.pane_id, Some(spawned.session_name), false)
-    };
+    let guard = PaneGuard::acquire(
+        &spawn_cfg,
+        &effective_agent,
+        &effective_cwd,
+        config,
+        cfg,
+        active_pane,
+        continue_session_from,
+    )?;
+    let pane_id = guard.pane_id();
 
-    let result = (|| {
-        if !echo_mode {
-            let ready_cfg = WaitConfig {
-                mode: WaitMode::Ready,
-                timeout,
-                idle_seconds: cfg.and_then(|cfg| cfg.idle_seconds),
-                ready_stable_seconds: cfg.and_then(|cfg| cfg.ready_stable_seconds),
-                ..Default::default()
-            };
-            let ready = wait_for_mode(&pane_id, &ready_cfg, timeout)?;
-            if ready.reason == IdleReason::TimedOut {
-                return Ok(failed_result(
-                    "Timed out waiting for tmux agent readiness",
-                    -2,
-                    &effective_agent,
-                    &effective_prompt,
-                    start.elapsed(),
-                    Some(pane_id.clone()),
-                    Some(NodeOutcome::ErrorTimeout),
-                ));
-            }
-
-            let before = capture_visible_stripped(&pane_id)?;
-            send_text(&pane_id, &effective_prompt, true)?;
-            let wait_cfg = WaitConfig {
-                mode: if cfg.and_then(|cfg| cfg.until.as_ref()).is_some() {
-                    WaitMode::Until
-                } else {
-                    WaitMode::Idle
-                },
-                marker: cfg.and_then(|cfg| cfg.until.clone()),
-                timeout,
-                idle_seconds: cfg.and_then(|cfg| cfg.idle_seconds),
-                ready_stable_seconds: cfg.and_then(|cfg| cfg.ready_stable_seconds),
-                ..Default::default()
-            };
-            let waited = wait_for_mode(&pane_id, &wait_cfg, timeout)?;
-            if waited.reason == IdleReason::TimedOut {
-                return Ok(failed_result(
-                    "Timed out waiting for tmux agent response",
-                    -2,
-                    &effective_agent,
-                    &effective_prompt,
-                    start.elapsed(),
-                    Some(pane_id.clone()),
-                    Some(NodeOutcome::ErrorTimeout),
-                ));
-            }
-            let after = capture_visible_stripped(&pane_id)?;
-            let output = extract_after_prompt(&before, &after, &effective_prompt);
-            return Ok(NodeResult {
-                success: true,
-                output: output.clone(),
-                stderr: String::new(),
-                exit_code: 0,
-                duration: duration_string(start.elapsed()),
-                agent: effective_agent.clone(),
-                prompt: effective_prompt.clone(),
-                raw_output: Some(after),
-                metadata: AgentExecutionMetadata {
-                    outcome: Some(NodeOutcome::Success),
-                    agent_session_id: Some(pane_id.clone()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-        }
-
-        let wait_cfg = WaitConfig {
-            mode: WaitMode::Idle,
+    if !echo_mode {
+        let ready_cfg = WaitConfig {
+            mode: WaitMode::Ready,
             timeout,
             idle_seconds: cfg.and_then(|cfg| cfg.idle_seconds),
             ready_stable_seconds: cfg.and_then(|cfg| cfg.ready_stable_seconds),
             ..Default::default()
         };
-        let waited = wait_for_mode(&pane_id, &wait_cfg, timeout)?;
-        if waited.reason == IdleReason::TimedOut {
-            return Ok(failed_result(
-                "Timed out waiting for tmux command",
-                -2,
+        let ready = wait_for_mode(pane_id, &ready_cfg, timeout)?;
+        if !ready.success {
+            return Ok(failed_wait_result(
+                &ready,
+                "Timed out waiting for tmux agent readiness",
+                "Tmux agent became idle before matching its readiness marker",
                 &effective_agent,
                 &effective_prompt,
                 start.elapsed(),
-                Some(pane_id.clone()),
-                Some(NodeOutcome::ErrorTimeout),
+                Some(pane_id.to_owned()),
             ));
         }
-        let output = capture_visible_stripped(&pane_id)?;
-        Ok(NodeResult {
+
+        let before = capture_visible_stripped(pane_id)?;
+        send_text(pane_id, &effective_prompt, true)?;
+        let wait_cfg = WaitConfig {
+            mode: if cfg.and_then(|cfg| cfg.until.as_ref()).is_some() {
+                WaitMode::Until
+            } else {
+                WaitMode::Idle
+            },
+            marker: cfg.and_then(|cfg| cfg.until.clone()),
+            timeout,
+            idle_seconds: cfg.and_then(|cfg| cfg.idle_seconds),
+            ready_stable_seconds: cfg.and_then(|cfg| cfg.ready_stable_seconds),
+            ..Default::default()
+        };
+        let waited = wait_for_mode(pane_id, &wait_cfg, timeout)?;
+        if !waited.success {
+            return Ok(failed_wait_result(
+                &waited,
+                "Timed out waiting for tmux agent response",
+                "Tmux agent response became idle before matching its wait marker",
+                &effective_agent,
+                &effective_prompt,
+                start.elapsed(),
+                Some(pane_id.to_owned()),
+            ));
+        }
+        let after = capture_visible_stripped(pane_id)?;
+        let output = extract_after_prompt(&before, &after, &effective_prompt);
+        return Ok(NodeResult {
             success: true,
             output: output.clone(),
             stderr: String::new(),
@@ -1286,28 +1328,52 @@ fn run_agent_sequence(
             duration: duration_string(start.elapsed()),
             agent: effective_agent.clone(),
             prompt: effective_prompt.clone(),
-            raw_output: Some(output),
+            raw_output: Some(after),
             metadata: AgentExecutionMetadata {
                 outcome: Some(NodeOutcome::Success),
-                agent_session_id: Some(pane_id.clone()),
+                agent_session_id: Some(pane_id.to_owned()),
                 ..Default::default()
             },
             ..Default::default()
-        })
-    })();
-
-    if should_kill_after(cfg, config, reused) {
-        if let Some(session_name) = session_name.as_deref() {
-            let _ = tmux::run(&["kill-session", "-t", session_name]);
-        } else {
-            let _ = tmux::run(&["kill-pane", "-t", &pane_id]);
-        }
-        if let Some(active_pane) = active_pane {
-            active_pane.clear_key();
-        }
+        });
     }
 
-    result
+    let wait_cfg = WaitConfig {
+        mode: WaitMode::Idle,
+        timeout,
+        idle_seconds: cfg.and_then(|cfg| cfg.idle_seconds),
+        ready_stable_seconds: cfg.and_then(|cfg| cfg.ready_stable_seconds),
+        ..Default::default()
+    };
+    let waited = wait_for_mode(pane_id, &wait_cfg, timeout)?;
+    if !waited.success {
+        return Ok(failed_wait_result(
+            &waited,
+            "Timed out waiting for tmux command",
+            "Tmux command became idle before matching its wait marker",
+            &effective_agent,
+            &effective_prompt,
+            start.elapsed(),
+            Some(pane_id.to_owned()),
+        ));
+    }
+    let output = capture_visible_stripped(pane_id)?;
+    Ok(NodeResult {
+        success: true,
+        output: output.clone(),
+        stderr: String::new(),
+        exit_code: 0,
+        duration: duration_string(start.elapsed()),
+        agent: effective_agent.clone(),
+        prompt: effective_prompt.clone(),
+        raw_output: Some(output),
+        metadata: AgentExecutionMetadata {
+            outcome: Some(NodeOutcome::Success),
+            agent_session_id: Some(pane_id.to_owned()),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
 }
 
 fn resolve_reused_pane(
@@ -1346,7 +1412,9 @@ fn should_kill_after(
 #[allow(clippy::too_many_arguments)]
 fn wait_for_agent_ready_interactive(
     pane: &str,
-    timeout: Duration,
+    run_start: Instant,
+    run_deadline: Instant,
+    absolute_deadline: Instant,
     idle_seconds: f64,
     ready_stable_seconds: f64,
     auto_approve: bool,
@@ -1357,14 +1425,11 @@ fn wait_for_agent_ready_interactive(
     abort_flag: Option<&AtomicBool>,
 ) -> anyhow::Result<InteractiveReadyResult> {
     let ready_signal = ready_signal_for_pane(pane)?;
-    let start = Instant::now();
-    let mut deadline = start + timeout;
-    let max_total_timeout = timeout.max(subagent_timeout * 10);
-    let absolute_deadline = start + max_total_timeout;
+    let mut deadline = run_deadline;
     let mut capture = capture_visible_stripped(pane).unwrap_or_default();
     let mut last_seen = capture.clone();
-    let mut progress = CaptureProgress::new(&capture, start);
-    let mut handled_matches = Vec::new();
+    let mut progress = CaptureProgress::new(&capture, run_start);
+    let mut cursor: usize = 0;
     let mut handled_destructive_matches = HandledDestructiveMatches::default();
     let mut first_poll = true;
 
@@ -1380,76 +1445,35 @@ fn wait_for_agent_ready_interactive(
             }
             Err(err) => return Err(err),
         };
+        let prefix_len = common_prefix_len(&last_seen, &capture);
         let new_text = capture_delta(&last_seen, &capture);
         let has_new_text = !new_text.is_empty();
+        if prefix_len < cursor {
+            cursor = prefix_len;
+        }
+        cursor = cursor.min(capture.len());
         if has_new_text {
             last_seen = capture.clone();
         }
 
-        if let Some(destructive_match) = next_unhandled_destructive_match(
-            destructive_regexes,
-            &capture,
-            &handled_destructive_matches,
-        ) {
-            handled_destructive_matches.record(destructive_match);
-            let reply = escalate_or_fallback(
-                interaction,
+        if matches!(
+            dispatch_pattern_match(
                 pane,
-                InteractionKind::DestructiveWarning.event_type(),
-                "Potentially destructive command detected",
                 &capture,
-                "n",
-            )?;
-            send_reply_if_present(pane, &reply, true)?;
+                first_poll || has_new_text,
+                interaction_patterns,
+                destructive_regexes,
+                interaction,
+                auto_approve,
+                subagent_timeout,
+                absolute_deadline,
+                &mut handled_destructive_matches,
+                &mut cursor,
+                &mut deadline,
+            )?,
+            Dispatch::Handled
+        ) {
             continue;
-        }
-
-        if (first_poll || has_new_text)
-            && let Some((idx, key)) =
-                next_unhandled_pattern_match(interaction_patterns, &capture, &handled_matches)
-        {
-            handled_matches.push(key);
-            let pattern = &interaction_patterns[idx];
-            match &pattern.kind {
-                InteractionKind::AutoRespond { response } => {
-                    send_text(pane, response, pattern.send_enter)?;
-                    continue;
-                }
-                InteractionKind::SubagentActive => {
-                    let reset_at = Instant::now();
-                    deadline = reset_at + subagent_timeout;
-                    if reset_at < absolute_deadline {
-                        continue;
-                    }
-                }
-                InteractionKind::PermissionRequest => {
-                    let is_destructive = destructive_regexes
-                        .iter()
-                        .any(|regex| regex.is_match(&capture));
-                    let reply = permission_request_reply(
-                        interaction,
-                        pane,
-                        &pattern.description,
-                        &capture,
-                        is_destructive,
-                        auto_approve,
-                    )?;
-                    send_reply_if_present(pane, &reply, pattern.send_enter)?;
-                    continue;
-                }
-                InteractionKind::DestructiveWarning => {
-                    let reply = escalate_or_fallback(
-                        interaction,
-                        pane,
-                        InteractionKind::DestructiveWarning.event_type(),
-                        &pattern.description,
-                        &capture,
-                        "n",
-                    )?;
-                    send_reply_if_present(pane, &reply, pattern.send_enter)?;
-                    continue;
-                }
-            }
         }
 
         if let Some(reason) = progress.observe(
@@ -1478,7 +1502,9 @@ fn poll_agent_interactive(
     pane: &str,
     before: &str,
     prompt: &str,
-    timeout: Duration,
+    run_start: Instant,
+    run_deadline: Instant,
+    absolute_deadline: Instant,
     idle_seconds: f64,
     ready_stable_seconds: f64,
     until: Option<&str>,
@@ -1496,13 +1522,12 @@ fn poll_agent_interactive(
     let stale_threshold = stale_timeout_secs
         .map(|seconds| seconds as f64)
         .unwrap_or(IDLE_ESCALATE_SECS);
-    let start = Instant::now();
-    let mut deadline = start + timeout;
-    let max_total_timeout = timeout.max(subagent_timeout * 10);
-    let absolute_deadline = start + max_total_timeout;
+    let now = Instant::now();
+    let poll_floor = now + INTERACTIVE_POLL_MIN_REMAINING;
+    let mut deadline = run_deadline.max(poll_floor).min(absolute_deadline);
     let mut last_seen = before.to_owned();
-    let mut progress = CaptureProgress::new(before, start);
-    let mut handled_matches = Vec::new();
+    let mut progress = CaptureProgress::new(before, run_start);
+    let mut cursor: usize = 0;
     let mut handled_destructive_matches = HandledDestructiveMatches::default();
     let mut idle_since: Option<Instant> = None;
     let mut escalated_idle = false;
@@ -1529,8 +1554,13 @@ fn poll_agent_interactive(
             }
             Err(err) => return Err(err),
         };
+        let prefix_len = common_prefix_len(&last_seen, &capture);
         let new_text = capture_delta(&last_seen, &capture);
         let has_new_text = !new_text.is_empty();
+        if prefix_len < cursor {
+            cursor = prefix_len;
+        }
+        cursor = cursor.min(capture.len());
         if has_new_text {
             last_seen = capture.clone();
             idle_since = None;
@@ -1539,70 +1569,24 @@ fn poll_agent_interactive(
             extract_after_prompt_with_markers(before, &capture, prompt, capture_markers);
 
         // Cumulative over the visible pane; a line that scrolls fully off-screen is still out of scope.
-        if let Some(destructive_match) = next_unhandled_destructive_match(
-            destructive_regexes,
-            &output_so_far,
-            &handled_destructive_matches,
-        ) {
-            handled_destructive_matches.record(destructive_match);
-            let reply = escalate_or_fallback(
-                interaction,
+        if matches!(
+            dispatch_pattern_match(
                 pane,
-                InteractionKind::DestructiveWarning.event_type(),
-                "Potentially destructive command detected",
                 &output_so_far,
-                "n",
-            )?;
-            send_reply_if_present(pane, &reply, true)?;
+                has_new_text,
+                interaction_patterns,
+                destructive_regexes,
+                interaction,
+                auto_approve,
+                subagent_timeout,
+                absolute_deadline,
+                &mut handled_destructive_matches,
+                &mut cursor,
+                &mut deadline,
+            )?,
+            Dispatch::Handled
+        ) {
             continue;
-        }
-
-        if has_new_text
-            && let Some((idx, key)) =
-                next_unhandled_pattern_match(interaction_patterns, &output_so_far, &handled_matches)
-        {
-            handled_matches.push(key);
-            let pattern = &interaction_patterns[idx];
-            match &pattern.kind {
-                InteractionKind::AutoRespond { response } => {
-                    send_text(pane, response, pattern.send_enter)?;
-                    continue;
-                }
-                InteractionKind::SubagentActive => {
-                    let reset_at = Instant::now();
-                    deadline = reset_at + subagent_timeout;
-                    if reset_at < absolute_deadline {
-                        continue;
-                    }
-                }
-                InteractionKind::PermissionRequest => {
-                    let is_destructive = destructive_regexes
-                        .iter()
-                        .any(|regex| regex.is_match(&output_so_far));
-                    let reply = permission_request_reply(
-                        interaction,
-                        pane,
-                        &pattern.description,
-                        &output_so_far,
-                        is_destructive,
-                        auto_approve,
-                    )?;
-                    send_reply_if_present(pane, &reply, pattern.send_enter)?;
-                    continue;
-                }
-                InteractionKind::DestructiveWarning => {
-                    let reply = escalate_or_fallback(
-                        interaction,
-                        pane,
-                        InteractionKind::DestructiveWarning.event_type(),
-                        &pattern.description,
-                        &output_so_far,
-                        "n",
-                    )?;
-                    send_reply_if_present(pane, &reply, pattern.send_enter)?;
-                    continue;
-                }
-            }
         }
 
         if let Some(reason) = progress.observe(
@@ -1778,6 +1762,96 @@ fn permission_request_reply(
     )
 }
 
+enum Dispatch {
+    Handled,
+    NoAction,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_pattern_match(
+    pane: &str,
+    scan_buffer: &str,
+    should_check_patterns: bool,
+    interaction_patterns: &[CompiledInteractionPattern],
+    destructive_regexes: &[Regex],
+    interaction: Option<&InteractionEscalation>,
+    auto_approve: bool,
+    subagent_timeout: Duration,
+    absolute_deadline: Instant,
+    handled_destructive: &mut HandledDestructiveMatches,
+    cursor: &mut usize,
+    deadline: &mut Instant,
+) -> anyhow::Result<Dispatch> {
+    if let Some(destructive_match) = next_unhandled_destructive_match(
+        destructive_regexes,
+        scan_buffer,
+        handled_destructive,
+    ) {
+        handled_destructive.record(destructive_match);
+        let reply = escalate_or_fallback(
+            interaction,
+            pane,
+            InteractionKind::DestructiveWarning.event_type(),
+            "Potentially destructive command detected",
+            scan_buffer,
+            "n",
+        )?;
+        send_reply_if_present(pane, &reply, true)?;
+        return Ok(Dispatch::Handled);
+    }
+
+    if should_check_patterns
+        && let Some((idx, new_cursor)) =
+            next_unhandled_pattern_match(interaction_patterns, scan_buffer, *cursor)
+    {
+        *cursor = new_cursor;
+        let pattern = &interaction_patterns[idx];
+        match &pattern.kind {
+            InteractionKind::AutoRespond { response } => {
+                send_text(pane, response, pattern.send_enter)?;
+                return Ok(Dispatch::Handled);
+            }
+            InteractionKind::SubagentActive => {
+                let reset_at = Instant::now();
+                *deadline = reset_at + subagent_timeout;
+                if reset_at < absolute_deadline {
+                    return Ok(Dispatch::Handled);
+                }
+                return Ok(Dispatch::NoAction);
+            }
+            InteractionKind::PermissionRequest => {
+                let is_destructive = destructive_regexes
+                    .iter()
+                    .any(|regex| regex.is_match(scan_buffer));
+                let reply = permission_request_reply(
+                    interaction,
+                    pane,
+                    &pattern.description,
+                    scan_buffer,
+                    is_destructive,
+                    auto_approve,
+                )?;
+                send_reply_if_present(pane, &reply, pattern.send_enter)?;
+                return Ok(Dispatch::Handled);
+            }
+            InteractionKind::DestructiveWarning => {
+                let reply = escalate_or_fallback(
+                    interaction,
+                    pane,
+                    InteractionKind::DestructiveWarning.event_type(),
+                    &pattern.description,
+                    scan_buffer,
+                    "n",
+                )?;
+                send_reply_if_present(pane, &reply, pattern.send_enter)?;
+                return Ok(Dispatch::Handled);
+            }
+        }
+    }
+
+    Ok(Dispatch::NoAction)
+}
+
 fn send_reply_if_present(pane: &str, reply: &str, send_enter: bool) -> anyhow::Result<()> {
     if !reply.is_empty() {
         send_text(pane, reply, send_enter)?;
@@ -1847,18 +1921,12 @@ fn next_unhandled_destructive_match(
 fn next_unhandled_pattern_match(
     patterns: &[CompiledInteractionPattern],
     text: &str,
-    handled_matches: &[String],
-) -> Option<(usize, String)> {
+    cursor: usize,
+) -> Option<(usize, usize)> {
+    let scan_from = cursor.min(text.len());
     patterns.iter().enumerate().find_map(|(idx, pattern)| {
-        let matched = pattern.regex.find(text)?;
-        let key = format!(
-            "{}:{}:{}:{}",
-            pattern.kind.event_type(),
-            pattern.description,
-            matched.start(),
-            matched.end()
-        );
-        (!handled_matches.iter().any(|handled| handled == &key)).then_some((idx, key))
+        let matched = pattern.regex.find(&text[scan_from..])?;
+        Some((idx, scan_from + matched.end()))
     })
 }
 
@@ -1961,6 +2029,17 @@ fn bottom_non_blank_lines(stripped: &str, count: usize) -> Vec<&str> {
     lines
 }
 
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    let mut boundary = 0usize;
+    for ((a_idx, a_ch), (b_idx, b_ch)) in a.char_indices().zip(b.char_indices()) {
+        if a_ch != b_ch || a_idx != b_idx {
+            break;
+        }
+        boundary = b_idx + b_ch.len_utf8();
+    }
+    boundary
+}
+
 fn capture_delta(previous: &str, current: &str) -> String {
     if current == previous {
         return String::new();
@@ -1969,15 +2048,7 @@ fn capture_delta(previous: &str, current: &str) -> String {
         return suffix.to_owned();
     }
 
-    let mut boundary = 0usize;
-    for ((prev_idx, prev_ch), (current_idx, current_ch)) in
-        previous.char_indices().zip(current.char_indices())
-    {
-        if prev_ch != current_ch || prev_idx != current_idx {
-            break;
-        }
-        boundary = current_idx + current_ch.len_utf8();
-    }
+    let boundary = common_prefix_len(previous, current);
     current[boundary..].to_owned()
 }
 
@@ -2130,11 +2201,16 @@ fn access_profile_from_config(config: Option<&AgentConfig>) -> Option<String> {
     )
 }
 
+struct WaitForModeResult {
+    outcome: IdleOutcome,
+    success: bool,
+}
+
 fn wait_for_mode(
     pane: &str,
     cfg: &WaitConfig,
     timeout_secs: Option<u64>,
-) -> anyhow::Result<tmux_tools_core::idle::IdleOutcome> {
+) -> anyhow::Result<WaitForModeResult> {
     let mut ready_regex = None;
     let mut ready_scan_lines = DEFAULT_READY_SCAN_LINES;
     let mut until_regex = None;
@@ -2165,7 +2241,14 @@ fn wait_for_mode(
         .ready_stable_seconds
         .unwrap_or(DEFAULT_READY_STABLE_SECONDS);
 
-    wait_for_idle(
+    let required_reason = if until_regex.is_some() {
+        Some(IdleReason::UntilMatched)
+    } else if ready_regex.is_some() {
+        Some(IdleReason::ReadyMatched)
+    } else {
+        None
+    };
+    let outcome = wait_for_idle(
         pane,
         &IdleConfig {
             idle_seconds,
@@ -2176,7 +2259,12 @@ fn wait_for_mode(
             ready_stable_seconds,
             until_regex,
         },
-    )
+    )?;
+    let success = required_reason
+        .map(|reason| outcome.reason == reason)
+        .unwrap_or(outcome.reason != IdleReason::TimedOut);
+
+    Ok(WaitForModeResult { outcome, success })
 }
 
 struct ReadySignal {
@@ -2261,12 +2349,20 @@ fn capture_visible_stripped(pane: &str) -> anyhow::Result<String> {
     Ok(strip_ansi(raw.as_bytes()))
 }
 
-fn resolve_pane_target(configured: Option<&str>, previous_output: &str) -> anyhow::Result<String> {
+fn resolve_pane_target(
+    configured: Option<&str>,
+    previous_output: &str,
+    active_pane: Option<&ActivePaneRegistration>,
+) -> anyhow::Result<String> {
     let previous = parse_previous(previous_output);
     let raw = configured
-        .or_else(|| previous_value(&previous, &["paneId", "pane_id", "target"]))
+        .or_else(|| previous_value(&previous, &PANE_ALIAS_KEYS))
         .ok_or_else(|| anyhow!("tmux pane target is required"))?;
-    target::resolve(&target::parse(raw), None, None)
+    let pane = target::resolve(&target::parse(raw), None, None)?;
+    if active_pane.is_some_and(|active_pane| !active_pane.owns_pane(&pane)) {
+        anyhow::bail!("tmux pane target {pane:?} is not owned by this run");
+    }
+    Ok(pane)
 }
 
 fn parse_previous(previous_output: &str) -> Option<Value> {
@@ -2334,6 +2430,31 @@ fn failed_result(
         },
         ..Default::default()
     }
+}
+
+fn failed_wait_result(
+    waited: &WaitForModeResult,
+    timeout_message: &str,
+    unmatched_message: &str,
+    agent: &str,
+    prompt: &str,
+    duration: Duration,
+    pane_id: Option<String>,
+) -> NodeResult {
+    let (stderr, exit_code, outcome) = if waited.outcome.reason == IdleReason::TimedOut {
+        (timeout_message, -2, NodeOutcome::ErrorTimeout)
+    } else {
+        (unmatched_message, 1, NodeOutcome::ErrorExecution)
+    };
+    failed_result(
+        stderr,
+        exit_code,
+        agent,
+        prompt,
+        duration,
+        pane_id,
+        Some(outcome),
+    )
 }
 
 fn aborted_result(
@@ -2511,7 +2632,306 @@ fn trim_before_last_marker_line<'a>(text: &'a str, marker: &str) -> Option<&'a s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::RunAsConfig;
+    use crate::model::{RunAsConfig, SplitFailurePolicy};
+
+    fn control_test_node() -> WorkflowNode {
+        WorkflowNode {
+            id: "control".to_string(),
+            name: "Control".to_string(),
+            kind: NodeKind::Send {
+                send_config: SendConfig::default(),
+            },
+            agent: None,
+            prompt: String::new(),
+            context_sources: Vec::new(),
+            response_format: None,
+            output_schema: None,
+            retry_count: None,
+            retry_delay: None,
+            timeout: None,
+            skip_condition: None,
+            loop_max_iterations: None,
+            loop_condition: None,
+            split_failure_policy: crate::model::SplitFailurePolicy::BestEffortContinue,
+            cwd: None,
+            continue_session_from: None,
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn control_nodes_reject_unowned_panes_and_sessions_before_calling_tmux() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db);
+        let run_id = "run-owner";
+        ctx.registry.register_test_run(run_id).await;
+
+        let active_pane = ActivePaneRegistration::new(
+            &ctx,
+            run_id.to_string(),
+            "cursor".to_string(),
+            "control".to_string(),
+        );
+        let script = temp.path().join("tmux-must-not-run.sh");
+        let log = temp.path().join("tmux-called.log");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'called\\n' >> \"$1\"\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![
+                script.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+            ],
+            socket: Some("ownership-rejection-test-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+
+        let errors = std::thread::spawn(move || {
+            tmux_tools_core::with_invocation(invocation, || {
+                let node = control_test_node();
+                let send = execute_send(
+                    &node,
+                    &SendConfig {
+                        target: Some("%42".to_string()),
+                        text: "echo unauthorized".to_string(),
+                        enter: true,
+                    },
+                    "",
+                    "",
+                    Some(&active_pane),
+                );
+                let wait = execute_wait(
+                    &node,
+                    &WaitConfig {
+                        target: Some("%42".to_string()),
+                        mode: WaitMode::Until,
+                        marker: Some("never".to_string()),
+                        timeout: Some(0),
+                        ..WaitConfig::default()
+                    },
+                    Some(0),
+                    "",
+                    Some(&active_pane),
+                );
+                let capture = execute_capture(
+                    &node,
+                    &CaptureConfig {
+                        target: Some("%42".to_string()),
+                        ..CaptureConfig::default()
+                    },
+                    "",
+                    Some(&active_pane),
+                );
+                let kill_pane = execute_kill(
+                    &node,
+                    &KillConfig {
+                        target: Some("%42".to_string()),
+                        session_name: None,
+                    },
+                    "",
+                    Some(&active_pane),
+                );
+                let kill_session = execute_kill(
+                    &node,
+                    &KillConfig {
+                        target: None,
+                        session_name: Some("foreign-session".to_string()),
+                    },
+                    "",
+                    Some(&active_pane),
+                );
+
+                [send, wait, capture, kill_pane, kill_session]
+                    .into_iter()
+                    .map(|result| match result {
+                        Ok(_) => "control node unexpectedly succeeded".to_string(),
+                        Err(err) => err.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(errors.len(), 5);
+        for error in errors {
+            assert!(
+                error.contains("not owned by this run"),
+                "unexpected authorization error: {error}"
+            );
+        }
+        assert!(
+            !log.exists(),
+            "authorization must reject foreign targets before invoking tmux"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn spawned_pane_remains_controllable_by_later_nodes_in_the_same_run() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db);
+        let run_id = "run-owner";
+        ctx.registry.register_test_run(run_id).await;
+
+        let registration = |node_id: &str| {
+            ActivePaneRegistration::new(
+                &ctx,
+                run_id.to_string(),
+                "cursor".to_string(),
+                node_id.to_string(),
+            )
+        };
+        let spawn_registration = registration("spawn");
+        let reuse_registration = registration("reuse");
+        let send_registration = registration("send");
+        let wait_registration = registration("wait");
+        let capture_registration = registration("capture");
+        let kill_pane_registration = registration("kill-pane");
+        let kill_session_registration = registration("kill-session");
+
+        let script = temp.path().join("tmux-owned-targets.sh");
+        let log = temp.path().join("tmux-owned-targets.log");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+log="$1"
+shift
+printf '%s\n' "$@" >> "$log"
+if [ "$1" = "tmux" ]; then shift; fi
+if [ "$1" = "-L" ]; then shift 2; fi
+case "$1" in
+  new-session) printf '%%7\n' ;;
+  capture-pane) printf 'DONE\n' ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![
+                script.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+            ],
+            socket: Some("owned-target-test-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+
+        let results = std::thread::spawn(move || {
+            tmux_tools_core::with_invocation(invocation, || -> anyhow::Result<_> {
+                let node = control_test_node();
+                let spawned = execute_spawn(
+                    &node,
+                    &SpawnConfig {
+                        command: Some("true".to_string()),
+                        session_name: Some("owned-session".to_string()),
+                        ..SpawnConfig::default()
+                    },
+                    "",
+                    "",
+                    Some(&spawn_registration),
+                )?;
+                let reused = resolve_reused_pane(Some(&reuse_registration), Some("spawn"))?;
+                let sent = execute_send(
+                    &node,
+                    &SendConfig {
+                        target: reused.clone(),
+                        text: "echo allowed".to_string(),
+                        enter: true,
+                    },
+                    "",
+                    &spawned.output,
+                    Some(&send_registration),
+                )?;
+                let waited = execute_wait(
+                    &node,
+                    &WaitConfig {
+                        target: None,
+                        mode: WaitMode::Until,
+                        marker: Some("DONE".to_string()),
+                        timeout: Some(1),
+                        ready_stable_seconds: Some(0.0),
+                        ..WaitConfig::default()
+                    },
+                    Some(1),
+                    &spawned.output,
+                    Some(&wait_registration),
+                )?;
+                let captured = execute_capture(
+                    &node,
+                    &CaptureConfig {
+                        target: None,
+                        ..CaptureConfig::default()
+                    },
+                    &spawned.output,
+                    Some(&capture_registration),
+                )?;
+                let killed_pane = execute_kill(
+                    &node,
+                    &KillConfig {
+                        target: Some("%7".to_string()),
+                        session_name: None,
+                    },
+                    "",
+                    Some(&kill_pane_registration),
+                )?;
+                let killed_session = execute_kill(
+                    &node,
+                    &KillConfig {
+                        target: None,
+                        session_name: Some("owned-session".to_string()),
+                    },
+                    "",
+                    Some(&kill_session_registration),
+                )?;
+
+                Ok((
+                    reused,
+                    sent.success,
+                    waited.success,
+                    captured.output,
+                    killed_pane.success,
+                    killed_session.success,
+                ))
+            })
+        })
+        .join()
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(results.0.as_deref(), Some("%7"));
+        assert!(results.1, "same-run send should succeed");
+        assert!(results.2, "same-run wait should succeed");
+        assert_eq!(results.3, "DONE\n");
+        assert!(results.4, "same-run pane kill should succeed");
+        assert!(results.5, "same-run session kill should succeed");
+
+        let recorded = std::fs::read_to_string(log).unwrap();
+        for command in [
+            "new-session",
+            "send-keys",
+            "capture-pane",
+            "kill-pane",
+            "kill-session",
+        ] {
+            assert!(
+                recorded.lines().any(|line| line == command),
+                "expected tmux command {command:?}; args={recorded:?}"
+            );
+        }
+    }
 
     /// build_tmux_invocation: no explicit socket → socket defaults to the run id.
     #[test]
@@ -2765,6 +3185,139 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn wait_until_does_not_succeed_when_pane_idles_without_marker() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-wait-prefix.sh");
+        std::fs::write(&script, "#!/bin/sh\nprintf 'TESTS FAILED\\n'\n").unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![script.to_string_lossy().into_owned()],
+            socket: Some("wait-test-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+        let cfg = WaitConfig {
+            target: Some("%1".to_string()),
+            mode: WaitMode::Until,
+            marker: Some("TESTS PASSED".to_string()),
+            timeout: Some(5),
+            idle_seconds: Some(0.0),
+            ready_stable_seconds: Some(0.0),
+        };
+        let node = WorkflowNode {
+            id: "wait-tests".to_string(),
+            name: "Wait for tests".to_string(),
+            kind: NodeKind::Wait {
+                wait_config: cfg.clone(),
+            },
+            agent: None,
+            prompt: String::new(),
+            context_sources: Vec::new(),
+            response_format: None,
+            output_schema: None,
+            retry_count: None,
+            retry_delay: None,
+            timeout: None,
+            skip_condition: None,
+            loop_max_iterations: None,
+            loop_condition: None,
+            split_failure_policy: SplitFailurePolicy::BestEffortContinue,
+            cwd: None,
+            continue_session_from: None,
+        };
+
+        let result = tmux_tools_core::with_invocation(invocation, || {
+            execute_wait(&node, &cfg, Some(5), "", None)
+        })
+        .unwrap();
+
+        assert!(!result.success, "an unmatched until marker must reject");
+        assert_eq!(result.exit_code, 1);
+        assert_eq!(
+            result
+                .parsed_output
+                .as_ref()
+                .and_then(|value| value.get("reason"))
+                .and_then(Value::as_str),
+            Some("idle")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_ready_with_marker_does_not_succeed_on_idle() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let invocation = wait_invocation_with_agent(&temp, Some("cursor"));
+        let cfg = WaitConfig {
+            mode: WaitMode::Ready,
+            timeout: Some(5),
+            idle_seconds: Some(0.0),
+            ready_stable_seconds: Some(0.0),
+            ..Default::default()
+        };
+
+        let waited =
+            tmux_tools_core::with_invocation(invocation, || wait_for_mode("%1", &cfg, Some(5)))
+                .unwrap();
+
+        assert_eq!(waited.outcome.reason, IdleReason::Idle);
+        assert!(!waited.success, "an unmatched ready marker must reject");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_ready_without_marker_preserves_idle_fallback() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let invocation = wait_invocation_with_agent(&temp, None);
+        let cfg = WaitConfig {
+            mode: WaitMode::Ready,
+            timeout: Some(5),
+            idle_seconds: Some(0.0),
+            ready_stable_seconds: Some(0.0),
+            ..Default::default()
+        };
+
+        let waited =
+            tmux_tools_core::with_invocation(invocation, || wait_for_mode("%1", &cfg, Some(5)))
+                .unwrap();
+
+        assert_eq!(waited.outcome.reason, IdleReason::Idle);
+        assert!(
+            waited.success,
+            "markerless ready waits may complete on idle"
+        );
+    }
+
+    #[cfg(unix)]
+    fn wait_invocation_with_agent(
+        temp: &tempfile::TempDir,
+        agent: Option<&str>,
+    ) -> tmux_tools_core::TmuxInvocation {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = temp.path().join("tmux-ready-wait-prefix.sh");
+        let script_contents = format!(
+            "#!/bin/sh\ncase \" $* \" in\n  *\" display-message \"*) printf '\\037{}\\037\\037\\037\\n' ;;\n  *) printf 'NOT READY\\n' ;;\nesac\n",
+            agent.unwrap_or_default()
+        );
+        std::fs::write(&script, script_contents).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        tmux_tools_core::TmuxInvocation {
+            prefix: vec![script.to_string_lossy().into_owned()],
+            socket: Some("ready-wait-test-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        }
+    }
+
     #[test]
     fn build_agent_command_appends_resolved_session_safety_args() {
         let spawn_cfg = SpawnConfig {
@@ -2916,6 +3469,73 @@ mod tests {
         assert!(
             tmux_session_exists(&session_name),
             "disarmed SessionGuard must not kill the session on drop"
+        );
+        let _ = tmux::run(&["kill-session", "-t", &session_name]);
+    }
+
+    #[test]
+    fn pane_guard_kills_spawned_pane_on_drop() {
+        if !tmux_available() {
+            return;
+        }
+        let spawn_cfg = SpawnConfig {
+            command: Some("sleep 600".to_string()),
+            ..Default::default()
+        };
+        let session_name = {
+            let guard = PaneGuard::acquire(
+                &spawn_cfg,
+                "echo",
+                "/tmp",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let session_name = guard
+                .session_name()
+                .expect("spawned pane should have a session name")
+                .to_owned();
+            assert!(tmux_session_exists(&session_name));
+            session_name
+        };
+        assert!(
+            !tmux_session_exists(&session_name),
+            "PaneGuard should kill the spawned session on drop when kill_after is set"
+        );
+    }
+
+    #[test]
+    fn pane_guard_disarm_prevents_kill_on_drop() {
+        if !tmux_available() {
+            return;
+        }
+        let spawn_cfg = SpawnConfig {
+            command: Some("sleep 600".to_string()),
+            ..Default::default()
+        };
+        let session_name = {
+            let mut guard = PaneGuard::acquire(
+                &spawn_cfg,
+                "echo",
+                "/tmp",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let session_name = guard
+                .session_name()
+                .expect("spawned pane should have a session name")
+                .to_owned();
+            guard.disarm();
+            session_name
+        };
+        assert!(
+            tmux_session_exists(&session_name),
+            "disarmed PaneGuard must not kill the session on drop"
         );
         let _ = tmux::run(&["kill-session", "-t", &session_name]);
     }
@@ -3097,18 +3717,23 @@ exit 0
         });
 
         let started = Instant::now();
+        let timeout = Duration::from_millis(10);
+        let subagent_timeout = Duration::from_millis(5);
+        let absolute_deadline = started + timeout.max(subagent_timeout * 10);
         let result = tmux_tools_core::with_invocation(invocation, || {
             poll_agent_interactive(
                 "%subagent-test",
                 "Task prompt\n",
                 "Task prompt",
-                Duration::from_millis(10),
+                started,
+                started + timeout,
+                absolute_deadline,
                 60.0,
                 0.0,
                 None,
                 None,
                 false,
-                Duration::from_millis(5),
+                subagent_timeout,
                 None,
                 &interaction_patterns,
                 &[],
@@ -3293,6 +3918,73 @@ exit 0
             next_unhandled_destructive_match(&regexes, current, &handled).is_none(),
             "repainted destructive line should not escalate twice"
         );
+    }
+
+    #[test]
+    fn pattern_match_cursor_skips_reflowed_duplicate() {
+        let patterns = vec![CompiledInteractionPattern {
+            regex: Regex::new(r"proceed\? \(y/n\)").unwrap(),
+            kind: InteractionKind::AutoRespond {
+                response: "y".to_string(),
+            },
+            description: "proceed".to_string(),
+            send_enter: false,
+        }];
+
+        let text1 = "header line\nproceed? (y/n)";
+        let (_, cursor) = next_unhandled_pattern_match(&patterns, text1, 0).unwrap();
+
+        // Viewport scrolled: header off-screen, same prompt now at byte 0.
+        let text2 = "proceed? (y/n)";
+        assert!(
+            next_unhandled_pattern_match(&patterns, text2, cursor).is_none(),
+            "cursor past reflowed text end must not re-fire the same prompt"
+        );
+    }
+
+    #[test]
+    fn pattern_match_cursor_fires_recurring_prompt_after_cursor() {
+        let patterns = vec![CompiledInteractionPattern {
+            regex: Regex::new(r"proceed\? \(y/n\)").unwrap(),
+            kind: InteractionKind::AutoRespond {
+                response: "y".to_string(),
+            },
+            description: "proceed".to_string(),
+            send_enter: false,
+        }];
+
+        let text1 = "tool1 output\nproceed? (y/n)\n";
+        let (_, cursor) = next_unhandled_pattern_match(&patterns, text1, 0).unwrap();
+
+        let text2 = format!("{text1}tool2 output\nproceed? (y/n)\n");
+        let (idx, new_cursor) = next_unhandled_pattern_match(&patterns, &text2, cursor).unwrap();
+        assert_eq!(idx, 0);
+        assert!(new_cursor > cursor);
+    }
+
+    #[test]
+    fn pattern_match_cursor_reanchors_after_full_redraw() {
+        let patterns = vec![CompiledInteractionPattern {
+            regex: Regex::new(r"proceed\? \(y/n\)").unwrap(),
+            kind: InteractionKind::AutoRespond {
+                response: "y".to_string(),
+            },
+            description: "proceed".to_string(),
+            send_enter: false,
+        }];
+
+        let previous = "████████ fullscreen TUI content\nproceed? (y/n)";
+        let (_, mut cursor) = next_unhandled_pattern_match(&patterns, previous, 0).unwrap();
+
+        let current = "████████ new screen\nproceed? (y/n)";
+        let prefix_len = common_prefix_len(previous, current);
+        if prefix_len < cursor {
+            cursor = prefix_len;
+        }
+        cursor = cursor.min(current.len());
+
+        let (idx, _) = next_unhandled_pattern_match(&patterns, current, cursor).unwrap();
+        assert_eq!(idx, 0);
     }
 
     #[test]

@@ -7,6 +7,7 @@ import PaneTerminal from "./PaneTerminal.svelte";
 const streamPaneMock = vi.hoisted(() =>
   vi.fn(() => ({
     requestResync: vi.fn(),
+    reconnect: vi.fn(),
     close: vi.fn(),
   })),
 );

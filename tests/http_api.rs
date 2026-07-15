@@ -206,7 +206,8 @@ async fn streaming_routes_allow_same_origin_sse_and_require_ws_origin() {
         &router,
         Request::builder()
             .method("GET")
-            .uri(format!("/api/runs/{run_id}/stream?token={stream_token}"))
+            .uri(format!("/api/runs/{run_id}/stream"))
+            .header("X-Stream-Token", stream_token.as_str())
             .header(SEC_FETCH_SITE, "same-origin")
             .body(Body::empty())
             .unwrap(),
@@ -218,7 +219,8 @@ async fn streaming_routes_allow_same_origin_sse_and_require_ws_origin() {
         &router,
         Request::builder()
             .method("GET")
-            .uri(format!("/api/runs/{run_id}/stream?token={stream_token}"))
+            .uri(format!("/api/runs/{run_id}/stream"))
+            .header("X-Stream-Token", stream_token.as_str())
             .header(SEC_FETCH_SITE, "cross-site")
             .body(Body::empty())
             .unwrap(),
@@ -230,7 +232,8 @@ async fn streaming_routes_allow_same_origin_sse_and_require_ws_origin() {
         &router,
         Request::builder()
             .method("GET")
-            .uri(format!("/api/runs/{run_id}/stream?token={stream_token}"))
+            .uri(format!("/api/runs/{run_id}/stream"))
+            .header("X-Stream-Token", stream_token.as_str())
             .header("origin", "https://evil.com")
             .body(Body::empty())
             .unwrap(),
@@ -242,7 +245,8 @@ async fn streaming_routes_allow_same_origin_sse_and_require_ws_origin() {
         &router,
         Request::builder()
             .method("GET")
-            .uri(format!("/api/runs/{run_id}/stream?token={stream_token}"))
+            .uri(format!("/api/runs/{run_id}/stream"))
+            .header("X-Stream-Token", stream_token.as_str())
             .header("origin", "http://127.0.0.1:3333")
             .body(Body::empty())
             .unwrap(),
@@ -303,7 +307,8 @@ async fn run_stream_requires_matching_stream_token() {
         &router,
         Request::builder()
             .method("GET")
-            .uri(format!("/api/runs/{run_id}/stream?token=wrong-token"))
+            .uri(format!("/api/runs/{run_id}/stream"))
+            .header("X-Stream-Token", "wrong-token")
             .header(SEC_FETCH_SITE, "same-origin")
             .body(Body::empty())
             .unwrap(),
@@ -315,7 +320,8 @@ async fn run_stream_requires_matching_stream_token() {
         &router,
         Request::builder()
             .method("GET")
-            .uri(format!("/api/runs/{run_id}/stream?token={stream_token}"))
+            .uri(format!("/api/runs/{run_id}/stream"))
+            .header("X-Stream-Token", stream_token)
             .header(SEC_FETCH_SITE, "same-origin")
             .body(Body::empty())
             .unwrap(),
@@ -578,12 +584,15 @@ async fn internal_http_errors_use_fixed_client_body() {
     };
     let router = api::router(state);
     let run_id = "run_secret_internal";
+    let stream_token = "stream_secret_internal";
 
     let (status, body) = json_response(
         &router,
         Request::builder()
             .method("GET")
             .uri(format!("/api/runs/{run_id}/events"))
+            .header("X-Stream-Token", stream_token)
+            .header(SEC_FETCH_SITE, "same-origin")
             .body(Body::empty())
             .unwrap(),
     )
@@ -593,7 +602,11 @@ async fn internal_http_errors_use_fixed_client_body() {
     assert_eq!(body["error"], "internal error");
     assert_body_omits(
         &body,
-        &[run_id, paths.database_path.to_string_lossy().as_ref()],
+        &[
+            run_id,
+            stream_token,
+            paths.database_path.to_string_lossy().as_ref(),
+        ],
     );
 }
 
@@ -643,7 +656,7 @@ async fn validates_and_saves_workflows() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(validation["workflow"]["version"], 3);
+    assert_eq!(validation["workflow"]["version"], 4);
     assert_eq!(
         validation["workflow"]["ui"]["canvas"]["nodes"]["n1"]["x"],
         128.0
@@ -680,7 +693,7 @@ async fn validates_and_saves_workflows() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list.as_array().unwrap().len(), 1);
-    assert_eq!(list[0]["workflow"]["version"], 3);
+    assert_eq!(list[0]["workflow"]["version"], 4);
     assert_eq!(
         list[0]["workflow"]["ui"]["canvas"]["viewport"]["zoom"],
         1.25
@@ -1035,7 +1048,7 @@ async fn lists_templates_without_failing_on_invalid_files() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(list.as_array().unwrap().len(), 1);
     assert_eq!(list[0]["name"], "Valid Template");
-    assert_eq!(list[0]["workflow"]["version"], 3);
+    assert_eq!(list[0]["workflow"]["version"], 4);
 }
 
 #[tokio::test]
@@ -1094,7 +1107,7 @@ async fn creates_and_approves_runs() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|run| run["runId"] == run_id)
+            .all(|run| run["runId"] != run_id)
     );
 
     let (status, approved) = json_response(

@@ -8,7 +8,7 @@ use crate::{
     api, frontend,
     runtime::RuntimeContext,
     storage::{Database, TemplateStore, WorkflowStore, seed_bundled_templates},
-    util::ensure_dir,
+    util::{constant_time_eq, ensure_dir},
 };
 
 #[derive(Debug, Clone)]
@@ -114,14 +114,6 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    let mut diff = left.len() ^ right.len();
-    for (a, b) in left.iter().zip(right.iter()) {
-        diff |= usize::from(*a ^ *b);
-    }
-    diff == 0
-}
-
 #[derive(Clone)]
 pub struct AppState {
     pub paths: AppPaths,
@@ -154,11 +146,14 @@ impl Default for PaneStreamRegistry {
 }
 
 impl PaneStreamRegistry {
-    pub(crate) async fn unsubscribe(&self, target: &str) {
+    pub(crate) async fn unsubscribe(&self, target: &str, sender: &broadcast::Sender<Vec<u8>>) {
         let mut inner = self.inner.lock().await;
         let Some(entry) = inner.get_mut(target) else {
             return;
         };
+        if !entry.sender.same_channel(sender) {
+            return;
+        }
         if entry.refcount <= 1 {
             inner.remove(target);
         } else {
@@ -219,7 +214,7 @@ impl Application {
         let db = Database::new(paths.database_path.clone());
         db.init().await?;
         let runtime = RuntimeContext::new(db);
-        crate::runtime::reap_stale_tmux_sessions(&runtime).await?;
+        crate::runtime::reap_stale_tmux_sessions(&runtime).await;
 
         let state = AppState {
             paths: paths.clone(),

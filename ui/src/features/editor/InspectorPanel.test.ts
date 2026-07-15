@@ -54,10 +54,12 @@ const capabilities: RuntimeCapabilities = {
     claude: {
       available: true,
       capabilities: agentCaps,
+      accessProfiles: ["default", "full-access", "read-only", "workspace-write"],
     },
     codex: {
       available: true,
       capabilities: agentCaps,
+      accessProfiles: ["default", "full-access", "read-only", "workspace-write"],
     },
   },
 };

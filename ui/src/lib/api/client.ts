@@ -117,8 +117,10 @@ export const api = {
     apiFetch<{ success: boolean }>(`/api/logs/${encodeURIComponent(id)}`, {
       method: "DELETE",
     }),
-  runEvents: (runId: string) =>
-    apiFetch<RunEvent[]>(`/api/runs/${encodeURIComponent(runId)}/events`),
+  runEvents: (runId: string, streamToken: string) =>
+    apiFetch<RunEvent[]>(`/api/runs/${encodeURIComponent(runId)}/events`, {
+      headers: { "X-Stream-Token": streamToken },
+    }),
 };
 
 export async function streamRun(
@@ -126,8 +128,9 @@ export async function streamRun(
   streamToken: string,
   onEvent: (event: RunEvent) => void,
 ): Promise<void> {
-  const query = new URLSearchParams({ token: streamToken });
-  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/stream?${query}`);
+  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/stream`, {
+    headers: { "X-Stream-Token": streamToken },
+  });
   if (!response.ok || !response.body) {
     throw new Error(`Unable to open stream for run ${runId}`);
   }
@@ -178,8 +181,9 @@ const PANE_FAST_CLOSE_LIMIT = 3;
 // case so the reconnect loop terminates and surfaces the "unavailable" state.
 const PANE_FAILED_CONNECT_LIMIT = 5;
 const PANE_HEARTBEAT_TIMEOUT_MS = 15000;
+const PANE_RESYNC_TIMEOUT_MS = 15000;
 
-export type PaneStreamStatus = "connecting" | "open" | "closed" | "unavailable";
+export type PaneStreamStatus = "connecting" | "open" | "closed" | "stalled" | "unavailable";
 
 export interface PaneStreamHandlers {
   /** Full repaint: callers should clear the terminal before writing these bytes. */
@@ -193,6 +197,8 @@ export interface PaneStreamHandlers {
 export interface PaneStreamHandle {
   /** Ask the server to resend a snapshot (clear + repaint). */
   requestResync: () => void;
+  /** Reset recovery state and open a fresh connection (e.g. after give-up or seq-gap stall). */
+  reconnect: () => void;
   /** Permanently close the stream and stop reconnecting. */
   close: () => void;
 }
@@ -233,6 +239,7 @@ export function streamPane(
   let consecutiveFailedConnects = 0;
   let lastSeq = -1;
   let resyncPending = false;
+  let resyncRequestedAt = 0;
   let heartbeatWatchdog: ReturnType<typeof setInterval> | null = null;
 
   const clearHeartbeatWatchdog = () => {
@@ -253,6 +260,30 @@ export function streamPane(
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send("resync");
     }
+  };
+
+  const reconnect = () => {
+    closed = false;
+    consecutiveFastCloses = 0;
+    consecutiveFailedConnects = 0;
+    reconnectDelay = PANE_RECONNECT_BASE_MS;
+    resyncPending = false;
+    resyncRequestedAt = 0;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    clearHeartbeatWatchdog();
+    const open = socket;
+    socket = null;
+    if (open) {
+      try {
+        open.close();
+      } catch {
+        // ignore — already closing/closed
+      }
+    }
+    connect();
   };
 
   const scheduleReconnect = () => {
@@ -285,6 +316,7 @@ export function streamPane(
     // A new connection always begins with a server snapshot — reset gap tracking.
     lastSeq = -1;
     resyncPending = false;
+    resyncRequestedAt = 0;
 
     let openedAt: number | null = null;
     let firstFrameSeen = false;
@@ -297,7 +329,17 @@ export function streamPane(
       clearHeartbeatWatchdog();
       heartbeatWatchdog = setInterval(() => {
         if (closed || ws !== socket) return;
-        if (Date.now() - lastFrameTime > PANE_HEARTBEAT_TIMEOUT_MS) {
+        const now = Date.now();
+        if (
+          resyncPending &&
+          resyncRequestedAt > 0 &&
+          now - resyncRequestedAt > PANE_RESYNC_TIMEOUT_MS
+        ) {
+          handlers.onStatus?.("stalled");
+          reconnect();
+          return;
+        }
+        if (now - lastFrameTime > PANE_HEARTBEAT_TIMEOUT_MS) {
           handlers.onStatus?.("connecting");
           ws.close();
         }
@@ -323,9 +365,9 @@ export function streamPane(
       const seq = typeof frame.seq === "number" ? frame.seq : null;
       if (
         frame.type === "snapshot" ||
-        frame.type === "data" ||
         frame.type === "heartbeat" ||
-        frame.type === "error"
+        frame.type === "error" ||
+        (frame.type === "data" && !resyncPending)
       ) {
         lastFrameTime = Date.now();
       }
@@ -342,6 +384,7 @@ export function streamPane(
             handlers.onSnapshot(bytes);
           }
           resyncPending = false;
+          resyncRequestedAt = 0;
           break;
         case "data":
           if (seq !== null) {
@@ -350,6 +393,7 @@ export function streamPane(
             lastSeq = seq;
             if (gapDetected && !resyncPending) {
               resyncPending = true;
+              resyncRequestedAt = Date.now();
               requestResync();
             }
           }
@@ -408,6 +452,7 @@ export function streamPane(
 
   return {
     requestResync,
+    reconnect,
     close: () => {
       closed = true;
       clearHeartbeatWatchdog();

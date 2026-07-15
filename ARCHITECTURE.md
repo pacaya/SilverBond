@@ -191,17 +191,19 @@ Responsibilities:
 - manage approvals, aborts, resume, and restart-from
 - emit and persist runtime events and execution logs
 
-### `/src/session.rs`
+### `/src/tmux_exec.rs`
 
-PTY session management.
+Tmux-backed execution and interactive agent integration layer.
 
 Responsibilities:
 
-- manage interactive PTY sessions for agent CLIs using `expectrl`
-- implement 4-tier escalation for PTY prompts (auto-respond, auto-approve, orchestrator, human-in-the-loop)
-- track session state (`Idle`, `Processing`, `WaitingInteraction`, `Completed`, `Error`)
-- resolve interactions by sending human responses to PTY sessions
-- warmup sessions with auto-response to known prompts
+- resolve per-run tmux invocations, binaries, sockets, pane targets, and session names
+- spawn panes and register each run's owned panes and sessions
+- execute spawn, send, wait, capture, and kill control nodes
+- run interactive agents, reuse panes across nodes, and support pane output capture and streaming
+- handle interactions, approvals, destructive-command checks, and aborts
+- expose pane and session cleanup helpers used by run finalization and stale-session reaping
+- build on `tmux-tools-core` for tmux commands, target and name resolution, idle detection, capture, and streaming
 
 ### `/src/driver.rs`
 

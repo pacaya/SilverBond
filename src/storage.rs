@@ -1,10 +1,13 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
+    time::Duration,
 };
 
 use include_dir::{Dir, include_dir};
+use r2d2::Pool;
+use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,7 +25,14 @@ use crate::{
 #[derive(Clone)]
 pub struct Database {
     path: Arc<PathBuf>,
-    connection: Arc<Mutex<Option<Connection>>>,
+    connection: Pool<SqliteConnectionManager>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReapableTmuxSession {
+    pub(crate) run_id: String,
+    pub(crate) session_name: String,
+    pub(crate) tmux_invocation: Option<tmux_tools_core::TmuxInvocation>,
 }
 
 impl std::fmt::Debug for Database {
@@ -66,6 +76,7 @@ pub struct TemplateItem {
 }
 
 static BUNDLED_TEMPLATES_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/templates");
+const INTERRUPTED_RUNS_LIMIT: i64 = 200;
 
 pub fn seed_bundled_templates(dir: &Path) -> anyhow::Result<()> {
     ensure_dir(dir)?;
@@ -84,9 +95,16 @@ pub fn seed_bundled_templates(dir: &Path) -> anyhow::Result<()> {
 
 impl Database {
     pub fn new(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let manager = SqliteConnectionManager::file(&path).with_init(configure_connection);
+        let connection = Pool::builder()
+            .max_size(8)
+            .min_idle(Some(0))
+            .connection_timeout(Duration::from_secs(5))
+            .build_unchecked(manager);
         Self {
-            path: Arc::new(path.into()),
-            connection: Arc::new(Mutex::new(None)),
+            path: Arc::new(path),
+            connection,
         }
     }
 
@@ -114,7 +132,10 @@ impl Database {
                     pending_approval_json TEXT,
                     state_json TEXT NOT NULL,
                     workflow_json TEXT NOT NULL,
-                    terminal_reason TEXT
+                    terminal_reason TEXT,
+                    tmux_bin TEXT,
+                    tmux_socket TEXT,
+                    tmux_prefix_json TEXT
                 );
                 CREATE TABLE IF NOT EXISTS run_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,6 +144,11 @@ impl Database {
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_run_events_run_id_id ON run_events(run_id, id);
+                CREATE TABLE IF NOT EXISTS run_tmux_sessions (
+                    run_id TEXT NOT NULL,
+                    session_name TEXT NOT NULL,
+                    PRIMARY KEY (run_id, session_name)
+                );
                 CREATE TABLE IF NOT EXISTS logs (
                     id TEXT PRIMARY KEY,
                     filename TEXT NOT NULL,
@@ -138,6 +164,8 @@ impl Database {
             "#,
                 )?;
                 ensure_runs_stream_token_column(conn)?;
+                ensure_runs_tmux_invocation_columns(conn)?;
+                backfill_legacy_tmux_sessions(conn)?;
                 Ok(())
             })
         })
@@ -155,8 +183,13 @@ impl Database {
                     r#"
                 INSERT INTO runs (
                     run_id, stream_token, status, workflow_name, current_node_id, current_node_name, total_executed,
-                    started_at, updated_at, pending_approval_json, state_json, workflow_json, terminal_reason
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                    started_at, updated_at, pending_approval_json, state_json, workflow_json, terminal_reason,
+                    tmux_bin, tmux_socket, tmux_prefix_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                -- workflow_json and stream_token are intentionally frozen at first INSERT and are
+                -- NOT updated on conflict; this is an immutable-snapshot invariant, not an oversight.
+                -- The only sanctioned write-back to workflow_json is H3's one-time startup upgrade
+                -- (which stamps version: 4), not a per-upsert or per-read write-back.
                 ON CONFLICT(run_id) DO UPDATE SET
                     status = excluded.status,
                     workflow_name = excluded.workflow_name,
@@ -188,6 +221,19 @@ impl Database {
                         serde_json::to_string(&persisted.checkpoint)?,
                         serde_json::to_string(&persisted.workflow)?,
                         persisted.checkpoint.execution_log.terminal_reason,
+                        persisted
+                            .tmux_invocation
+                            .as_ref()
+                            .map(|invocation| invocation.tmux_bin.as_str()),
+                        persisted
+                            .tmux_invocation
+                            .as_ref()
+                            .and_then(|invocation| invocation.socket.as_deref()),
+                        persisted
+                            .tmux_invocation
+                            .as_ref()
+                            .map(|invocation| serde_json::to_string(&invocation.prefix))
+                            .transpose()?,
                     ],
                 )?;
                 Ok(())
@@ -253,27 +299,91 @@ impl Database {
             with_connection(&connection, path.as_path(), |conn| {
                 let row = conn
                     .query_row(
-                        "SELECT stream_token, state_json, workflow_json FROM runs WHERE run_id = ?1",
+                        "SELECT stream_token, state_json, workflow_json, tmux_bin, tmux_socket, tmux_prefix_json FROM runs WHERE run_id = ?1",
                         params![run_id],
                         |row| {
                             Ok((
                                 row.get::<_, String>(0)?,
                                 row.get::<_, String>(1)?,
                                 row.get::<_, String>(2)?,
+                                row.get::<_, Option<String>>(3)?,
+                                row.get::<_, Option<String>>(4)?,
+                                row.get::<_, Option<String>>(5)?,
                             ))
                         },
                     )
                     .optional()?;
-                let Some((stream_token, state_json, workflow_json)) = row else {
+                let Some((
+                    stream_token,
+                    state_json,
+                    workflow_json,
+                    tmux_bin,
+                    tmux_socket,
+                    tmux_prefix_json,
+                )) = row
+                else {
                     return Ok(None);
                 };
                 let workflow_value: Value = serde_json::from_str(&workflow_json)?;
+                // Migrate-on-read normalization for the in-memory PersistedRun only: recomputed on
+                // every read and intentionally NOT persisted back (no read-path write-back).
+                // Persisting per-read would race with M3's wholesale state_json overwrite and would
+                // break the stores_run_records test's immutable-snapshot assertions; the durable
+                // repair is H3's one-time startup upgrade (CAS below), not this read path.
                 let workflow = normalize_workflow_value(workflow_value)?.workflow;
+                let normalized_workflow_json = serde_json::to_string(&workflow)?;
+                if normalized_workflow_json != workflow_json {
+                    // Compare-and-swap keeps concurrent readers/processes from replacing a
+                    // workflow that changed after this read. Once upgraded, subsequent loads
+                    // see the canonical JSON and skip the write.
+                    conn.execute(
+                        "UPDATE runs SET workflow_json = ?1 WHERE run_id = ?2 AND workflow_json = ?3",
+                        params![normalized_workflow_json, run_id, workflow_json],
+                    )?;
+                }
                 Ok(Some(PersistedRun {
                     stream_token,
+                    tmux_invocation: decode_tmux_invocation(
+                        tmux_bin,
+                        tmux_socket,
+                        tmux_prefix_json,
+                    ),
                     checkpoint: serde_json::from_str(&state_json)?,
                     workflow,
                 }))
+            })
+        })
+        .await?
+    }
+
+    pub async fn store_tmux_invocation_if_missing(
+        &self,
+        run_id: &str,
+        invocation: &tmux_tools_core::TmuxInvocation,
+    ) -> anyhow::Result<bool> {
+        let path = self.path.clone();
+        let connection = self.connection.clone();
+        let run_id = run_id.to_string();
+        let invocation = invocation.clone();
+        spawn_blocking(move || -> anyhow::Result<bool> {
+            with_connection(&connection, path.as_path(), |conn| {
+                let updated = conn.execute(
+                    r#"
+                    UPDATE runs SET
+                        tmux_bin = ?2,
+                        tmux_socket = ?3,
+                        tmux_prefix_json = ?4
+                    WHERE run_id = ?1
+                      AND (tmux_bin IS NULL OR tmux_prefix_json IS NULL)
+                    "#,
+                    params![
+                        run_id,
+                        invocation.tmux_bin,
+                        invocation.socket,
+                        serde_json::to_string(&invocation.prefix)?,
+                    ],
+                )?;
+                Ok(updated > 0)
             })
         })
         .await?
@@ -340,40 +450,125 @@ impl Database {
         .await?
     }
 
-    pub async fn list_runs_with_tmux_sessions(
+    pub async fn register_tmux_session(
         &self,
-    ) -> anyhow::Result<Vec<(String, RuntimeStatus, BTreeSet<String>)>> {
+        run_id: &str,
+        session_name: &str,
+    ) -> anyhow::Result<bool> {
         let path = self.path.clone();
         let connection = self.connection.clone();
-        spawn_blocking(
-            move || -> anyhow::Result<Vec<(String, RuntimeStatus, BTreeSet<String>)>> {
-                with_connection(&connection, path.as_path(), |conn| {
-                    let mut stmt = conn.prepare("SELECT run_id, status, state_json FROM runs")?;
-                    let rows = stmt.query_map([], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    })?;
-                    let mut runs = Vec::new();
-                    for row in rows {
-                        let (run_id, status, state_json) = row?;
-                        let partial: PartialCheckpointTmuxSessions = serde_json::from_str(
-                            &state_json,
-                        )
-                        .unwrap_or(PartialCheckpointTmuxSessions {
-                            tmux_sessions: BTreeSet::new(),
-                        });
-                        if partial.tmux_sessions.is_empty() {
-                            continue;
-                        }
-                        runs.push((run_id, status_from_str(&status), partial.tmux_sessions));
-                    }
-                    Ok(runs)
-                })
-            },
-        )
+        let run_id = run_id.to_string();
+        let session_name = session_name.to_string();
+        spawn_blocking(move || -> anyhow::Result<bool> {
+            with_connection(&connection, path.as_path(), |conn| {
+                let inserted = conn.execute(
+                    r#"
+                    INSERT INTO run_tmux_sessions (run_id, session_name)
+                    SELECT ?1, ?2
+                    WHERE EXISTS (SELECT 1 FROM runs WHERE run_id = ?1)
+                    ON CONFLICT(run_id, session_name) DO NOTHING
+                    "#,
+                    params![run_id, session_name],
+                )?;
+                Ok(inserted > 0)
+            })
+        })
+        .await?
+    }
+
+    pub async fn remove_tmux_sessions(
+        &self,
+        run_id: &str,
+        session_names: &BTreeSet<String>,
+    ) -> anyhow::Result<()> {
+        if session_names.is_empty() {
+            return Ok(());
+        }
+        let path = self.path.clone();
+        let connection = self.connection.clone();
+        let run_id = run_id.to_string();
+        let session_names = session_names.clone();
+        spawn_blocking(move || -> anyhow::Result<()> {
+            with_connection(&connection, path.as_path(), |conn| {
+                let transaction = conn.unchecked_transaction()?;
+                for session_name in session_names {
+                    transaction.execute(
+                        "DELETE FROM run_tmux_sessions WHERE run_id = ?1 AND session_name = ?2",
+                        params![run_id, session_name],
+                    )?;
+                }
+                transaction.commit()?;
+                Ok(())
+            })
+        })
+        .await??;
+        Ok(())
+    }
+
+    pub async fn list_run_tmux_session_names(&self, run_id: &str) -> anyhow::Result<Vec<String>> {
+        let path = self.path.clone();
+        let connection = self.connection.clone();
+        let run_id = run_id.to_string();
+        spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+            with_connection(&connection, path.as_path(), |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT session_name FROM run_tmux_sessions \
+                     WHERE run_id = ?1 ORDER BY session_name",
+                )?;
+                let rows = stmt.query_map(params![run_id], |row| row.get::<_, String>(0))?;
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })
+        })
+        .await?
+    }
+
+    pub(crate) async fn list_reapable_tmux_sessions(
+        &self,
+    ) -> anyhow::Result<Vec<ReapableTmuxSession>> {
+        let path = self.path.clone();
+        let connection = self.connection.clone();
+        spawn_blocking(move || -> anyhow::Result<Vec<ReapableTmuxSession>> {
+            with_connection(&connection, path.as_path(), |conn| {
+                let mut stmt = conn.prepare(
+                    r#"
+                    SELECT
+                        runs.run_id,
+                        run_tmux_sessions.session_name,
+                        runs.tmux_bin,
+                        runs.tmux_socket,
+                        runs.tmux_prefix_json
+                    FROM runs
+                    INNER JOIN run_tmux_sessions
+                        ON run_tmux_sessions.run_id = runs.run_id
+                    WHERE runs.status IN ('completed', 'failed', 'aborted', 'restarted')
+                    ORDER BY runs.run_id, run_tmux_sessions.session_name
+                    "#,
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                })?;
+                let mut sessions = Vec::new();
+                for row in rows {
+                    let (run_id, session_name, tmux_bin, tmux_socket, tmux_prefix_json) = row?;
+                    sessions.push(ReapableTmuxSession {
+                        run_id,
+                        session_name,
+                        tmux_invocation: decode_tmux_invocation(
+                            tmux_bin,
+                            tmux_socket,
+                            tmux_prefix_json,
+                        ),
+                    });
+                }
+                Ok(sessions)
+            })
+        })
         .await?
     }
 
@@ -385,9 +580,10 @@ impl Database {
                 let mut stmt = conn.prepare(
                     "SELECT run_id, status, workflow_name, current_node_id, current_node_name, \
                  total_executed, started_at, updated_at, pending_approval_json \
-                 FROM runs WHERE status IN ('running', 'paused') ORDER BY updated_at DESC",
+                 FROM runs WHERE status IN ('running', 'paused') ORDER BY updated_at DESC \
+                 LIMIT ?1",
                 )?;
-                let rows = stmt.query_map([], |row| {
+                let rows = stmt.query_map(params![INTERRUPTED_RUNS_LIMIT], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -485,7 +681,7 @@ impl Database {
         let path = self.path.clone();
         let connection = self.connection.clone();
         spawn_blocking(move || -> anyhow::Result<Vec<LogListItem>> {
-            with_connection(&connection, path.as_path(), |conn| {
+            let rows = with_connection(&connection, path.as_path(), |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT id, filename, workflow_name, goal, start_time, end_time, total_duration, aborted, run_id, data_json FROM logs ORDER BY start_time DESC",
                 )?;
@@ -503,76 +699,78 @@ impl Database {
                         row.get::<_, String>(9)?,
                     ))
                 })?;
-                let mut logs = Vec::new();
-                for row in rows {
-                    let (id, filename, workflow_name, goal, start_time, end_time, total_duration, aborted, run_id, data_json) =
-                        row?;
-                    let data_value: Value = serde_json::from_str(&data_json)?;
-                    let node_execs = data_value.get("nodeExecutions").and_then(Value::as_array);
-                    let node_execution_count = node_execs.map(Vec::len).unwrap_or(0);
-                    let (total_cost, total_in, total_out, succeeded, failed) =
-                        if let Some(execs) = node_execs {
-                            let mut cost = 0.0f64;
-                            let mut has_cost = false;
-                            let mut input = 0u64;
-                            let mut output = 0u64;
-                            let mut has_tokens = false;
-                            let mut ok = 0usize;
-                            let mut err = 0usize;
-                            for e in execs {
-                                if let Some(c) = e.get("costUsd").and_then(Value::as_f64) {
-                                    cost += c;
-                                    has_cost = true;
-                                }
-                                if let Some(t) = e.get("inputTokens").and_then(Value::as_u64) {
-                                    input += t;
-                                    has_tokens = true;
-                                }
-                                if let Some(t) = e.get("outputTokens").and_then(Value::as_u64) {
-                                    output += t;
-                                    has_tokens = true;
-                                }
-                                if e.get("success").and_then(Value::as_bool).unwrap_or(false) {
-                                    ok += 1;
-                                } else {
-                                    err += 1;
-                                }
+                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+            })?;
+
+            let mut logs = Vec::new();
+            for row in rows {
+                let (id, filename, workflow_name, goal, start_time, end_time, total_duration, aborted, run_id, data_json) =
+                    row;
+                let data_value: Value = serde_json::from_str(&data_json)?;
+                let node_execs = data_value.get("nodeExecutions").and_then(Value::as_array);
+                let node_execution_count = node_execs.map(Vec::len).unwrap_or(0);
+                let (total_cost, total_in, total_out, succeeded, failed) =
+                    if let Some(execs) = node_execs {
+                        let mut cost = 0.0f64;
+                        let mut has_cost = false;
+                        let mut input = 0u64;
+                        let mut output = 0u64;
+                        let mut has_tokens = false;
+                        let mut ok = 0usize;
+                        let mut err = 0usize;
+                        for e in execs {
+                            if let Some(c) = e.get("costUsd").and_then(Value::as_f64) {
+                                cost += c;
+                                has_cost = true;
                             }
-                            (
-                                if has_cost { Some(cost) } else { None },
-                                if has_tokens { Some(input) } else { None },
-                                if has_tokens { Some(output) } else { None },
-                                ok,
-                                err,
-                            )
-                        } else {
-                            (None, None, None, 0, 0)
-                        };
-                    logs.push(LogListItem {
-                        id,
-                        filename,
-                        workflow_name,
-                        goal,
-                        start_time,
-                        end_time,
-                        total_duration,
-                        node_execution_count,
-                        decision_count: data_value
-                            .get("decisions")
-                            .and_then(Value::as_array)
-                            .map(Vec::len)
-                            .unwrap_or(0),
-                        aborted: aborted == 1,
-                        run_id,
-                        total_cost_usd: total_cost,
-                        total_input_tokens: total_in,
-                        total_output_tokens: total_out,
-                        nodes_succeeded: succeeded,
-                        nodes_failed: failed,
-                    });
-                }
-                Ok(logs)
-            })
+                            if let Some(t) = e.get("inputTokens").and_then(Value::as_u64) {
+                                input += t;
+                                has_tokens = true;
+                            }
+                            if let Some(t) = e.get("outputTokens").and_then(Value::as_u64) {
+                                output += t;
+                                has_tokens = true;
+                            }
+                            if e.get("success").and_then(Value::as_bool).unwrap_or(false) {
+                                ok += 1;
+                            } else {
+                                err += 1;
+                            }
+                        }
+                        (
+                            if has_cost { Some(cost) } else { None },
+                            if has_tokens { Some(input) } else { None },
+                            if has_tokens { Some(output) } else { None },
+                            ok,
+                            err,
+                        )
+                    } else {
+                        (None, None, None, 0, 0)
+                    };
+                logs.push(LogListItem {
+                    id,
+                    filename,
+                    workflow_name,
+                    goal,
+                    start_time,
+                    end_time,
+                    total_duration,
+                    node_execution_count,
+                    decision_count: data_value
+                        .get("decisions")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0),
+                    aborted: aborted == 1,
+                    run_id,
+                    total_cost_usd: total_cost,
+                    total_input_tokens: total_in,
+                    total_output_tokens: total_out,
+                    nodes_succeeded: succeeded,
+                    nodes_failed: failed,
+                });
+            }
+            Ok(logs)
         })
         .await?
     }
@@ -760,33 +958,25 @@ fn value_str<'a>(value: &'a Value, key: &str) -> &'a str {
 }
 
 fn with_connection<T>(
-    connection: &Arc<Mutex<Option<Connection>>>,
+    connection: &Pool<SqliteConnectionManager>,
     path: &Path,
     operation: impl FnOnce(&Connection) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let mut guard = connection
-        .lock()
-        .map_err(|_| anyhow::anyhow!("database connection mutex poisoned"))?;
-    if guard.is_none() {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            ensure_dir(parent)?;
-        }
-        *guard = Some(open_connection(path)?);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        ensure_dir(parent)?;
     }
-    let conn = guard
-        .as_ref()
-        .expect("database connection should be initialized");
-    operation(conn)
+    let connection = connection.get()?;
+    operation(&connection)
 }
 
-fn open_connection(path: &Path) -> anyhow::Result<Connection> {
-    let conn = Connection::open(path)?;
+fn configure_connection(conn: &mut Connection) -> rusqlite::Result<()> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
-    Ok(conn)
+    conn.busy_timeout(Duration::from_secs(5))?;
+    Ok(())
 }
 
 fn ensure_runs_stream_token_column(conn: &Connection) -> anyhow::Result<()> {
@@ -823,11 +1013,83 @@ fn ensure_runs_stream_token_column(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PartialCheckpointTmuxSessions {
-    #[serde(default)]
-    tmux_sessions: BTreeSet<String>,
+fn ensure_runs_tmux_invocation_columns(conn: &Connection) -> anyhow::Result<()> {
+    let columns = {
+        let mut stmt = conn.prepare("PRAGMA table_info(runs)")?;
+        let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        columns.collect::<Result<BTreeSet<_>, _>>()?
+    };
+
+    for (column, sql_type) in [
+        ("tmux_bin", "TEXT"),
+        ("tmux_socket", "TEXT"),
+        ("tmux_prefix_json", "TEXT"),
+    ] {
+        if !columns.contains(column) {
+            conn.execute(
+                &format!("ALTER TABLE runs ADD COLUMN {column} {sql_type}"),
+                [],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn decode_tmux_invocation(
+    tmux_bin: Option<String>,
+    socket: Option<String>,
+    prefix_json: Option<String>,
+) -> Option<tmux_tools_core::TmuxInvocation> {
+    let tmux_bin = tmux_bin.filter(|value| !value.trim().is_empty())?;
+    let prefix = serde_json::from_str(&prefix_json?).ok()?;
+    Some(tmux_tools_core::TmuxInvocation {
+        prefix,
+        socket,
+        tmux_bin,
+    })
+}
+
+fn backfill_legacy_tmux_sessions(conn: &Connection) -> anyhow::Result<()> {
+    let transaction = conn.unchecked_transaction()?;
+    let legacy_rows = {
+        let mut stmt = transaction.prepare("SELECT run_id, state_json FROM runs")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    for (run_id, state_json) in legacy_rows {
+        let Ok(mut state) = serde_json::from_str::<Value>(&state_json) else {
+            continue;
+        };
+        let Some(state_object) = state.as_object_mut() else {
+            continue;
+        };
+        let Some(legacy_sessions) = state_object.remove("tmuxSessions") else {
+            continue;
+        };
+        if let Some(sessions) = legacy_sessions.as_array() {
+            for session_name in sessions.iter().filter_map(Value::as_str) {
+                transaction.execute(
+                    r#"
+                    INSERT INTO run_tmux_sessions (run_id, session_name)
+                    VALUES (?1, ?2)
+                    ON CONFLICT(run_id, session_name) DO NOTHING
+                    "#,
+                    params![run_id, session_name],
+                )?;
+            }
+        }
+        transaction.execute(
+            "UPDATE runs SET state_json = ?2 WHERE run_id = ?1",
+            params![run_id, serde_json::to_string(&state)?],
+        )?;
+    }
+
+    transaction.commit()?;
+    Ok(())
 }
 
 fn status_from_str(s: &str) -> RuntimeStatus {
@@ -859,12 +1121,13 @@ mod tests {
 
     use super::*;
     use crate::model::{
-        WorkflowEdge, WorkflowEdgeOutcome, WorkflowLimits, WorkflowNode, WorkflowNodeType,
+        WORKFLOW_SCHEMA_VERSION, WorkflowEdge, WorkflowEdgeOutcome, WorkflowLimits, WorkflowNode,
+        WorkflowNodeType,
     };
 
     fn sample_workflow() -> WorkflowV3 {
         WorkflowV3 {
-            version: 3,
+            version: WORKFLOW_SCHEMA_VERSION,
             name: Some("sample".to_string()),
             goal: "goal".to_string(),
             cwd: String::new(),
@@ -907,6 +1170,59 @@ mod tests {
             agent_defaults: std::collections::BTreeMap::new(),
             subflows: std::collections::BTreeMap::new(),
             ui: None,
+        }
+    }
+
+    fn sample_persisted_run(run_id: &str) -> PersistedRun {
+        PersistedRun {
+            stream_token: "test-stream-token".to_string(),
+            tmux_invocation: None,
+            checkpoint: crate::runtime::RuntimeCheckpoint {
+                run_id: run_id.to_string(),
+                status: RuntimeStatus::Running,
+                workflow_name: "wf".to_string(),
+                current_node_id: Some("n1".to_string()),
+                current_node_name: Some("Node".to_string()),
+                all_results: Default::default(),
+                batch_item_results: Default::default(),
+                last_output: String::new(),
+                execution_epoch: 1,
+                active_cursors: Vec::new(),
+                split_families: Default::default(),
+                collector_barriers: Default::default(),
+                queued_approvals: Vec::new(),
+                loop_counters: Default::default(),
+                visit_counters: Default::default(),
+                total_executed: 0,
+                output_hashes: Default::default(),
+                last_branch_origin_id: None,
+                last_branch_choice: None,
+                var_map: Default::default(),
+                goal: String::new(),
+                cwd: String::new(),
+                use_orchestrator: false,
+                max_total_steps: 10,
+                max_visits_per_node: 5,
+                started_at: now_iso(),
+                updated_at: now_iso(),
+                pending_approval: None,
+                execution_log: crate::runtime::ExecutionLog {
+                    run_id: run_id.to_string(),
+                    workflow_name: "wf".to_string(),
+                    goal: String::new(),
+                    cwd: String::new(),
+                    start_time: now_iso(),
+                    end_time: None,
+                    use_orchestrator: false,
+                    aborted: false,
+                    total_duration: "0".to_string(),
+                    node_executions: Vec::new(),
+                    decisions: Vec::new(),
+                    transitions: Vec::new(),
+                    terminal_reason: None,
+                },
+            },
+            workflow: sample_workflow(),
         }
     }
 
@@ -976,7 +1292,7 @@ mod tests {
             templates[0].description.as_deref(),
             Some("A valid workflow template")
         );
-        assert_eq!(templates[0].workflow.version, 3);
+        assert_eq!(templates[0].workflow.version, 4);
     }
 
     #[tokio::test]
@@ -995,7 +1311,7 @@ mod tests {
         assert!(
             templates
                 .iter()
-                .all(|template| template.workflow.version == 3)
+                .all(|template| template.workflow.version == 4)
         );
     }
 
@@ -1018,56 +1334,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
         db.init().await.unwrap();
-        let persisted = PersistedRun {
-            stream_token: "test-stream-token".to_string(),
-            checkpoint: crate::runtime::RuntimeCheckpoint {
-                run_id: "r1".to_string(),
-                status: RuntimeStatus::Running,
-                workflow_name: "wf".to_string(),
-                current_node_id: Some("n1".to_string()),
-                current_node_name: Some("Node".to_string()),
-                all_results: Default::default(),
-                batch_item_results: Default::default(),
-                last_output: String::new(),
-                execution_epoch: 1,
-                active_cursors: Vec::new(),
-                split_families: Default::default(),
-                collector_barriers: Default::default(),
-                tmux_sessions: Default::default(),
-                queued_approvals: Vec::new(),
-                loop_counters: Default::default(),
-                visit_counters: Default::default(),
-                total_executed: 0,
-                output_hashes: Default::default(),
-                last_branch_origin_id: None,
-                last_branch_choice: None,
-                var_map: Default::default(),
-                goal: String::new(),
-                cwd: String::new(),
-                use_orchestrator: false,
-                max_total_steps: 10,
-                max_visits_per_node: 5,
-                started_at: now_iso(),
-                updated_at: now_iso(),
-                pending_approval: None,
-                execution_log: crate::runtime::ExecutionLog {
-                    run_id: "r1".to_string(),
-                    workflow_name: "wf".to_string(),
-                    goal: String::new(),
-                    cwd: String::new(),
-                    start_time: now_iso(),
-                    end_time: None,
-                    use_orchestrator: false,
-                    aborted: false,
-                    total_duration: "0".to_string(),
-                    node_executions: Vec::new(),
-                    decisions: Vec::new(),
-                    transitions: Vec::new(),
-                    terminal_reason: None,
-                },
-            },
-            workflow: sample_workflow(),
-        };
+        let persisted = sample_persisted_run("r1");
         db.upsert_run(&persisted).await.unwrap();
         let loaded = db.get_run("r1").await.unwrap().unwrap();
         assert_eq!(loaded.workflow, persisted.workflow);
@@ -1090,5 +1357,322 @@ mod tests {
         assert_eq!(loaded.checkpoint.total_executed, 8);
         assert_eq!(loaded.workflow, persisted.workflow);
         assert_eq!(loaded.stream_token, persisted.stream_token);
+    }
+
+    #[tokio::test]
+    async fn stores_resolved_tmux_invocation_with_run() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let mut persisted = sample_persisted_run("run-with-invocation");
+        persisted.tmux_invocation = Some(tmux_tools_core::TmuxInvocation {
+            prefix: vec!["sudo".to_string(), "-u".to_string(), "agent".to_string()],
+            socket: Some("run-socket".to_string()),
+            tmux_bin: "/opt/homebrew/bin/tmux".to_string(),
+        });
+
+        db.upsert_run(&persisted).await.unwrap();
+
+        let loaded = db.get_run("run-with-invocation").await.unwrap().unwrap();
+        assert_eq!(loaded.tmux_invocation, persisted.tmux_invocation);
+    }
+
+    #[tokio::test]
+    async fn tmux_session_registration_survives_checkpoint_updates() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let mut persisted = sample_persisted_run("terminal-run");
+        persisted.checkpoint.status = RuntimeStatus::Completed;
+        db.upsert_run(&persisted).await.unwrap();
+
+        crate::runtime::register_tmux_session(&db, "terminal-run", "silverbond-session")
+            .await
+            .unwrap();
+        db.update_run_checkpoint(&persisted.checkpoint)
+            .await
+            .unwrap();
+
+        let sessions = db.list_reapable_tmux_sessions().await.unwrap();
+        assert_eq!(
+            sessions,
+            vec![ReapableTmuxSession {
+                run_id: "terminal-run".to_string(),
+                session_name: "silverbond-session".to_string(),
+                tmux_invocation: None,
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn lists_run_tmux_session_names_in_order_for_one_run() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        db.upsert_run(&sample_persisted_run("selected-run"))
+            .await
+            .unwrap();
+        db.upsert_run(&sample_persisted_run("other-run"))
+            .await
+            .unwrap();
+        db.register_tmux_session("selected-run", "silverbond-zeta")
+            .await
+            .unwrap();
+        db.register_tmux_session("selected-run", "silverbond-alpha")
+            .await
+            .unwrap();
+        db.register_tmux_session("other-run", "silverbond-other")
+            .await
+            .unwrap();
+
+        let sessions = db
+            .list_run_tmux_session_names("selected-run")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sessions,
+            vec![
+                "silverbond-alpha".to_string(),
+                "silverbond-zeta".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn limits_interrupted_run_summaries_to_two_hundred() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        for index in 0..201 {
+            db.upsert_run(&sample_persisted_run(&format!("run-{index:03}")))
+                .await
+                .unwrap();
+        }
+
+        let runs = db.list_interrupted_runs().await.unwrap();
+
+        assert_eq!(runs.len(), 200);
+    }
+
+    #[tokio::test]
+    async fn concurrent_tmux_registrations_accumulate_and_active_runs_are_filtered() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let mut terminal = sample_persisted_run("terminal-run");
+        terminal.checkpoint.status = RuntimeStatus::Aborted;
+        db.upsert_run(&terminal).await.unwrap();
+        db.upsert_run(&sample_persisted_run("active-run"))
+            .await
+            .unwrap();
+
+        let (first, second, active) = tokio::join!(
+            db.register_tmux_session("terminal-run", "silverbond-alpha"),
+            db.register_tmux_session("terminal-run", "silverbond-beta"),
+            db.register_tmux_session("active-run", "silverbond-active"),
+        );
+        first.unwrap();
+        second.unwrap();
+        active.unwrap();
+
+        assert_eq!(
+            db.list_reapable_tmux_sessions().await.unwrap(),
+            vec![
+                ReapableTmuxSession {
+                    run_id: "terminal-run".to_string(),
+                    session_name: "silverbond-alpha".to_string(),
+                    tmux_invocation: None,
+                },
+                ReapableTmuxSession {
+                    run_id: "terminal-run".to_string(),
+                    session_name: "silverbond-beta".to_string(),
+                    tmux_invocation: None,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn lists_reapable_tmux_sessions_with_persisted_invocations_in_one_query() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec!["sudo".to_string(), "-u".to_string(), "agent".to_string()],
+            socket: Some("reaper-socket".to_string()),
+            tmux_bin: "/custom/tmux".to_string(),
+        };
+        let mut terminal = sample_persisted_run("terminal-run");
+        terminal.checkpoint.status = RuntimeStatus::Failed;
+        terminal.tmux_invocation = Some(invocation.clone());
+        db.upsert_run(&terminal).await.unwrap();
+        db.register_tmux_session("terminal-run", "silverbond-alpha")
+            .await
+            .unwrap();
+        db.register_tmux_session("terminal-run", "silverbond-beta")
+            .await
+            .unwrap();
+
+        let sessions = db.list_reapable_tmux_sessions().await.unwrap();
+
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].run_id, "terminal-run");
+        assert_eq!(sessions[0].session_name, "silverbond-alpha");
+        assert_eq!(sessions[0].tmux_invocation, Some(invocation.clone()));
+        assert_eq!(sessions[1].run_id, "terminal-run");
+        assert_eq!(sessions[1].session_name, "silverbond-beta");
+        assert_eq!(sessions[1].tmux_invocation, Some(invocation));
+    }
+
+    #[tokio::test]
+    async fn init_backfills_and_retires_legacy_checkpoint_tmux_sessions() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("silverbond.db");
+        let db = Database::new(path.clone());
+        db.init().await.unwrap();
+        let mut persisted = sample_persisted_run("legacy-terminal-run");
+        persisted.checkpoint.status = RuntimeStatus::Failed;
+        db.upsert_run(&persisted).await.unwrap();
+        with_connection(&db.connection, db.path(), |conn| {
+            let mut state = serde_json::to_value(&persisted.checkpoint)?;
+            state["tmuxSessions"] =
+                serde_json::json!(["silverbond-legacy-alpha", "silverbond-legacy-beta"]);
+            conn.execute("DROP TABLE run_tmux_sessions", [])?;
+            conn.execute(
+                "UPDATE runs SET state_json = ?2 WHERE run_id = ?1",
+                params!["legacy-terminal-run", serde_json::to_string(&state)?],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let migrated = Database::new(path);
+        migrated.init().await.unwrap();
+
+        let sessions = migrated.list_reapable_tmux_sessions().await.unwrap();
+        assert_eq!(
+            sessions,
+            vec![
+                ReapableTmuxSession {
+                    run_id: "legacy-terminal-run".to_string(),
+                    session_name: "silverbond-legacy-alpha".to_string(),
+                    tmux_invocation: None,
+                },
+                ReapableTmuxSession {
+                    run_id: "legacy-terminal-run".to_string(),
+                    session_name: "silverbond-legacy-beta".to_string(),
+                    tmux_invocation: None,
+                },
+            ]
+        );
+        let state_json = with_connection(&migrated.connection, migrated.path(), |conn| {
+            Ok(conn.query_row(
+                "SELECT state_json FROM runs WHERE run_id = ?1",
+                params!["legacy-terminal-run"],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .unwrap();
+        let state: Value = serde_json::from_str(&state_json).unwrap();
+        assert!(state.get("tmuxSessions").is_none());
+    }
+
+    #[tokio::test]
+    async fn writer_progresses_while_a_read_connection_is_checked_out() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        db.upsert_run(&sample_persisted_run("concurrent-run"))
+            .await
+            .unwrap();
+
+        let connection = db.connection.clone();
+        let path = db.path.clone();
+        let (read_started_tx, read_started_rx) = std::sync::mpsc::channel();
+        let (release_read_tx, release_read_rx) = std::sync::mpsc::channel();
+        let held_read = spawn_blocking(move || {
+            with_connection(&connection, path.as_path(), |conn| {
+                conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0))?;
+                read_started_tx.send(()).unwrap();
+                release_read_rx.recv().unwrap();
+                Ok(())
+            })
+        });
+        read_started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+
+        let append_result = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            db.append_event("concurrent-run", &RuntimeEvent::new("concurrent_write")),
+        )
+        .await;
+
+        release_read_tx.send(()).unwrap();
+        held_read.await.unwrap().unwrap();
+        assert!(
+            append_result.is_ok(),
+            "a checked-out read connection must not serialize an unrelated writer"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_run_persists_structurally_migrated_v3_workflow_as_v4() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        db.upsert_run(&sample_persisted_run("legacy-run"))
+            .await
+            .unwrap();
+
+        let legacy_workflow = serde_json::json!({
+            "version": 3,
+            "goal": "legacy run",
+            "cwd": "/tmp",
+            "useOrchestrator": false,
+            "entryNodeId": "decide",
+            "variables": [],
+            "limits": { "maxTotalSteps": 10, "maxVisitsPerNode": 5 },
+            "nodes": [{
+                "id": "decide",
+                "name": "Pick",
+                "type": "decide",
+                "decideConfig": {
+                    "prompt": "Pick one",
+                    "outcomes": ["yes"]
+                }
+            }],
+            "edges": []
+        });
+        with_connection(&db.connection, db.path(), |conn| {
+            conn.execute(
+                "UPDATE runs SET workflow_json = ?2 WHERE run_id = ?1",
+                params!["legacy-run", serde_json::to_string(&legacy_workflow)?],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = db.get_run("legacy-run").await.unwrap().unwrap();
+        assert_eq!(loaded.workflow.version, 4);
+        assert!(matches!(
+            &loaded.workflow.nodes[0].kind,
+            crate::model::NodeKind::Decide { decide_config }
+                if decide_config.outcomes == vec!["yes".to_string()]
+        ));
+
+        let stored_workflow_json = with_connection(&db.connection, db.path(), |conn| {
+            Ok(conn.query_row(
+                "SELECT workflow_json FROM runs WHERE run_id = ?1",
+                params!["legacy-run"],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .unwrap();
+        let stored_workflow: Value = serde_json::from_str(&stored_workflow_json).unwrap();
+        assert_eq!(stored_workflow["version"], 4);
+        assert_eq!(stored_workflow["nodes"][0]["kind"]["type"], "decide");
+        assert!(stored_workflow["nodes"][0].get("type").is_none());
     }
 }

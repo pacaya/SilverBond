@@ -552,4 +552,66 @@ describe("streamPane client", () => {
 
     handle.close();
   });
+
+  it("13. reconnect() resets give-up state and opens a fresh socket", () => {
+    const onStatus = vi.fn();
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
+      onSnapshot: vi.fn(),
+      onData: vi.fn(),
+      onStatus,
+    });
+
+    const firstWs = MockWebSocket.last();
+    firstWs.simulateOpen();
+    firstWs.simulateClose();
+    vi.advanceTimersByTime(500);
+
+    const secondWs = MockWebSocket.last();
+    secondWs.simulateOpen();
+    secondWs.simulateClose();
+    vi.advanceTimersByTime(1000);
+
+    const thirdWs = MockWebSocket.last();
+    thirdWs.simulateOpen();
+    thirdWs.simulateClose();
+    expect(onStatus).toHaveBeenLastCalledWith("unavailable");
+
+    const countBeforeReconnect = MockWebSocket.instances.length;
+    handle.reconnect();
+
+    expect(MockWebSocket.instances.length).toBeGreaterThan(countBeforeReconnect);
+    const freshWs = MockWebSocket.last();
+    freshWs.simulateOpen();
+    freshWs.simulateMessage(frame("snapshot", 0, b64("recovered")));
+    expect(onStatus).toHaveBeenLastCalledWith("open");
+
+    handle.close();
+  });
+
+  it("14. seq-gap resync wait escalates to stalled and reconnects", () => {
+    const onStatus = vi.fn();
+    const onData = vi.fn();
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
+      onSnapshot: vi.fn(),
+      onData,
+      onStatus,
+    });
+
+    const ws = MockWebSocket.last();
+    ws.simulateOpen();
+    ws.simulateMessage(frame("snapshot", 0, b64("base")));
+    ws.simulateMessage(frame("data", 1, b64("a")));
+    ws.simulateMessage(frame("data", 5, b64("gap")));
+
+    expect(ws.sent).toContain("resync");
+    expect(onData).toHaveBeenCalledTimes(1);
+
+    // Watchdog polls every 5s; need elapsed > 15s resync bound on a poll tick.
+    vi.advanceTimersByTime(20_000);
+
+    expect(onStatus).toHaveBeenCalledWith("stalled");
+    expect(MockWebSocket.instances.length).toBeGreaterThan(1);
+
+    handle.close();
+  });
 });

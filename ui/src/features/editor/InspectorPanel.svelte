@@ -286,6 +286,11 @@
     return selectedNode.agent ?? "claude";
   });
 
+  let selectedAgentAccessProfiles = $derived.by(() => {
+    if (!capabilities) return undefined;
+    return capabilities.agents[selectedAgentValue]?.accessProfiles;
+  });
+
   let selectedPromptValue = $derived.by(() => {
     if (!selectedNode) return "";
     if (selectedNode.kind.type === "run_agent") {
@@ -443,31 +448,57 @@
     execute: "Edit files + run commands. Sandboxed to workspace.",
     unrestricted: "Full system + network access. For installs and deployments.",
   };
+
+  const ACCESS_MODE_LABELS: Record<AccessMode, string> = {
+    read_only: "read_only",
+    edit: "edit",
+    execute: "execute (default)",
+    unrestricted: "unrestricted",
+  };
+
+  function supportedAccessModes(accessProfiles: string[] | undefined): AccessMode[] {
+    if (!accessProfiles || accessProfiles.length === 0) {
+      return ["read_only", "edit", "execute", "unrestricted"];
+    }
+    const profiles = new Set(accessProfiles);
+    const modes: AccessMode[] = [];
+    if (profiles.has("read-only")) modes.push("read_only");
+    if (profiles.has("workspace-write")) {
+      modes.push("edit", "execute");
+    } else if (profiles.has("default")) {
+      modes.push("execute");
+    }
+    if (profiles.has("full-access")) modes.push("unrestricted");
+    return modes;
+  }
 </script>
 
 <!-- Shared agent config fields: used for both node-level and workflow-level defaults -->
 {#snippet agentConfigFields(
   caps: AgentCapabilities,
+  accessProfiles: string[] | undefined,
   values: AgentDefaults,
   update: <K extends keyof AgentDefaults>(key: K, value: AgentDefaults[K]) => void,
   placeholders: { model: string; systemPrompt: string },
 )}
+  {@const availableModes = supportedAccessModes(accessProfiles)}
+  {@const currentMode = values.accessMode ?? "execute"}
+  {@const effectiveMode = availableModes.includes(currentMode) ? currentMode : "execute"}
   <label class="field">
     <span>Access mode</span>
     <select
-      value={values.accessMode ?? "execute"}
+      value={effectiveMode}
       onchange={(e) => {
         const val = (e.target as HTMLSelectElement).value as AccessMode;
         update("accessMode", val === "execute" ? undefined : val);
       }}
     >
-      <option value="read_only">read_only</option>
-      <option value="edit">edit</option>
-      <option value="execute">execute (default)</option>
-      <option value="unrestricted">unrestricted</option>
+      {#each availableModes as mode (mode)}
+        <option value={mode}>{ACCESS_MODE_LABELS[mode]}</option>
+      {/each}
     </select>
     <small class="helperText" style="margin-top: -4px;">
-      {accessModeDescriptions[values.accessMode ?? "execute"]}
+      {accessModeDescriptions[effectiveMode]}
     </small>
   </label>
 
@@ -842,6 +873,7 @@
             </div>
             {@render agentConfigFields(
               agentCaps,
+              selectedAgentAccessProfiles,
               nodeConfig,
               (key, value) => updateNodeConfig(key as keyof AgentNodeConfig, value),
               { model: "workflow default", systemPrompt: "workflow default" },
@@ -1743,6 +1775,7 @@
               <div class="agentDefaultsBody">
                 {@render agentConfigFields(
                   caps,
+                  agentInfo.accessProfiles,
                   defaults,
                   (key, value) => updateAgentDefault(agentName, key, value),
                   { model: "agent default", systemPrompt: "none" },

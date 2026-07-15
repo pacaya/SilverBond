@@ -5,7 +5,6 @@ import {
   ensureCanvas,
 } from "@/lib/types/workflow";
 import type {
-  NodeKind,
   RunEvent,
   RunObservability,
   SplitFailurePolicy,
@@ -16,6 +15,7 @@ import type {
   WorkflowNode,
   WorkflowNodeType,
 } from "@/lib/types/workflow";
+import { defaultNodeKind, defaultNodeName } from "@/lib/stores/nodeMetadata";
 import { formatTokens } from "@/lib/utils/format";
 
 type Selection =
@@ -55,86 +55,13 @@ export interface ApprovalState {
   lastOutput: string;
 }
 
-export type PaneStatus = "idle" | "connecting" | "open" | "closed" | "unavailable";
+export type PaneStatus = "idle" | "connecting" | "open" | "closed" | "stalled" | "unavailable";
 
 export interface InteractionState {
   sessionId: string;
   description: string;
   outputSoFar: string;
   interactionType: "permission" | "question" | "destructive_warning";
-}
-
-function defaultNodeName(type: WorkflowNodeType, count: number): string {
-  switch (type) {
-    case "approval":
-      return `Approval ${count}`;
-    case "split":
-      return `Split ${count}`;
-    case "collector":
-      return `Collector ${count}`;
-    case "decide":
-      return `Decide ${count}`;
-    case "parallel_batch":
-      return `Batch ${count}`;
-    case "subflow":
-      return `Subflow ${count}`;
-    case "call":
-      return `Call ${count}`;
-    case "spawn":
-      return `Spawn ${count}`;
-    case "send":
-      return `Send ${count}`;
-    case "wait":
-      return `Wait ${count}`;
-    case "capture":
-      return `Capture ${count}`;
-    case "kill":
-      return `Kill ${count}`;
-    case "run_agent":
-      return `Run Agent ${count}`;
-    case "task":
-    default:
-      return `Task ${count}`;
-  }
-}
-
-/** Minimal valid per-type config so a freshly-dropped node round-trips through backend serde. */
-function defaultNodeKind(type: WorkflowNodeType): NodeKind {
-  switch (type) {
-    case "task":
-      return { type: "task" };
-    case "approval":
-      return { type: "approval" };
-    case "split":
-      return { type: "split" };
-    case "collector":
-      return { type: "collector" };
-    case "decide":
-      return { type: "decide", decideConfig: { prompt: "", inputs: [], outcomes: [] } };
-    case "parallel_batch":
-      return {
-        type: "parallel_batch",
-        batchConfig: { itemsBinding: "", maxConcurrent: 4, itemVar: "item", bodyEntry: "" },
-      };
-    case "run_agent":
-      // agent lives on node.agent (set in addNode); prompt stays unset so it
-      // does not shadow node.prompt on the backend (Some("") would win).
-      return { type: "run_agent", runAgentConfig: { killAfter: true } };
-    case "spawn":
-      return { type: "spawn", spawnConfig: { agent: "claude" } };
-    case "send":
-      return { type: "send", sendConfig: { text: "", enter: true } };
-    case "wait":
-      return { type: "wait", waitConfig: { mode: "idle" } };
-    case "capture":
-      return { type: "capture", captureConfig: { all: false, ansi: false } };
-    case "kill":
-      return { type: "kill", killConfig: {} };
-    case "subflow":
-      return { type: "subflow", subflowConfig: { workflowName: "", inputs: [], maxDepth: 10 } };
-    case "call":
-      return { type: "call", subflowConfig: { workflowName: "", inputs: [], maxDepth: 10 } };
-  }
 }
 
 function nodeSubflowConfig(node: WorkflowNode | undefined): SubflowConfig | null {
@@ -176,6 +103,22 @@ interface UndoEntry {
 
 const MAX_UNDO = 50;
 
+/** Match PaneTerminal xterm scrollback — bounds RunPanel DOM nodes and retained strings. */
+const MAX_RUN_LINES = 5000;
+const MAX_RUN_LINE_CHARS = 8_000;
+
+function truncateRunLineText(text: string): string {
+  if (text.length <= MAX_RUN_LINE_CHARS) return text;
+  const remaining = text.length - MAX_RUN_LINE_CHARS;
+  return `${text.slice(0, MAX_RUN_LINE_CHARS)}… truncated, ${remaining.toLocaleString()} more chars`;
+}
+
+function capRunLines(lines: RunLine[]): void {
+  if (lines.length > MAX_RUN_LINES) {
+    lines.splice(0, lines.length - MAX_RUN_LINES);
+  }
+}
+
 class WorkflowStore {
   workflow = $state<WorkflowDocument | null>(null);
   validation = $state<ValidationResponse | null>(null);
@@ -190,6 +133,7 @@ class WorkflowStore {
   approval = $state<ApprovalState | null>(null);
   interactions = $state<InteractionState[]>([]);
   errorMessage = $state<string>("");
+  #errorTimer: ReturnType<typeof setTimeout> | undefined;
 
   /* ── live pane terminal ───────────────────────────────────────────── */
   selectedPane = $state<string>("active");
@@ -608,6 +552,7 @@ class WorkflowStore {
 
   appendLine(line: RunLine) {
     this.lines.push(line);
+    capRunLines(this.lines);
   }
 
   clearLines() {
@@ -657,13 +602,21 @@ class WorkflowStore {
   }
 
   setError(message: string) {
+    clearTimeout(this.#errorTimer);
     this.errorMessage = message;
-    if (message) setTimeout(() => { this.errorMessage = ""; }, 5000);
+    if (message) {
+      this.#errorTimer = setTimeout(() => {
+        this.errorMessage = "";
+      }, 5000);
+    }
   }
 
   applyRunEvent(event: RunEvent) {
     const nodeId = typeof event.nodeId === "string" ? event.nodeId : null;
-    const push = (tone: RunLine["tone"], text: string) => this.lines.push({ tone, text });
+    const push = (tone: RunLine["tone"], text: string) => {
+      this.lines.push({ tone, text });
+      capRunLines(this.lines);
+    };
 
     switch (event.type) {
       case "run_start":
@@ -689,8 +642,12 @@ class WorkflowStore {
           result.success ? "success" : "error",
           `${String(event.nodeName ?? nodeId ?? "")} ${result.success ? "completed" : "failed"}${outcomeLabel}`,
         );
-        if (typeof result.output === "string" && result.output) push("detail", result.output);
-        if (typeof result.stderr === "string" && result.stderr) push("error", result.stderr);
+        if (typeof result.output === "string" && result.output) {
+          push("detail", truncateRunLineText(result.output));
+        }
+        if (typeof result.stderr === "string" && result.stderr) {
+          push("error", truncateRunLineText(result.stderr));
+        }
         // Show metadata summary when available
         const metaParts: string[] = [];
         if (result.duration) metaParts.push(`${String(result.duration)}s`);

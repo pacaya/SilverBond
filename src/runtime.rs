@@ -561,8 +561,6 @@ pub struct RuntimeCheckpoint {
     #[serde(default, with = "collector_barriers_serde")]
     pub collector_barriers: BTreeMap<CollectorBarrierKey, CollectorBarrierState>,
     #[serde(default)]
-    pub tmux_sessions: BTreeSet<String>,
-    #[serde(default)]
     pub queued_approvals: Vec<QueuedApproval>,
     #[serde(default)]
     pub loop_counters: BTreeMap<String, u32>,
@@ -590,11 +588,131 @@ pub struct RuntimeCheckpoint {
     pub execution_log: ExecutionLog,
 }
 
+pub(crate) const PANE_ALIAS_KEYS: [&str; 3] = ["paneId", "pane_id", "target"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneCandidate {
+    pub(crate) key: String,
+    pub(crate) target: String,
+}
+
+impl RuntimeCheckpoint {
+    pub(crate) fn pane_candidates(&self) -> Vec<PaneCandidate> {
+        let mut candidates = Vec::new();
+        let trusted_targets = trusted_pane_targets(self);
+        for (node_id, result) in &self.all_results {
+            push_pane_candidate(
+                &mut candidates,
+                node_id,
+                result.metadata.agent_session_id.as_deref(),
+            );
+            if let Some(value) = &result.parsed_output {
+                push_output_pane_candidate(
+                    &mut candidates,
+                    &trusted_targets,
+                    &self.run_id,
+                    node_id,
+                    pane_target_from_value(value),
+                );
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(&result.output) {
+                push_output_pane_candidate(
+                    &mut candidates,
+                    &trusted_targets,
+                    &self.run_id,
+                    node_id,
+                    pane_target_from_value(&value),
+                );
+            }
+        }
+
+        for execution in &self.execution_log.node_executions {
+            push_pane_candidate(
+                &mut candidates,
+                &execution.node_id,
+                execution.metadata.agent_session_id.as_deref(),
+            );
+        }
+
+        candidates
+    }
+}
+
+fn trusted_pane_targets(checkpoint: &RuntimeCheckpoint) -> BTreeSet<String> {
+    let mut trusted_targets = BTreeSet::new();
+    for result in checkpoint.all_results.values() {
+        insert_trusted_pane_target(
+            &mut trusted_targets,
+            result.metadata.agent_session_id.as_deref(),
+        );
+    }
+    for execution in &checkpoint.execution_log.node_executions {
+        insert_trusted_pane_target(
+            &mut trusted_targets,
+            execution.metadata.agent_session_id.as_deref(),
+        );
+    }
+    trusted_targets
+}
+
+fn insert_trusted_pane_target(trusted_targets: &mut BTreeSet<String>, target: Option<&str>) {
+    let Some(target) = target.map(str::trim).filter(|target| !target.is_empty()) else {
+        return;
+    };
+    trusted_targets.insert(target.to_string());
+}
+
+fn push_output_pane_candidate(
+    candidates: &mut Vec<PaneCandidate>,
+    trusted_targets: &BTreeSet<String>,
+    run_id: &str,
+    node_id: &str,
+    target: Option<&str>,
+) {
+    let Some(target) = target.map(str::trim).filter(|target| !target.is_empty()) else {
+        return;
+    };
+    if trusted_targets.contains(target) {
+        push_pane_candidate(candidates, node_id, Some(target));
+    } else {
+        tracing::warn!(
+            run_id = %run_id,
+            node_id = %node_id,
+            pane_target = %target,
+            "ignored untrusted pane target from node output"
+        );
+    }
+}
+
+fn push_pane_candidate(candidates: &mut Vec<PaneCandidate>, key: &str, target: Option<&str>) {
+    let Some(target) = target.map(str::trim).filter(|target| !target.is_empty()) else {
+        return;
+    };
+    if candidates
+        .iter()
+        .any(|candidate| candidate.key == key && candidate.target == target)
+    {
+        return;
+    }
+    candidates.push(PaneCandidate {
+        key: key.to_string(),
+        target: target.to_string(),
+    });
+}
+
+fn pane_target_from_value(value: &Value) -> Option<&str> {
+    PANE_ALIAS_KEYS
+        .iter()
+        .find_map(|name| value.get(*name).and_then(Value::as_str))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PersistedRun {
     #[serde(default = "new_stream_token")]
     pub stream_token: String,
+    #[serde(skip)]
+    pub tmux_invocation: Option<TmuxInvocation>,
     pub checkpoint: RuntimeCheckpoint,
     pub workflow: WorkflowV3,
 }
@@ -655,6 +773,7 @@ pub struct AgentSpec {
     pub name: String,
     pub binary: String,
     pub capabilities: AgentCapabilities,
+    pub access_profiles: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -663,6 +782,8 @@ pub enum RunControlError {
     RunNotFound,
     #[error("run is in terminal state")]
     TerminalState,
+    #[error("run is already actively executing")]
+    AlreadyActive,
     #[error("node not found in workflow")]
     NodeNotFound,
     #[error("no active interaction for this run")]
@@ -729,10 +850,20 @@ struct ActiveRun {
     sender: broadcast::Sender<RuntimeEvent>,
     abort_flag: Arc<AtomicBool>,
     abort_notify: Arc<Notify>,
+    drained: Arc<AtomicBool>,
+    drained_notify: Arc<Notify>,
     approval_sender: Arc<Mutex<Option<oneshot::Sender<ApprovalDecision>>>>,
     interaction_senders: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
     active_panes: Arc<Mutex<BTreeMap<String, ActivePaneTarget>>>,
     active_pane_sequence: Arc<AtomicU64>,
+    active_pane_notify: Arc<Notify>,
+    owned_tmux_targets: Arc<Mutex<OwnedTmuxTargets>>,
+}
+
+#[derive(Debug, Default)]
+struct OwnedTmuxTargets {
+    pane_ids: HashSet<String>,
+    session_names: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -767,20 +898,34 @@ fn active_pane_key_matches_node(key: &str, node_id: &str) -> bool {
 }
 
 impl RunRegistry {
-    async fn register(&self, run_id: &str) {
+    async fn register(&self, run_id: &str) -> bool {
         let mut guard = self.inner.lock().await;
-        guard.entry(run_id.to_string()).or_insert_with(|| {
-            let (sender, _) = broadcast::channel(512);
+        if guard.contains_key(run_id) {
+            return false;
+        }
+        let (sender, _) = broadcast::channel(512);
+        guard.insert(
+            run_id.to_string(),
             ActiveRun {
                 sender,
                 abort_flag: Arc::new(AtomicBool::new(false)),
                 abort_notify: Arc::new(Notify::new()),
+                drained: Arc::new(AtomicBool::new(false)),
+                drained_notify: Arc::new(Notify::new()),
                 approval_sender: Arc::new(Mutex::new(None)),
                 interaction_senders: Arc::new(Mutex::new(HashMap::new())),
                 active_panes: Arc::new(Mutex::new(BTreeMap::new())),
                 active_pane_sequence: Arc::new(AtomicU64::new(0)),
-            }
-        });
+                active_pane_notify: Arc::new(Notify::new()),
+                owned_tmux_targets: Arc::new(Mutex::new(OwnedTmuxTargets::default())),
+            },
+        );
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn register_test_run(&self, run_id: &str) {
+        let _ = self.register(run_id).await;
     }
 
     pub(crate) async fn subscribe(
@@ -804,6 +949,22 @@ impl RunRegistry {
         if let Some(active) = self.inner.lock().await.get(run_id).cloned() {
             active.abort_flag.store(true, Ordering::SeqCst);
             active.abort_notify.notify_waiters();
+        }
+    }
+
+    async fn abort_and_wait(&self, run_id: &str) {
+        let Some(active) = self.inner.lock().await.get(run_id).cloned() else {
+            return;
+        };
+        active.abort_flag.store(true, Ordering::SeqCst);
+        active.abort_notify.notify_waiters();
+        loop {
+            let drained = active.drained_notify.notified();
+            tokio::pin!(drained);
+            if active.drained.load(Ordering::SeqCst) {
+                return;
+            }
+            drained.await;
         }
     }
 
@@ -921,7 +1082,10 @@ impl RunRegistry {
     }
 
     async fn clear(&self, run_id: &str) {
-        self.inner.lock().await.remove(run_id);
+        if let Some(active) = self.inner.lock().await.remove(run_id) {
+            active.drained.store(true, Ordering::SeqCst);
+            active.drained_notify.notify_waiters();
+        }
     }
 
     pub async fn active_run_ids(&self) -> HashSet<String> {
@@ -952,7 +1116,56 @@ impl RunRegistry {
                     sequence,
                 },
             );
+            drop(panes);
+            active.active_pane_notify.notify_waiters();
         }
+    }
+
+    pub(crate) async fn active_pane_notify(&self, run_id: &str) -> Option<Arc<Notify>> {
+        self.inner
+            .lock()
+            .await
+            .get(run_id)
+            .map(|active| active.active_pane_notify.clone())
+    }
+
+    pub(crate) async fn register_owned_tmux_target(
+        &self,
+        run_id: &str,
+        pane_id: &str,
+        session_name: Option<&str>,
+    ) {
+        if let Some(active) = self.inner.lock().await.get(run_id).cloned() {
+            let mut targets = active.owned_tmux_targets.lock().await;
+            targets.pane_ids.insert(pane_id.to_string());
+            if let Some(session_name) = session_name {
+                targets.session_names.insert(session_name.to_string());
+            }
+        }
+    }
+
+    pub(crate) async fn owns_tmux_pane(&self, run_id: &str, pane_id: &str) -> bool {
+        let Some(active) = self.inner.lock().await.get(run_id).cloned() else {
+            return false;
+        };
+        active
+            .owned_tmux_targets
+            .lock()
+            .await
+            .pane_ids
+            .contains(pane_id)
+    }
+
+    pub(crate) async fn owns_tmux_session(&self, run_id: &str, session_name: &str) -> bool {
+        let Some(active) = self.inner.lock().await.get(run_id).cloned() else {
+            return false;
+        };
+        active
+            .owned_tmux_targets
+            .lock()
+            .await
+            .session_names
+            .contains(session_name)
     }
 
     pub(crate) async fn clear_active_pane(&self, run_id: &str, key: &str) {
@@ -1153,19 +1366,38 @@ impl RuntimeContext {
         workflow: WorkflowV3,
         variable_overrides: BTreeMap<String, String>,
         start_node_id: Option<String>,
-    ) -> anyhow::Result<String> {
+    ) -> Result<String, RunControlError> {
         let run_id = format!("run_{}", Uuid::now_v7());
         let checkpoint =
             build_initial_checkpoint(&workflow, &run_id, variable_overrides, start_node_id);
-        self.db
+        let tmux_invocation = resolve_workflow_invocation(
+            self.run_invocation.clone(),
+            workflow.run_as.clone(),
+            run_id.clone(),
+        )
+        .await
+        .map_err(RunControlError::Internal)?
+        .unwrap_or_default();
+        if !self.registry.register(&run_id).await {
+            return Err(RunControlError::AlreadyActive);
+        }
+        if let Err(error) = self
+            .db
             .upsert_run(&PersistedRun {
                 stream_token: new_stream_token(),
+                tmux_invocation: Some(tmux_invocation.clone()),
                 checkpoint: checkpoint.clone(),
                 workflow: workflow.clone(),
             })
-            .await?;
-        self.registry.register(&run_id).await;
-        let ctx = self.clone();
+            .await
+        {
+            self.registry.clear(&run_id).await;
+            return Err(RunControlError::Internal(error));
+        }
+        let ctx = RuntimeContext {
+            run_invocation: Some(tmux_invocation),
+            ..self.clone()
+        };
         tokio::spawn(async move {
             execute_workflow_to_terminal(ctx, workflow, checkpoint, false).await;
         });
@@ -1185,8 +1417,26 @@ impl RuntimeContext {
         ) {
             return Err(RunControlError::TerminalState);
         }
-        self.registry.register(run_id).await;
-        let ctx = self.clone();
+        if !self.registry.register(run_id).await {
+            return Err(RunControlError::AlreadyActive);
+        }
+        let tmux_invocation = match load_or_resolve_run_tmux_invocation(
+            &self.db,
+            &persisted,
+            self.run_invocation.clone(),
+        )
+        .await
+        {
+            Ok(invocation) => invocation,
+            Err(error) => {
+                self.registry.clear(run_id).await;
+                return Err(RunControlError::Internal(error));
+            }
+        };
+        let ctx = RuntimeContext {
+            run_invocation: Some(tmux_invocation),
+            ..self.clone()
+        };
         tokio::spawn(async move {
             execute_workflow_to_terminal(ctx, persisted.workflow, persisted.checkpoint, true).await;
         });
@@ -1212,6 +1462,13 @@ impl RuntimeContext {
         {
             return Err(RunControlError::NodeNotFound);
         }
+        self.registry.abort_and_wait(run_id).await;
+        let persisted = self
+            .db
+            .get_run(run_id)
+            .await
+            .map_err(RunControlError::Internal)?
+            .ok_or(RunControlError::RunNotFound)?;
 
         let descendants = collect_descendants(&persisted.workflow, node_id);
         let mut checkpoint = persisted.checkpoint.clone();
@@ -1281,25 +1538,47 @@ impl RuntimeContext {
         checkpoint.execution_log.aborted = false;
 
         let new_run_id = checkpoint.run_id.clone();
-        self.db
+        let tmux_invocation = resolve_workflow_invocation(
+            self.run_invocation.clone(),
+            persisted.workflow.run_as.clone(),
+            new_run_id.clone(),
+        )
+        .await
+        .map_err(RunControlError::Internal)?
+        .unwrap_or_default();
+        if !self.registry.register(&new_run_id).await {
+            return Err(RunControlError::AlreadyActive);
+        }
+        if let Err(error) = self
+            .db
             .upsert_run(&PersistedRun {
                 stream_token: new_stream_token(),
+                tmux_invocation: Some(tmux_invocation.clone()),
                 checkpoint: checkpoint.clone(),
                 workflow: persisted.workflow.clone(),
             })
             .await
-            .map_err(RunControlError::Internal)?;
-        self.db
+        {
+            self.registry.clear(&new_run_id).await;
+            return Err(RunControlError::Internal(error));
+        }
+        if let Err(error) = self
+            .db
             .mark_run_status(
                 run_id,
                 RuntimeStatus::Restarted,
                 Some("restarted".to_string()),
             )
             .await
-            .map_err(RunControlError::Internal)?;
-        self.registry.register(&new_run_id).await;
+        {
+            self.registry.clear(&new_run_id).await;
+            return Err(RunControlError::Internal(error));
+        }
 
-        let ctx = self.clone();
+        let ctx = RuntimeContext {
+            run_invocation: Some(tmux_invocation),
+            ..self.clone()
+        };
         tokio::spawn(async move {
             execute_workflow_to_terminal(ctx, persisted.workflow, checkpoint, true).await;
         });
@@ -1341,6 +1620,7 @@ pub fn available_agents() -> Vec<AgentSpec> {
             name: d.name().to_string(),
             binary: driver::agent_binary(d.name()).unwrap_or_else(|| d.name().to_string()),
             capabilities: d.capabilities(),
+            access_profiles: driver::agent_access_profile_names(d.name()),
         })
         .collect()
 }
@@ -1351,6 +1631,7 @@ pub fn find_agent(name: &str) -> Option<AgentSpec> {
         name: name.to_string(),
         binary: driver::agent_binary(name).unwrap_or_else(|| name.to_string()),
         capabilities: drv.capabilities(),
+        access_profiles: driver::agent_access_profile_names(name),
     })
 }
 
@@ -1580,7 +1861,7 @@ struct CursorTaskExecutionContext {
     cwd: String,
     use_orchestrator: bool,
     total_executed: u32,
-    all_results: BTreeMap<String, NodeResult>,
+    all_results: Arc<BTreeMap<String, NodeResult>>,
     var_map: BTreeMap<String, String>,
     /// Constant-per-run data shared via Arc to avoid cloning on each dispatch.
     shared: Arc<RunConstantData>,
@@ -1931,7 +2212,6 @@ fn build_initial_checkpoint(
         }],
         split_families: BTreeMap::new(),
         collector_barriers: BTreeMap::new(),
-        tmux_sessions: BTreeSet::new(),
         queued_approvals: Vec::new(),
         loop_counters: BTreeMap::new(),
         visit_counters: BTreeMap::new(),
@@ -2121,15 +2401,53 @@ fn graph_for_cursor<'a>(
     Ok(workflow_for_cursor(root_workflow, cursor)?.graph())
 }
 
+fn results_for_cursor<'a>(
+    checkpoint: &'a RuntimeCheckpoint,
+    cursor: &'a CursorState,
+) -> &'a BTreeMap<String, NodeResult> {
+    cursor
+        .call_stack
+        .last()
+        .map(|frame| &frame.subflow_results)
+        .unwrap_or(&checkpoint.all_results)
+}
+
 fn all_results_for_cursor(
     checkpoint: &RuntimeCheckpoint,
     cursor: &CursorState,
 ) -> BTreeMap<String, NodeResult> {
-    cursor
-        .call_stack
-        .last()
-        .map(|frame| frame.subflow_results.clone())
-        .unwrap_or_else(|| checkpoint.all_results.clone())
+    results_for_cursor(checkpoint, cursor).clone()
+}
+
+fn collect_skip_regexes(
+    workflow: &WorkflowV3,
+    cache: &mut BTreeMap<String, Regex>,
+) -> anyhow::Result<()> {
+    for node in &workflow.nodes {
+        let Some(skip) = &node.skip_condition else {
+            continue;
+        };
+        if skip.kind != "regex" {
+            continue;
+        }
+        let regex = Regex::new(&skip.value).with_context(|| {
+            format!(
+                "invalid skip condition regex on node \"{}\" ({})",
+                node.name, node.id
+            )
+        })?;
+        cache.insert(node.id.clone(), regex);
+    }
+    Ok(())
+}
+
+fn compile_skip_regex_cache(workflow: &WorkflowV3) -> anyhow::Result<BTreeMap<String, Regex>> {
+    let mut cache = BTreeMap::new();
+    collect_skip_regexes(workflow, &mut cache)?;
+    for subflow in workflow.subflows.values() {
+        collect_skip_regexes(subflow, &mut cache)?;
+    }
+    Ok(cache)
 }
 
 fn var_map_for_cursor(
@@ -2210,26 +2528,33 @@ fn should_skip_cursor_node(
     node: &WorkflowNode,
     cursor: &CursorState,
     checkpoint: &RuntimeCheckpoint,
-) -> bool {
+    skip_regex_cache: &BTreeMap<String, Regex>,
+) -> anyhow::Result<bool> {
     let Some(skip) = &node.skip_condition else {
-        return false;
+        return Ok(false);
     };
     let source_text = if skip.source == "previous_output" {
-        cursor.last_output.clone()
+        cursor.last_output.as_str()
     } else {
-        all_results_for_cursor(checkpoint, cursor)
+        results_for_cursor(checkpoint, cursor)
             .get(&skip.source)
-            .map(|result| result.output.clone())
-            .unwrap_or_default()
+            .map(|result| result.output.as_str())
+            .unwrap_or("")
     };
-    match skip.kind.as_str() {
+    Ok(match skip.kind.as_str() {
         "contains" => source_text.contains(&skip.value),
         "not_contains" => !source_text.contains(&skip.value),
-        "regex" => Regex::new(&skip.value)
-            .map(|regex| regex.is_match(&source_text))
-            .unwrap_or(false),
+        "regex" => skip_regex_cache
+            .get(&node.id)
+            .with_context(|| {
+                format!(
+                    "missing compiled skip regex for node \"{}\" ({})",
+                    node.name, node.id
+                )
+            })?
+            .is_match(source_text),
         _ => false,
-    }
+    })
 }
 
 fn nearest_collectors_for_node(graph: &WorkflowGraph, node_id: &str) -> Vec<CollectorTarget> {
@@ -2293,6 +2618,7 @@ async fn execute_workflow(
     if let Some(pending) = rehydrate_checkpoint_for_execution(&workflow, &mut checkpoint) {
         drop_inconsistent_pending_approval(&ctx, &mut checkpoint, pending).await?;
     }
+    let skip_regex_cache = compile_skip_regex_cache(&workflow)?;
     let start_instant = std::time::Instant::now();
     let mut running_tasks = JoinSet::new();
     let mut active_approval: Option<ActiveApprovalWait> = None;
@@ -2337,8 +2663,14 @@ async fn execute_workflow(
         }
 
         let mut changed = false;
-        while process_immediate_cursors(&ctx, &workflow, &mut checkpoint, &mut active_approval)
-            .await?
+        while process_immediate_cursors(
+            &ctx,
+            &workflow,
+            &mut checkpoint,
+            &mut active_approval,
+            &skip_regex_cache,
+        )
+        .await?
         {
             changed = true;
             if checkpoint.execution_log.terminal_reason.is_some() {
@@ -2405,10 +2737,10 @@ async fn execute_workflow(
             }
             let dispatch_cursor = cursor_snapshot(&checkpoint, &cursor_id).unwrap_or(cursor);
             let active_workflow = workflow_for_cursor(&workflow, &dispatch_cursor)?;
-            let all_results = all_results_for_cursor(&checkpoint, &dispatch_cursor);
+            let all_results = Arc::new(all_results_for_cursor(&checkpoint, &dispatch_cursor));
             let var_map = var_map_for_cursor(&checkpoint, &dispatch_cursor);
             let session_persistence_nodes =
-                build_session_persistence_set(&active_graph, &all_results);
+                build_session_persistence_set(&active_graph, all_results.as_ref());
             let run_ctx = CursorTaskExecutionContext {
                 run_id: run_id.clone(),
                 workflow_goal: active_workflow.goal.clone(),
@@ -2579,6 +2911,7 @@ async fn process_immediate_cursors(
     workflow: &WorkflowV3,
     checkpoint: &mut RuntimeCheckpoint,
     active_approval: &mut Option<ActiveApprovalWait>,
+    skip_regex_cache: &BTreeMap<String, Regex>,
 ) -> anyhow::Result<bool> {
     if active_approval.is_none() && checkpoint.pending_approval.is_none() {
         if activate_next_approval(ctx, checkpoint, active_approval).await? {
@@ -2628,7 +2961,7 @@ async fn process_immediate_cursors(
             | NodeKind::Capture { .. }
             | NodeKind::Kill { .. }
             | NodeKind::RunAgent { .. } => {
-                if should_skip_cursor_node(&node, &cursor, checkpoint) {
+                if should_skip_cursor_node(&node, &cursor, checkpoint, skip_regex_cache)? {
                     let Some(_) =
                         prepare_cursor_visit(ctx, workflow, checkpoint, &cursor_id, &node).await?
                     else {
@@ -2849,6 +3182,27 @@ async fn resolve_workflow_invocation(
         crate::tmux_exec::build_tmux_invocation,
     )
     .await
+}
+
+pub(crate) async fn load_or_resolve_run_tmux_invocation(
+    db: &Database,
+    persisted: &PersistedRun,
+    existing: Option<TmuxInvocation>,
+) -> anyhow::Result<TmuxInvocation> {
+    if let Some(invocation) = persisted.tmux_invocation.clone() {
+        return Ok(invocation);
+    }
+
+    let invocation = resolve_workflow_invocation(
+        existing,
+        persisted.workflow.run_as.clone(),
+        persisted.checkpoint.run_id.clone(),
+    )
+    .await?
+    .unwrap_or_default();
+    db.store_tmux_invocation_if_missing(&persisted.checkpoint.run_id, &invocation)
+        .await?;
+    Ok(invocation)
 }
 
 async fn resolve_workflow_invocation_with<F>(
@@ -3185,7 +3539,7 @@ async fn run_cursor_task(
         &TemplateRuntimeContext {
             current_node_id: &node.id,
             current_node: &node,
-            all_results: &run_ctx.all_results,
+            all_results: run_ctx.all_results.as_ref(),
             last_output: &cursor.last_output,
             var_map: &run_ctx.var_map,
             inbound_map: &run_ctx.shared.inbound_map,
@@ -3380,7 +3734,7 @@ async fn run_decide_node(
     let template_context = TemplateRuntimeContext {
         current_node_id: &node.id,
         current_node: &node,
-        all_results: &run_ctx.all_results,
+        all_results: run_ctx.all_results.as_ref(),
         last_output: &cursor.last_output,
         var_map: &run_ctx.var_map,
         inbound_map: &run_ctx.shared.inbound_map,
@@ -4394,14 +4748,14 @@ async fn handle_parallel_batch_node(
         return Ok(());
     };
     let parent_cursor = checkpoint.active_cursors[parent_index].clone();
-    let base_all_results = all_results_for_cursor(checkpoint, &parent_cursor);
+    let base_all_results = Arc::new(all_results_for_cursor(checkpoint, &parent_cursor));
     let base_var_map = var_map_for_cursor(checkpoint, &parent_cursor);
     let inbound_map = build_inbound_source_map(graph);
     let items = {
         let binding_context = TemplateRuntimeContext {
             current_node_id: &node.id,
             current_node: &node,
-            all_results: &base_all_results,
+            all_results: base_all_results.as_ref(),
             last_output: &parent_cursor.last_output,
             var_map: &base_var_map,
             inbound_map: &inbound_map,
@@ -4450,7 +4804,7 @@ async fn handle_parallel_batch_node(
             .insert(batch_key.clone(), item_results_by_index.clone());
     }
 
-    let session_persistence_nodes = build_session_persistence_set(graph, &base_all_results);
+    let session_persistence_nodes = build_session_persistence_set(graph, base_all_results.as_ref());
     let scoped_cwd = scoped_workflow_cwd(workflow, &checkpoint.cwd);
     let scoped_use_orchestrator = workflow.use_orchestrator;
     let shared = Arc::new(RunConstantData {
@@ -4759,7 +5113,7 @@ async fn spawn_batch_item_task(
     shared: Arc<RunConstantData>,
     cwd: String,
     use_orchestrator: bool,
-    base_all_results: BTreeMap<String, NodeResult>,
+    base_all_results: Arc<BTreeMap<String, NodeResult>>,
     mut base_var_map: BTreeMap<String, String>,
     parent_cursor: CursorState,
     batch_node: WorkflowNode,
@@ -4789,7 +5143,7 @@ async fn spawn_batch_item_task(
             &TemplateRuntimeContext {
                 current_node_id: &body_node.id,
                 current_node: &body_node,
-                all_results: &base_all_results,
+                all_results: base_all_results.as_ref(),
                 last_output: &parent_cursor.last_output,
                 var_map: &base_var_map,
                 inbound_map: &shared.inbound_map,
@@ -5925,6 +6279,7 @@ async fn finalize_run(
             ctx.db
                 .upsert_run(&PersistedRun {
                     stream_token: new_stream_token(),
+                    tmux_invocation: ctx.run_invocation.clone(),
                     checkpoint: checkpoint.clone(),
                     workflow: workflow.clone(),
                 })
@@ -5992,12 +6347,7 @@ async fn cleanup_terminal_active_panes(
         return;
     }
 
-    if let Ok(Some(mut persisted)) = ctx.db.get_run(run_id).await {
-        for session in &killed_sessions {
-            persisted.checkpoint.tmux_sessions.remove(session);
-        }
-        let _ = ctx.db.update_run_checkpoint(&persisted.checkpoint).await;
-    }
+    let _ = ctx.db.remove_tmux_sessions(run_id, &killed_sessions).await;
 }
 
 pub(crate) async fn register_tmux_session(
@@ -6005,16 +6355,7 @@ pub(crate) async fn register_tmux_session(
     run_id: &str,
     session_name: &str,
 ) -> anyhow::Result<()> {
-    let Some(mut persisted) = db.get_run(run_id).await? else {
-        return Ok(());
-    };
-    if persisted
-        .checkpoint
-        .tmux_sessions
-        .insert(session_name.to_string())
-    {
-        db.update_run_checkpoint(&persisted.checkpoint).await?;
-    }
+    db.register_tmux_session(run_id, session_name).await?;
     Ok(())
 }
 
@@ -6026,42 +6367,36 @@ fn tmux_invocation_key(invocation: &TmuxInvocation) -> (Vec<String>, Option<Stri
     )
 }
 
-pub async fn reap_stale_tmux_sessions(ctx: &RuntimeContext) -> anyhow::Result<()> {
-    let checkpoint_runs = ctx.db.list_runs_with_tmux_sessions().await?;
+pub async fn reap_stale_tmux_sessions(ctx: &RuntimeContext) {
+    let reapable_sessions = match ctx.db.list_reapable_tmux_sessions().await {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            tracing::warn!(error = %error, "Skipping stale tmux cleanup after storage error");
+            return;
+        }
+    };
     let active_run_ids = ctx.registry.active_run_ids().await;
     let mut terminal_sessions_by_invocation = HashMap::<
         (Vec<String>, Option<String>, String),
         (TmuxInvocation, HashMap<String, String>),
     >::new();
-    for (run_id, status, sessions) in checkpoint_runs {
-        if matches!(
-            status,
-            RuntimeStatus::Completed
-                | RuntimeStatus::Failed
-                | RuntimeStatus::Aborted
-                | RuntimeStatus::Restarted
-        ) {
-            if active_run_ids.contains(&run_id) {
-                continue;
-            }
-            let Some(persisted) = ctx.db.get_run(&run_id).await? else {
-                continue;
-            };
-            let invocation = resolve_workflow_invocation(
-                None,
-                persisted.workflow.run_as.clone(),
-                run_id.clone(),
-            )
-            .await?
-            .unwrap_or_default();
-            let key = tmux_invocation_key(&invocation);
-            let entry = terminal_sessions_by_invocation
-                .entry(key)
-                .or_insert_with(|| (invocation, HashMap::new()));
-            for session in sessions {
-                entry.1.insert(session, run_id.clone());
-            }
+    for reapable in reapable_sessions {
+        if active_run_ids.contains(&reapable.run_id) {
+            continue;
         }
+        let Some(invocation) = reapable.tmux_invocation else {
+            tracing::warn!(
+                run_id = %reapable.run_id,
+                session_name = %reapable.session_name,
+                "Skipping stale tmux session without a persisted invocation"
+            );
+            continue;
+        };
+        let key = tmux_invocation_key(&invocation);
+        let entry = terminal_sessions_by_invocation
+            .entry(key)
+            .or_insert_with(|| (invocation, HashMap::new()));
+        entry.1.insert(reapable.session_name, reapable.run_id);
     }
 
     for (_, (invocation, terminal_session_runs)) in terminal_sessions_by_invocation {
@@ -6076,8 +6411,22 @@ pub async fn reap_stale_tmux_sessions(ctx: &RuntimeContext) -> anyhow::Result<()
         .await
         {
             Ok(Ok(sessions)) => sessions,
-            Ok(Err(error)) => return Err(error),
-            Err(error) => return Err(error.into()),
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    error = %error,
+                    invocation = ?invocation,
+                    "Skipping stale tmux sessions after list failure"
+                );
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    invocation = ?invocation,
+                    "Skipping stale tmux sessions after list task failure"
+                );
+                continue;
+            }
         };
         if live_sessions.is_empty() {
             continue;
@@ -6088,17 +6437,46 @@ pub async fn reap_stale_tmux_sessions(ctx: &RuntimeContext) -> anyhow::Result<()
                 continue;
             }
             let session = session.clone();
+            let Some(run_id) = terminal_session_runs.get(&session).cloned() else {
+                continue;
+            };
             let invocation = invocation.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let session_to_kill = session.clone();
+            let killed = tokio::task::spawn_blocking(move || {
                 tmux_tools_core::with_invocation(invocation, || {
-                    crate::tmux_exec::kill_tmux_session(&session);
-                });
+                    crate::tmux_exec::kill_tmux_session(&session_to_kill)
+                })
             })
             .await;
+            match killed {
+                Ok(true) => {
+                    if let Err(error) = ctx
+                        .db
+                        .remove_tmux_sessions(&run_id, &BTreeSet::from([session.clone()]))
+                        .await
+                    {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            session_name = %session,
+                            error = %error,
+                            "Stale tmux session was killed but its registration remains"
+                        );
+                    }
+                }
+                Ok(false) => tracing::warn!(
+                    run_id = %run_id,
+                    session_name = %session,
+                    "Failed to kill stale tmux session"
+                ),
+                Err(error) => tracing::warn!(
+                    run_id = %run_id,
+                    session_name = %session,
+                    error = %error,
+                    "Stale tmux kill task failed"
+                ),
+            }
         }
     }
-
-    Ok(())
 }
 
 async fn kill_active_run_panes(ctx: &RuntimeContext, run_id: &str) {
@@ -6136,6 +6514,7 @@ async fn persist_checkpoint(
     ctx.db
         .upsert_run(&PersistedRun {
             stream_token: new_stream_token(),
+            tmux_invocation: ctx.run_invocation.clone(),
             checkpoint: checkpoint.clone(),
             workflow: workflow.clone(),
         })
@@ -7403,6 +7782,190 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn start_run_persists_resolved_tmux_invocation_before_returning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::new(db.clone());
+        let script = temp.path().join("resolve-tmux.sh");
+        let lookup_log = temp.path().join("tmux-lookups.log");
+        fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\nshift\nif [ \"$1\" = \"zsh\" ]; then printf 'lookup\\n' >> \"$log\"; printf 'SBTMUX:/custom/bin/tmux\\n'; fi\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let mut workflow = workflow_from_parts(
+            "approve",
+            vec![approval_node("approve", "Approve", "continue?")],
+            vec![],
+        );
+        workflow.run_as = Some(model::RunAsConfig {
+            command: Some(vec![
+                script.to_string_lossy().into_owned(),
+                lookup_log.to_string_lossy().into_owned(),
+            ]),
+            user: None,
+            socket: Some("persisted-socket".to_string()),
+        });
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+
+        let persisted = db.get_run(&run_id).await.unwrap().unwrap();
+        assert_eq!(
+            persisted.tmux_invocation,
+            Some(TmuxInvocation {
+                prefix: vec![
+                    script.to_string_lossy().into_owned(),
+                    lookup_log.to_string_lossy().into_owned(),
+                ],
+                socket: Some("persisted-socket".to_string()),
+                tmux_bin: "/custom/bin/tmux".to_string(),
+            })
+        );
+        assert_eq!(fs::read_to_string(&lookup_log).unwrap(), "lookup\n");
+
+        runtime.abort_run(&run_id).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn resume_run_persists_missing_tmux_invocation_before_returning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::new(db.clone());
+        let script = temp.path().join("resolve-legacy-tmux.sh");
+        let lookup_log = temp.path().join("legacy-tmux-lookups.log");
+        fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\nshift\nif [ \"$1\" = \"zsh\" ]; then printf 'lookup\\n' >> \"$log\"; printf 'SBTMUX:/legacy/bin/tmux\\n'; fi\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let run_id = "run_pre_m5";
+        let mut workflow = workflow_from_parts(
+            "approve",
+            vec![approval_node("approve", "Approve", "continue?")],
+            vec![],
+        );
+        workflow.run_as = Some(model::RunAsConfig {
+            command: Some(vec![
+                script.to_string_lossy().into_owned(),
+                lookup_log.to_string_lossy().into_owned(),
+            ]),
+            user: None,
+            socket: Some("legacy-socket".to_string()),
+        });
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: None,
+            checkpoint: build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None),
+            workflow,
+        })
+        .await
+        .unwrap();
+
+        runtime.resume_run(run_id).await.unwrap();
+
+        let persisted = db.get_run(run_id).await.unwrap().unwrap();
+        assert_eq!(
+            persisted.tmux_invocation,
+            Some(TmuxInvocation {
+                prefix: vec![
+                    script.to_string_lossy().into_owned(),
+                    lookup_log.to_string_lossy().into_owned(),
+                ],
+                socket: Some("legacy-socket".to_string()),
+                tmux_bin: "/legacy/bin/tmux".to_string(),
+            })
+        );
+        assert_eq!(fs::read_to_string(&lookup_log).unwrap(), "lookup\n");
+
+        runtime.abort_run(run_id).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_run_persists_fresh_tmux_invocation_before_returning() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::new(db.clone());
+        let script = temp.path().join("resolve-restart-tmux.sh");
+        let lookup_log = temp.path().join("restart-tmux-lookups.log");
+        fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\nshift\nif [ \"$1\" = \"zsh\" ]; then printf 'lookup\\n' >> \"$log\"; printf 'SBTMUX:/restart/bin/tmux\\n'; fi\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let old_run_id = "run_before_restart";
+        let mut workflow = workflow_from_parts(
+            "approve",
+            vec![approval_node("approve", "Approve", "continue?")],
+            vec![],
+        );
+        workflow.run_as = Some(model::RunAsConfig {
+            command: Some(vec![
+                script.to_string_lossy().into_owned(),
+                lookup_log.to_string_lossy().into_owned(),
+            ]),
+            user: None,
+            socket: Some("restart-socket".to_string()),
+        });
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: Some(TmuxInvocation {
+                prefix: vec!["old-prefix".to_string()],
+                socket: Some("old-socket".to_string()),
+                tmux_bin: "old-tmux".to_string(),
+            }),
+            checkpoint: build_initial_checkpoint(&workflow, old_run_id, BTreeMap::new(), None),
+            workflow,
+        })
+        .await
+        .unwrap();
+
+        let new_run_id = runtime.restart_from(old_run_id, "approve").await.unwrap();
+
+        let persisted = db.get_run(&new_run_id).await.unwrap().unwrap();
+        assert_eq!(
+            persisted.tmux_invocation,
+            Some(TmuxInvocation {
+                prefix: vec![
+                    script.to_string_lossy().into_owned(),
+                    lookup_log.to_string_lossy().into_owned(),
+                ],
+                socket: Some("restart-socket".to_string()),
+                tmux_bin: "/restart/bin/tmux".to_string(),
+            })
+        );
+        assert_eq!(fs::read_to_string(&lookup_log).unwrap(), "lookup\n");
+
+        runtime.abort_run(&new_run_id).await.unwrap();
+    }
+
+    #[cfg(unix)]
     fn fake_run_as_config(
         temp: &TempDir,
         stem: &str,
@@ -7720,7 +8283,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn stale_tmux_reaper_uses_persisted_run_invocation() {
+    async fn stale_tmux_reaper_batches_by_persisted_invocation_without_resolving() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = TempDir::new().unwrap();
@@ -7729,12 +8292,14 @@ mod tests {
         let ctx = RuntimeContext::new(db.clone());
 
         let socket = "stale-run-socket";
-        let session = "silverbond-Stale-Session";
+        let first_session = "silverbond-Stale-First";
+        let second_session = "silverbond-Stale-Second";
         let script = temp.path().join("tmux-reaper-prefix.sh");
         let log = temp.path().join("tmux-reaper-args.log");
+        let resolver_marker = temp.path().join("tmux-reaper-resolver-ran");
         fs::write(
             &script,
-            "#!/bin/sh\nlog=\"$1\"\nsession=\"$2\"\nshift 2\nif [ \"$1\" = \"zsh\" ]; then printf 'tmux\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n' \"$session\"; fi\nexit 0\n",
+            "#!/bin/sh\nlog=\"$1\"\nfirst=\"$2\"\nsecond=\"$3\"\nresolver_marker=\"$4\"\nshift 4\nif [ \"$1\" = \"zsh\" ]; then touch \"$resolver_marker\"; printf 'SBTMUX:tmux\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n%s\\n' \"$first\" \"$second\"; fi\nexit 0\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&script).unwrap().permissions();
@@ -7746,27 +8311,50 @@ mod tests {
             command: Some(vec![
                 script.to_string_lossy().into_owned(),
                 log.to_string_lossy().into_owned(),
-                session.to_string(),
+                first_session.to_string(),
+                second_session.to_string(),
+                resolver_marker.to_string_lossy().into_owned(),
             ]),
             user: None,
             socket: Some(socket.to_string()),
         });
-        let run_id = "run_stale_reaper";
-        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
-        checkpoint.status = RuntimeStatus::Completed;
-        checkpoint.tmux_sessions.insert(session.to_string());
-        db.upsert_run(&PersistedRun {
-            stream_token: new_stream_token(),
-            checkpoint,
-            workflow,
-        })
-        .await
-        .unwrap();
+        let invocation = TmuxInvocation {
+            prefix: workflow.run_as.as_ref().unwrap().command.clone().unwrap(),
+            socket: Some(socket.to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+        for (run_id, session) in [
+            ("run_stale_reaper_first", first_session),
+            ("run_stale_reaper_second", second_session),
+        ] {
+            let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+            checkpoint.status = RuntimeStatus::Completed;
+            db.upsert_run(&PersistedRun {
+                stream_token: new_stream_token(),
+                tmux_invocation: Some(invocation.clone()),
+                checkpoint,
+                workflow: workflow.clone(),
+            })
+            .await
+            .unwrap();
+            register_tmux_session(&db, run_id, session).await.unwrap();
+        }
 
-        reap_stale_tmux_sessions(&ctx).await.unwrap();
+        reap_stale_tmux_sessions(&ctx).await;
 
+        assert!(
+            !resolver_marker.exists(),
+            "startup reaper must not resolve persisted tmux invocations"
+        );
         let recorded = fs::read_to_string(log).expect("fake tmux prefix should record reaper args");
         let args = recorded.lines().collect::<Vec<_>>();
+        assert_eq!(
+            args.iter()
+                .filter(|argument| **argument == "list-sessions")
+                .count(),
+            1,
+            "shared invocation should be listed once; args={args:?}"
+        );
         assert!(
             args.windows(6).any(|window| window
                 == [
@@ -7781,9 +8369,33 @@ mod tests {
         );
         assert!(
             args.windows(6)
-                .any(|window| window == ["tmux", "-L", socket, "kill-session", "-t", session]),
-            "reaper should kill stale sessions under the persisted invocation; args={args:?}"
+                .any(|window| window
+                    == ["tmux", "-L", socket, "kill-session", "-t", first_session]),
+            "reaper should kill first stale session under the persisted invocation; args={args:?}"
         );
+        assert!(
+            args.windows(6).any(
+                |window| window == ["tmux", "-L", socket, "kill-session", "-t", second_session]
+            ),
+            "reaper should kill second stale session under the persisted invocation; args={args:?}"
+        );
+        assert!(db.list_reapable_tmux_sessions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_tmux_reaper_is_best_effort_when_storage_is_unavailable() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db.clone());
+        let connection = rusqlite::Connection::open(db.path()).unwrap();
+        connection
+            .execute("DROP TABLE run_tmux_sessions", [])
+            .unwrap();
+
+        let outcome: () = reap_stale_tmux_sessions(&ctx).await;
+
+        assert_eq!(outcome, ());
     }
 
     async fn wait_for_run<F>(db: &Database, run_id: &str, mut predicate: F) -> PersistedRun
@@ -7929,6 +8541,7 @@ mod tests {
         let checkpoint = build_initial_checkpoint(&workflow, "run_decide", BTreeMap::new(), None);
         db.upsert_run(&PersistedRun {
             stream_token: new_stream_token(),
+            tmux_invocation: None,
             checkpoint: checkpoint.clone(),
             workflow: workflow.clone(),
         })
@@ -7970,6 +8583,7 @@ mod tests {
         refinement_db
             .upsert_run(&PersistedRun {
                 stream_token: new_stream_token(),
+                tmux_invocation: None,
                 checkpoint: refinement_checkpoint.clone(),
                 workflow: refinement_workflow.clone(),
             })
@@ -8250,6 +8864,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tmux_target_ownership_is_run_scoped_and_separate_from_active_panes() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db);
+        let owning_run = "run-owner";
+        let foreign_run = "run-foreign";
+        ctx.registry.register(owning_run).await;
+        ctx.registry.register(foreign_run).await;
+
+        ctx.registry
+            .register_owned_tmux_target(owning_run, "%owned-pane", Some("owned-session"))
+            .await;
+        ctx.registry
+            .set_active_pane(
+                owning_run,
+                &active_pane_key("cursor", "attacker-controlled"),
+                "%active-but-unowned-pane",
+            )
+            .await;
+
+        assert!(ctx.registry.owns_tmux_pane(owning_run, "%owned-pane").await);
+        assert!(
+            ctx.registry
+                .owns_tmux_session(owning_run, "owned-session")
+                .await
+        );
+        assert!(
+            !ctx.registry
+                .owns_tmux_pane(owning_run, "%active-but-unowned-pane")
+                .await,
+            "an active-pane alias must not establish ownership"
+        );
+        assert!(
+            !ctx.registry
+                .owns_tmux_pane(foreign_run, "%owned-pane")
+                .await
+        );
+        assert!(
+            !ctx.registry
+                .owns_tmux_session(foreign_run, "owned-session")
+                .await
+        );
+    }
+
+    #[tokio::test]
     async fn terminal_cleanup_targets_skip_persistent_panes_and_reused_aliases() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
@@ -8461,6 +9121,7 @@ mod tests {
             .await;
         db.upsert_run(&PersistedRun {
             stream_token: new_stream_token(),
+            tmux_invocation: runtime.run_invocation.clone(),
             checkpoint: checkpoint.clone(),
             workflow: workflow.clone(),
         })
@@ -8519,6 +9180,7 @@ mod tests {
             .await;
         db.upsert_run(&PersistedRun {
             stream_token: new_stream_token(),
+            tmux_invocation: runtime.run_invocation.clone(),
             checkpoint: checkpoint.clone(),
             workflow: workflow.clone(),
         })
@@ -8596,6 +9258,7 @@ mod tests {
         }];
         db.upsert_run(&PersistedRun {
             stream_token: new_stream_token(),
+            tmux_invocation: None,
             checkpoint,
             workflow: workflow.clone(),
         })
@@ -9128,6 +9791,7 @@ mod tests {
         );
         db.upsert_run(&PersistedRun {
             stream_token: new_stream_token(),
+            tmux_invocation: None,
             checkpoint,
             workflow: workflow.clone(),
         })
@@ -9401,6 +10065,7 @@ mod tests {
             .await;
         db.upsert_run(&PersistedRun {
             stream_token: new_stream_token(),
+            tmux_invocation: runtime.run_invocation.clone(),
             checkpoint: checkpoint.clone(),
             workflow: workflow.clone(),
         })
@@ -10287,6 +10952,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_from_drains_active_executor_before_spawning_replacement() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::new(db.clone());
+        let workflow = workflow_from_parts(
+            "approve",
+            vec![approval_node("approve", "Approve", "continue?")],
+            Vec::new(),
+        );
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        wait_for_run(&db, &run_id, |persisted| {
+            persisted.checkpoint.pending_approval.is_some()
+        })
+        .await;
+
+        let restarted_run_id = runtime.restart_from(&run_id, "approve").await.unwrap();
+        let active_run_ids = runtime.registry.active_run_ids().await;
+
+        assert!(!active_run_ids.contains(&run_id));
+        assert!(active_run_ids.contains(&restarted_run_id));
+
+        runtime.abort_run(&restarted_run_id).await.unwrap();
+        wait_for_terminal_run(&db, &restarted_run_id).await;
+    }
+
+    #[tokio::test]
     async fn restart_from_advances_epoch_and_drops_stale_collector_arrivals() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
@@ -10695,7 +11390,7 @@ mod tests {
                 ..Default::default()
             };
 
-            // Both built-in agents should handle all access modes without error
+            // Built-in drivers should handle all access modes without error.
             for agent_name in &["claude", "codex"] {
                 let driver = get_driver(agent_name).unwrap();
                 let result = driver.build_session_args(&config);
@@ -10715,6 +11410,25 @@ mod tests {
 
                 if let Some(dir) = cmd.temp_dir {
                     let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+
+            // Registry-backed agents resolve mapped profiles or fall back to default.
+            for agent_name in &["cursor", "agy"] {
+                let Some(driver) = get_driver(agent_name) else {
+                    continue;
+                };
+                let result = driver.build_session_args(&config);
+                assert!(
+                    result.is_ok(),
+                    "registry agent {agent_name} failed with {mode:?}: {:?}",
+                    result.as_ref().err()
+                );
+
+                if let Ok(cmd) = result {
+                    if let Some(dir) = cmd.temp_dir {
+                        let _ = std::fs::remove_dir_all(dir);
+                    }
                 }
             }
         }

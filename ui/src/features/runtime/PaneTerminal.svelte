@@ -72,13 +72,15 @@
   const statusLabel = $derived(
     store.paneStatus === "open"
       ? "Live"
-      : store.paneStatus === "connecting"
-        ? "Connecting…"
-        : store.paneStatus === "closed"
-          ? "Reconnecting…"
-          : store.paneStatus === "unavailable"
-            ? "Unavailable"
-            : "Idle",
+      : store.paneStatus === "stalled"
+        ? "Stalled"
+        : store.paneStatus === "connecting"
+          ? "Connecting…"
+          : store.paneStatus === "closed"
+            ? "Reconnecting…"
+            : store.paneStatus === "unavailable"
+              ? "Unavailable"
+              : "Idle",
   );
 
   function requestFit() {
@@ -164,7 +166,11 @@
 
   function resync() {
     term?.reset();
-    handle?.requestResync();
+    if (store.paneStatus === "unavailable" || store.paneStatus === "stalled") {
+      handle?.reconnect();
+    } else {
+      handle?.requestResync();
+    }
   }
 </script>
 
@@ -288,6 +294,11 @@
   .paneTerminal__status--closed {
     color: #fde68a;
     border-color: rgba(253, 230, 138, 0.32);
+  }
+
+  .paneTerminal__status--stalled {
+    color: #fdba74;
+    border-color: rgba(251, 146, 60, 0.32);
   }
 
   .paneTerminal__status--unavailable {
