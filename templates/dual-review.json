@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "name": "Dual Review",
   "description": "Two parallel reviewers cross-verify findings and adjudicate disagreements into a merged report.",
   "goal": "Produce a merged adversarial code review from dual independent reviewers",

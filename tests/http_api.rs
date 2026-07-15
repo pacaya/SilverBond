@@ -90,7 +90,7 @@ where
 
 fn echo_workflow() -> Value {
     json!({
-        "version": 3,
+        "version": 4,
         "name": "Echo Finish",
         "goal": "Finish",
         "cwd": "",
@@ -430,7 +430,7 @@ async fn run_control_routes_return_typed_client_errors() {
     assert_eq!(body["success"], true);
 
     let approval_workflow = json!({
-        "version": 3,
+        "version": 4,
         "name": "Approval Only",
         "goal": "Approve",
         "cwd": "",
@@ -490,7 +490,7 @@ async fn run_control_routes_return_typed_client_errors() {
     assert_body_omits(&body, &[&active_run_id, stale_session_id]);
 
     let echo_workflow = json!({
-        "version": 3,
+        "version": 4,
         "name": "Echo Finish",
         "goal": "Finish",
         "cwd": "",
@@ -614,7 +614,7 @@ async fn internal_http_errors_use_fixed_client_body() {
 async fn validates_and_saves_workflows() {
     let (_temp, router) = test_router().await;
     let workflow = json!({
-        "version": 3,
+        "version": 4,
         "name": "Example",
         "goal": "Test",
         "cwd": "",
@@ -814,7 +814,7 @@ async fn test_node_rejects_non_preview_node_payloads() {
     );
 
     let workflow_payload = json!({
-        "version": 3,
+        "version": 4,
         "name": "Workflow Payload",
         "entryNodeId": "preview-task",
         "nodes": [
@@ -856,7 +856,7 @@ async fn test_node_rejects_non_preview_node_payloads() {
 async fn validates_workflow_with_agent_config() {
     let (_temp, router) = test_router().await;
     let workflow = json!({
-        "version": 3,
+        "version": 4,
         "name": "Agent Config Test",
         "goal": "Test agent configuration",
         "cwd": "/work",
@@ -946,7 +946,7 @@ async fn exposes_capabilities() {
     .await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(capabilities["workflowVersion"], 3);
+    assert_eq!(capabilities["workflowVersion"], 4);
     assert_eq!(
         capabilities["supportedNodeTypes"],
         json!([
@@ -1006,7 +1006,7 @@ async fn lists_templates_without_failing_on_invalid_files() {
     std::fs::write(
         temp.path().join("templates").join("valid.json"),
         serde_json::to_vec_pretty(&json!({
-            "version": 3,
+            "version": 4,
             "name": "Valid Template",
             "description": "A valid workflow template",
             "goal": "goal",
@@ -1055,7 +1055,7 @@ async fn lists_templates_without_failing_on_invalid_files() {
 async fn creates_and_approves_runs() {
     let (_temp, router) = test_router().await;
     let approval_workflow = json!({
-        "version": 3,
+        "version": 4,
         "name": "Approval Only",
         "goal": "Approve",
         "cwd": "",

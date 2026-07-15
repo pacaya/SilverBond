@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "name": "Epic Dev",
   "description": "Serial sprint loop: read status, pick story, implement, review, with human gates on blocked and needs-review outcomes.",
   "goal": "Implement sprint stories iteratively until the epic is complete",

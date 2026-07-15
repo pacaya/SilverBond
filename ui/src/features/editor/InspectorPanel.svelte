@@ -291,6 +291,11 @@
     return capabilities.agents[selectedAgentValue]?.accessProfiles;
   });
 
+  let selectedAgentHasNoAccessModes = $derived.by(() =>
+    selectedAgentAccessProfiles !== undefined
+      && supportedAccessModes(selectedAgentAccessProfiles).length === 0
+  );
+
   let selectedPromptValue = $derived.by(() => {
     if (!selectedNode) return "";
     if (selectedNode.kind.type === "run_agent") {
@@ -457,7 +462,7 @@
   };
 
   function supportedAccessModes(accessProfiles: string[] | undefined): AccessMode[] {
-    if (!accessProfiles || accessProfiles.length === 0) {
+    if (!accessProfiles) {
       return ["read_only", "edit", "execute", "unrestricted"];
     }
     const profiles = new Set(accessProfiles);
@@ -471,6 +476,30 @@
     if (profiles.has("full-access")) modes.push("unrestricted");
     return modes;
   }
+
+  $effect(() => {
+    if (!selectedNode || (selectedNode.kind.type !== "task" && selectedNode.kind.type !== "run_agent")) {
+      return;
+    }
+    const availableModes = supportedAccessModes(selectedAgentAccessProfiles);
+    const currentMode = nodeConfig.accessMode ?? "execute";
+    const firstSupported = availableModes[0];
+    if (firstSupported && !availableModes.includes(currentMode)) {
+      updateNodeConfig("accessMode", firstSupported);
+    }
+  });
+
+  $effect(() => {
+    const agentName = showAgentDefaultsFor;
+    if (!agentName || !capabilities) return;
+
+    const availableModes = supportedAccessModes(capabilities.agents[agentName]?.accessProfiles);
+    const currentMode = activeWorkflow.agentDefaults?.[agentName]?.accessMode ?? "execute";
+    const firstSupported = availableModes[0];
+    if (firstSupported && !availableModes.includes(currentMode)) {
+      updateAgentDefault(agentName, "accessMode", firstSupported);
+    }
+  });
 </script>
 
 <!-- Shared agent config fields: used for both node-level and workflow-level defaults -->
@@ -483,23 +512,28 @@
 )}
   {@const availableModes = supportedAccessModes(accessProfiles)}
   {@const currentMode = values.accessMode ?? "execute"}
-  {@const effectiveMode = availableModes.includes(currentMode) ? currentMode : "execute"}
+  {@const effectiveMode = availableModes.includes(currentMode) ? currentMode : availableModes[0]}
   <label class="field">
     <span>Access mode</span>
-    <select
-      value={effectiveMode}
-      onchange={(e) => {
-        const val = (e.target as HTMLSelectElement).value as AccessMode;
-        update("accessMode", val === "execute" ? undefined : val);
-      }}
-    >
-      {#each availableModes as mode (mode)}
-        <option value={mode}>{ACCESS_MODE_LABELS[mode]}</option>
-      {/each}
-    </select>
-    <small class="helperText" style="margin-top: -4px;">
-      {accessModeDescriptions[effectiveMode]}
-    </small>
+    {#if effectiveMode}
+      <select
+        value={effectiveMode}
+        onchange={(e) => {
+          const val = (e.target as HTMLSelectElement).value as AccessMode;
+          update("accessMode", val === "execute" ? undefined : val);
+        }}
+      >
+        {#each availableModes as mode (mode)}
+          <option value={mode}>{ACCESS_MODE_LABELS[mode]}</option>
+        {/each}
+      </select>
+      <small class="helperText" style="margin-top: -4px;">
+        {accessModeDescriptions[effectiveMode]}
+      </small>
+    {:else}
+      <select disabled><option>No access modes available</option></select>
+      <small class="issue issue--error">Agent has no supported access profiles.</small>
+    {/if}
   </label>
 
   {#if caps.modelSelection}
@@ -679,6 +713,9 @@
                   <span class="capBadge">{badge.label}</span>
                 {/each}
               </div>
+            {/if}
+            {#if selectedAgentHasNoAccessModes}
+              <small class="issue issue--error">Agent has no supported access profiles.</small>
             {/if}
           </label>
           <div class="field field--prompt">

@@ -1250,7 +1250,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let store = TemplateStore::new(temp.path());
         let valid = serde_json::json!({
-            "version": 3,
+            "version": 4,
             "name": "Valid Template",
             "description": "A valid workflow template",
             "goal": "goal",
@@ -1627,7 +1627,7 @@ mod tests {
             .unwrap();
 
         let legacy_workflow = serde_json::json!({
-            "version": 3,
+            "version": 4,
             "goal": "legacy run",
             "cwd": "/tmp",
             "useOrchestrator": false,

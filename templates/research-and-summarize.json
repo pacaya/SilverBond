@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "name": "Research & Summarize",
   "description": "Research a topic with branching depth, iterative refinement, and final summary.",
   "goal": "Research the given topic thoroughly and produce a concise summary",

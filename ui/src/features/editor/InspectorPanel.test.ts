@@ -28,7 +28,7 @@ const agentCaps: AgentCapabilities = {
 };
 
 const capabilities: RuntimeCapabilities = {
-  workflowVersion: 3,
+  workflowVersion: 4,
   supportedNodeTypes: [
     "task",
     "approval",
@@ -66,7 +66,7 @@ const capabilities: RuntimeCapabilities = {
 
 function workflow(patch: Partial<WorkflowDocument> = {}): WorkflowDocument {
   return {
-    version: 3,
+    version: 4,
     name: "Test Workflow",
     goal: "",
     cwd: "",
@@ -86,7 +86,11 @@ function workflow(patch: Partial<WorkflowDocument> = {}): WorkflowDocument {
   };
 }
 
-function renderInspector(document: WorkflowDocument, selectedNodeId?: string) {
+function renderInspector(
+  document: WorkflowDocument,
+  selectedNodeId?: string,
+  runtimeCapabilities: RuntimeCapabilities = capabilities,
+) {
   store.setWorkflow(document);
   if (selectedNodeId) {
     store.selectNode(selectedNodeId);
@@ -96,7 +100,7 @@ function renderInspector(document: WorkflowDocument, selectedNodeId?: string) {
     props: {
       workflow: store.workflow!,
       validation: null,
-      capabilities,
+      capabilities: runtimeCapabilities,
     },
   });
 }
@@ -147,6 +151,90 @@ describe("InspectorPanel", () => {
     if (node.kind.type !== "run_agent") throw new Error("node was not run_agent");
     expect(node.kind.runAgentConfig?.agent).toBe("codex");
     expect(node.kind.runAgentConfig?.prompt).toBe("Edited nested prompt");
+  });
+
+  it("persists and displays read-only for a read-only-only agent", async () => {
+    const readOnlyCapabilities: RuntimeCapabilities = {
+      ...capabilities,
+      agents: {
+        observer: {
+          available: true,
+          capabilities: agentCaps,
+          accessProfiles: ["read-only"],
+        },
+      },
+    };
+    const taskNode: WorkflowNode = {
+      id: "observer-task",
+      name: "Observer task",
+      kind: { type: "task" },
+      agent: "observer",
+      prompt: "Inspect the repository",
+      contextSources: [],
+      responseFormat: null,
+    };
+
+    renderInspector(workflow({
+      entryNodeId: taskNode.id,
+      nodes: [taskNode],
+    }), taskNode.id, readOnlyCapabilities);
+
+    const accessMode = await screen.findByDisplayValue("read_only") as HTMLSelectElement;
+    expect(accessMode).toHaveValue("read_only");
+    const storedNode = store.workflow!.nodes[0];
+    expect(storedNode.kind.type).toBe("task");
+    if (storedNode.kind.type !== "task") throw new Error("node was not task");
+    expect(storedNode.kind.agentConfig?.accessMode).toBe("read_only");
+  });
+
+  it("persists and displays unrestricted in defaults for a full-access-only agent", async () => {
+    const fullAccessCapabilities: RuntimeCapabilities = {
+      ...capabilities,
+      agents: {
+        deployer: {
+          available: true,
+          capabilities: agentCaps,
+          accessProfiles: ["full-access"],
+        },
+      },
+    };
+
+    renderInspector(workflow(), undefined, fullAccessCapabilities);
+    await fireEvent.click(screen.getByRole("button", { name: /deployer/ }));
+
+    const accessMode = await screen.findByDisplayValue("unrestricted") as HTMLSelectElement;
+    expect(accessMode).toHaveValue("unrestricted");
+    expect(store.workflow!.agentDefaults?.deployer?.accessMode).toBe("unrestricted");
+  });
+
+  it("surfaces an agent with no supported access modes without persisting a fallback", async () => {
+    const noAccessCapabilities: RuntimeCapabilities = {
+      ...capabilities,
+      agents: {
+        broken: {
+          available: true,
+          capabilities: agentCaps,
+          accessProfiles: [],
+        },
+      },
+    };
+    const taskNode: WorkflowNode = {
+      id: "broken-task",
+      name: "Broken task",
+      kind: { type: "task" },
+      agent: "broken",
+      prompt: "Cannot launch",
+      contextSources: [],
+      responseFormat: null,
+    };
+
+    renderInspector(workflow({ nodes: [taskNode] }), taskNode.id, noAccessCapabilities);
+
+    expect(await screen.findByText("Agent has no supported access profiles.")).toBeInTheDocument();
+    const storedNode = store.workflow!.nodes[0];
+    expect(storedNode.kind.type).toBe("task");
+    if (storedNode.kind.type !== "task") throw new Error("node was not task");
+    expect(storedNode.kind.agentConfig?.accessMode).toBeUndefined();
   });
 
   it("round-trips run-as command prefix as one argv element per line", async () => {

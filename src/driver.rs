@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tmux_tools_core::agents;
@@ -137,7 +140,16 @@ fn registry_capabilities_or(name: &str, fallback: AgentCapabilities) -> AgentCap
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum AgentsConfigFingerprint {
     Missing,
-    Present { mtime: SystemTime, len: u64 },
+    Present {
+        mtime: SystemTime,
+        len: u64,
+        #[cfg(unix)]
+        inode: u64,
+        #[cfg(unix)]
+        ctime: i64,
+        #[cfg(unix)]
+        ctime_nsec: i64,
+    },
 }
 
 fn agents_config_path() -> Option<PathBuf> {
@@ -156,6 +168,12 @@ fn agents_config_fingerprint(path: &Path) -> std::io::Result<AgentsConfigFingerp
         Ok(meta) => Ok(AgentsConfigFingerprint::Present {
             mtime: meta.modified()?,
             len: meta.len(),
+            #[cfg(unix)]
+            inode: meta.ino(),
+            #[cfg(unix)]
+            ctime: meta.ctime(),
+            #[cfg(unix)]
+            ctime_nsec: meta.ctime_nsec(),
         }),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             Ok(AgentsConfigFingerprint::Missing)
@@ -174,10 +192,11 @@ fn current_agents_config_fingerprint() -> anyhow::Result<AgentsConfigFingerprint
 static AGENT_REGISTRY_CACHE: OnceLock<Mutex<Option<(AgentsConfigFingerprint, agents::Registry)>>> =
     OnceLock::new();
 
-pub(crate) fn load_agent_registry() -> anyhow::Result<agents::Registry> {
-    let fingerprint = current_agents_config_fingerprint()?;
-    let cache = AGENT_REGISTRY_CACHE.get_or_init(|| Mutex::new(None));
-
+fn load_agent_registry_cached(
+    fingerprint: AgentsConfigFingerprint,
+    cache: &Mutex<Option<(AgentsConfigFingerprint, agents::Registry)>>,
+    load: impl FnOnce() -> anyhow::Result<(agents::Registry, Vec<agents::LoadWarning>)>,
+) -> anyhow::Result<agents::Registry> {
     if let Ok(guard) = cache.lock() {
         if let Some((cached_fingerprint, cached_registry)) = guard.as_ref() {
             if *cached_fingerprint == fingerprint {
@@ -186,7 +205,7 @@ pub(crate) fn load_agent_registry() -> anyhow::Result<agents::Registry> {
         }
     }
 
-    let (registry, warnings) = agents::Registry::load()?;
+    let (registry, warnings) = load()?;
     for warning in warnings {
         tracing::warn!(
             "[tmux-tools] agent registry warning [{}]: {}",
@@ -200,6 +219,12 @@ pub(crate) fn load_agent_registry() -> anyhow::Result<agents::Registry> {
     }
 
     Ok(registry)
+}
+
+pub(crate) fn load_agent_registry() -> anyhow::Result<agents::Registry> {
+    let fingerprint = current_agents_config_fingerprint()?;
+    let cache = AGENT_REGISTRY_CACHE.get_or_init(|| Mutex::new(None));
+    load_agent_registry_cached(fingerprint, cache, agents::Registry::load)
 }
 
 fn registry_interaction_pattern(
@@ -264,14 +289,19 @@ fn resolve_registry_access_profile(
         .ok_or_else(|| anyhow::anyhow!("unknown agent {agent}"))?;
     let mapped = access_mode_profile_name(&config.access_mode);
     if spec.access_profiles.contains_key(mapped) {
-        Ok(mapped.to_string())
-    } else if spec.access_profiles.contains_key("default") {
-        Ok("default".to_string())
-    } else {
-        anyhow::bail!(
-            "agent {agent} has no access profile {mapped} and no default profile"
-        );
+        return Ok(mapped.to_string());
     }
+
+    // A default profile may safely reduce or preserve privileges for the
+    // write-capable modes, but it must never turn read-only into write access.
+    if config.access_mode == AccessMode::ReadOnly {
+        anyhow::bail!("agent {agent} has no read-only access profile");
+    }
+    if spec.access_profiles.contains_key("default") {
+        return Ok("default".to_string());
+    }
+
+    anyhow::bail!("agent {agent} has no access profile {mapped} and no default profile");
 }
 
 fn validate_registry_config_fields(
@@ -923,12 +953,83 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[cfg(unix)]
+    fn restore_file_times(path: &Path, metadata: &std::fs::Metadata) {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let times = [
+            libc::timespec {
+                tv_sec: metadata.atime(),
+                tv_nsec: metadata.atime_nsec() as _,
+            },
+            libc::timespec {
+                tv_sec: metadata.mtime(),
+                tv_nsec: metadata.mtime_nsec() as _,
+            },
+        ];
+        // SAFETY: `path` is a valid NUL-terminated path and `times` contains
+        // exactly the two timespec values required by utimensat.
+        let result = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(result, 0, "failed to restore file times");
+    }
+
     // -----------------------------------------------------------------------
     // Helpers
     // -----------------------------------------------------------------------
 
     fn default_config() -> AgentConfig {
         AgentConfig::default()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_cache_reloads_after_equal_length_rewrite_with_restored_mtime() {
+        const FIRST_CONFIG: &str = r#"[cache_probe]
+binary = "agent-one"
+"#;
+        const SECOND_CONFIG: &str = r#"[cache_probe]
+binary = "agent-two"
+"#;
+        assert_eq!(FIRST_CONFIG.len(), SECOND_CONFIG.len());
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agents.toml");
+        std::fs::write(&path, FIRST_CONFIG).unwrap();
+        let original_metadata = std::fs::metadata(&path).unwrap();
+        let first_fingerprint = agents_config_fingerprint(&path).unwrap();
+        let cache = Mutex::new(None);
+
+        let first_registry = load_agent_registry_cached(first_fingerprint, &cache, || {
+            agents::Registry::load_with_user_path(Some(&path))
+        })
+        .unwrap();
+        assert_eq!(
+            first_registry.get("cache_probe").unwrap().binary,
+            "agent-one"
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&path, SECOND_CONFIG).unwrap();
+        restore_file_times(&path, &original_metadata);
+        let rewritten_metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(rewritten_metadata.len(), original_metadata.len());
+        assert_eq!(
+            rewritten_metadata.modified().unwrap(),
+            original_metadata.modified().unwrap()
+        );
+
+        let second_fingerprint = agents_config_fingerprint(&path).unwrap();
+        let second_registry = load_agent_registry_cached(second_fingerprint, &cache, || {
+            agents::Registry::load_with_user_path(Some(&path))
+        })
+        .unwrap();
+        assert_eq!(
+            second_registry.get("cache_probe").unwrap().binary,
+            "agent-two"
+        );
     }
 
     fn args_contain(args: &[String], needle: &str) -> bool {
@@ -1545,17 +1646,14 @@ mod tests {
     }
 
     #[test]
-    fn registry_profile_agy_read_only_falls_back_to_default() {
+    fn registry_profile_agy_rejects_read_only_without_a_read_only_profile() {
         let driver = RegistryProfileDriver::new("agy");
         let config = AgentConfig {
             access_mode: AccessMode::ReadOnly,
             ..default_config()
         };
-        let cmd = driver.build_session_args(&config).unwrap();
-        assert!(!args_contain(
-            &cmd.args,
-            "--dangerously-skip-permissions"
-        ));
+        let err = driver.build_session_args(&config).unwrap_err();
+        assert_eq!(err.to_string(), "agent agy has no read-only access profile");
     }
 
     #[test]

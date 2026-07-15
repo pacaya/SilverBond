@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "name": "Build & Deploy with Approval",
   "description": "Run tests, get human approval, then create a deployment summary. Rejection loops back to re-run tests.",
   "goal": "Build, verify, and deploy the project with human oversight",

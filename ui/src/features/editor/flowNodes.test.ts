@@ -9,7 +9,7 @@ import type { ValidationResponse, WorkflowDocument } from "@/lib/types/workflow"
 
 function testWorkflow(overrides: Partial<WorkflowDocument> = {}): WorkflowDocument {
   return {
-    version: 3,
+    version: 4,
     goal: "",
     cwd: "",
     useOrchestrator: false,

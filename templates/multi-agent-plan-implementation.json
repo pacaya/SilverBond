@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "name": "Multi-Agent Plan Implementation",
   "description": "Plan, parallel implement, merge gate, parallel test, dual-review, parallel fixes, and consolidate.",
   "goal": "Execute a multi-agent plan with bounded parallelism, human merge gate, and adversarial review",
@@ -189,7 +189,7 @@
   ],
   "subflows": {
     "dual-review": {
-      "version": 3,
+      "version": 4,
       "name": "Dual Review",
       "goal": "Produce a merged adversarial code review from dual independent reviewers",
       "cwd": "",

@@ -37,7 +37,7 @@ vi.mock("@/lib/api/client", async (importOriginal) => {
 });
 
 const dualReviewWorkflow: WorkflowDocument = {
-  version: 3,
+  version: 4,
   name: "Dual Review",
   goal: "Produce a merged adversarial code review from dual independent reviewers",
   cwd: "",

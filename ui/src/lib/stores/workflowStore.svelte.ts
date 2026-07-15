@@ -479,7 +479,7 @@ class WorkflowStore {
     // Build the subflow document (deep clone so it is decoupled from the parent).
     const positions = (active.ui?.canvas ?? defaultCanvas(active)).nodes;
     const subflowDoc: WorkflowDocument = {
-      version: 3,
+      version: 4,
       name,
       goal: "",
       cwd: active.cwd,

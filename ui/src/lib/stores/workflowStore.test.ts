@@ -10,7 +10,7 @@ import type {
 
 function workflow(overrides: Partial<WorkflowDocument> = {}): WorkflowDocument {
   return {
-    version: 3,
+    version: 4,
     name: "",
     goal: "",
     cwd: "",

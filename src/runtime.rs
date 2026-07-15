@@ -2441,13 +2441,39 @@ fn collect_skip_regexes(
     Ok(())
 }
 
-fn compile_skip_regex_cache(workflow: &WorkflowV3) -> anyhow::Result<BTreeMap<String, Regex>> {
+fn compile_skip_regex_cache(
+    workflow: &WorkflowV3,
+) -> anyhow::Result<BTreeMap<Option<String>, BTreeMap<String, Regex>>> {
     let mut cache = BTreeMap::new();
-    collect_skip_regexes(workflow, &mut cache)?;
-    for subflow in workflow.subflows.values() {
-        collect_skip_regexes(subflow, &mut cache)?;
+    let mut root_map = BTreeMap::new();
+    collect_skip_regexes(workflow, &mut root_map)?;
+    cache.insert(None, root_map);
+    for (subflow_name, subflow) in &workflow.subflows {
+        let mut subflow_map = BTreeMap::new();
+        collect_skip_regexes(subflow, &mut subflow_map)?;
+        cache.insert(Some(subflow_name.clone()), subflow_map);
     }
     Ok(cache)
+}
+
+fn skip_regex_scope_key(cursor: &CursorState) -> Option<String> {
+    cursor
+        .call_stack
+        .last()
+        .map(|frame| frame.subflow_name.clone())
+}
+
+fn skip_regex_cache_for_cursor<'a>(
+    cache: &'a BTreeMap<Option<String>, BTreeMap<String, Regex>>,
+    cursor: &CursorState,
+) -> anyhow::Result<&'a BTreeMap<String, Regex>> {
+    let scope = skip_regex_scope_key(cursor);
+    cache.get(&scope).with_context(|| {
+        format!(
+            "missing compiled skip regex cache for scope {:?}",
+            scope
+        )
+    })
 }
 
 fn var_map_for_cursor(
@@ -2911,7 +2937,7 @@ async fn process_immediate_cursors(
     workflow: &WorkflowV3,
     checkpoint: &mut RuntimeCheckpoint,
     active_approval: &mut Option<ActiveApprovalWait>,
-    skip_regex_cache: &BTreeMap<String, Regex>,
+    skip_regex_cache: &BTreeMap<Option<String>, BTreeMap<String, Regex>>,
 ) -> anyhow::Result<bool> {
     if active_approval.is_none() && checkpoint.pending_approval.is_none() {
         if activate_next_approval(ctx, checkpoint, active_approval).await? {
@@ -2930,6 +2956,7 @@ async fn process_immediate_cursors(
             continue;
         };
         let active_workflow = workflow_for_cursor(workflow, &cursor)?;
+        let scope_skip_cache = skip_regex_cache_for_cursor(skip_regex_cache, &cursor)?;
         let active_graph = active_workflow.graph();
         let Some(node) = active_graph
             .node_map
@@ -2961,7 +2988,7 @@ async fn process_immediate_cursors(
             | NodeKind::Capture { .. }
             | NodeKind::Kill { .. }
             | NodeKind::RunAgent { .. } => {
-                if should_skip_cursor_node(&node, &cursor, checkpoint, skip_regex_cache)? {
+                if should_skip_cursor_node(&node, &cursor, checkpoint, scope_skip_cache)? {
                     let Some(_) =
                         prepare_cursor_visit(ctx, workflow, checkpoint, &cursor_id, &node).await?
                     else {
@@ -6957,9 +6984,9 @@ mod tests {
         driver::{AccessMode, AgentConfig, ReasoningLevel, get_driver},
         model::{
             AgentDefaults, AgentNodeConfig, BatchConfig, InputBinding, NodeKind,
-            SplitFailurePolicy, StructuredCondition, SubflowConfig, WorkflowEdge,
-            WorkflowEdgeOutcome, WorkflowLimits, WorkflowNode, WorkflowNodeType, WorkflowV3,
-            WorkflowVariable, normalize_workflow_value, resolve_agent_config,
+            SplitFailurePolicy, StructuredCondition, SubflowConfig, SkipCondition,
+            WorkflowEdge, WorkflowEdgeOutcome, WorkflowLimits, WorkflowNode, WorkflowNodeType,
+            WorkflowV3, WorkflowVariable, normalize_workflow_value, resolve_agent_config,
         },
         storage::Database,
     };
@@ -8261,7 +8288,7 @@ mod tests {
         edges: Vec<WorkflowEdge>,
     ) -> WorkflowV3 {
         WorkflowV3 {
-            version: 3,
+            version: 4,
             name: Some("test".to_string()),
             goal: "goal".to_string(),
             cwd: String::new(),
@@ -8279,6 +8306,136 @@ mod tests {
             subflows: BTreeMap::new(),
             ui: None,
         }
+    }
+
+    fn task_node_with_regex_skip(id: &str, name: &str, regex: &str) -> WorkflowNode {
+        let mut node = task_node(id, name, "");
+        node.skip_condition = Some(SkipCondition {
+            source: "previous_output".to_string(),
+            kind: "regex".to_string(),
+            value: regex.to_string(),
+        });
+        node
+    }
+
+    #[test]
+    fn compile_skip_regex_cache_honors_scope_for_duplicate_node_ids() {
+        let root_step1 = task_node_with_regex_skip("step1", "Root Step 1", "^root-skip$");
+        let subflow_step1 = task_node_with_regex_skip("step1", "Subflow Step 1", "^subflow-skip$");
+        let subflow = WorkflowV3 {
+            version: 4,
+            name: Some("child".to_string()),
+            goal: "child goal".to_string(),
+            cwd: String::new(),
+            use_orchestrator: false,
+            run_as: None,
+            entry_node_id: "step1".to_string(),
+            variables: Vec::new(),
+            limits: WorkflowLimits {
+                max_total_steps: 20,
+                max_visits_per_node: 10,
+            },
+            nodes: vec![subflow_step1.clone()],
+            edges: Vec::new(),
+            agent_defaults: BTreeMap::new(),
+            subflows: BTreeMap::new(),
+            ui: None,
+        };
+        let mut workflow = workflow_from_parts("step1", vec![root_step1.clone()], Vec::new());
+        workflow
+            .subflows
+            .insert("child".to_string(), Box::new(subflow));
+
+        let cache = compile_skip_regex_cache(&workflow).unwrap();
+        let checkpoint = build_initial_checkpoint(&workflow, "run_scope_skip", BTreeMap::new(), None);
+
+        let root_cursor = CursorState {
+            cursor_id: "root".to_string(),
+            node_id: "step1".to_string(),
+            execution_epoch: 1,
+            parent_cursor_id: None,
+            incoming_edge_id: None,
+            incoming_node_id: None,
+            split_family_ids: Vec::new(),
+            last_output: "root-skip".to_string(),
+            loop_counters: BTreeMap::new(),
+            visit_counters: BTreeMap::new(),
+            var_map: BTreeMap::new(),
+            call_stack: Vec::new(),
+            last_branch_origin_id: None,
+            last_branch_choice: None,
+            cancel_requested: false,
+            state: CursorRuntimeState::Runnable,
+        };
+        let subflow_cursor = CursorState {
+            cursor_id: "child".to_string(),
+            node_id: "step1".to_string(),
+            execution_epoch: 1,
+            parent_cursor_id: None,
+            incoming_edge_id: None,
+            incoming_node_id: None,
+            split_family_ids: Vec::new(),
+            last_output: "subflow-skip".to_string(),
+            loop_counters: BTreeMap::new(),
+            visit_counters: BTreeMap::new(),
+            var_map: BTreeMap::new(),
+            call_stack: vec![CallFrameState {
+                frame_id: String::new(),
+                call_node_id: "call_child".to_string(),
+                call_node_name: "Call Child".to_string(),
+                subflow_name: "child".to_string(),
+                exit_node_id: "step1".to_string(),
+                parent_last_output: String::new(),
+                parent_loop_counters: BTreeMap::new(),
+                parent_visit_counters: BTreeMap::new(),
+                parent_last_branch_origin_id: None,
+                parent_last_branch_choice: None,
+                parent_var_map: BTreeMap::new(),
+                subflow_results: BTreeMap::new(),
+            }],
+            last_branch_origin_id: None,
+            last_branch_choice: None,
+            cancel_requested: false,
+            state: CursorRuntimeState::Runnable,
+        };
+
+        let root_cache = skip_regex_cache_for_cursor(&cache, &root_cursor).unwrap();
+        assert!(should_skip_cursor_node(
+            &root_step1,
+            &root_cursor,
+            &checkpoint,
+            root_cache
+        )
+        .unwrap());
+
+        let mut root_cursor_other_scope = root_cursor.clone();
+        root_cursor_other_scope.last_output = "subflow-skip".to_string();
+        assert!(!should_skip_cursor_node(
+            &root_step1,
+            &root_cursor_other_scope,
+            &checkpoint,
+            root_cache
+        )
+        .unwrap());
+
+        let subflow_cache = skip_regex_cache_for_cursor(&cache, &subflow_cursor).unwrap();
+        assert!(should_skip_cursor_node(
+            &subflow_step1,
+            &subflow_cursor,
+            &checkpoint,
+            subflow_cache
+        )
+        .unwrap());
+
+        let mut subflow_cursor_other_scope = subflow_cursor.clone();
+        subflow_cursor_other_scope.last_output = "root-skip".to_string();
+        assert!(!should_skip_cursor_node(
+            &subflow_step1,
+            &subflow_cursor_other_scope,
+            &checkpoint,
+            subflow_cache
+        )
+        .unwrap());
     }
 
     #[cfg(unix)]
@@ -8447,7 +8604,7 @@ mod tests {
 
     fn basic_workflow() -> WorkflowV3 {
         WorkflowV3 {
-            version: 3,
+            version: 4,
             name: Some("test".to_string()),
             goal: "goal".to_string(),
             cwd: String::new(),
@@ -11197,7 +11354,7 @@ mod tests {
         n3.continue_session_from = Some("n2".to_string());
 
         let wf = WorkflowV3 {
-            version: 3,
+            version: 4,
             name: None,
             goal: "test".to_string(),
             cwd: "/tmp".to_string(),
@@ -11230,7 +11387,7 @@ mod tests {
         n2.continue_session_from = Some("n1".to_string());
 
         let wf = WorkflowV3 {
-            version: 3,
+            version: 4,
             name: None,
             goal: "test".to_string(),
             cwd: "/tmp".to_string(),
@@ -11419,6 +11576,13 @@ mod tests {
                     continue;
                 };
                 let result = driver.build_session_args(&config);
+                if *agent_name == "agy" && *mode == AccessMode::ReadOnly {
+                    assert_eq!(
+                        result.unwrap_err().to_string(),
+                        "agent agy has no read-only access profile"
+                    );
+                    continue;
+                }
                 assert!(
                     result.is_ok(),
                     "registry agent {agent_name} failed with {mode:?}: {:?}",
@@ -11454,7 +11618,7 @@ mod tests {
     #[test]
     fn integration_workflow_with_agent_defaults_roundtrip() {
         let json = json!({
-            "version": 3,
+            "version": 4,
             "goal": "test",
             "cwd": "/work",
             "useOrchestrator": false,
@@ -11515,7 +11679,7 @@ mod tests {
     #[test]
     fn build_session_persistence_set_empty_when_no_references() {
         let wf = WorkflowV3 {
-            version: 3,
+            version: 4,
             name: None,
             goal: "test".to_string(),
             cwd: "/tmp".to_string(),

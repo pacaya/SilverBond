@@ -1569,10 +1569,12 @@ fn poll_agent_interactive(
             extract_after_prompt_with_markers(before, &capture, prompt, capture_markers);
 
         // Cumulative over the visible pane; a line that scrolls fully off-screen is still out of scope.
+        // Scan `capture` (not prompt-stripped `output_so_far`) so the S4 cursor stays in the same
+        // coordinate system as `common_prefix_len` reanchoring — matching `wait_for_agent_ready_interactive`.
         if matches!(
             dispatch_pattern_match(
                 pane,
-                &output_so_far,
+                &capture,
                 has_new_text,
                 interaction_patterns,
                 destructive_regexes,
@@ -3985,6 +3987,158 @@ exit 0
 
         let (idx, _) = next_unhandled_pattern_match(&patterns, current, cursor).unwrap();
         assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn poll_loop_pattern_scan_uses_capture_coordinates_on_redraw() {
+        let patterns = vec![CompiledInteractionPattern {
+            regex: Regex::new(r"Allow\? \[y/n\]").unwrap(),
+            kind: InteractionKind::AutoRespond {
+                response: "y".to_string(),
+            },
+            description: "permission".to_string(),
+            send_enter: false,
+        }];
+
+        let before = "Task prompt\n";
+        let prompt = "Task prompt";
+        let previous = "Task prompt\nSHARED\nAllow? [y/n]";
+        let (_, mut cursor) = next_unhandled_pattern_match(&patterns, previous, 0).unwrap();
+
+        let capture = "Task prompt\nSHARED2\nAllow? [y/n]";
+        let output_so_far = extract_after_prompt(before, capture, prompt);
+        let prefix_len = common_prefix_len(previous, capture);
+        if prefix_len < cursor {
+            cursor = prefix_len;
+        }
+        cursor = cursor.min(capture.len());
+
+        assert!(
+            next_unhandled_pattern_match(&patterns, &output_so_far, cursor).is_none(),
+            "prompt-stripped buffer misaligns capture-byte cursor and skips the fresh prompt"
+        );
+
+        let (idx, new_cursor) = next_unhandled_pattern_match(&patterns, capture, cursor).unwrap();
+        assert_eq!(idx, 0);
+        assert!(new_cursor > cursor);
+        assert!(
+            next_unhandled_pattern_match(&patterns, capture, new_cursor).is_none(),
+            "handled permission prompt must not re-fire on a stable redraw"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_loop_permission_prompt_answered_once_after_redraw() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-poll-redraw-prefix.sh");
+        let log = temp.path().join("send-log");
+        let state = temp.path().join("capture-count");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+log="$1"
+state="$2"
+shift 2
+if [ "$1" = "tmux" ]; then shift; fi
+if [ "$1" = "-L" ]; then shift 2; fi
+cmd="$1"
+
+case "$cmd" in
+  display-message)
+    printf '\037codex\037\037\037\n'
+    ;;
+  capture-pane)
+    count=0
+    if [ -f "$state" ]; then count=$(cat "$state"); fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$state"
+    case "$count" in
+      1) printf 'Task prompt\nWorking on task...\n' ;;
+      2) printf 'Task prompt\n████████ NEW\nAllow this action? [y/n]\n' ;;
+      *) printf 'Task prompt\n████████ NEW\nAllow this action? [y/n]\nDONE\n' ;;
+    esac
+    ;;
+  send-keys)
+    shift
+    literal=""
+    previous=""
+    for arg in "$@"; do
+      if [ "$previous" = "--" ]; then
+        literal="$arg"
+        break
+      fi
+      previous="$arg"
+    done
+    if [ -n "$literal" ]; then
+      printf '%s\n' "$literal" >> "$log"
+    fi
+    ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![
+                script.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+                state.to_string_lossy().into_owned(),
+            ],
+            socket: Some("poll-redraw-permission-test-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+        let interaction_patterns = vec![CompiledInteractionPattern {
+            regex: Regex::new(r"Allow this action\? \[y/n\]").unwrap(),
+            kind: InteractionKind::PermissionRequest,
+            description: "Tool permission prompt".to_string(),
+            send_enter: false,
+        }];
+        let started = Instant::now();
+        let timeout = Duration::from_secs(5);
+        let result = tmux_tools_core::with_invocation(invocation, || {
+            poll_agent_interactive(
+                "%poll-redraw-test",
+                "Task prompt\n",
+                "Task prompt",
+                started,
+                started + timeout,
+                started + timeout,
+                60.0,
+                0.0,
+                Some("DONE"),
+                None,
+                true,
+                Duration::from_secs(60),
+                None,
+                &interaction_patterns,
+                &[],
+                None,
+                None,
+            )
+        })
+        .unwrap();
+
+        assert!(
+            matches!(result, InteractivePollResult::Completed(_)),
+            "poll loop should complete after the redraw permission prompt is answered"
+        );
+
+        let replies = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .filter(|line| *line == "y")
+            .count();
+        assert_eq!(
+            replies, 1,
+            "redraw permission prompt must be answered exactly once, not skipped or re-fired"
+        );
     }
 
     #[test]

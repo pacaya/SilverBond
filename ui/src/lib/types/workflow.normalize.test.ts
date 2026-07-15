@@ -78,7 +78,7 @@ describe("normalizeWorkflowNode", () => {
 describe("normalizeWorkflowNodes", () => {
   it("normalizes every node in a workflow document", () => {
     const workflow = {
-      version: 3,
+      version: 4,
       name: "wf",
       goal: "",
       cwd: "",
@@ -99,7 +99,7 @@ describe("normalizeWorkflowNodes", () => {
 describe("duplicateWorkflowForEditing", () => {
   it("clones and normalizes legacy nodes at ingress", () => {
     const workflow = {
-      version: 3,
+      version: 4,
       name: "wf",
       goal: "",
       cwd: "",

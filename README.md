@@ -104,7 +104,7 @@ Key frontend modules:
 
 ## Current Constraints
 
-- workflows must be canonical `version: 3`
+- workflows must be canonical `version: 4`
 - the backend owns multi-cursor checkpoints, execution epochs, validation, and traversal semantics
 - `split` and `collector` are executable today; explicit `join` nodes are still planned
 - workflow validation and traversal semantics are backend-authoritative

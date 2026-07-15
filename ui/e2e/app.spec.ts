@@ -3,7 +3,7 @@ import { expect, test } from "@playwright/test";
 test("shows completed history for a real approval run", async ({ page }) => {
   const workflowName = `playwright-approval-${Date.now()}`;
   const workflow = {
-    version: 3,
+    version: 4,
     name: workflowName,
     goal: "Verify approval flow through the real backend",
     cwd: "",

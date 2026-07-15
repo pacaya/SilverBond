@@ -265,7 +265,7 @@ export interface WorkflowEdge {
 }
 
 export interface WorkflowDocument {
-  version: 3;
+  version: 4;
   name?: string | null;
   goal: string;
   cwd: string;
@@ -461,7 +461,7 @@ export interface NodeTestPreview {
 
 export function createEmptyWorkflow(): WorkflowDocument {
   return {
-    version: 3,
+    version: 4,
     name: "",
     goal: "",
     cwd: "",

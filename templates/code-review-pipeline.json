@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "name": "Code Review Pipeline",
   "description": "Three-step code review: analyze code, write a report, suggest fixes.",
   "goal": "Perform a thorough code review of the target project",

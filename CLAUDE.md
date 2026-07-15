@@ -26,5 +26,5 @@ just check          # cargo check
 ## Conventions
 
 - Svelte 5 runes (`$state`, `$derived`, `$effect`) — no legacy reactive stores
-- Workflows must be canonical `version: 3` schema
+- Workflows must be canonical `version: 4` schema
 - Backend is authoritative for validation, traversal, and checkpoint semantics

@@ -75,7 +75,7 @@ async function waitForRunDone(
 /** Minimal v3 RunAgent workflow using the "echo" stub agent. */
 function echoRunAgentWorkflow(name: string): unknown {
   return {
-    version: 3,
+    version: 4,
     name,
     goal: "E2E echo run-agent test",
     cwd: "/tmp",
@@ -108,7 +108,7 @@ function echoRunAgentWorkflow(name: string): unknown {
 /** Minimal v3 spawn workflow that starts a long-running shell pane. */
 function spawnWorkflow(name: string): unknown {
   return {
-    version: 3,
+    version: 4,
     name,
     goal: "E2E pane-stream spawn test",
     cwd: "/tmp",

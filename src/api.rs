@@ -37,7 +37,8 @@ use tokio::{
 use crate::{
     app::{AppState, PaneStreamEntry, SecurityConfig},
     model::{
-        NodeKind, RunAsConfig, WorkflowNode, WorkflowV3, normalize_workflow_value,
+        NodeKind, RunAsConfig, WorkflowNode, WorkflowV3, WORKFLOW_SCHEMA_VERSION,
+        normalize_workflow_value,
         validate_workflow, validate_workflow_input_bounds,
     },
     runtime::{
@@ -183,7 +184,7 @@ async fn capabilities() -> Result<Json<Value>, ApiError> {
         );
     }
     Ok(Json(json!({
-        "workflowVersion": 3,
+        "workflowVersion": WORKFLOW_SCHEMA_VERSION,
         "supportedNodeTypes": ["task", "approval", "split", "collector", "decide", "parallel_batch", "subflow", "call", "spawn", "send", "wait", "capture", "kill", "run_agent"],
         "supportedEdgeOutcomes": ["success", "reject", "branch", "loop_continue", "loop_exit"],
         "agents": agents,
@@ -2012,7 +2013,7 @@ mod tests {
 
     fn approval_workflow_with_run_as(command: Vec<String>) -> WorkflowV3 {
         WorkflowV3 {
-            version: 3,
+            version: WORKFLOW_SCHEMA_VERSION,
             name: Some("observability-test".to_string()),
             goal: "wait for approval".to_string(),
             cwd: String::new(),
@@ -2056,7 +2057,7 @@ mod tests {
 
     fn approval_only_workflow() -> WorkflowV3 {
         WorkflowV3 {
-            version: 3,
+            version: WORKFLOW_SCHEMA_VERSION,
             name: Some("approval-only".to_string()),
             goal: "wait for approval".to_string(),
             cwd: String::new(),
