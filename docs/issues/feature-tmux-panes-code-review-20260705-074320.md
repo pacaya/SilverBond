@@ -569,7 +569,8 @@ Node defaults/labels mirror backend node-kind metadata.
 
 ---
 
-### M24. Fallback response offset still includes pre-send capture (FINALIZED)
+### M24. Fallback response offset still includes pre-send capture (FIXED)
+> **Fix:** Unified extract_after_prompt_with_sentinels head detection across all branches, floored at max(prompt-boundary, common_prefix_len(before, after)); response_end now only trims the tail. Added staged pre-send-literal regression test proving no false escalation fires.
 **Severity:** MEDIUM — fail-open keystroke injection (un-fixed remainder of M22); narrow trigger (destructive/interaction literal must be in pre-send pane content AND the poll must land before the prompt echoes), fail-safe direction `n`.
 **Files:** `src/tmux_exec.rs:2559-2612` (`extract_after_prompt_with_sentinels` fall-through `:2612` + response-end-only branch `:2588`), `:1790-1811` (`dispatch_pattern_match` destructive scan floor / unconditional `next_unhandled_destructive_match` at `:1791`), `:1569-1570` (call site — `before`/`capture` both in scope), `:2039` (`common_prefix_len` helper), tests `:4151` / `:4380`
 **Description:** When the echoed prompt isn't yet visible, `extract_after_prompt_with_sentinels` returns offset `0` in both the no-boundary fall-through (`src/tmux_exec.rs:2612`) and the response-end-only branch (`:2588`). `dispatch_pattern_match` then floors the destructive scan at `scan_buffer[0..]` (`:1790`), which includes pre-send pane content carried from `before`. Because the destructive scan (`:1791`) is unconditional — unlike the interaction scan gated at `:1807` — a `rm -rf`/`DROP TABLE` literal already on screen before the prompt was sent matches and fires `escalate_or_fallback(..., DestructiveWarning, "n")` (`:1795`), injecting a keystroke into the agent pane with no agent request: the exact M22 false escalation in its un-fixed corner. Existing tests never exercise this (`poll_loop_ignores_interaction_literals_in_echoed_prompt` `:4151` always emits the full prompt; `..._at_capture_origin` `:4380` asserts offset 0 with a benign `before`).
@@ -577,7 +578,8 @@ Node defaults/labels mirror backend node-kind metadata.
 
 ---
 
-### L11. The canonical-v4 test does not assert an unchanged round trip (FINALIZED)
+### L11. The canonical-v4 test does not assert an unchanged round trip (FIXED)
+> **Fix:** Rebuilt the fixture from a canonical WorkflowV3 serialization and added a full JSON round-trip equality assertion after get_run, keeping the nested kind/outcomes checks as supplemental diagnostics.
 **Severity:** LOW — test-only weakness; no runtime/durability impact (the underlying normalize + compare-and-swap behavior is correct per H3/M20). The false test *name* is a mild correctness-signal hazard, still LOW.
 **Files:** `src/storage.rs:1680-1745` (`get_run_leaves_canonical_v4_workflow_unchanged` — fixture `:1688-1708`, assertions `:1736-1744`), `:335-342` (`get_run` normalize + CAS write-back), `src/model.rs:786-787` (`WorkflowNode.prompt` — `#[serde(default)]`, no `skip_serializing_if`), `:849` (`WorkflowV3`), `:1128` (`sample_workflow` precedent)
 **Description:** `get_run_leaves_canonical_v4_workflow_unchanged` (`src/storage.rs:1680`) inserts a hand-built JSON fixture (`:1688-1708`) that omits the always-serialized node-level `prompt`, then after `get_run` asserts only six shallow keys — `version`, `goal`, `entryNodeId`, `nodes[0].kind.type`, `decideConfig.outcomes`, and absence of a stray top-level `type` (`:1736-1744`) — never a full round-trip comparison. Because `WorkflowNode.prompt` is `#[serde(default)]` with no `skip_serializing_if` (`src/model.rs:786-787`), re-serialization emits `"prompt":""`, so `get_run`'s compare-and-swap (`:335-342`) rewrites the row and the persisted value genuinely changes — the "unchanged" name is false for its own fixture. Impact is coverage, not runtime: the test would stay green if `get_run` dropped or rewrote any field outside those six keys (e.g. losing `limits`/`edges`/retry fields), the exact regression the L9 fix plan's unchanged-v4 test was meant to catch.
@@ -585,7 +587,8 @@ Node defaults/labels mirror backend node-kind metadata.
 
 ---
 
-### L12. Canonical schema documentation still advertises v3 (FINALIZED)
+### L12. Canonical schema documentation still advertises v3 (FIXED)
+> **Fix:** Swept README, ARCHITECTURE, docs index, Sidebar label, and api.rs error strings onto canonical v4; added scripts/check-canonical-v4-docs.sh with a CI workflow and a just check-v4-docs guard.
 **Severity:** LOW — documentation/label-only, no runtime impact (client ignores the version number; the live API already emits 4 per L10/M20). Top of the LOW band since README/ARCHITECTURE are high-visibility entry points.
 **Files:** `README.md:11` ("v3-only workflow schema"), `ARCHITECTURE.md:267` ("The only accepted workflow format is version `3`."), `docs/README.md:11` ("Complete v3 workflow format reference"); additional user-facing surfaces surfaced in verification: `ui/src/features/workflows/Sidebar.svelte:59` ("Import v3 JSON" button), `src/api.rs:1825`/`:1834`/`:1837` (error strings labeling the canonical `kind` shape "v3"); contract source `src/model.rs:10` (`WORKFLOW_SCHEMA_VERSION = 4`), pattern to match `docs/workflow-schema.md:1-3`
 **Description:** Three user-facing docs still advertise v3 as the canonical/only format, contradicting the v4 schema reference L10 already converged (`docs/workflow-schema.md:1-3`): `README.md:11`, `ARCHITECTURE.md:267` (literally "The only accepted workflow format is version `3`." — false, since the backend accepts and silently migrates v2/v3 to v4), and `docs/README.md:11`. A reader at these entry points could stamp `version: 3` believing it canonical, or believe v4 is rejected. The same drift persists in two more user-facing surfaces the original finding omitted: the `Sidebar.svelte:59` "Import v3 JSON" button and the `src/api.rs:1825/1834/1837` error messages that call the current v4 canonical `kind` shape "v3." L10's enumerated file list never covered any of these — they were missed, not deliberately excluded. Out of scope (correctly): the internal `WorkflowV3` type name, genuine migration-input fixtures (`storage.rs:1630`, `model.rs:3006`/`:3041`), and historical `docs/tasks/` docs.
@@ -596,5 +599,17 @@ Node defaults/labels mirror backend node-kind metadata.
 - `ui/src/features/workflows/Sidebar.svelte:59` → "Import workflow JSON".
 - `src/api.rs:1825`/`:1834`/`:1837` → "canonical v4" wording (grep for test assertions on these exact strings before editing).
 - Add a CI/test step that greps for v3 canonical-format declarations outside an allowlist (migration code, `docs/issues/`, `docs/tasks/`, package files) and fails, enforcing the "repo-wide contract search" as an executable contract so a future v-bump can't reintroduce the drift that let M20/L10 miss these files. Leave genuine migration-input references (`storage.rs:1630`, `model.rs:3006`/`:3041`) untouched.
+
+---
+
+### L13. Embedded UI still advertises v3
+
+**File:** `ui/src/features/workflows/Sidebar.svelte:59 (embedded bundle: public/assets/index-SBZnEnwS.js:3, public/index.html)`
+**Source:** fix-review audit (was L12)
+**Severity:** LOW
+
+L12 is not complete in the application users actually receive: the source now says "Import workflow JSON", but the fix commit did not regenerate public/, and the asset referenced by public/index.html still contains "Import v3 JSON"; the new scripts/check-canonical-v4-docs.sh:14 guard excludes public/** so it reports success despite this stale shipped label, while the repo's separate frontend-freshness CI job is expected to reject the commit for this reason.
+
+**Fix:** Run `npm run build`, include the regenerated public/index.html and hashed assets in the fix commit, then verify both `git diff --exit-code public/` after a clean build and the canonical-v4 docs guard; also remove the blanket public/** exclusion or otherwise make the guard validate the active embedded bundle.
 
 ---

@@ -1822,7 +1822,7 @@ fn node_from_value(value: Value) -> anyhow::Result<WorkflowNode> {
                 return Ok(node);
             }
             anyhow::bail!(
-                "node payload must use canonical v3 task or approval kind types; got {}",
+                "node payload must use canonical v4 task or approval kind types; got {}",
                 node.kind.as_str()
             )
         }
@@ -1831,10 +1831,10 @@ fn node_from_value(value: Value) -> anyhow::Result<WorkflowNode> {
             // (top-level `type` with no `kind` wrapper).
             if value.get("type").is_some() && value.get("kind").is_none() {
                 anyhow::bail!(
-                    "node uses the legacy flat shape; migrate to the canonical v3 `kind: {{ type, ... }}` form"
+                    "node uses the legacy flat shape; migrate to the canonical v4 `kind: {{ type, ... }}` form"
                 );
             }
-            Err(anyhow::anyhow!(err).context("node payload must be a canonical v3 WorkflowNode"))
+            Err(anyhow::anyhow!(err).context("node payload must be a canonical v4 WorkflowNode"))
         }
     }
 }

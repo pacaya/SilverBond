@@ -2570,46 +2570,37 @@ pub(crate) fn extract_after_prompt_with_sentinels(
     prompt_end_marker: Option<&str>,
     response_end_marker: Option<&str>,
 ) -> (String, usize) {
-    if let Some(prompt_end_marker) = prompt_end_marker {
-        if let Some(start) = marker_line_end(after, prompt_end_marker) {
-            let answer_region = &after[start..];
-            let answer_region = if let Some(response_end_marker) = response_end_marker {
-                trim_before_last_marker_line(answer_region, response_end_marker)
-                    .unwrap_or(answer_region)
-            } else {
-                answer_region
-            };
-            return (answer_region.to_owned(), start);
-        }
-    }
+    let prompt_end = prompt_end_marker
+        .and_then(|marker| marker_line_end(after, marker))
+        .or_else(|| {
+            let before_lines = before.lines().collect::<HashSet<_>>();
+            let mut first_new_match_end = None;
+            let mut last_match_end = None;
+            let mut offset = 0usize;
 
-    if let Some(response_end_marker) = response_end_marker {
-        if let Some(end) = marker_line_start(after, response_end_marker) {
-            return (after[..end].to_owned(), 0);
-        }
-    }
-
-    let before_lines = before.lines().collect::<HashSet<_>>();
-    let mut first_new_match_end = None;
-    let mut last_match_end = None;
-    let mut offset = 0usize;
-
-    for line in after.split_inclusive('\n') {
-        if line.contains(prompt_text) {
-            let end = offset + line.len();
-            last_match_end = Some(end);
-            let trimmed = line.strip_suffix('\n').unwrap_or(line);
-            if first_new_match_end.is_none() && !before_lines.contains(trimmed) {
-                first_new_match_end = Some(end);
+            for line in after.split_inclusive('\n') {
+                if line.contains(prompt_text) {
+                    let end = offset + line.len();
+                    last_match_end = Some(end);
+                    let trimmed = line.strip_suffix('\n').unwrap_or(line);
+                    if first_new_match_end.is_none() && !before_lines.contains(trimmed) {
+                        first_new_match_end = Some(end);
+                    }
+                }
+                offset += line.len();
             }
-        }
-        offset += line.len();
-    }
 
-    first_new_match_end
-        .or(last_match_end)
-        .map(|index| (after[index..].to_owned(), index))
-        .unwrap_or_else(|| (after.to_owned(), 0))
+            first_new_match_end.or(last_match_end)
+        });
+    let response_start = prompt_end
+        .unwrap_or_default()
+        .max(common_prefix_len(before, after));
+    let answer_region = &after[response_start..];
+    let answer_region = response_end_marker
+        .and_then(|marker| trim_before_last_marker_line(answer_region, marker))
+        .unwrap_or(answer_region);
+
+    (answer_region.to_owned(), response_start)
 }
 
 fn marker_line_end(text: &str, marker: &str) -> Option<usize> {
@@ -4245,6 +4236,116 @@ exit 0
             std::fs::read_to_string(log).unwrap_or_default(),
             "",
             "interaction literals in the echoed prompt must not trigger an automatic reply"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn poll_loop_ignores_pre_send_literals_before_prompt_echo() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-poll-staged-response-prefix.sh");
+        let log = temp.path().join("send-log");
+        let state = temp.path().join("capture-count");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+log="$1"
+state="$2"
+shift 2
+if [ "$1" = "tmux" ]; then shift; fi
+if [ "$1" = "-L" ]; then shift 2; fi
+cmd="$1"
+
+case "$cmd" in
+  display-message)
+    printf '\037codex\037\037\037\n'
+    ;;
+  capture-pane)
+    count=0
+    if [ -f "$state" ]; then count=$(cat "$state"); fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$state"
+    printf 'ready\nEarlier example: rm -rf /tmp/cache\nAllow this action? [y/n]\n'
+    if [ "$count" -gt 2 ]; then
+      printf 'No action is needed.\nDONE\n'
+    fi
+    ;;
+  send-keys)
+    shift
+    literal=""
+    previous=""
+    for arg in "$@"; do
+      if [ "$previous" = "--" ]; then
+        literal="$arg"
+        break
+      fi
+      previous="$arg"
+    done
+    if [ -n "$literal" ]; then
+      printf '%s\n' "$literal" >> "$log"
+    fi
+    ;;
+esac
+exit 0
+"#,
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![
+                script.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+                state.to_string_lossy().into_owned(),
+            ],
+            socket: Some("poll-staged-response-test-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+        let interaction_patterns = vec![CompiledInteractionPattern {
+            regex: Regex::new(r"Allow this action\? \[y/n\]").unwrap(),
+            kind: InteractionKind::PermissionRequest,
+            description: "Tool permission prompt".to_string(),
+            send_enter: false,
+        }];
+        let destructive_regexes = vec![Regex::new(r"rm\s+-rf").unwrap()];
+        let before = "ready\nEarlier example: rm -rf /tmp/cache\nAllow this action? [y/n]\n";
+        let started = Instant::now();
+        let timeout = Duration::from_secs(5);
+        let result = tmux_tools_core::with_invocation(invocation, || {
+            poll_agent_interactive(
+                "%poll-staged-response-test",
+                before,
+                "Explain the earlier examples without taking action",
+                started,
+                started + timeout,
+                started + timeout,
+                60.0,
+                0.0,
+                Some("DONE"),
+                None,
+                true,
+                Duration::from_secs(60),
+                None,
+                &interaction_patterns,
+                &destructive_regexes,
+                None,
+                None,
+            )
+        })
+        .unwrap();
+
+        assert!(
+            matches!(result, InteractivePollResult::Completed(_)),
+            "poll loop should complete after the staged response arrives"
+        );
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap_or_default(),
+            "",
+            "pre-send interaction literals must not trigger an automatic reply"
         );
     }
 

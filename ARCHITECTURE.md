@@ -264,7 +264,7 @@ Important frontend boundaries:
 
 ### Canonical format
 
-The only accepted workflow format is version `3`.
+The canonical workflow format is version `4`; legacy versions `2` and `3` are accepted as migration inputs and silently upgraded.
 
 Top-level fields:
 

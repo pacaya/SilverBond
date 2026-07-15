@@ -8,7 +8,7 @@ SilverBond is a local-first graph workflow runner that executes multi-step workf
 |----------|-------------|
 | [Getting Started](getting-started.md) | Setup, installation, and running the application |
 | [Architecture Overview](architecture-overview.md) | High-level system design and core principles |
-| [Workflow Schema](workflow-schema.md) | Complete v3 workflow format reference |
+| [Workflow Schema](workflow-schema.md) | Complete v4 workflow format reference |
 | [Backend](backend.md) | Rust backend modules and their responsibilities |
 | [Frontend](frontend.md) | Svelte 5 UI architecture, components, and patterns |
 | [API Reference](api-reference.md) | HTTP and SSE endpoint documentation |

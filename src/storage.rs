@@ -1121,8 +1121,8 @@ mod tests {
 
     use super::*;
     use crate::model::{
-        WORKFLOW_SCHEMA_VERSION, WorkflowEdge, WorkflowEdgeOutcome, WorkflowLimits, WorkflowNode,
-        WorkflowNodeType,
+        DecideConfig, NodeKind, WORKFLOW_SCHEMA_VERSION, WorkflowEdge, WorkflowEdgeOutcome,
+        WorkflowLimits, WorkflowNode, WorkflowNodeType, WorkflowV3,
     };
 
     fn sample_workflow() -> WorkflowV3 {
@@ -1676,6 +1676,53 @@ mod tests {
         assert!(stored_workflow["nodes"][0].get("type").is_none());
     }
 
+    fn canonical_v4_decide_workflow() -> WorkflowV3 {
+        WorkflowV3 {
+            version: WORKFLOW_SCHEMA_VERSION,
+            name: None,
+            goal: "current run".to_string(),
+            cwd: "/tmp".to_string(),
+            use_orchestrator: false,
+            run_as: None,
+            entry_node_id: "decide".to_string(),
+            variables: Vec::new(),
+            limits: WorkflowLimits {
+                max_total_steps: 10,
+                max_visits_per_node: 5,
+            },
+            nodes: vec![WorkflowNode {
+                id: "decide".to_string(),
+                name: "Pick".to_string(),
+                kind: NodeKind::Decide {
+                    decide_config: DecideConfig {
+                        prompt: "Pick one".to_string(),
+                        outcomes: vec!["yes".to_string()],
+                        model: None,
+                        inputs: Vec::new(),
+                    },
+                },
+                agent: None,
+                prompt: String::new(),
+                context_sources: Vec::new(),
+                response_format: None,
+                output_schema: None,
+                retry_count: None,
+                retry_delay: None,
+                timeout: None,
+                skip_condition: None,
+                loop_max_iterations: None,
+                loop_condition: None,
+                split_failure_policy: crate::model::SplitFailurePolicy::BestEffortContinue,
+                cwd: None,
+                continue_session_from: None,
+            }],
+            edges: Vec::new(),
+            agent_defaults: std::collections::BTreeMap::new(),
+            subflows: std::collections::BTreeMap::new(),
+            ui: None,
+        }
+    }
+
     #[tokio::test]
     async fn get_run_leaves_canonical_v4_workflow_unchanged() {
         let temp = TempDir::new().unwrap();
@@ -1685,28 +1732,9 @@ mod tests {
             .await
             .unwrap();
 
-        let current_workflow = serde_json::json!({
-            "version": 4,
-            "goal": "current run",
-            "cwd": "/tmp",
-            "useOrchestrator": false,
-            "entryNodeId": "decide",
-            "variables": [],
-            "limits": { "maxTotalSteps": 10, "maxVisitsPerNode": 5 },
-            "nodes": [{
-                "id": "decide",
-                "name": "Pick",
-                "kind": {
-                    "type": "decide",
-                    "decideConfig": {
-                        "prompt": "Pick one",
-                        "outcomes": ["yes"]
-                    }
-                }
-            }],
-            "edges": []
-        });
+        let current_workflow = canonical_v4_decide_workflow();
         let canonical_json = serde_json::to_string(&current_workflow).unwrap();
+        let original_workflow: Value = serde_json::from_str(&canonical_json).unwrap();
         with_connection(&db.connection, db.path(), |conn| {
             conn.execute(
                 "UPDATE runs SET workflow_json = ?2 WHERE run_id = ?1",
@@ -1733,9 +1761,10 @@ mod tests {
         })
         .unwrap();
         let stored_workflow: Value = serde_json::from_str(&stored_workflow_json).unwrap();
-        assert_eq!(stored_workflow["version"], 4);
-        assert_eq!(stored_workflow["goal"], "current run");
-        assert_eq!(stored_workflow["entryNodeId"], "decide");
+        assert_eq!(
+            original_workflow, stored_workflow,
+            "get_run must not rewrite a fully canonical v4 workflow"
+        );
         assert_eq!(stored_workflow["nodes"][0]["kind"]["type"], "decide");
         assert_eq!(
             stored_workflow["nodes"][0]["kind"]["decideConfig"]["outcomes"],

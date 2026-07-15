@@ -8,7 +8,7 @@ Today it is built as:
 - a Svelte 5 + TypeScript graph editor authored in `ui/`
 - generated `public/` assets embedded into the Rust binary
 - an optional Tauri shell in `src-tauri/` that wraps the same localhost app
-- a v3-only workflow schema with `nodes[]`, `edges[]`, `entryNodeId`, per-agent `agentDefaults`, and optional `ui.canvas`
+- a version-4 workflow schema (legacy v2/v3 accepted as migration inputs) with `nodes[]`, `edges[]`, `entryNodeId`, per-agent `agentDefaults`, and optional `ui.canvas`
 - executable `task`, `approval`, `split`, and `collector` nodes with per-node `agentConfig` overrides
 - multi-cursor checkpoints with execution epochs, split families, and collector barriers
 - SQLite-backed checkpoints, event history, interrupted runs, and execution logs

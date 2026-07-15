@@ -1,0 +1,16 @@
+name: Canonical v4 Docs Guard
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  canonical-v4-docs:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify user-facing docs advertise v4 as canonical
+        run: bash scripts/check-canonical-v4-docs.sh

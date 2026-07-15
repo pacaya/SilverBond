@@ -58,6 +58,10 @@ typecheck:
 check:
     cargo check
 
+# Guard against v3 canonical-format drift in user-facing docs/UI
+check-v4-docs:
+    bash scripts/check-canonical-v4-docs.sh
+
 # Clean frontend build output
 clean:
     rm -rf public/assets

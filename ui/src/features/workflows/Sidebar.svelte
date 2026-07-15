@@ -56,7 +56,7 @@
       New workflow
     </button>
     <button class="button button--ghost" onclick={() => fileInput?.click()}>
-      Import v3 JSON
+      Import workflow JSON
     </button>
     <input
       bind:this={fileInput}
