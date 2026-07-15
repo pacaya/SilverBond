@@ -32,3 +32,10 @@ One row per unique key (`file:line` + smell name). Columns:
 | `ui/src/features/runtime/RunPanel.svelte:30` + auto-scroll no at-bottom check | 0 | 2026-07-14 | fixed: S17 (promoted MEDIUM -> stickToBottom boolean + onscroll, co-impl with M14) |
 | `ui/src/lib/api/client.ts:344` + seq-gap drops frames silent freeze | 0 | 2026-07-14 | fixed: S18 (promoted MEDIUM -> bounded gap-wait deadline + M4 reconnect escalation, after M4) |
 | `ui/src/features/editor/flowNodes.ts:55` + node.kind.type no legacy guard | 0 | 2026-07-14 | fixed: S19 (promoted MEDIUM -> client-side normalizer at ingress, mirrors migrate_v2_node_to_v3_kind) |
+| `src/app.rs:82` + Primitive Obsession | 1 | 2026-07-15 | fixed: S1 (promoted LOW -> documented threat-model assumption + cfg(test) reject-branch coverage) |
+| `src/model.rs:985` + Speculative Generality | 1 | 2026-07-15 | fixed: S2 (promoted LOW -> reject nested catalogs in validate_workflow_input_bounds, with M8 root-vs-subflow distinction) |
+| `ui/src/features/editor/InspectorPanel.svelte:66` + Duplicated Code | 1 | 2026-07-15 | fixed: S3 (promoted LOW -> delegate both runAs mutators to existing mergeConfig helper) |
+| `ui/src/lib/types/workflow.ts:1071` + Duplicated Code | 1 | 2026-07-15 | fixed: S4 (promoted LOW -> recurse into subflows[*].nodes; actual site is workflow.ts:613, key line stale) |
+| `ui/src/lib/stores/workflowStore.svelte.ts:754` + Positional coupling | 0 | 2026-07-19 | fixed: S5 (promoted LOW -> match-by-id with fail-safe no-op; branch unreachable from current emitter) |
+| `ui/src/lib/stores/workflowStore.svelte.ts:455-457` + entry-guard OR-vs-AND | 0 | 2026-07-19 | fixed: S6 (promoted LOW -> REFUTED: shipped OR is correct; added entry-selection tests + comment, corrected M4/R3-4 record) |
+| `playwright.config.ts:3-5` + committed test unlock hash / reuseExistingServer | 0 | 2026-07-19 | fixed: S7 (promoted LOW -> reuseExistingServer:false + per-run random secret via globalSetup; harness hygiene, not security) |

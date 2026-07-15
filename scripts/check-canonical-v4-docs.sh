@@ -11,14 +11,12 @@ if command -v rg >/dev/null 2>&1; then
   MATCHES="$(rg -n --pcre2 "$PATTERN" \
     --glob '!docs/issues/**' \
     --glob '!docs/tasks/**' \
-    --glob '!public/**' \
     --glob '!scripts/check-canonical-v4-docs.sh' \
     . || true)"
 else
   MATCHES="$(grep -RInE "$PATTERN" \
     --exclude-dir=docs/issues \
     --exclude-dir=docs/tasks \
-    --exclude-dir=public \
     --exclude=check-canonical-v4-docs.sh \
     . || true)"
 fi

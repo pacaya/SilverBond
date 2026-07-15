@@ -602,8 +602,8 @@ Node defaults/labels mirror backend node-kind metadata.
 
 ---
 
-### L13. Embedded UI still advertises v3
-
+### L13. Embedded UI still advertises v3 (FIXED)
+> **Fix:** Ran npm run build to regenerate the embedded public/ bundle (new hashed assets, updated index.html) and removed the public/** exclusion from scripts/check-canonical-v4-docs.sh so the guard now validates the shipped bundle.
 **File:** `ui/src/features/workflows/Sidebar.svelte:59 (embedded bundle: public/assets/index-SBZnEnwS.js:3, public/index.html)`
 **Source:** fix-review audit (was L12)
 **Severity:** LOW
