@@ -39,3 +39,10 @@ One row per unique key (`file:line` + smell name). Columns:
 | `ui/src/lib/stores/workflowStore.svelte.ts:754` + Positional coupling | 0 | 2026-07-19 | fixed: S5 (promoted LOW -> match-by-id with fail-safe no-op; branch unreachable from current emitter) |
 | `ui/src/lib/stores/workflowStore.svelte.ts:455-457` + entry-guard OR-vs-AND | 0 | 2026-07-19 | fixed: S6 (promoted LOW -> REFUTED: shipped OR is correct; added entry-selection tests + comment, corrected M4/R3-4 record) |
 | `playwright.config.ts:3-5` + committed test unlock hash / reuseExistingServer | 0 | 2026-07-19 | fixed: S7 (promoted LOW -> reuseExistingServer:false + per-run random secret via globalSetup; harness hygiene, not security) |
+| src/api.rs:1441-1610 Divergent Change | 1 | 2026-07-19 | open |
+| src/model.rs:1205-1235 Speculative Generality | 1 | 2026-07-19 | open |
+| ui/src/lib/stores/workflowStore.svelte.ts:104-108 Duplicated Code | 1 | 2026-07-19 | open |
+| src/driver.rs:648-674 Duplicated Code | 1 | 2026-07-19 | open |
+| src/api.rs:1544-1547 Mysterious Name | 1 | 2026-07-19 | open |
+| ui/src/app/AppShell.svelte:201 Duplicated Code | 1 | 2026-07-19 | open |
+| ui/src/lib/stores/workflowStore.svelte.ts:110 Repeated Switches | 1 | 2026-07-19 | open |
