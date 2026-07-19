@@ -42,7 +42,11 @@ One row per unique key (`file:line` + smell name). Columns:
 | src/api.rs:1441-1610 Divergent Change | 1 | 2026-07-19 | open |
 | src/model.rs:1205-1235 Speculative Generality | 1 | 2026-07-19 | open |
 | ui/src/lib/stores/workflowStore.svelte.ts:104-108 Duplicated Code | 1 | 2026-07-19 | open |
-| src/driver.rs:648-674 Duplicated Code | 1 | 2026-07-19 | open |
-| src/api.rs:1544-1547 Mysterious Name | 1 | 2026-07-19 | open |
-| ui/src/app/AppShell.svelte:201 Duplicated Code | 1 | 2026-07-19 | open |
-| ui/src/lib/stores/workflowStore.svelte.ts:110 Repeated Switches | 1 | 2026-07-19 | open |
+| src/driver.rs:648-674 Duplicated Code | 1 | 2026-07-19 | retired: not independently actionable - duplicate branch collapses as a byproduct of the read-only-enforcement fix in the same if/else chain |
+| src/api.rs:1544-1547 Mysterious Name | 1 | 2026-07-19 | retired: duplicate key of src/api.rs:1498 (same identifier `termination`, same rename) |
+| ui/src/app/AppShell.svelte:201 Duplicated Code | 1 | 2026-07-19 | fixed: S8 (promoted LOW -> shared runLifecycle(label, kickoff) helper; collapses startRun/resumeRun/restartFromNode triplication) |
+| ui/src/lib/stores/workflowStore.svelte.ts:110 Repeated Switches | 1 | 2026-07-19 | fixed: S9 (promoted MEDIUM -> OutsideNodePatch carries prompts[]; deletes two switches + parallel interface, rider on M17) |
+| `src/model.rs:990` + Speculative Generality | 1 | 2026-07-19 | open |
+| `ui/src/lib/stores/workflowStore.svelte.ts:401` + Repeated Switches | 1 | 2026-07-19 | retired: duplicate key of workflowStore.svelte.ts:110 (same CompoundPromptField smell, filed at one of its switch sites) |
+| `ui/src/lib/stores/workflowStore.svelte.ts:909` + Speculative Generality | 1 | 2026-07-19 | open |
+| `src/api.rs:1498` + Mysterious Name | 1 | 2026-07-19 | open |
