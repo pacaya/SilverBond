@@ -66,7 +66,7 @@ Process-launching workflows must be configured through one of two paths before t
 
 These variables apply to `just server`, production builds, and the packaged desktop app. With neither variable set, SilverBond rejects process-launching runs with guidance instead of asking for an unlock password that cannot verify.
 
-When `SILVERBOND_AGENT_USER` selects a different OS user, place `SILVERBOND_ROOT` in a location that user can traverse. On macOS, avoid `~/Desktop` and `~/Documents`: TCC can deny a sudo-launched low-privilege process even when POSIX permissions allow access. SilverBond creates cross-user pane-stream FIFOs under `<app-root>/run-states/`.
+When `SILVERBOND_AGENT_USER` selects a different OS user, place `SILVERBOND_ROOT` in a location that user can traverse. Grant execute permission on the root and every otherwise-inaccessible ancestor (for example, `chmod o+x <path>`); SilverBond checks this before starting a pane stream and never changes those permissions. On macOS, avoid `~/Desktop` and `~/Documents`: TCC can deny a sudo-launched low-privilege process even when POSIX permissions allow access. SilverBond creates cross-user pane-stream FIFOs under `<app-root>/run-states/`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|

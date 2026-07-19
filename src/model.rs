@@ -176,6 +176,13 @@ pub fn default_max_visits_per_node() -> u32 {
     10
 }
 
+/// True when limits are absent-equivalent (`{0,0}`) or explicitly canonical (`{50,10}`).
+pub fn limits_are_canonical(limits: &WorkflowLimits) -> bool {
+    (limits.max_total_steps == 0 && limits.max_visits_per_node == 0)
+        || (limits.max_total_steps == default_max_total_steps()
+            && limits.max_visits_per_node == default_max_visits_per_node())
+}
+
 pub fn default_max_call_depth() -> u32 {
     10
 }
@@ -982,11 +989,18 @@ pub fn normalize_workflow_value(value: Value) -> anyhow::Result<NormalizedWorkfl
 
 pub fn ensure_defaults(mut workflow: WorkflowV3) -> WorkflowV3 {
     workflow.version = WORKFLOW_SCHEMA_VERSION;
-    if workflow.limits.max_total_steps == 0 {
-        workflow.limits.max_total_steps = default_max_total_steps();
-    }
-    if workflow.limits.max_visits_per_node == 0 {
-        workflow.limits.max_visits_per_node = default_max_visits_per_node();
+    if limits_are_canonical(&workflow.limits) {
+        if workflow.limits.max_total_steps == 0 {
+            workflow.limits.max_total_steps = default_max_total_steps();
+            workflow.limits.max_visits_per_node = default_max_visits_per_node();
+        }
+    } else {
+        if workflow.limits.max_total_steps == 0 {
+            workflow.limits.max_total_steps = default_max_total_steps();
+        }
+        if workflow.limits.max_visits_per_node == 0 {
+            workflow.limits.max_visits_per_node = default_max_visits_per_node();
+        }
     }
     workflow
 }
@@ -1189,7 +1203,7 @@ fn validate_subflow_body_root_only_fields(
         });
     }
 
-    if workflow.limits != WorkflowLimits::default() {
+    if !limits_are_canonical(&workflow.limits) {
         issues.push(ValidationIssue {
             severity: "warning".to_string(),
             node_id: None,
@@ -4316,6 +4330,37 @@ mod tests {
             issue.severity == "warning"
                 && issue.message.contains("Subflow \"child\" defines custom limits")
         }));
+    }
+
+    #[test]
+    fn does_not_warn_when_subflow_limits_are_canonical() {
+        let parent_nodes = vec![node("start", "Start", WorkflowNodeType::Task)];
+        let subflow_nodes = vec![node("step", "Step", WorkflowNodeType::Task)];
+
+        let omitted = WorkflowLimits::default();
+        let explicit = WorkflowLimits {
+            max_total_steps: default_max_total_steps(),
+            max_visits_per_node: default_max_visits_per_node(),
+        };
+        let serde_defaults: WorkflowLimits = serde_json::from_value(json!({})).unwrap();
+
+        for limits in [omitted, explicit, serde_defaults] {
+            let mut subflow = workflow(subflow_nodes.clone(), vec![], "step");
+            subflow.limits = limits;
+
+            let mut parent = workflow(parent_nodes.clone(), vec![], "start");
+            parent.subflows.insert("child".to_string(), Box::new(subflow));
+
+            let result = validate_workflow(parent);
+
+            assert!(
+                !result.issues.iter().any(|issue| {
+                    issue.severity == "warning"
+                        && issue.message.contains("Subflow \"child\" defines custom limits")
+                }),
+                "canonical subflow limits should not produce a custom-limits warning"
+            );
+        }
     }
 
     #[test]

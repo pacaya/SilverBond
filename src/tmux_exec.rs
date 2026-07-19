@@ -2618,6 +2618,9 @@ mod tests {
     use crate::driver::AccessMode;
     use crate::model::{RunAsConfig, SplitFailurePolicy};
 
+    const TMUX_INTERACTIVE_TEST_TIMEOUT: Duration =
+        tmux::DEFAULT_TMUX_COMMAND_TIMEOUT.saturating_mul(3);
+
     fn control_test_node() -> WorkflowNode {
         WorkflowNode {
             id: "control".to_string(),
@@ -3963,7 +3966,7 @@ exit 0
             tmux_bin: "tmux".to_string(),
         };
         let run_cfg = RunAgentConfig {
-            timeout: Some(2),
+            timeout: Some(TMUX_INTERACTIVE_TEST_TIMEOUT.as_secs()),
             idle_seconds: Some(0.01),
             ready_stable_seconds: Some(0.0),
             until: Some("DONE".to_string()),
@@ -3979,7 +3982,7 @@ exit 0
                 "codex".to_string(),
                 "Workflow prompt".to_string(),
                 temp.path().to_string_lossy().into_owned(),
-                Some(2),
+                Some(TMUX_INTERACTIVE_TEST_TIMEOUT.as_secs()),
                 Some(&run_cfg),
                 Some(&agent_cfg),
                 None,

@@ -1378,28 +1378,91 @@ async fn start_pane_stream(
     invocation: &TmuxInvocation,
 ) -> anyhow::Result<PaneStream> {
     let root = root.to_path_buf();
-    let pane_target = pane_target.to_string();
-    let invocation = invocation.clone();
-    let prepared = tokio::time::timeout(
-        PANE_STREAM_SETUP_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
+    let setup_pane_target = pane_target.to_string();
+    let setup_invocation = invocation.clone();
+    let setup_result = tokio::time::timeout(PANE_STREAM_SETUP_TIMEOUT, async move {
+        let prepared = tokio::task::spawn_blocking(move || {
+            ensure_run_as_can_traverse_root(&root, &setup_invocation)?;
             let prepared = prepare_pane_stream(&root)?;
+            let data_path = shell_quote(&prepared.data_path.to_string_lossy());
+            let lifecycle_path = shell_quote(&prepared.termination_path.to_string_lossy());
             let shell_command = format!(
-                "cat > {}; printf . > {}",
-                shell_quote(&prepared.data_path.to_string_lossy()),
-                shell_quote(&prepared.termination_path.to_string_lossy())
+                "exec 3> {data_path} && printf r > {lifecycle_path}; cat >&3; printf . > {lifecycle_path}"
             );
-            with_invocation(invocation, || {
-                tmux::run_checked(&["pipe-pane", "-t", &pane_target, &shell_command])
+            with_invocation(setup_invocation, || {
+                tmux::run_checked(&[
+                    "pipe-pane",
+                    "-t",
+                    &setup_pane_target,
+                    &shell_command,
+                ])
             })?;
             Ok::<_, anyhow::Error>(prepared)
-        }),
-    )
-    .await
-    .context("timed out while starting pane stream")?
-    .context("pane stream setup task panicked")??;
+        })
+        .await
+        .context("pane stream setup task panicked")??;
 
-    PaneStream::new(prepared)
+        let mut stream = PaneStream::new(prepared)?;
+        stream
+            .wait_until_ready()
+            .await
+            .context("pane stream writer did not become ready")?;
+        Ok::<_, anyhow::Error>(stream)
+    })
+    .await;
+
+    match setup_result {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(error)) => {
+            if let Err(cleanup_error) = stop_pane_stream(pane_target, invocation).await {
+                tracing::debug!(
+                    pane_target,
+                    error = %cleanup_error,
+                    "failed to stop pane stream after setup error"
+                );
+            }
+            Err(error)
+        }
+        Err(_) => {
+            if let Err(error) = stop_pane_stream(pane_target, invocation).await {
+                tracing::debug!(
+                    pane_target,
+                    error = %error,
+                    "failed to stop pane stream after setup timeout"
+                );
+            }
+            anyhow::bail!("timed out while starting pane stream")
+        }
+    }
+}
+
+fn ensure_run_as_can_traverse_root(
+    root: &FsPath,
+    invocation: &TmuxInvocation,
+) -> anyhow::Result<()> {
+    let Some((program, prefix_args)) = invocation.prefix.split_first() else {
+        return Ok(());
+    };
+    let status = Command::new(program)
+        .args(prefix_args)
+        .args(["/bin/test", "-x"])
+        .arg(root)
+        .status()
+        .with_context(|| {
+            format!(
+                "failed to check whether the configured run-as identity can traverse SILVERBOND_ROOT {}",
+                root.display()
+            )
+        })?;
+    if !status.success() {
+        let chmod_command = format!("chmod o+x {}", shell_quote(&root.to_string_lossy()));
+        anyhow::bail!(
+            "configured run-as identity cannot traverse SILVERBOND_ROOT {}; run `{}` and repeat it for each inaccessible ancestor",
+            root.display(),
+            chmod_command
+        );
+    }
+    Ok(())
 }
 
 async fn stop_pane_stream(pane_target: &str, invocation: &TmuxInvocation) -> anyhow::Result<()> {
@@ -1439,17 +1502,6 @@ struct PreparedPaneStream {
 }
 
 fn prepare_pane_stream(root: &FsPath) -> anyhow::Result<PreparedPaneStream> {
-    let mut root_permissions = fs::metadata(root)
-        .with_context(|| format!("failed to inspect SILVERBOND_ROOT {}", root.display()))?
-        .permissions();
-    root_permissions.set_mode(root_permissions.mode() | 0o111);
-    fs::set_permissions(root, root_permissions).with_context(|| {
-        format!(
-            "failed to make SILVERBOND_ROOT traversable {}",
-            root.display()
-        )
-    })?;
-
     let stream_dir = root.join("run-states");
     fs::create_dir_all(&stream_dir).with_context(|| {
         format!(
@@ -1525,6 +1577,7 @@ fn make_cross_user_fifo(path: &FsPath) -> anyhow::Result<()> {
 struct PaneStream {
     data: AsyncFd<File>,
     termination: AsyncFd<File>,
+    ready: bool,
     terminated: bool,
     _fifo_guard: PaneStreamFifoGuard,
 }
@@ -1535,9 +1588,58 @@ impl PaneStream {
             data: AsyncFd::new(prepared.data).context("failed to register pane stream FIFO")?,
             termination: AsyncFd::new(prepared.termination)
                 .context("failed to register pane stream termination FIFO")?,
+            ready: false,
             terminated: false,
             _fifo_guard: prepared.fifo_guard,
         })
+    }
+
+    async fn wait_until_ready(&mut self) -> io::Result<()> {
+        while !self.ready {
+            if self.terminated {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "pane stream writer terminated before becoming ready",
+                ));
+            }
+
+            let marker_result = {
+                let mut readiness = self.termination.readable().await?;
+                let mut marker = [0_u8; 1];
+                match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut marker)) {
+                    Ok(result) => Some(result.map(|bytes_read| (bytes_read, marker[0]))),
+                    Err(_would_block) => None,
+                }
+            };
+
+            match marker_result {
+                Some(Ok((0, _))) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "pane stream lifecycle FIFO closed before writer became ready",
+                    ));
+                }
+                Some(Ok((_, marker))) => self.observe_lifecycle_marker(marker)?,
+                Some(Err(error)) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Some(Err(error)) => return Err(error),
+                None => continue,
+            }
+        }
+        Ok(())
+    }
+
+    fn observe_lifecycle_marker(&mut self, marker: u8) -> io::Result<()> {
+        match marker {
+            b'r' => self.ready = true,
+            b'.' => self.terminated = true,
+            marker => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("unexpected pane stream lifecycle marker {marker:#04x}"),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1567,10 +1669,11 @@ impl AsyncRead for PaneStream {
                 let mut marker = [0_u8; 1];
                 match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut marker)) {
                     Ok(Ok(0)) => break,
-                    Ok(Ok(_)) => {
-                        this.terminated = true;
-                        break;
-                    }
+                    Ok(Ok(_)) => match this.observe_lifecycle_marker(marker[0]) {
+                        Ok(()) if this.terminated => break,
+                        Ok(()) => continue,
+                        Err(error) => return Poll::Ready(Err(error)),
+                    },
                     Ok(Err(error)) => return Poll::Ready(Err(error)),
                     Err(_would_block) => continue,
                 }
@@ -2286,6 +2389,8 @@ mod tests {
         },
         storage::{Database, TemplateStore, WorkflowStore},
     };
+
+    const PANE_STREAM_TEST_TIMEOUT: Duration = PANE_STREAM_SETUP_TIMEOUT.saturating_mul(3);
 
     struct ScriptedReader {
         reads: VecDeque<io::Result<Vec<u8>>>,
@@ -3572,6 +3677,67 @@ printf 'fallback-session\n'
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn pane_stream_start_preserves_silverbond_root_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mode_before = std::fs::metadata(temp.path()).unwrap().permissions().mode();
+        let fake_tmux = temp.path().join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            "#!/bin/sh\nfor arg do command=$arg; done\n/bin/sh -c \"$command\" </dev/null >/dev/null 2>&1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = TmuxInvocation {
+            prefix: vec!["/usr/bin/env".to_string()],
+            socket: None,
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        };
+
+        let stream = start_pane_stream(temp.path(), "%1", &invocation)
+            .await
+            .unwrap();
+        let mode_after = std::fs::metadata(temp.path()).unwrap().permissions().mode();
+
+        assert_eq!(mode_after, mode_before);
+        drop(stream);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_stream_start_rejects_root_the_run_as_identity_cannot_traverse() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let run_as = temp.path().join("run-as");
+        std::fs::write(
+            &run_as,
+            "#!/bin/sh\nif [ \"$1\" = /bin/test ]; then exit 1; fi\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&run_as, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = TmuxInvocation {
+            prefix: vec![run_as.to_string_lossy().into_owned()],
+            socket: None,
+            tmux_bin: "/usr/bin/true".to_string(),
+        };
+
+        let error = start_pane_stream(temp.path(), "%1", &invocation)
+            .await
+            .err()
+            .expect("a non-traversable root must reject pane-stream setup");
+        let required_command = format!("chmod o+x {}", shell_quote(&temp.path().to_string_lossy()));
+
+        assert!(
+            error.to_string().contains(&required_command),
+            "error must tell the operator how to make the root traversable: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn pane_stream_fifo_is_cross_user_accessible_after_umask() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3592,7 +3758,7 @@ printf 'fallback-session\n'
         };
 
         let mut stream = tokio::time::timeout(
-            Duration::from_secs(1),
+            PANE_STREAM_TEST_TIMEOUT,
             start_pane_stream(temp.path(), "%1", &invocation),
         )
         .await
@@ -3616,7 +3782,7 @@ printf 'fallback-session\n'
         );
 
         let mut bytes = Vec::new();
-        tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut bytes))
+        tokio::time::timeout(PANE_STREAM_TEST_TIMEOUT, stream.read_to_end(&mut bytes))
             .await
             .expect("pane stream must terminate after forwarding the writer's bytes")
             .unwrap();
@@ -3643,6 +3809,7 @@ printf 'fallback-session\n'
             .prefix("silverbond-pane-stream-")
             .tempdir_in("/tmp")
             .unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
         let fake_tmux = temp.path().join("tmux");
         std::fs::write(
             &fake_tmux,
@@ -3669,7 +3836,7 @@ printf 'fallback-session\n'
             .await
             .unwrap();
         let mut bytes = Vec::new();
-        tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut bytes))
+        tokio::time::timeout(PANE_STREAM_TEST_TIMEOUT, stream.read_to_end(&mut bytes))
             .await
             .expect("different-UID writer must terminate cleanly")
             .unwrap();
@@ -3716,7 +3883,7 @@ printf 'fallback-session\n'
                 .unwrap();
         drop(sender);
 
-        let result = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+        let result = tokio::time::timeout(PANE_STREAM_TEST_TIMEOUT, receiver.recv())
             .await
             .expect("pane death must terminate the stream task and close its sender");
         assert!(matches!(result, Err(broadcast::error::RecvError::Closed)));
@@ -3783,12 +3950,12 @@ printf 'fallback-session\n'
             .insert("sec-websocket-protocol", stream_token.parse().unwrap());
 
         let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-        let snapshot = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        let snapshot = tokio::time::timeout(PANE_STREAM_TEST_TIMEOUT, socket.next())
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        let error = tokio::time::timeout(Duration::from_secs(2), socket.next())
+        let error = tokio::time::timeout(PANE_STREAM_TEST_TIMEOUT, socket.next())
             .await
             .unwrap()
             .unwrap()
@@ -3805,6 +3972,105 @@ printf 'fallback-session\n'
         assert_eq!(snapshot["type"], "snapshot");
         assert_eq!(error["type"], "error");
         assert_eq!(error["error"], "pane stream unavailable");
+
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_writer_that_never_starts_sends_pane_stream_unavailable_frame() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let (temp, mut state) = create_test_state(SecurityConfig::default()).await;
+        let fake_tmux = temp.path().join("tmux");
+        let tmux_log = temp.path().join("tmux.log");
+        std::fs::write(
+            &fake_tmux,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = capture-pane ]; then printf snapshot; fi\n",
+                tmux_log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_tmux, permissions).unwrap();
+        state.runtime.run_invocation = Some(TmuxInvocation {
+            prefix: Vec::new(),
+            socket: None,
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        });
+        let run_id = state
+            .runtime
+            .start_run(approval_only_workflow(), BTreeMap::new(), None)
+            .await
+            .unwrap();
+        wait_for_pending_approval(&state.runtime.db, &run_id).await;
+        state
+            .runtime
+            .registry
+            .set_active_pane(&run_id, "active", "%1")
+            .await;
+        let stream_token = state
+            .runtime
+            .db
+            .get_run(&run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .stream_token;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state.clone())).await.unwrap();
+        });
+        let mut request = format!("ws://{address}/api/runs/{run_id}/panes/active/stream")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("origin", format!("http://{address}").parse().unwrap());
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", stream_token.parse().unwrap());
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let snapshot = tokio::time::timeout(PANE_STREAM_TEST_TIMEOUT, socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let tokio_tungstenite::tungstenite::Message::Text(snapshot) = snapshot else {
+            panic!("expected snapshot websocket frame");
+        };
+        let snapshot: Value = serde_json::from_str(snapshot.as_str()).unwrap();
+        let error = tokio::time::timeout(PANE_STREAM_TEST_TIMEOUT, async {
+            loop {
+                let message = socket.next().await.unwrap().unwrap();
+                let tokio_tungstenite::tungstenite::Message::Text(message) = message else {
+                    continue;
+                };
+                let frame: Value = serde_json::from_str(message.as_str()).unwrap();
+                if frame["type"] == "error" {
+                    break frame;
+                }
+            }
+        })
+        .await
+        .expect("missing writer must fail within the pane stream setup timeout");
+
+        assert_eq!(snapshot["type"], "snapshot");
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"], "pane stream unavailable");
+        assert!(
+            std::fs::read_to_string(tmux_log)
+                .unwrap()
+                .lines()
+                .any(|line| line == "pipe-pane -t %1"),
+            "failed setup must turn pipe-pane off"
+        );
 
         server.abort();
     }

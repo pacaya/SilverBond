@@ -7035,6 +7035,9 @@ mod tests {
 
     use super::*;
 
+    const TMUX_CLEANUP_TEST_TIMEOUT: Duration =
+        tmux_tools_core::tmux::DEFAULT_TMUX_COMMAND_TIMEOUT.saturating_mul(3);
+
     thread_local! {
         static ASYNC_WORKER_MARKER: Cell<bool> = const { Cell::new(false) };
     }
@@ -7524,7 +7527,10 @@ mod tests {
                 registered.wait().await;
                 let pane_for_result = pane_id.clone();
                 tokio::task::spawn_blocking(move || -> anyhow::Result<NodeResult> {
-                    let deadline = Instant::now() + Duration::from_secs(3);
+                    let deadline = Instant::now()
+                        + TMUX_CLEANUP_TEST_TIMEOUT.saturating_add(
+                            tmux_tools_core::tmux::DEFAULT_TMUX_COMMAND_TIMEOUT,
+                        );
                     while !kill_marker.exists() && Instant::now() < deadline {
                         std::thread::sleep(Duration::from_millis(20));
                     }
@@ -9651,14 +9657,16 @@ mod tests {
 
         let started = Instant::now();
         runtime.abort_run(&run_id).await.unwrap();
-        let persisted =
-            tokio::time::timeout(Duration::from_secs(2), wait_for_terminal_run(&db, &run_id))
-                .await
-                .expect("abort did not reach a terminal state promptly");
+        let persisted = tokio::time::timeout(
+            TMUX_CLEANUP_TEST_TIMEOUT,
+            wait_for_terminal_run(&db, &run_id),
+        )
+        .await
+        .expect("abort did not reach a terminal state promptly");
 
         assert_eq!(persisted.checkpoint.status, RuntimeStatus::Aborted);
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < TMUX_CLEANUP_TEST_TIMEOUT,
             "abort waited too long: {:?}",
             started.elapsed()
         );

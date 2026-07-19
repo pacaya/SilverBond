@@ -466,7 +466,7 @@ describe("workflowStore", () => {
     expect(result).toMatchObject({ ok: true });
     const subflow = store.workflow!.subflows?.Bound;
     expect(subflow?.variables.map((v) => v.name).sort()).toEqual(
-      expect.arrayContaining(["ROOT_VAR", "upstream"]),
+      expect.arrayContaining(["ROOT_VAR", "from_x"]),
     );
     const compound = store.workflow!.nodes.find((n) => n.kind.type === "subflow");
     expect(compound?.kind.type).toBe("subflow");
@@ -474,7 +474,7 @@ describe("workflowStore", () => {
     expect(compound.kind.subflowConfig.inputs).toEqual(
       expect.arrayContaining([
         { name: "ROOT_VAR", source: "var:ROOT_VAR" },
-        { name: "upstream", source: "node:x.output" },
+        { name: "from_x", source: "node:x.output" },
       ]),
     );
     const movedA = subflow?.nodes.find((n) => n.id === "a");
@@ -529,6 +529,210 @@ describe("workflowStore", () => {
     expect(result.ok).toBe(false);
     if (result.ok) throw new Error("compound save unexpectedly succeeded");
     expect(result.code).toBe("unsupported_dependency");
+  });
+
+  it("preserves run_agent and send prompt fields across a compound boundary", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "x",
+        nodes: [
+          node("x", "task", { prompt: "upstream" }),
+          node("a", "run_agent", {
+            kind: {
+              type: "run_agent",
+              runAgentConfig: { killAfter: true, prompt: "agent {{node:x.output}}" },
+            },
+          }),
+          node("b", "send", {
+            kind: { type: "send", sendConfig: { text: "send {{node:x.output}}", enter: true } },
+          }),
+          node("after", "run_agent", {
+            kind: {
+              type: "run_agent",
+              runAgentConfig: { killAfter: true, prompt: "after {{node:b.output}}" },
+            },
+          }),
+        ],
+        edges: [
+          edge("x-a", "x", "a"),
+          edge("a-b", "a", "b"),
+          edge("b-after", "b", "after"),
+        ],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "AgentSend");
+
+    expect(result).toMatchObject({ ok: true });
+    const subflow = store.workflow!.subflows?.AgentSend;
+    const movedA = subflow?.nodes.find((n) => n.id === "a");
+    const movedB = subflow?.nodes.find((n) => n.id === "b");
+    expect(movedA?.kind.type).toBe("run_agent");
+    if (movedA?.kind.type !== "run_agent") throw new Error("expected run_agent");
+    expect(movedA.kind.runAgentConfig?.prompt).toContain("{{var:");
+    expect(movedA.kind.runAgentConfig?.prompt).not.toContain("{{node:x.output}}");
+    expect(movedB?.kind.type).toBe("send");
+    if (movedB?.kind.type !== "send") throw new Error("expected send");
+    expect(movedB.kind.sendConfig.text).toContain("{{var:");
+    expect(movedB.kind.sendConfig.text).not.toContain("{{node:x.output}}");
+    const compound = store.workflow!.nodes.find((n) => n.kind.type === "subflow");
+    const after = store.workflow!.nodes.find((n) => n.id === "after");
+    expect(after?.kind.type).toBe("run_agent");
+    if (after?.kind.type !== "run_agent") throw new Error("expected run_agent");
+    expect(after.kind.runAgentConfig?.prompt).toContain(`{{node:${compound!.id}.output}}`);
+  });
+
+  it("rejects cross-boundary field-path refs in run_agent and send prompt fields", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [
+          node("a", "run_agent", {
+            kind: {
+              type: "run_agent",
+              runAgentConfig: { killAfter: true, prompt: "bad {{node:x.output.field}}" },
+            },
+          }),
+          node("b", "task"),
+          node("x", "task"),
+        ],
+        edges: [edge("a-b", "a", "b"), edge("x-a", "x", "a")],
+      }),
+    );
+
+    const runAgentResult = store.saveSelectionAsCompound(["a", "b"], "RunAgentField");
+    expect(runAgentResult.ok).toBe(false);
+    if (runAgentResult.ok) throw new Error("compound save unexpectedly succeeded");
+    expect(runAgentResult.code).toBe("unsupported_dependency");
+
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [
+          node("a", "send", {
+            kind: { type: "send", sendConfig: { text: "bad {{node:x.output.field}}", enter: true } },
+          }),
+          node("b", "task"),
+          node("x", "task"),
+        ],
+        edges: [edge("a-b", "a", "b"), edge("x-a", "x", "a")],
+      }),
+    );
+
+    const sendResult = store.saveSelectionAsCompound(["a", "b"], "SendField");
+    expect(sendResult.ok).toBe(false);
+    if (sendResult.ok) throw new Error("compound save unexpectedly succeeded");
+    expect(sendResult.code).toBe("unsupported_dependency");
+  });
+
+  it("allocates distinct bindings when moved nodes share a context name with different sources", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "x",
+        nodes: [
+          node("x", "task", { prompt: "x-out" }),
+          node("y", "task", { prompt: "y-out" }),
+          node("a", "task", {
+            prompt: "a {{context:notes}}",
+            contextSources: [{ name: "notes", nodeId: "x" }],
+          }),
+          node("b", "task", {
+            prompt: "b {{context:notes}}",
+            contextSources: [{ name: "notes", nodeId: "y" }],
+          }),
+        ],
+        edges: [edge("x-a", "x", "a"), edge("a-b", "a", "b")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "ContextAlias");
+
+    expect(result).toMatchObject({ ok: true });
+    const subflow = store.workflow!.subflows?.ContextAlias;
+    const movedA = subflow?.nodes.find((n) => n.id === "a");
+    const movedB = subflow?.nodes.find((n) => n.id === "b");
+    const varNames = subflow?.variables.map((v) => v.name) ?? [];
+    expect(varNames.filter((name) => name === "notes" || name.startsWith("notes_"))).toHaveLength(2);
+    expect(movedA?.prompt).toMatch(/\{\{var:(notes|notes_\d+)\}\}/);
+    expect(movedB?.prompt).toMatch(/\{\{var:(notes|notes_\d+)\}\}/);
+    expect(movedA?.prompt).not.toBe(movedB?.prompt);
+  });
+
+  it("keeps context bindings separate from root variables with the same name", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "x",
+        variables: [{ name: "notes", default: "root-notes" }],
+        nodes: [
+          node("x", "task", { prompt: "upstream" }),
+          node("a", "task", {
+            prompt: "ctx {{context:notes}} root {{var:notes}}",
+            contextSources: [{ name: "notes", nodeId: "x" }],
+          }),
+          node("b", "task", { prompt: "exit" }),
+        ],
+        edges: [edge("x-a", "x", "a"), edge("a-b", "a", "b")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "ContextRootCollision");
+
+    expect(result).toMatchObject({ ok: true });
+    const subflow = store.workflow!.subflows?.ContextRootCollision;
+    const compound = store.workflow!.nodes.find((n) => n.kind.type === "subflow");
+    if (compound?.kind.type !== "subflow") throw new Error("expected subflow compound");
+    expect(compound.kind.subflowConfig.inputs).toEqual(
+      expect.arrayContaining([
+        { name: "notes", source: "var:notes" },
+        { name: "notes_2", source: "node:x.output" },
+      ]),
+    );
+    const movedA = subflow?.nodes.find((n) => n.id === "a");
+    expect(movedA?.prompt).toContain("{{var:notes_2}}");
+    expect(movedA?.prompt).toContain("{{var:notes}}");
+  });
+
+  it("allows internal field-path refs and moved-to-moved context sources", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [
+          node("a", "task", { prompt: "use {{node:b.output.field}}" }),
+          node("b", "task", {
+            prompt: "exit {{context:notes}}",
+            contextSources: [{ name: "notes", nodeId: "a" }],
+          }),
+        ],
+        edges: [edge("a-b", "a", "b")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "InternalRefs");
+
+    expect(result).toMatchObject({ ok: true });
+    const subflow = store.workflow!.subflows?.InternalRefs;
+    const movedB = subflow?.nodes.find((n) => n.id === "b");
+    expect(movedB?.prompt).toContain("{{context:notes}}");
+    expect(movedB?.contextSources).toEqual([{ name: "notes", nodeId: "a" }]);
+  });
+
+  it("does not reject unrelated outside field-path refs when saving a compound", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [
+          node("a", "task"),
+          node("b", "task"),
+          node("q", "task", { prompt: "use {{node:r.output.field}}" }),
+          node("r", "task"),
+        ],
+        edges: [edge("a-b", "a", "b"), edge("q-r", "q", "r")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "UnrelatedFieldPath");
+
+    expect(result).toMatchObject({ ok: true });
   });
 
   it("corrects stale selectedPane when observability panes change across runs", () => {
