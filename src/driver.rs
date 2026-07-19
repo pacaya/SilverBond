@@ -288,8 +288,27 @@ fn resolve_registry_access_profile(
         .get(agent)
         .ok_or_else(|| anyhow::anyhow!("unknown agent {agent}"))?;
     let mapped = access_mode_profile_name(&config.access_mode);
-    if spec.access_profiles.contains_key(mapped) {
-        return Ok(mapped.to_string());
+    let selected = if let Some(profile) = config.access_profile_override.as_deref() {
+        if !spec.access_profiles.contains_key(profile) {
+            anyhow::bail!("agent {agent} has no access profile {profile}");
+        }
+        let widens_access = match config.access_mode {
+            AccessMode::ReadOnly => profile != "read-only",
+            AccessMode::Edit | AccessMode::Execute => profile == "full-access",
+            AccessMode::Unrestricted => false,
+        };
+        if widens_access {
+            anyhow::bail!(
+                "access profile {profile} would widen {:?} access mode for agent {agent}",
+                config.access_mode
+            );
+        }
+        profile
+    } else {
+        mapped
+    };
+    if spec.access_profiles.contains_key(selected) {
+        return Ok(selected.to_string());
     }
 
     // A default profile may safely reduce or preserve privileges for the
@@ -304,18 +323,67 @@ fn resolve_registry_access_profile(
     anyhow::bail!("agent {agent} has no access profile {mapped} and no default profile");
 }
 
+fn resolve_builtin_access_profile(
+    agent: &str,
+    config: &AgentConfig,
+) -> anyhow::Result<(String, Option<Vec<String>>)> {
+    let registry = load_agent_registry()?;
+    let profile = resolve_registry_access_profile(&registry, agent, config)?;
+    let override_args = if config.access_profile_override.is_some() {
+        let (_binary, args) = registry.launch_argv(agent, Some(&profile))?;
+        Some(args)
+    } else {
+        None
+    };
+    Ok((profile, override_args))
+}
+
 fn validate_registry_config_fields(
     config: &AgentConfig,
     caps: &AgentCapabilities,
 ) -> anyhow::Result<()> {
-    if config.model.is_some() && !caps.model_selection {
+    let AgentConfig {
+        model,
+        reasoning_level,
+        system_prompt,
+        max_turns,
+        max_budget_usd,
+        resume_session_id: _,
+        ephemeral_session: _,
+        json_schema: _,
+        access_mode: _,
+        access_profile_override: _,
+        tool_toggles,
+        allowed_tools,
+        disallowed_tools,
+        cwd: _,
+        auto_approve: _,
+        orchestrator: _,
+    } = config;
+
+    if model.is_some() && !caps.model_selection {
         anyhow::bail!("agent does not support model selection");
     }
-    if config.system_prompt.is_some() && !caps.system_prompt {
+    if reasoning_level.is_some() && !caps.reasoning_config {
+        anyhow::bail!("agent does not support reasoning config");
+    }
+    if system_prompt.is_some() && !caps.system_prompt {
         anyhow::bail!("agent does not support system prompt");
     }
-    if config.allowed_tools.is_some() && !caps.tool_allowlist {
+    if max_budget_usd.is_some() && !caps.budget_limit {
+        anyhow::bail!("agent does not support budget limit");
+    }
+    if max_turns.is_some() && !caps.turn_limit {
+        anyhow::bail!("agent does not support turn limit");
+    }
+    if tool_toggles.web_search.is_some() && !caps.web_search {
+        anyhow::bail!("agent does not support web search toggle");
+    }
+    if allowed_tools.is_some() && !caps.tool_allowlist {
         anyhow::bail!("agent does not support tool allowlist");
+    }
+    if disallowed_tools.is_some() && !caps.tool_allowlist {
+        anyhow::bail!("agent does not support tool denylist");
     }
     Ok(())
 }
@@ -364,6 +432,7 @@ pub struct AgentConfig {
     pub ephemeral_session: bool,
     pub json_schema: Option<Value>,
     pub access_mode: AccessMode,
+    pub access_profile_override: Option<String>,
     pub tool_toggles: ToolToggles,
     pub allowed_tools: Option<Vec<String>>,
     pub disallowed_tools: Option<Vec<String>>,
@@ -384,6 +453,7 @@ impl Default for AgentConfig {
             ephemeral_session: true,
             json_schema: None,
             access_mode: AccessMode::Execute,
+            access_profile_override: None,
             tool_toggles: ToolToggles::default(),
             allowed_tools: None,
             disallowed_tools: None,
@@ -445,6 +515,8 @@ pub struct AgentOutput {
 pub struct CommandArgs {
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// Registry profile used to render the command's access arguments.
+    pub access_profile: String,
     /// Temporary directory to clean up after the agent process exits.
     pub temp_dir: Option<PathBuf>,
 }
@@ -538,6 +610,8 @@ impl AgentDriver for ClaudeDriver {
 
     fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
         let mut args = Vec::new();
+        let (access_profile, access_profile_override_args) =
+            resolve_builtin_access_profile(self.name(), config)?;
 
         // Model selection
         if let Some(model) = &config.model {
@@ -571,7 +645,21 @@ impl AgentDriver for ClaudeDriver {
 
         // Access mode / tool control ------------------------------------------------
         // Fine-grained tool control overrides the access-mode shorthand when present.
-        if config.allowed_tools.is_some() || config.disallowed_tools.is_some() {
+        if let Some(access_args) = access_profile_override_args {
+            args.extend(access_args);
+            if let Some(allowed) = &config.allowed_tools {
+                for tool in allowed {
+                    args.push("--allowedTools".to_string());
+                    args.push(tool.clone());
+                }
+            }
+            if let Some(disallowed) = &config.disallowed_tools {
+                for tool in disallowed {
+                    args.push("--disallowedTools".to_string());
+                    args.push(tool.clone());
+                }
+            }
+        } else if config.allowed_tools.is_some() || config.disallowed_tools.is_some() {
             if let Some(allowed) = &config.allowed_tools {
                 for tool in allowed {
                     args.push("--allowedTools".to_string());
@@ -613,6 +701,7 @@ impl AgentDriver for ClaudeDriver {
         Ok(CommandArgs {
             args,
             env: Vec::new(),
+            access_profile,
             temp_dir: None,
         })
     }
@@ -700,6 +789,8 @@ impl AgentDriver for CodexDriver {
 
     fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
         let mut args = Vec::new();
+        let (access_profile, access_profile_override_args) =
+            resolve_builtin_access_profile(self.name(), config)?;
 
         // Sub-command: `exec resume <id>` or plain `exec`
         if let Some(session_id) = &config.resume_session_id {
@@ -733,27 +824,31 @@ impl AgentDriver for CodexDriver {
         }
 
         // Access mode
-        match config.access_mode {
-            AccessMode::ReadOnly => {
-                args.push("--sandbox".to_string());
-                args.push("read-only".to_string());
-                args.push("-a".to_string());
-                args.push("never".to_string());
-            }
-            AccessMode::Edit => {
-                args.push("--sandbox".to_string());
-                args.push("workspace-write".to_string());
-                args.push("-a".to_string());
-                args.push("untrusted".to_string());
-            }
-            AccessMode::Execute => {
-                args.push("--full-auto".to_string());
-            }
-            AccessMode::Unrestricted => {
-                args.push("--sandbox".to_string());
-                args.push("danger-full-access".to_string());
-                args.push("-a".to_string());
-                args.push("never".to_string());
+        if let Some(access_args) = access_profile_override_args {
+            args.extend(access_args);
+        } else {
+            match config.access_mode {
+                AccessMode::ReadOnly => {
+                    args.push("--sandbox".to_string());
+                    args.push("read-only".to_string());
+                    args.push("-a".to_string());
+                    args.push("never".to_string());
+                }
+                AccessMode::Edit => {
+                    args.push("--sandbox".to_string());
+                    args.push("workspace-write".to_string());
+                    args.push("-a".to_string());
+                    args.push("untrusted".to_string());
+                }
+                AccessMode::Execute => {
+                    args.push("--full-auto".to_string());
+                }
+                AccessMode::Unrestricted => {
+                    args.push("--sandbox".to_string());
+                    args.push("danger-full-access".to_string());
+                    args.push("-a".to_string());
+                    args.push("never".to_string());
+                }
             }
         }
 
@@ -765,6 +860,7 @@ impl AgentDriver for CodexDriver {
         Ok(CommandArgs {
             args,
             env: Vec::new(),
+            access_profile,
             temp_dir: None,
         })
     }
@@ -852,23 +948,36 @@ impl AgentDriver for RegistryProfileDriver {
     }
 
     fn capabilities(&self) -> AgentCapabilities {
-        capabilities_from_registry(&self.name).unwrap_or(AgentCapabilities {
-            worker_execution: true,
-            prompt_refinement: false,
-            branch_choice: false,
-            loop_verdict: false,
-            structured_output: false,
-            session_reuse: false,
-            native_json_schema: false,
-            model_selection: false,
-            reasoning_config: false,
-            system_prompt: false,
-            budget_limit: false,
-            turn_limit: false,
-            cost_reporting: false,
-            tool_allowlist: false,
-            web_search: false,
-        })
+        let mut capabilities =
+            capabilities_from_registry(&self.name).unwrap_or(AgentCapabilities {
+                worker_execution: true,
+                prompt_refinement: false,
+                branch_choice: false,
+                loop_verdict: false,
+                structured_output: false,
+                session_reuse: false,
+                native_json_schema: false,
+                model_selection: false,
+                reasoning_config: false,
+                system_prompt: false,
+                budget_limit: false,
+                turn_limit: false,
+                cost_reporting: false,
+                tool_allowlist: false,
+                web_search: false,
+            });
+
+        // Registry profiles provide only static access-profile argv. Do not
+        // advertise tuning controls this driver cannot render dynamically,
+        // even when a hand-authored registry spec claims CLI-level support.
+        capabilities.model_selection = false;
+        capabilities.reasoning_config = false;
+        capabilities.system_prompt = false;
+        capabilities.budget_limit = false;
+        capabilities.turn_limit = false;
+        capabilities.tool_allowlist = false;
+        capabilities.web_search = false;
+        capabilities
     }
 
     fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
@@ -879,6 +988,7 @@ impl AgentDriver for RegistryProfileDriver {
         Ok(CommandArgs {
             args,
             env: Vec::new(),
+            access_profile: profile,
             temp_dir: None,
         })
     }
@@ -1638,6 +1748,26 @@ binary = "agent-two"
     }
 
     #[test]
+    fn registry_profile_driver_hides_unrendered_registry_capabilities() {
+        let claude_caps = RegistryProfileDriver::new("claude").capabilities();
+
+        assert!(claude_caps.worker_execution);
+        assert!(claude_caps.structured_output);
+        assert!(claude_caps.session_reuse);
+        assert!(claude_caps.native_json_schema);
+        assert!(claude_caps.cost_reporting);
+        assert!(!claude_caps.model_selection);
+        assert!(!claude_caps.system_prompt);
+        assert!(!claude_caps.budget_limit);
+        assert!(!claude_caps.turn_limit);
+        assert!(!claude_caps.tool_allowlist);
+        assert!(!claude_caps.web_search);
+
+        let codex_caps = RegistryProfileDriver::new("codex").capabilities();
+        assert!(!codex_caps.reasoning_config);
+    }
+
+    #[test]
     fn agent_access_profile_names_includes_known_agents() {
         let profiles = agent_access_profile_names("agy");
         assert!(profiles.contains(&"default".to_string()));
@@ -1668,6 +1798,53 @@ binary = "agent-two"
     }
 
     #[test]
+    fn agent_access_profile_override_rejects_unknown_profile() {
+        let driver = CodexDriver;
+        let config = AgentConfig {
+            access_profile_override: Some("read_only".to_string()),
+            ..default_config()
+        };
+
+        let err = driver.build_session_args(&config).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "agent codex has no access profile read_only"
+        );
+    }
+
+    #[test]
+    fn agent_access_profile_override_cannot_widen_access_mode() {
+        let driver = CodexDriver;
+        let config = AgentConfig {
+            access_mode: AccessMode::ReadOnly,
+            access_profile_override: Some("workspace-write".to_string()),
+            ..default_config()
+        };
+
+        let err = driver.build_session_args(&config).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "access profile workspace-write would widen ReadOnly access mode for agent codex"
+        );
+    }
+
+    #[test]
+    fn registry_profile_accepts_rendered_access_profile_override() {
+        let driver = RegistryProfileDriver::new("cursor");
+        let config = AgentConfig {
+            access_profile_override: Some("read-only".to_string()),
+            ..default_config()
+        };
+
+        let cmd = driver.build_session_args(&config).unwrap();
+
+        assert_eq!(cmd.access_profile, "read-only");
+        assert_eq!(arg_after(&cmd.args, "--mode"), Some("ask"));
+    }
+
+    #[test]
     fn registry_profile_rejects_unsupported_model() {
         let driver = RegistryProfileDriver::new("agy");
         let config = AgentConfig {
@@ -1687,6 +1864,63 @@ binary = "agent-two"
         };
         let err = driver.build_session_args(&config).unwrap_err();
         assert!(err.to_string().contains("system prompt"));
+    }
+
+    #[test]
+    fn registry_profile_rejects_unsupported_reasoning_config() {
+        let driver = RegistryProfileDriver::new("cursor");
+        let config = AgentConfig {
+            reasoning_level: Some(ReasoningLevel::High),
+            ..default_config()
+        };
+        let err = driver.build_session_args(&config).unwrap_err();
+        assert_eq!(err.to_string(), "agent does not support reasoning config");
+    }
+
+    #[test]
+    fn registry_profile_rejects_unsupported_budget_limit() {
+        let driver = RegistryProfileDriver::new("cursor");
+        let config = AgentConfig {
+            max_budget_usd: Some(1.25),
+            ..default_config()
+        };
+        let err = driver.build_session_args(&config).unwrap_err();
+        assert_eq!(err.to_string(), "agent does not support budget limit");
+    }
+
+    #[test]
+    fn registry_profile_rejects_unsupported_turn_limit() {
+        let driver = RegistryProfileDriver::new("cursor");
+        let config = AgentConfig {
+            max_turns: Some(3),
+            ..default_config()
+        };
+        let err = driver.build_session_args(&config).unwrap_err();
+        assert_eq!(err.to_string(), "agent does not support turn limit");
+    }
+
+    #[test]
+    fn registry_profile_rejects_unsupported_web_search_toggle() {
+        let driver = RegistryProfileDriver::new("cursor");
+        let config = AgentConfig {
+            tool_toggles: ToolToggles {
+                web_search: Some(false),
+            },
+            ..default_config()
+        };
+        let err = driver.build_session_args(&config).unwrap_err();
+        assert_eq!(err.to_string(), "agent does not support web search toggle");
+    }
+
+    #[test]
+    fn registry_profile_rejects_unsupported_disallowed_tools() {
+        let driver = RegistryProfileDriver::new("cursor");
+        let config = AgentConfig {
+            disallowed_tools: Some(vec!["Bash(rm *)".into()]),
+            ..default_config()
+        };
+        let err = driver.build_session_args(&config).unwrap_err();
+        assert_eq!(err.to_string(), "agent does not support tool denylist");
     }
 
     #[test]

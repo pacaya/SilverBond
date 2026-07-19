@@ -77,8 +77,18 @@ export const api = {
   templates: () => apiFetch<TemplateItem[]>("/api/templates"),
   validateWorkflow: (workflow: WorkflowDocument) =>
     postJson<ValidationResponse>("/api/validate-workflow", { workflow }),
-  testNode: (node: WorkflowDocument["nodes"][number], cwd: string, mockContext: NodeTestContext) =>
-    postJson<NodeTestPreview>("/api/test-node", { node, cwd, mockContext }),
+  testNode: (
+    node: WorkflowDocument["nodes"][number],
+    cwd: string,
+    mockContext: NodeTestContext,
+    unlockSecret?: string,
+  ) =>
+    postJson<NodeTestPreview>("/api/test-node", {
+      node,
+      cwd,
+      mockContext,
+      ...(unlockSecret !== undefined && { unlockSecret }),
+    }),
   createRun: (
     workflow: WorkflowDocument,
     variableOverrides: Record<string, string>,
@@ -123,37 +133,74 @@ export const api = {
     }),
 };
 
-export async function streamRun(
+export type RunStreamHandle = {
+  close: () => void;
+  finished: Promise<void>;
+};
+
+export function streamRun(
   runId: string,
   streamToken: string,
   onEvent: (event: RunEvent) => void,
-): Promise<void> {
-  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/stream`, {
-    headers: { "X-Stream-Token": streamToken },
-  });
-  if (!response.ok || !response.body) {
-    throw new Error(`Unable to open stream for run ${runId}`);
-  }
+  options?: { signal?: AbortSignal },
+): RunStreamHandle {
+  const ownedController = options?.signal ? null : new AbortController();
+  const signal = options?.signal ?? ownedController!.signal;
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let closed = false;
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
+  const finished = (async () => {
+    try {
+      const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/stream`, {
+        headers: { "X-Stream-Token": streamToken },
+        signal,
+      });
+      if (!response.ok || !response.body) {
+        throw new Error(`Unable to open stream for run ${runId}`);
+      }
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const chunks = buffer.split("\n");
-    buffer = chunks.pop() ?? "";
-    for (const chunk of chunks) {
-      if (!chunk.startsWith("data: ")) continue;
+      reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (!signal.aborted) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split("\n");
+        buffer = chunks.pop() ?? "";
+        for (const chunk of chunks) {
+          if (!chunk.startsWith("data: ")) continue;
+          try {
+            onEvent(JSON.parse(chunk.slice(6)) as RunEvent);
+          } catch {
+            // Ignore malformed chunks; the stream continues.
+          }
+        }
+      }
+    } catch (err) {
+      if (signal.aborted) return;
+      throw err;
+    } finally {
       try {
-        onEvent(JSON.parse(chunk.slice(6)) as RunEvent);
+        await reader?.cancel();
       } catch {
-        // Ignore malformed chunks; the stream continues.
+        // ignore — stream may already be closed
       }
     }
-  }
+  })();
+
+  return {
+    close: () => {
+      if (closed) return;
+      closed = true;
+      ownedController?.abort();
+      void reader?.cancel().catch(() => {
+        // ignore — reader may not be open yet
+      });
+    },
+    finished,
+  };
 }
 
 /* ── Live pane terminal stream (WebSocket) ────────────────────────────────

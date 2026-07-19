@@ -1,10 +1,6 @@
 use std::{
     collections::HashSet,
     process::Command,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -21,9 +17,10 @@ use tmux_tools_core::{
     },
     names, target, tmux,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
-    driver::{self, AccessMode, AgentConfig, InteractionKind, NodeOutcome},
+    driver::{self, AgentConfig, InteractionKind, NodeOutcome},
     model::{
         CaptureConfig, KillConfig, NodeKind, RunAgentConfig, RunAsConfig, SendConfig, SpawnConfig,
         WaitConfig, WaitMode, WorkflowNode,
@@ -66,6 +63,15 @@ impl PaneCleanupTarget {
 }
 
 pub fn build_tmux_invocation(run_as: &RunAsConfig, run_id: &str) -> TmuxInvocation {
+    let mut invocation = build_tmux_invocation_without_resolving(run_as, run_id);
+    invocation.tmux_bin = resolve_tmux_bin(&invocation.prefix);
+    invocation
+}
+
+pub(crate) fn build_tmux_invocation_without_resolving(
+    run_as: &RunAsConfig,
+    run_id: &str,
+) -> TmuxInvocation {
     let prefix = if let Some(command) = &run_as.command {
         command.clone()
     } else if let Some(user) = &run_as.user {
@@ -84,12 +90,11 @@ pub fn build_tmux_invocation(run_as: &RunAsConfig, run_id: &str) -> TmuxInvocati
         .socket
         .clone()
         .unwrap_or_else(|| format!("silverbond-{run_id}"));
-    let tmux_bin = resolve_tmux_bin(&prefix);
 
     TmuxInvocation {
         prefix,
         socket: Some(socket),
-        tmux_bin,
+        tmux_bin: "tmux".to_string(),
     }
 }
 
@@ -182,12 +187,8 @@ impl NodeRunner for TmuxNodeRunner {
     ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
         Box::pin(async move {
             let inv = ctx.run_invocation.clone();
-            let abort_flag = ctx
-                .registry
-                .abort_signal(&run_id)
-                .await
-                .map(|(abort_flag, _)| abort_flag);
-            let interaction = InteractionEscalation::new(ctx, run_id, abort_flag);
+            let abort_token = ctx.registry.abort_signal(&run_id).await;
+            let interaction = InteractionEscalation::new(ctx, run_id, abort_token);
             tokio::task::spawn_blocking(move || {
                 if let Some(inv) = inv {
                     tmux_tools_core::with_invocation(inv, || {
@@ -237,14 +238,10 @@ impl NodeRunner for TmuxNodeRunner {
     ) -> BoxFuture<'static, anyhow::Result<NodeResult>> {
         Box::pin(async move {
             let inv = ctx.run_invocation.clone();
-            let abort_flag = ctx
-                .registry
-                .abort_signal(&run_id)
-                .await
-                .map(|(abort_flag, _)| abort_flag);
+            let abort_token = ctx.registry.abort_signal(&run_id).await;
             let active_pane =
                 ActivePaneRegistration::new(&ctx, run_id.clone(), cursor_id, node.id.clone());
-            let interaction = InteractionEscalation::new(ctx, run_id, abort_flag);
+            let interaction = InteractionEscalation::new(ctx, run_id, abort_token);
             tokio::task::spawn_blocking(move || {
                 if let Some(inv) = inv {
                     tmux_tools_core::with_invocation(inv, || {
@@ -596,25 +593,29 @@ pub(crate) struct InteractionEscalation {
     ctx: RuntimeContext,
     run_id: String,
     handle: tokio::runtime::Handle,
-    abort_flag: Option<Arc<AtomicBool>>,
+    abort_token: Option<CancellationToken>,
 }
 
 impl InteractionEscalation {
-    pub(crate) fn new(ctx: RuntimeContext, run_id: String, abort_flag: Option<Arc<AtomicBool>>) -> Self {
+    pub(crate) fn new(
+        ctx: RuntimeContext,
+        run_id: String,
+        abort_token: Option<CancellationToken>,
+    ) -> Self {
         Self {
             ctx,
             run_id,
             handle: tokio::runtime::Handle::current(),
-            abort_flag,
+            abort_token,
         }
     }
 
-    fn abort_flag(&self) -> Option<&AtomicBool> {
-        self.abort_flag.as_deref()
+    fn abort_token(&self) -> Option<&CancellationToken> {
+        self.abort_token.as_ref()
     }
 
     fn is_aborted(&self) -> bool {
-        abort_requested(self.abort_flag())
+        abort_requested(self.abort_token())
     }
 
     fn request(
@@ -630,13 +631,13 @@ impl InteractionEscalation {
         let interaction_type = interaction_type.to_string();
         let description = description.to_string();
         let output_so_far = output_so_far.to_string();
-        let abort_flag = self.abort_flag.clone();
+        let abort_token = self.abort_token.clone();
         debug_assert!(
             !in_current_task(),
             "Handle::block_on may only be called from spawn_blocking thread"
         );
         self.handle.block_on(async move {
-            if abort_requested(abort_flag.as_deref()) {
+            if abort_requested(abort_token.as_ref()) {
                 anyhow::bail!("Interaction aborted");
             }
             crate::runtime::escalate_agent_interaction(
@@ -940,7 +941,7 @@ fn run_agent_interactive(
 
     let start = Instant::now();
     let effective_prompt = prompt;
-    let abort_flag = interaction.and_then(InteractionEscalation::abort_flag);
+    let abort_token = interaction.and_then(InteractionEscalation::abort_token);
     let effective_cwd = cfg
         .and_then(|cfg| cfg.cwd.clone())
         .unwrap_or_else(|| cwd.clone());
@@ -962,7 +963,7 @@ fn run_agent_interactive(
         "Agent {} cannot execute workflow nodes",
         effective_agent
     );
-    if abort_requested(abort_flag) {
+    if abort_requested(abort_token) {
         return Ok(aborted_result(
             &effective_agent,
             &effective_prompt,
@@ -1001,9 +1002,7 @@ fn run_agent_interactive(
     let spawn_cfg = SpawnConfig {
         agent: Some(effective_agent.clone()),
         cwd: Some(effective_cwd.clone()),
-        access: cfg
-            .and_then(|cfg| cfg.access.clone())
-            .or_else(|| access_profile_from_config(config)),
+        access: cfg.and_then(|cfg| cfg.access.clone()),
         extra_args: cfg.map(|cfg| cfg.extra_args.clone()).unwrap_or_default(),
         name: cfg.and_then(|cfg| cfg.name.clone()),
         ..Default::default()
@@ -1047,7 +1046,7 @@ fn run_agent_interactive(
         &interaction_patterns,
         &destructive_regexes,
         interaction,
-        abort_flag,
+        abort_token,
     )?;
     match ready {
         InteractiveReadyResult::Ready(IdleReason::TimedOut) => {
@@ -1095,7 +1094,7 @@ fn run_agent_interactive(
         &interaction_patterns,
         &destructive_regexes,
         interaction,
-        abort_flag,
+        abort_token,
     )?;
 
     let response = match polled {
@@ -1170,7 +1169,7 @@ pub(crate) fn run_tmux_oneshot(
     prompt: &str,
     cwd: &str,
     config: Option<&AgentConfig>,
-    inv: Option<TmuxInvocation>,
+    inv: TmuxInvocation,
     interaction: Option<&InteractionEscalation>,
 ) -> anyhow::Result<NodeResult> {
     let run = || {
@@ -1187,11 +1186,7 @@ pub(crate) fn run_tmux_oneshot(
         )
     };
 
-    if let Some(inv) = inv {
-        tmux_tools_core::with_invocation(inv, run)
-    } else {
-        run()
-    }
+    tmux_tools_core::with_invocation(inv, run)
 }
 
 pub(crate) fn list_silverbond_tmux_sessions() -> anyhow::Result<Vec<String>> {
@@ -1247,9 +1242,7 @@ fn run_agent_sequence(
     let mut spawn_cfg = SpawnConfig {
         agent: Some(effective_agent.clone()),
         cwd: Some(effective_cwd.clone()),
-        access: cfg
-            .and_then(|cfg| cfg.access.clone())
-            .or_else(|| access_profile_from_config(config)),
+        access: cfg.and_then(|cfg| cfg.access.clone()),
         extra_args: cfg.map(|cfg| cfg.extra_args.clone()).unwrap_or_default(),
         name: cfg.and_then(|cfg| cfg.name.clone()),
         ..Default::default()
@@ -1422,7 +1415,7 @@ fn wait_for_agent_ready_interactive(
     interaction_patterns: &[CompiledInteractionPattern],
     destructive_regexes: &[Regex],
     interaction: Option<&InteractionEscalation>,
-    abort_flag: Option<&AtomicBool>,
+    abort_token: Option<&CancellationToken>,
 ) -> anyhow::Result<InteractiveReadyResult> {
     let ready_signal = ready_signal_for_pane(pane)?;
     let mut deadline = run_deadline;
@@ -1434,13 +1427,13 @@ fn wait_for_agent_ready_interactive(
     let mut first_poll = true;
 
     loop {
-        if abort_requested(abort_flag) {
+        if abort_requested(abort_token) {
             return Ok(InteractiveReadyResult::Aborted);
         }
         let now = Instant::now();
         capture = match capture_visible_stripped(pane) {
             Ok(capture) => capture,
-            Err(_err) if abort_requested(abort_flag) => {
+            Err(_err) if abort_requested(abort_token) => {
                 return Ok(InteractiveReadyResult::Aborted);
             }
             Err(err) => return Err(err),
@@ -1516,7 +1509,7 @@ fn poll_agent_interactive(
     interaction_patterns: &[CompiledInteractionPattern],
     destructive_regexes: &[Regex],
     interaction: Option<&InteractionEscalation>,
-    abort_flag: Option<&AtomicBool>,
+    abort_token: Option<&CancellationToken>,
 ) -> anyhow::Result<InteractivePollResult> {
     let ready_signal = ready_signal_for_pane(pane)?;
     let until_regexes = compile_until_regexes(until, capture_markers)?;
@@ -1534,7 +1527,7 @@ fn poll_agent_interactive(
     let mut escalated_idle = false;
 
     loop {
-        if abort_requested(abort_flag) {
+        if abort_requested(abort_token) {
             let (output_so_far, _) =
                 extract_after_prompt_with_markers(before, &last_seen, prompt, capture_markers);
             return Ok(InteractivePollResult::Aborted(InteractiveCapture {
@@ -1545,7 +1538,7 @@ fn poll_agent_interactive(
         let now = Instant::now();
         let capture = match capture_visible_stripped(pane) {
             Ok(capture) => capture,
-            Err(_err) if abort_requested(abort_flag) => {
+            Err(_err) if abort_requested(abort_token) => {
                 let (output_so_far, _) =
                     extract_after_prompt_with_markers(before, &last_seen, prompt, capture_markers);
                 return Ok(InteractivePollResult::Aborted(InteractiveCapture {
@@ -1866,8 +1859,8 @@ fn send_reply_if_present(pane: &str, reply: &str, send_enter: bool) -> anyhow::R
     Ok(())
 }
 
-fn abort_requested(abort_flag: Option<&AtomicBool>) -> bool {
-    abort_flag.is_some_and(|flag| flag.load(Ordering::SeqCst))
+fn abort_requested(abort_token: Option<&CancellationToken>) -> bool {
+    abort_token.is_some_and(CancellationToken::is_cancelled)
 }
 
 #[derive(Default)]
@@ -1895,6 +1888,7 @@ struct DestructiveMatch {
 struct BuiltCommand {
     command: String,
     env: Vec<(String, String)>,
+    access_profile: Option<String>,
 }
 
 fn next_unhandled_destructive_match(
@@ -2077,6 +2071,7 @@ fn spawn_pane(
             Ok(BuiltCommand {
                 command,
                 env: Vec::new(),
+                access_profile: None,
             })
         })
         .unwrap_or_else(|| {
@@ -2124,7 +2119,7 @@ fn spawn_pane(
     if let Some(agent) = &agent {
         names::set(&pane_id, names::KEY_AGENT, agent)?;
     }
-    if let Some(access) = cfg.and_then(|cfg| cfg.access.as_deref()) {
+    if let Some(access) = built_command.access_profile.as_deref() {
         names::set(&pane_id, names::KEY_ACCESS, access)?;
     }
     if let Some(name) = cfg.and_then(|cfg| cfg.name.as_deref()) {
@@ -2151,7 +2146,7 @@ fn build_agent_command(
     let extra_args = cfg.map(|cfg| cfg.extra_args.as_slice()).unwrap_or(&[]);
     let registry = driver::load_agent_registry()?;
 
-    let (argv, env) = if let Some(agent_config) = agent_config {
+    let (argv, env, access_profile) = if let Some(agent_config) = agent_config {
         let drv =
             driver::get_driver(agent).ok_or_else(|| anyhow!("No driver for agent: {agent}"))?;
         let session_args = drv.build_session_args(agent_config)?;
@@ -2166,6 +2161,7 @@ fn build_agent_command(
                 .chain(extra_args.iter().cloned())
                 .collect::<Vec<_>>(),
             session_args.env,
+            Some(session_args.access_profile),
         )
     } else {
         let explicit_access = cfg.and_then(|cfg| cfg.access.as_deref());
@@ -2183,7 +2179,7 @@ fn build_agent_command(
                     .collect::<Vec<_>>()
             }
         };
-        (argv, Vec::new())
+        (argv, Vec::new(), explicit_access.map(str::to_owned))
     };
 
     Ok(BuiltCommand {
@@ -2193,19 +2189,8 @@ fn build_agent_command(
             .collect::<Vec<_>>()
             .join(" "),
         env,
+        access_profile,
     })
-}
-
-fn access_profile_from_config(config: Option<&AgentConfig>) -> Option<String> {
-    let config = config?;
-    Some(
-        match config.access_mode {
-            AccessMode::ReadOnly => "read-only",
-            AccessMode::Edit | AccessMode::Execute => "workspace-write",
-            AccessMode::Unrestricted => "full-access",
-        }
-        .to_owned(),
-    )
 }
 
 struct WaitForModeResult {
@@ -2630,6 +2615,7 @@ fn trim_before_last_marker_line<'a>(text: &'a str, marker: &str) -> Option<&'a s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::driver::AccessMode;
     use crate::model::{RunAsConfig, SplitFailurePolicy};
 
     fn control_test_node() -> WorkflowNode {
@@ -3366,6 +3352,148 @@ exit 0
     }
 
     #[test]
+    fn build_agent_command_honors_run_agent_access_profile_override() {
+        let node: WorkflowNode = serde_json::from_value(json!({
+            "id": "restricted-agent",
+            "name": "Restricted agent",
+            "kind": {
+                "type": "run_agent",
+                "runAgentConfig": { "access": "read-only" }
+            },
+            "prompt": "Inspect the workspace"
+        }))
+        .unwrap();
+        let NodeKind::RunAgent {
+            run_agent_config, ..
+        } = &node.kind
+        else {
+            panic!("expected run_agent node");
+        };
+        let agent_config = crate::model::resolve_agent_config(
+            &Default::default(),
+            "/workspace",
+            "codex",
+            &node,
+            None,
+            false,
+            None,
+        );
+        assert_eq!(agent_config.access_mode, AccessMode::Execute);
+        let spawn_config = SpawnConfig {
+            access: run_agent_config.access.clone(),
+            ..SpawnConfig::default()
+        };
+
+        let built = build_agent_command("codex", Some(&spawn_config), Some(&agent_config)).unwrap();
+
+        assert!(built.command.contains("'--sandbox' 'read-only'"));
+        assert!(!built.command.contains("'--full-auto'"));
+    }
+
+    #[cfg(unix)]
+    fn access_metadata_invocation(
+        temp: &tempfile::TempDir,
+    ) -> (tmux_tools_core::TmuxInvocation, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = temp.path().join("tmux-access-metadata-prefix.sh");
+        let log = temp.path().join("tmux-access-metadata.log");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\nshift\nprintf '%s\\n' \"$@\" >> \"$log\"\ncase \" $* \" in *\" new-session \"*) printf '%%access-pane\\n' ;; esac\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        (
+            tmux_tools_core::TmuxInvocation {
+                prefix: vec![
+                    script.to_string_lossy().into_owned(),
+                    log.to_string_lossy().into_owned(),
+                ],
+                socket: Some("access-metadata-test-socket".to_string()),
+                tmux_bin: "tmux".to_string(),
+            },
+            log,
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_pane_stamps_driver_resolved_access_profile() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (invocation, log) = access_metadata_invocation(&temp);
+        let spawn_config = SpawnConfig {
+            agent: Some("codex".to_string()),
+            access: Some("full-access".to_string()),
+            ..SpawnConfig::default()
+        };
+        let agent_config = AgentConfig {
+            access_profile_override: Some("read-only".to_string()),
+            ..AgentConfig::default()
+        };
+
+        tmux_tools_core::with_invocation(invocation, || {
+            spawn_pane(
+                Some(&spawn_config),
+                None,
+                "/workspace",
+                Some(&agent_config),
+                None,
+                None,
+            )
+        })
+        .unwrap();
+
+        let recorded = std::fs::read_to_string(log).unwrap();
+        let args = recorded.lines().collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|window| window == [names::KEY_ACCESS, "read-only"]),
+            "pane metadata should use the profile that rendered argv; args={args:?}"
+        );
+        assert!(
+            !args
+                .windows(2)
+                .any(|window| { window == [names::KEY_ACCESS, "full-access"] })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_pane_command_override_omits_access_profile_metadata() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (invocation, log) = access_metadata_invocation(&temp);
+        let spawn_config = SpawnConfig {
+            agent: Some("echo".to_string()),
+            command: Some("printf '%s\\n' done".to_string()),
+            access: Some("workspace-write".to_string()),
+            ..SpawnConfig::default()
+        };
+
+        tmux_tools_core::with_invocation(invocation, || {
+            spawn_pane(
+                Some(&spawn_config),
+                None,
+                "/workspace",
+                Some(&AgentConfig::default()),
+                None,
+                None,
+            )
+        })
+        .unwrap();
+
+        let recorded = std::fs::read_to_string(log).unwrap();
+        let args = recorded.lines().collect::<Vec<_>>();
+        assert!(
+            !args.iter().any(|arg| *arg == names::KEY_ACCESS),
+            "command override panes do not run an agent access profile; args={args:?}"
+        );
+    }
+
+    #[test]
     fn wrap_keep_open_runs_follow_up_shell_after_short_lived_command() {
         if !zsh_available() {
             return;
@@ -3698,19 +3826,19 @@ exit 0
             description: "Subagent active".to_string(),
             send_enter: true,
         }];
-        let abort = Arc::new(AtomicBool::new(false));
-        let finished = Arc::new(AtomicBool::new(false));
-        let abort_worker = Arc::clone(&abort);
-        let finished_worker = Arc::clone(&finished);
+        let abort = CancellationToken::new();
+        let finished = CancellationToken::new();
+        let abort_worker = abort.clone();
+        let finished_worker = finished.clone();
         let abort_thread = std::thread::spawn(move || {
             let started = Instant::now();
             while started.elapsed() < Duration::from_secs(5)
-                && !finished_worker.load(Ordering::SeqCst)
+                && !finished_worker.is_cancelled()
             {
                 sleep(Duration::from_millis(10));
             }
-            if !finished_worker.load(Ordering::SeqCst) {
-                abort_worker.store(true, Ordering::SeqCst);
+            if !finished_worker.is_cancelled() {
+                abort_worker.cancel();
             }
         });
 
@@ -3740,7 +3868,7 @@ exit 0
             )
         })
         .unwrap();
-        finished.store(true, Ordering::SeqCst);
+        finished.cancel();
         abort_thread.join().unwrap();
 
         assert!(

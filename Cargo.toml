@@ -13,6 +13,7 @@ futures = "0.3"
 http = "1.3"
 http-body-util = "0.1"
 include_dir = "0.7"
+libc = "0.2"
 mime_guess = "2.0"
 regex = "1.12"
 r2d2 = "0.8"
@@ -25,7 +26,8 @@ shlex = "1"
 tempfile = "3.20"
 thiserror = "2.0"
 tmux-tools-core = { git = "https://github.com/pacaya/tmux-tools.git", rev = "69173d1bf31ca790831f08cd980271ef92af02c8" }
-tokio = { version = "1.47", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -34,4 +36,4 @@ strip-ansi-escapes = "0.2"
 
 [dev-dependencies]
 tempfile = "3.20"
-libc = "0.2"
+tokio-tungstenite = "0.28"

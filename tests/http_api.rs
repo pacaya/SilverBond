@@ -7,7 +7,10 @@ use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use silverbond::{
     api,
-    app::{AppPaths, AppState, PaneStreamRegistry, SecurityConfig, sha256_unlock_password_hash},
+    app::{
+        AppPaths, AppState, PaneStreamRegistry, SecurityConfig, UnlockThrottle,
+        sha256_unlock_password_hash,
+    },
     runtime::{PersistedRun, RuntimeContext, RuntimeStatus},
     storage::{Database, TemplateStore, WorkflowStore},
 };
@@ -46,6 +49,7 @@ async fn test_router_with_security(security: SecurityConfig) -> (TempDir, Router
         runtime: RuntimeContext::new(db.clone()),
         pane_streams: PaneStreamRegistry::default(),
         security,
+        unlock_throttle: UnlockThrottle::default(),
     };
     (temp, api::router(state), db)
 }
@@ -581,6 +585,7 @@ async fn internal_http_errors_use_fixed_client_body() {
         runtime: RuntimeContext::new(db),
         pane_streams: PaneStreamRegistry::default(),
         security: SecurityConfig::default(),
+        unlock_throttle: UnlockThrottle::default(),
     };
     let router = api::router(state);
     let run_id = "run_secret_internal";
@@ -747,6 +752,73 @@ async fn rejects_legacy_workflow_payloads() {
 }
 
 #[tokio::test]
+async fn test_node_rejects_privileged_preview_without_valid_unlock_secret() {
+    let (temp, router) = test_router().await;
+    let task_node = json!({
+        "id": "preview-task",
+        "name": "Preview Task",
+        "agent": "echo",
+        "prompt": "Preview task",
+        "kind": { "type": "task" }
+    });
+
+    let (status, rejection) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
+            .uri("/api/test-node")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "node": task_node,
+                    "cwd": temp.path().to_string_lossy(),
+                    "unlockSecret": "wrong-unlock"
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(rejection["code"], "privileged_unlock_required");
+}
+
+#[tokio::test]
+async fn test_node_with_default_security_reports_unlock_not_configured() {
+    let (temp, router, _db) = test_router_with_security(SecurityConfig::default()).await;
+    let task_node = json!({
+        "id": "preview-task",
+        "name": "Preview Task",
+        "agent": "echo",
+        "prompt": "Preview task",
+        "kind": { "type": "task" }
+    });
+
+    let (status, rejection) = json_response(
+        &router,
+        Request::builder()
+            .method("POST")
+            .header(SEC_FETCH_SITE, "same-origin")
+            .uri("/api/test-node")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "node": task_node,
+                    "cwd": temp.path().to_string_lossy()
+                }))
+                .unwrap(),
+            ))
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(rejection["code"], "unlock_not_configured");
+}
+
+#[tokio::test]
 async fn test_node_accepts_v3_task_node() {
     let (temp, router) = test_router().await;
     let task_node = json!({
@@ -767,7 +839,8 @@ async fn test_node_accepts_v3_task_node() {
             .body(Body::from(
                 serde_json::to_vec(&json!({
                     "node": task_node,
-                    "cwd": temp.path().to_string_lossy()
+                    "cwd": temp.path().to_string_lossy(),
+                    "unlockSecret": "test-unlock"
                 }))
                 .unwrap(),
             ))

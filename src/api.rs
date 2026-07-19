@@ -1,5 +1,12 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs::{self, File, OpenOptions},
+    io::{self, Read},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::{Path as FsPath, PathBuf},
+    pin::Pin,
+    process::Command,
+    task::{Context as TaskContext, Poll, ready},
     time::Duration,
 };
 
@@ -25,21 +32,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tmux_tools_core::{
     TmuxInvocation,
-    stream::{CaptureAnsiOpts, capture_ansi, stream_pane},
+    stream::{CaptureAnsiOpts, capture_ansi},
     tmux, with_invocation,
 };
 use tokio::{
-    io::{AsyncRead, AsyncReadExt},
+    io::{AsyncRead, AsyncReadExt, ReadBuf, unix::AsyncFd},
     sync::broadcast,
     time::Instant,
 };
 
 use crate::{
-    app::{AppState, PaneStreamEntry, SecurityConfig},
+    app::{AppState, PaneStreamEntry, PaneStreamKey, SecurityConfig, UnlockThrottle},
     model::{
-        NodeKind, RunAsConfig, WorkflowNode, WorkflowV3, WORKFLOW_SCHEMA_VERSION,
-        normalize_workflow_value,
-        validate_workflow, validate_workflow_input_bounds,
+        NodeKind, RunAsConfig, WORKFLOW_SCHEMA_VERSION, WorkflowLimits, WorkflowNode, WorkflowV3,
+        normalize_workflow_value, validate_workflow, validate_workflow_input_bounds,
     },
     runtime::{
         InterruptedRunSummary, NodeTestContext, PaneCandidate, PersistedRun, RunControlError,
@@ -52,6 +58,7 @@ use crate::{
 const PANE_STREAM_HEARTBEAT: Duration = Duration::from_secs(5);
 const PANE_STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 const PANE_STREAM_PENDING_TIMEOUT: Duration = Duration::from_secs(120);
+const PANE_STREAM_SETUP_TIMEOUT: Duration = Duration::from_secs(6);
 const PANE_STREAM_READ_MAX_RETRIES: usize = 5;
 const PANE_STREAM_READ_RETRY_DELAY: Duration = Duration::from_millis(100);
 const PANE_SESSION_LOOKUP_CONCURRENCY: usize = 4;
@@ -65,16 +72,16 @@ enum PaneStreamTaskExit {
 
 struct PaneStreamGuard {
     state: Option<AppState>,
-    pane_target: String,
-    sender: broadcast::Sender<Vec<u8>>,
+    key: PaneStreamKey,
+    sender: broadcast::WeakSender<Vec<u8>>,
 }
 
 impl PaneStreamGuard {
-    fn new(state: AppState, pane_target: String, sender: broadcast::Sender<Vec<u8>>) -> Self {
+    fn new(state: AppState, key: PaneStreamKey, sender: broadcast::Sender<Vec<u8>>) -> Self {
         Self {
             state: Some(state),
-            pane_target,
-            sender,
+            key,
+            sender: sender.downgrade(),
         }
     }
 
@@ -86,10 +93,12 @@ impl PaneStreamGuard {
         let Some(state) = self.state.take() else {
             return;
         };
-        let pane_target = self.pane_target.clone();
+        let key = self.key.clone();
         let sender = self.sender.clone();
         tokio::spawn(async move {
-            state.pane_streams.unsubscribe(&pane_target, &sender).await;
+            if let Some(sender) = sender.upgrade() {
+                state.pane_streams.unsubscribe(&key, &sender).await;
+            }
         });
     }
 }
@@ -623,9 +632,14 @@ struct TestStepRequest {
     cwd: Option<String>,
     #[serde(default)]
     mock_context: Option<NodeTestContext>,
+    #[serde(default)]
+    unlock_secret: Option<String>,
 }
 
-async fn test_node(Json(request): Json<TestStepRequest>) -> Result<Json<Value>, ApiError> {
+async fn test_node(
+    State(state): State<AppState>,
+    Json(request): Json<TestStepRequest>,
+) -> Result<Json<Value>, ApiError> {
     let node_value = request
         .node
         .context("node is required")
@@ -635,13 +649,57 @@ async fn test_node(Json(request): Json<TestStepRequest>) -> Result<Json<Value>, 
     if !matches!(&node.kind, NodeKind::Task { .. }) {
         return Err(ApiError::bad_request("Only task nodes can be tested"));
     }
+    let cwd = request.cwd.unwrap_or_default();
+    let run_as = authorize_and_prepare_node_preview_security(
+        &node,
+        &cwd,
+        &state.security,
+        &state.unlock_throttle,
+        request.unlock_secret.as_deref(),
+    )
+    .await?;
+    let preview_id = format!("preview_{}", uuid::Uuid::now_v7());
+    let invocation = tokio::task::spawn_blocking(move || {
+        crate::tmux_exec::build_tmux_invocation(&run_as, &preview_id)
+    })
+    .await
+    .context("join error while preparing node preview security")?;
     let preview = run_node_preview(
         &node,
-        request.cwd.as_deref().unwrap_or_default(),
+        &cwd,
         request.mock_context.unwrap_or_default(),
+        invocation,
     )
     .await?;
     Ok(Json(serde_json::to_value(preview)?))
+}
+
+async fn authorize_and_prepare_node_preview_security(
+    node: &WorkflowNode,
+    cwd: &str,
+    security: &SecurityConfig,
+    unlock_throttle: &UnlockThrottle,
+    unlock_secret: Option<&str>,
+) -> Result<RunAsConfig, ApiError> {
+    let mut workflow = WorkflowV3 {
+        version: WORKFLOW_SCHEMA_VERSION,
+        name: Some("Node preview".to_string()),
+        goal: "Preview one workflow node".to_string(),
+        cwd: cwd.to_string(),
+        use_orchestrator: false,
+        run_as: None,
+        entry_node_id: node.id.clone(),
+        variables: Vec::new(),
+        limits: WorkflowLimits::default(),
+        nodes: vec![node.clone()],
+        edges: Vec::new(),
+        agent_defaults: BTreeMap::new(),
+        subflows: BTreeMap::new(),
+        ui: None,
+    };
+    authorize_and_prepare_run_security(&mut workflow, security, unlock_throttle, unlock_secret)
+        .await?;
+    Ok(workflow.run_as.unwrap_or_default())
 }
 
 #[derive(Debug, Deserialize)]
@@ -663,6 +721,13 @@ async fn create_run(
     let mut normalized = normalize_workflow_value(request.workflow)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     hydrate_saved_subflows(&state, &mut normalized.workflow).await?;
+    authorize_and_prepare_run_security(
+        &mut normalized.workflow,
+        &state.security,
+        &state.unlock_throttle,
+        request.unlock_secret.as_deref(),
+    )
+    .await?;
     enforce_workflow_input_bounds(&normalized.workflow)?;
     let validation = validate_workflow(normalized.workflow.clone());
     let errors = validation
@@ -680,11 +745,6 @@ async fn create_run(
             }),
         ));
     }
-    authorize_and_prepare_run_security(
-        &mut normalized.workflow,
-        &state.security,
-        request.unlock_secret.as_deref(),
-    )?;
     let run_id = state
         .runtime
         .start_run(
@@ -696,21 +756,31 @@ async fn create_run(
     Ok(Json(run_action_response(&state, &run_id).await?))
 }
 
-fn authorize_and_prepare_run_security(
+async fn authorize_and_prepare_run_security(
     workflow: &mut WorkflowV3,
     security: &SecurityConfig,
+    unlock_throttle: &UnlockThrottle,
     unlock_secret: Option<&str>,
 ) -> Result<(), ApiError> {
     let launches_processes = workflow_launches_processes(workflow);
     let uses_run_as_prefix = workflow.run_as.is_some();
     if (launches_processes || uses_run_as_prefix)
         && resolved_run_as_is_privileged(workflow.run_as.as_ref(), security.agent_user.as_deref())
-        && !security.verify_unlock_secret(unlock_secret)
     {
         if security.unlock_password_hash.is_none() {
             return Err(unlock_not_configured());
         }
-        return Err(privileged_unlock_required());
+        let Some(unlock_secret) = unlock_secret else {
+            return Err(privileged_unlock_required());
+        };
+        match unlock_throttle
+            .verify_unlock_secret(security, unlock_secret)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return Err(privileged_unlock_required()),
+            Err(retry_delay) => return Err(unlock_throttled(retry_delay)),
+        }
     }
 
     if launches_processes && workflow.run_as.is_none() {
@@ -742,6 +812,18 @@ fn privileged_unlock_required() -> ApiError {
         json!({
             "error": "Privileged run requires unlock password.",
             "code": "privileged_unlock_required",
+        }),
+    )
+}
+
+fn unlock_throttled(retry_delay: Duration) -> ApiError {
+    let retry_after_seconds = retry_delay.as_secs() + u64::from(retry_delay.subsec_nanos() > 0);
+    ApiError::validation_body(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({
+            "error": "Privileged run unlock is temporarily throttled after failed attempts.",
+            "code": "unlock_throttled",
+            "retryAfterSeconds": retry_after_seconds,
         }),
     )
 }
@@ -996,7 +1078,7 @@ async fn pane_stream_socket(
         }
     };
 
-    let (mut pane_receiver, pane_sender) =
+    let (mut pane_receiver, pane_sender, pane_stream_key) =
         match subscribe_pane_stream(&state, &run_id, &pane, &pane_target, &invocation).await {
             Ok(subscription) => subscription,
             Err(error) => {
@@ -1005,8 +1087,11 @@ async fn pane_stream_socket(
                 return Ok(());
             }
         };
-    let pane_stream_guard = PaneStreamGuard::new(state.clone(), pane_target.clone(), pane_sender);
+    let pane_stream_guard = PaneStreamGuard::new(state.clone(), pane_stream_key, pane_sender);
 
+    // Snapshot capture and live pipe-pane bytes arrive through independent channels, so there is
+    // no atomic boundary: bytes rendered here may be replayed from the live buffer. "Clear and
+    // repaint" is the user remedy. See H3's control-mode rejection before revisiting the transport.
     send_snapshot(&mut sender, &pane_target, &invocation, &mut next_seq).await?;
 
     let mut heartbeat = Box::pin(tokio::time::sleep(PANE_STREAM_HEARTBEAT));
@@ -1288,18 +1373,242 @@ impl PaneContextError {
 }
 
 async fn start_pane_stream(
+    root: &FsPath,
     pane_target: &str,
     invocation: &TmuxInvocation,
-) -> anyhow::Result<impl AsyncReadExt + Send + Unpin + 'static> {
+) -> anyhow::Result<PaneStream> {
+    let root = root.to_path_buf();
     let pane_target = pane_target.to_string();
     let invocation = invocation.clone();
-    tokio::task::spawn_blocking(move || {
-        with_invocation(invocation, || {
-            futures::executor::block_on(stream_pane(&pane_target))
-        })
-    })
+    let prepared = tokio::time::timeout(
+        PANE_STREAM_SETUP_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            let prepared = prepare_pane_stream(&root)?;
+            let shell_command = format!(
+                "cat > {}; printf . > {}",
+                shell_quote(&prepared.data_path.to_string_lossy()),
+                shell_quote(&prepared.termination_path.to_string_lossy())
+            );
+            with_invocation(invocation, || {
+                tmux::run_checked(&["pipe-pane", "-t", &pane_target, &shell_command])
+            })?;
+            Ok::<_, anyhow::Error>(prepared)
+        }),
+    )
     .await
-    .context("stream_pane task panicked")?
+    .context("timed out while starting pane stream")?
+    .context("pane stream setup task panicked")??;
+
+    PaneStream::new(prepared)
+}
+
+async fn stop_pane_stream(pane_target: &str, invocation: &TmuxInvocation) -> anyhow::Result<()> {
+    let pane_target = pane_target.to_string();
+    let invocation = invocation.clone();
+    tokio::time::timeout(
+        PANE_STREAM_SETUP_TIMEOUT,
+        tokio::task::spawn_blocking(move || {
+            with_invocation(invocation, || {
+                tmux::run(&["pipe-pane", "-t", &pane_target]).map(|_| ())
+            })
+        }),
+    )
+    .await
+    .context("timed out while stopping pane stream")?
+    .context("pane stream teardown task panicked")?
+}
+
+struct PaneStreamFifoGuard {
+    paths: Vec<PathBuf>,
+}
+
+impl Drop for PaneStreamFifoGuard {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+struct PreparedPaneStream {
+    data: File,
+    termination: File,
+    data_path: PathBuf,
+    termination_path: PathBuf,
+    fifo_guard: PaneStreamFifoGuard,
+}
+
+fn prepare_pane_stream(root: &FsPath) -> anyhow::Result<PreparedPaneStream> {
+    let mut root_permissions = fs::metadata(root)
+        .with_context(|| format!("failed to inspect SILVERBOND_ROOT {}", root.display()))?
+        .permissions();
+    root_permissions.set_mode(root_permissions.mode() | 0o111);
+    fs::set_permissions(root, root_permissions).with_context(|| {
+        format!(
+            "failed to make SILVERBOND_ROOT traversable {}",
+            root.display()
+        )
+    })?;
+
+    let stream_dir = root.join("run-states");
+    fs::create_dir_all(&stream_dir).with_context(|| {
+        format!(
+            "failed to create pane stream directory {}",
+            stream_dir.display()
+        )
+    })?;
+    fs::set_permissions(&stream_dir, fs::Permissions::from_mode(0o711)).with_context(|| {
+        format!(
+            "failed to make pane stream directory traversable {}",
+            stream_dir.display()
+        )
+    })?;
+
+    let data_path = stream_dir.join(format!("pane-{}.fifo", uuid::Uuid::new_v4()));
+    let termination_path = stream_dir.join(format!("pane-{}.done.fifo", uuid::Uuid::new_v4()));
+    make_cross_user_fifo(&data_path)?;
+    let mut fifo_guard = PaneStreamFifoGuard {
+        paths: vec![data_path.clone()],
+    };
+    make_cross_user_fifo(&termination_path)?;
+    fifo_guard.paths.push(termination_path.clone());
+    let data = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&data_path)
+        .with_context(|| format!("failed to open pane stream FIFO {}", data_path.display()))?;
+    let termination = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&termination_path)
+        .with_context(|| {
+            format!(
+                "failed to open pane stream termination FIFO {}",
+                termination_path.display()
+            )
+        })?;
+
+    Ok(PreparedPaneStream {
+        data,
+        termination,
+        data_path,
+        termination_path,
+        fifo_guard,
+    })
+}
+
+fn make_cross_user_fifo(path: &FsPath) -> anyhow::Result<()> {
+    let status = Command::new("mkfifo")
+        .arg(path)
+        .status()
+        .with_context(|| format!("failed to run mkfifo for {}", path.display()))?;
+    if !status.success() {
+        anyhow::bail!(
+            "mkfifo {} failed with exit code {}",
+            path.display(),
+            status.code().unwrap_or(-1)
+        );
+    }
+
+    // mkfifo's requested/default mode is reduced by umask. The low-privilege
+    // pipe-pane writer requires the other-write bit, so set the final mode explicitly.
+    if let Err(error) = fs::set_permissions(path, fs::Permissions::from_mode(0o622)) {
+        let _ = fs::remove_file(path);
+        return Err(error)
+            .with_context(|| format!("failed to chmod pane stream FIFO {}", path.display()));
+    }
+    Ok(())
+}
+
+struct PaneStream {
+    data: AsyncFd<File>,
+    termination: AsyncFd<File>,
+    terminated: bool,
+    _fifo_guard: PaneStreamFifoGuard,
+}
+
+impl PaneStream {
+    fn new(prepared: PreparedPaneStream) -> anyhow::Result<Self> {
+        Ok(Self {
+            data: AsyncFd::new(prepared.data).context("failed to register pane stream FIFO")?,
+            termination: AsyncFd::new(prepared.termination)
+                .context("failed to register pane stream termination FIFO")?,
+            terminated: false,
+            _fifo_guard: prepared.fifo_guard,
+        })
+    }
+}
+
+fn read_nonblocking(file: &File, buffer: &mut [u8]) -> io::Result<usize> {
+    let mut file = file;
+    file.read(buffer)
+}
+
+impl AsyncRead for PaneStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buffer: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        if buffer.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        if !this.terminated {
+            loop {
+                let mut readiness = match this.termination.poll_read_ready(cx) {
+                    Poll::Ready(Ok(readiness)) => readiness,
+                    Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                    Poll::Pending => break,
+                };
+                let mut marker = [0_u8; 1];
+                match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), &mut marker)) {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(_)) => {
+                        this.terminated = true;
+                        break;
+                    }
+                    Ok(Err(error)) => return Poll::Ready(Err(error)),
+                    Err(_would_block) => continue,
+                }
+            }
+        }
+
+        if this.terminated {
+            let unfilled = buffer.initialize_unfilled();
+            match read_nonblocking(this.data.get_ref(), unfilled) {
+                Ok(0) => return Poll::Ready(Ok(())),
+                Ok(bytes_read) => {
+                    buffer.advance(bytes_read);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    return Poll::Ready(Ok(()));
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                Err(error) => return Poll::Ready(Err(error)),
+            }
+        }
+
+        loop {
+            let mut readiness = ready!(this.data.poll_read_ready(cx))?;
+            let unfilled = buffer.initialize_unfilled();
+            match readiness.try_io(|inner| read_nonblocking(inner.get_ref(), unfilled)) {
+                Ok(Ok(bytes_read)) => {
+                    buffer.advance(bytes_read);
+                    return Poll::Ready(Ok(()));
+                }
+                Ok(Err(error)) => return Poll::Ready(Err(error)),
+                Err(_would_block) => continue,
+            }
+        }
+    }
 }
 
 async fn subscribe_pane_stream(
@@ -1308,10 +1617,18 @@ async fn subscribe_pane_stream(
     pane: &str,
     pane_target: &str,
     invocation: &TmuxInvocation,
-) -> Result<(broadcast::Receiver<Vec<u8>>, broadcast::Sender<Vec<u8>>), PaneStreamSubscribeError> {
+) -> Result<
+    (
+        broadcast::Receiver<Vec<u8>>,
+        broadcast::Sender<Vec<u8>>,
+        PaneStreamKey,
+    ),
+    PaneStreamSubscribeError,
+> {
+    let key = PaneStreamKey::new(invocation, pane_target);
     let mut streams = state.pane_streams.inner.lock().await;
     let subscriber_limit = state.pane_streams.max_subscribers_per_pane;
-    if let Some(entry) = streams.get_mut(pane_target) {
+    if let Some(entry) = streams.get_mut(&key) {
         if entry.refcount >= subscriber_limit {
             return Err(PaneStreamSubscribeError::TooManySubscribers {
                 limit: subscriber_limit,
@@ -1319,7 +1636,7 @@ async fn subscribe_pane_stream(
         }
         entry.refcount = entry.refcount.saturating_add(1);
         let sender = entry.sender.clone();
-        return Ok((sender.subscribe(), sender));
+        return Ok((sender.subscribe(), sender, key));
     }
 
     if subscriber_limit == 0 {
@@ -1330,7 +1647,7 @@ async fn subscribe_pane_stream(
 
     let (sender, receiver) = broadcast::channel::<Vec<u8>>(256);
     streams.insert(
-        pane_target.to_string(),
+        key.clone(),
         PaneStreamEntry {
             sender: sender.clone(),
             refcount: 1,
@@ -1343,11 +1660,12 @@ async fn subscribe_pane_stream(
         run_id.to_string(),
         pane.to_string(),
         pane_target.to_string(),
+        key.clone(),
         invocation.clone(),
         sender.clone(),
     );
 
-    Ok((receiver, sender))
+    Ok((receiver, sender, key))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1450,13 +1768,14 @@ fn spawn_pane_stream_task(
     run_id: String,
     pane: String,
     pane_target: String,
+    key: PaneStreamKey,
     invocation: TmuxInvocation,
     sender: broadcast::Sender<Vec<u8>>,
 ) {
     tokio::spawn(async move {
-        let exit = match start_pane_stream(&pane_target, &invocation).await {
+        let exit = match start_pane_stream(&state.paths.root, &pane_target, &invocation).await {
             Ok(mut pane_reader) => {
-                pump_pane_stream(
+                let exit = pump_pane_stream(
                     &mut pane_reader,
                     &sender,
                     &run_id,
@@ -1464,7 +1783,17 @@ fn spawn_pane_stream_task(
                     &pane_target,
                     PANE_STREAM_READ_RETRY_DELAY,
                 )
-                .await
+                .await;
+                if let Err(error) = stop_pane_stream(&pane_target, &invocation).await {
+                    tracing::debug!(
+                        run_id = %run_id,
+                        pane = %pane,
+                        pane_target = %pane_target,
+                        error = %error,
+                        "failed to stop pane stream pipe"
+                    );
+                }
+                exit
             }
             Err(error) => {
                 tracing::warn!(
@@ -1478,21 +1807,19 @@ fn spawn_pane_stream_task(
             }
         };
 
-        cleanup_pane_stream_task_exit(&state.pane_streams, &pane_target, &sender, exit).await;
+        cleanup_pane_stream_task_exit(&state.pane_streams, &key, &sender, exit).await;
     });
 }
 
 async fn cleanup_pane_stream_task_exit(
     pane_streams: &crate::app::PaneStreamRegistry,
-    pane_target: &str,
+    key: &PaneStreamKey,
     sender: &broadcast::Sender<Vec<u8>>,
     exit: PaneStreamTaskExit,
 ) {
     match exit {
         PaneStreamTaskExit::NoSubscribers | PaneStreamTaskExit::Terminal => {
-            pane_streams
-                .remove_terminal_sender(pane_target, sender)
-                .await;
+            pane_streams.remove_terminal_sender(key, sender).await;
         }
     }
 }
@@ -1762,15 +2089,7 @@ async fn dismiss_run(
     State(state): State<AppState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    state
-        .runtime
-        .db
-        .mark_run_status(
-            &run_id,
-            crate::runtime::RuntimeStatus::Aborted,
-            Some("aborted".to_string()),
-        )
-        .await?;
+    state.runtime.dismiss_run(&run_id).await?;
     Ok(Json(json!({ "success": true })))
 }
 
@@ -2008,7 +2327,12 @@ mod tests {
             )),
             pane_streams,
             security: SecurityConfig::default(),
+            unlock_throttle: UnlockThrottle::default(),
         }
+    }
+
+    fn test_pane_stream_key(pane_target: &str) -> PaneStreamKey {
+        PaneStreamKey::new(&TmuxInvocation::default(), pane_target)
     }
 
     fn approval_workflow_with_run_as(command: Vec<String>) -> WorkflowV3 {
@@ -2143,6 +2467,7 @@ mod tests {
             runtime: crate::runtime::RuntimeContext::new(db),
             pane_streams: PaneStreamRegistry::default(),
             security,
+            unlock_throttle: UnlockThrottle::default(),
         };
         (temp, state)
     }
@@ -2162,6 +2487,19 @@ mod tests {
         };
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body["code"], "privileged_unlock_required");
+    }
+
+    fn assert_unlock_throttled(error: ApiError) {
+        let ApiError::ValidationBody { status, body, .. } = error else {
+            panic!("expected unlock throttle error, got {error:?}");
+        };
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(body["code"], "unlock_throttled");
+        assert!(
+            body["retryAfterSeconds"]
+                .as_u64()
+                .is_some_and(|delay| (1..=5).contains(&delay))
+        );
     }
 
     #[tokio::test]
@@ -2234,6 +2572,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_run_rejects_privileged_node_with_wrong_unlock_secret() {
+        let security = SecurityConfig {
+            agent_user: None,
+            unlock_password_hash: Some(sha256_unlock_password_hash("correct")),
+        };
+        let (_temp, state) = create_test_state(security).await;
+
+        let error = create_run(
+            State(state),
+            Json(create_run_request(
+                approval_workflow_with_unreachable_task(),
+                Some("wrong"),
+            )),
+        )
+        .await
+        .unwrap_err();
+
+        assert_privileged_unlock_required(error);
+    }
+
+    #[tokio::test]
+    async fn create_run_throttles_correct_secret_after_failed_unlock_attempt() {
+        let security = SecurityConfig {
+            agent_user: None,
+            unlock_password_hash: Some(sha256_unlock_password_hash("correct")),
+        };
+        let (_temp, state) = create_test_state(security).await;
+
+        let first_error = create_run(
+            State(state.clone()),
+            Json(create_run_request(
+                approval_workflow_with_unreachable_task(),
+                Some("wrong"),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_privileged_unlock_required(first_error);
+
+        let throttled = create_run(
+            State(state),
+            Json(create_run_request(
+                approval_workflow_with_unreachable_task(),
+                Some("correct"),
+            )),
+        )
+        .await
+        .unwrap_err();
+
+        assert_unlock_throttled(throttled);
+    }
+
+    #[tokio::test]
+    async fn create_run_counts_failed_unlock_before_workflow_validation() {
+        let security = SecurityConfig {
+            agent_user: None,
+            unlock_password_hash: Some(sha256_unlock_password_hash("correct")),
+        };
+        let (_temp, state) = create_test_state(security).await;
+        let mut invalid_workflow = approval_workflow_with_unreachable_task();
+        invalid_workflow.entry_node_id = "missing-entry".to_string();
+
+        let first_error = create_run(
+            State(state.clone()),
+            Json(create_run_request(invalid_workflow, Some("wrong"))),
+        )
+        .await
+        .unwrap_err();
+        assert_privileged_unlock_required(first_error);
+
+        let throttled = create_run(
+            State(state),
+            Json(create_run_request(
+                approval_workflow_with_unreachable_task(),
+                Some("correct"),
+            )),
+        )
+        .await
+        .unwrap_err();
+
+        assert_unlock_throttled(throttled);
+    }
+
+    #[tokio::test]
     async fn create_run_accepts_privileged_node_with_correct_unlock_secret() {
         let security = SecurityConfig {
             agent_user: None,
@@ -2289,6 +2711,38 @@ mod tests {
             response["streamToken"]
                 .as_str()
                 .is_some_and(|token| token.len() >= 32)
+        );
+    }
+
+    #[tokio::test]
+    async fn authorized_node_preview_invocation_uses_agent_user_downgrade() {
+        let node = approval_workflow_with_unreachable_task()
+            .nodes
+            .pop()
+            .unwrap();
+        let security = SecurityConfig {
+            agent_user: Some("preview-agent".to_string()),
+            unlock_password_hash: Some(sha256_unlock_password_hash("correct")),
+        };
+
+        let run_as = authorize_and_prepare_node_preview_security(
+            &node,
+            "/preview",
+            &security,
+            &UnlockThrottle::default(),
+            Some("correct"),
+        )
+        .await
+        .unwrap();
+        let invocation = crate::tmux_exec::build_tmux_invocation(&run_as, "preview_security");
+
+        assert_eq!(
+            invocation.prefix,
+            ["sudo", "-u", "preview-agent", "-H", "--"].map(str::to_string)
+        );
+        assert_eq!(
+            invocation.socket.as_deref(),
+            Some("silverbond-preview_security")
         );
     }
 
@@ -2709,6 +3163,140 @@ printf 'fallback-session\n'
         assert_eq!(runs[0]["runId"], "run_interrupted");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dismiss_run_reaps_only_the_interrupted_runs_tmux_sessions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (temp, state) = create_test_state(SecurityConfig::default()).await;
+        let dismissed_run_id = "run_interrupted_to_dismiss";
+        let running_run_id = "run_still_running";
+        let dismissed_session = "silverbond-Interrupted-Dismissed";
+        let running_session = "silverbond-Still-Running";
+        let socket = "dismissed-run-socket";
+        let script = temp.path().join("dismiss-tmux-prefix.sh");
+        let log = temp.path().join("dismiss-tmux-args.log");
+        let resolver_marker = temp.path().join("dismiss-tmux-resolver-ran");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\ndismissed=\"$2\"\nrunning=\"$3\"\nresolver_marker=\"$4\"\nshift 4\nif [ \"$1\" = \"zsh\" ]; then touch \"$resolver_marker\"; printf 'SBTMUX:tmux\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n%s\\n' \"$dismissed\" \"$running\"; fi\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let workflow = approval_workflow_with_run_as(vec![
+            script.to_string_lossy().into_owned(),
+            log.to_string_lossy().into_owned(),
+            dismissed_session.to_string(),
+            running_session.to_string(),
+            resolver_marker.to_string_lossy().into_owned(),
+        ]);
+        let mut workflow = workflow;
+        workflow.run_as.as_mut().unwrap().socket = Some(socket.to_string());
+        for (run_id, session) in [
+            (dismissed_run_id, dismissed_session),
+            (running_run_id, running_session),
+        ] {
+            let mut checkpoint = test_checkpoint();
+            checkpoint.run_id = run_id.to_string();
+            checkpoint.execution_log.run_id = run_id.to_string();
+            state
+                .runtime
+                .db
+                .upsert_run(&PersistedRun {
+                    stream_token: format!("stream-{run_id}"),
+                    tmux_invocation: None,
+                    checkpoint,
+                    workflow: workflow.clone(),
+                })
+                .await
+                .unwrap();
+            state
+                .runtime
+                .db
+                .register_tmux_session(run_id, session)
+                .await
+                .unwrap();
+        }
+
+        let Json(response) = dismiss_run(State(state.clone()), Path(dismissed_run_id.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(response, json!({ "success": true }));
+        assert!(
+            !state
+                .runtime
+                .db
+                .list_interrupted_runs()
+                .await
+                .unwrap()
+                .iter()
+                .any(|run| run.run_id == dismissed_run_id),
+            "dismissed run should leave the interrupted-run list"
+        );
+        assert!(
+            state
+                .runtime
+                .db
+                .list_run_tmux_session_names(dismissed_run_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "dismissed run should have its tmux registration reaped"
+        );
+        assert_eq!(
+            state
+                .runtime
+                .db
+                .list_run_tmux_session_names(running_run_id)
+                .await
+                .unwrap(),
+            vec![running_session.to_string()],
+            "another running run must retain its tmux registration"
+        );
+        assert!(
+            !resolver_marker.exists(),
+            "dismissal reaping must not resolve tmux"
+        );
+        let recorded = std::fs::read_to_string(log)
+            .expect("dismissal should issue invocation-scoped tmux commands");
+        let args = recorded.lines().collect::<Vec<_>>();
+        assert!(
+            args.windows(6).any(|window| window
+                == [
+                    "tmux",
+                    "-L",
+                    socket,
+                    "list-sessions",
+                    "-F",
+                    "#{session_name}"
+                ]),
+            "dismissal should list sessions under the run invocation; args={args:?}"
+        );
+        assert!(
+            args.windows(6).any(|window| window
+                == [
+                    "tmux",
+                    "-L",
+                    socket,
+                    "kill-session",
+                    "-t",
+                    dismissed_session
+                ]),
+            "dismissal should kill the interrupted run session; args={args:?}"
+        );
+        assert!(
+            !args
+                .windows(6)
+                .any(|window| window
+                    == ["tmux", "-L", socket, "kill-session", "-t", running_session]),
+            "dismissal must not kill another running run session; args={args:?}"
+        );
+    }
+
     #[test]
     fn origin_allowlist_accepts_tauri_and_local_development() {
         assert!(is_allowed_origin("tauri://localhost"));
@@ -2784,6 +3372,7 @@ printf 'fallback-session\n'
             runtime: crate::runtime::RuntimeContext::new(db.clone()),
             pane_streams: PaneStreamRegistry::default(),
             security: SecurityConfig::default(),
+            unlock_throttle: UnlockThrottle::default(),
         };
 
         let missing_run_id = "run_secret_missing";
@@ -2887,17 +3476,18 @@ printf 'fallback-session\n'
     #[tokio::test]
     async fn pane_stream_registry_fans_out_and_cleans_up() {
         let registry = PaneStreamRegistry::default();
+        let key = test_pane_stream_key("%1");
         let (sender, mut first_receiver) = broadcast::channel::<Vec<u8>>(256);
         let mut second_receiver = {
             let mut streams = registry.inner.lock().await;
             streams.insert(
-                "%1".to_string(),
+                key.clone(),
                 PaneStreamEntry {
                     sender: sender.clone(),
                     refcount: 1,
                 },
             );
-            let entry = streams.get_mut("%1").expect("pane stream entry exists");
+            let entry = streams.get_mut(&key).expect("pane stream entry exists");
             entry.refcount += 1;
             entry.sender.subscribe()
         };
@@ -2906,30 +3496,329 @@ printf 'fallback-session\n'
         assert_eq!(first_receiver.recv().await.unwrap(), b"chunk".to_vec());
         assert_eq!(second_receiver.recv().await.unwrap(), b"chunk".to_vec());
 
-        registry.unsubscribe("%1", &sender).await;
+        registry.unsubscribe(&key, &sender).await;
         assert_eq!(
             registry
                 .inner
                 .lock()
                 .await
-                .get("%1")
+                .get(&key)
                 .map(|entry| entry.refcount),
             Some(1)
         );
 
-        registry.unsubscribe("%1", &sender).await;
-        assert!(!registry.inner.lock().await.contains_key("%1"));
+        registry.unsubscribe(&key, &sender).await;
+        assert!(!registry.inner.lock().await.contains_key(&key));
+    }
+
+    #[tokio::test]
+    async fn pane_stream_registry_isolates_same_pane_id_on_different_tmux_servers() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let release = temp.path().join("release");
+        let fake_tmux = temp.path().join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            format!(
+                "#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.01; done\nexit 1\n",
+                release.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_tmux, permissions).unwrap();
+
+        let registry = PaneStreamRegistry::default();
+        let state = test_app_state(registry);
+        let first_invocation = TmuxInvocation {
+            prefix: Vec::new(),
+            socket: Some("server-a".to_string()),
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        };
+        let second_invocation = TmuxInvocation {
+            socket: Some("server-b".to_string()),
+            ..first_invocation.clone()
+        };
+
+        let (mut first_receiver, first_sender, _) =
+            subscribe_pane_stream(&state, "run-a", "pane", "%0", &first_invocation)
+                .await
+                .unwrap();
+        let (mut second_receiver, second_sender, _) =
+            subscribe_pane_stream(&state, "run-b", "pane", "%0", &second_invocation)
+                .await
+                .unwrap();
+
+        assert!(!first_sender.same_channel(&second_sender));
+        first_sender.send(b"first server".to_vec()).unwrap();
+        assert_eq!(
+            first_receiver.recv().await.unwrap(),
+            b"first server".to_vec()
+        );
+        assert!(matches!(
+            second_receiver.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        second_sender.send(b"second server".to_vec()).unwrap();
+        assert_eq!(
+            second_receiver.recv().await.unwrap(),
+            b"second server".to_vec()
+        );
+
+        std::fs::write(release, b"done").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_stream_fifo_is_cross_user_accessible_after_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let fake_tmux = temp.path().join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            "#!/bin/sh\nfor arg do command=$arg; done\nprintf 'pane bytes' | /bin/sh -c \"$command\" >/dev/null 2>&1 &\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_tmux, permissions).unwrap();
+        let invocation = TmuxInvocation {
+            prefix: Vec::new(),
+            socket: None,
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        };
+
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(1),
+            start_pane_stream(temp.path(), "%1", &invocation),
+        )
+        .await
+        .expect("stream setup must not block waiting for a writer")
+        .unwrap();
+        let stream_dir = temp.path().join("run-states");
+        let fifo = std::fs::read_dir(&stream_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().and_then(|value| value.to_str()) == Some("fifo"))
+            .expect("stream FIFO exists under SILVERBOND_ROOT");
+
+        assert_eq!(
+            std::fs::metadata(&stream_dir).unwrap().permissions().mode() & 0o777,
+            0o711
+        );
+        assert_eq!(
+            std::fs::metadata(fifo).unwrap().permissions().mode() & 0o777,
+            0o622,
+            "explicit chmod must restore other-write even when mkfifo applies umask"
+        );
+
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut bytes))
+            .await
+            .expect("pane stream must terminate after forwarding the writer's bytes")
+            .unwrap();
+        assert_eq!(bytes, b"pane bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_stream_fifo_accepts_a_writer_from_a_different_uid() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if unsafe { libc::geteuid() } != 0
+            || !std::path::Path::new("/usr/bin/sudo").exists()
+            || !Command::new("id")
+                .args(["-u", "daemon"])
+                .status()
+                .is_ok_and(|status| status.success())
+        {
+            eprintln!("different-UID pane stream test requires root, sudo, and the daemon user");
+            return;
+        }
+
+        let temp = tempfile::Builder::new()
+            .prefix("silverbond-pane-stream-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let fake_tmux = temp.path().join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            "#!/bin/sh\nfor arg do command=$arg; done\nprintf 'cross-user bytes' | /bin/sh -c \"$command\" >/dev/null 2>&1\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_tmux, permissions).unwrap();
+        let invocation = TmuxInvocation {
+            prefix: vec![
+                "/usr/bin/sudo".to_string(),
+                "-n".to_string(),
+                "-u".to_string(),
+                "daemon".to_string(),
+                "-H".to_string(),
+                "--".to_string(),
+            ],
+            socket: None,
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        };
+
+        let mut stream = start_pane_stream(temp.path(), "%1", &invocation)
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(Duration::from_secs(1), stream.read_to_end(&mut bytes))
+            .await
+            .expect("different-UID writer must terminate cleanly")
+            .unwrap();
+
+        assert_eq!(bytes, b"cross-user bytes");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_stream_writer_termination_closes_the_broadcast_stream() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let fake_tmux = temp.path().join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            "#!/bin/sh\nfor arg do command=$arg; done\n/bin/sh -c \"$command\" </dev/null >/dev/null 2>&1\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_tmux, permissions).unwrap();
+        let paths = AppPaths::from_root(temp.path());
+        let state = AppState {
+            paths: paths.clone(),
+            workflows: WorkflowStore::new(paths.workflows_dir.clone()),
+            templates: TemplateStore::new(paths.templates_dir.clone()),
+            runtime: crate::runtime::RuntimeContext::new(Database::new(
+                paths.database_path.clone(),
+            )),
+            pane_streams: PaneStreamRegistry::default(),
+            security: SecurityConfig::default(),
+            unlock_throttle: UnlockThrottle::default(),
+        };
+        let invocation = TmuxInvocation {
+            prefix: Vec::new(),
+            socket: None,
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        };
+
+        let (mut receiver, sender, key) =
+            subscribe_pane_stream(&state, "run-test", "pane-test", "%1", &invocation)
+                .await
+                .unwrap();
+        drop(sender);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("pane death must terminate the stream task and close its sender");
+        assert!(matches!(result, Err(broadcast::error::RecvError::Closed)));
+        assert!(
+            !state.pane_streams.inner.lock().await.contains_key(&key),
+            "terminal cleanup removes the dead pane's stream registry entry"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_death_before_live_bytes_sends_pane_stream_unavailable_frame() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let (temp, mut state) = create_test_state(SecurityConfig::default()).await;
+        let fake_tmux = temp.path().join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            "#!/bin/sh\nif [ \"$1\" = capture-pane ]; then printf snapshot; exit 0; fi\nif [ \"$#\" -gt 3 ]; then for arg do command=$arg; done; /bin/sh -c \"$command\" </dev/null >/dev/null 2>&1; fi\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake_tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake_tmux, permissions).unwrap();
+        state.runtime.run_invocation = Some(TmuxInvocation {
+            prefix: Vec::new(),
+            socket: None,
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        });
+        let run_id = state
+            .runtime
+            .start_run(approval_only_workflow(), BTreeMap::new(), None)
+            .await
+            .unwrap();
+        wait_for_pending_approval(&state.runtime.db, &run_id).await;
+        state
+            .runtime
+            .registry
+            .set_active_pane(&run_id, "active", "%1")
+            .await;
+        let stream_token = state
+            .runtime
+            .db
+            .get_run(&run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .stream_token;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router(state.clone())).await.unwrap();
+        });
+        let mut request = format!("ws://{address}/api/runs/{run_id}/panes/active/stream")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("origin", format!("http://{address}").parse().unwrap());
+        request
+            .headers_mut()
+            .insert("sec-websocket-protocol", stream_token.parse().unwrap());
+
+        let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let tokio_tungstenite::tungstenite::Message::Text(snapshot) = snapshot else {
+            panic!("expected snapshot websocket frame");
+        };
+        let tokio_tungstenite::tungstenite::Message::Text(error) = error else {
+            panic!("expected error websocket frame");
+        };
+        let snapshot: Value = serde_json::from_str(snapshot.as_str()).unwrap();
+        let error: Value = serde_json::from_str(error.as_str()).unwrap();
+
+        assert_eq!(snapshot["type"], "snapshot");
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"], "pane stream unavailable");
+
+        server.abort();
     }
 
     #[tokio::test]
     async fn pane_stream_registry_stale_unsubscribe_keeps_replacement_channel() {
         let registry = PaneStreamRegistry::default();
+        let key = test_pane_stream_key("%1");
         let (stale_sender, _stale_receiver) = broadcast::channel::<Vec<u8>>(16);
         let (replacement_sender, _replacement_receiver) = broadcast::channel::<Vec<u8>>(16);
         {
             let mut streams = registry.inner.lock().await;
             streams.insert(
-                "%1".to_string(),
+                key.clone(),
                 PaneStreamEntry {
                     sender: replacement_sender.clone(),
                     refcount: 1,
@@ -2937,10 +3826,10 @@ printf 'fallback-session\n'
             );
         }
 
-        registry.unsubscribe("%1", &stale_sender).await;
+        registry.unsubscribe(&key, &stale_sender).await;
 
         let streams = registry.inner.lock().await;
-        let entry = streams.get("%1").expect("replacement channel remains");
+        let entry = streams.get(&key).expect("replacement channel remains");
         assert!(entry.sender.same_channel(&replacement_sender));
         assert_eq!(entry.refcount, 1);
     }
@@ -2949,11 +3838,12 @@ printf 'fallback-session\n'
     async fn subscribe_pane_stream_rejects_when_subscriber_limit_reached() {
         let mut registry = PaneStreamRegistry::default();
         registry.max_subscribers_per_pane = 1;
+        let key = test_pane_stream_key("%1");
         let (sender, _receiver) = broadcast::channel::<Vec<u8>>(16);
         {
             let mut streams = registry.inner.lock().await;
             streams.insert(
-                "%1".to_string(),
+                key.clone(),
                 PaneStreamEntry {
                     sender: sender.clone(),
                     refcount: 1,
@@ -2980,7 +3870,7 @@ printf 'fallback-session\n'
                 .inner
                 .lock()
                 .await
-                .get("%1")
+                .get(&key)
                 .map(|entry| entry.refcount),
             Some(1)
         );
@@ -3043,11 +3933,12 @@ printf 'fallback-session\n'
     #[tokio::test]
     async fn pane_stream_registry_remove_if_sender_keeps_live_subscribers() {
         let registry = PaneStreamRegistry::default();
+        let key = test_pane_stream_key("%1");
         let (sender, _receiver) = broadcast::channel::<Vec<u8>>(16);
         {
             let mut streams = registry.inner.lock().await;
             streams.insert(
-                "%1".to_string(),
+                key.clone(),
                 PaneStreamEntry {
                     sender: sender.clone(),
                     refcount: 2,
@@ -3055,29 +3946,30 @@ printf 'fallback-session\n'
             );
         }
 
-        registry.remove_if_sender("%1", &sender).await;
+        registry.remove_if_sender(&key, &sender).await;
         assert_eq!(
             registry
                 .inner
                 .lock()
                 .await
-                .get("%1")
+                .get(&key)
                 .map(|entry| entry.refcount),
             Some(2)
         );
 
-        registry.remove_terminal_sender("%1", &sender).await;
-        assert!(!registry.inner.lock().await.contains_key("%1"));
+        registry.remove_terminal_sender(&key, &sender).await;
+        assert!(!registry.inner.lock().await.contains_key(&key));
     }
 
     #[tokio::test]
     async fn pane_stream_task_no_subscribers_uses_terminal_sender_cleanup() {
         let registry = PaneStreamRegistry::default();
+        let key = test_pane_stream_key("%1");
         let (sender, _receiver) = broadcast::channel::<Vec<u8>>(16);
         {
             let mut streams = registry.inner.lock().await;
             streams.insert(
-                "%1".to_string(),
+                key.clone(),
                 PaneStreamEntry {
                     sender: sender.clone(),
                     refcount: 2,
@@ -3085,15 +3977,15 @@ printf 'fallback-session\n'
             );
         }
 
-        cleanup_pane_stream_task_exit(&registry, "%1", &sender, PaneStreamTaskExit::NoSubscribers)
+        cleanup_pane_stream_task_exit(&registry, &key, &sender, PaneStreamTaskExit::NoSubscribers)
             .await;
-        assert!(!registry.inner.lock().await.contains_key("%1"));
+        assert!(!registry.inner.lock().await.contains_key(&key));
 
         let (new_sender, _new_receiver) = broadcast::channel::<Vec<u8>>(16);
         {
             let mut streams = registry.inner.lock().await;
             streams.insert(
-                "%1".to_string(),
+                key.clone(),
                 PaneStreamEntry {
                     sender: new_sender.clone(),
                     refcount: 1,
@@ -3101,10 +3993,10 @@ printf 'fallback-session\n'
             );
         }
 
-        cleanup_pane_stream_task_exit(&registry, "%1", &sender, PaneStreamTaskExit::NoSubscribers)
+        cleanup_pane_stream_task_exit(&registry, &key, &sender, PaneStreamTaskExit::NoSubscribers)
             .await;
         let streams = registry.inner.lock().await;
-        let entry = streams.get("%1").expect("new pane stream entry remains");
+        let entry = streams.get(&key).expect("new pane stream entry remains");
         assert!(entry.sender.same_channel(&new_sender));
         assert_eq!(entry.refcount, 1);
     }

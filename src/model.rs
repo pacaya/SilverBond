@@ -254,6 +254,12 @@ pub fn resolve_agent_config(
 
     let tool_toggles = merge!(tool_toggles).unwrap_or_default();
     let access_mode = merge!(access_mode).unwrap_or_default();
+    let access_profile_override = match &node.kind {
+        NodeKind::RunAgent {
+            run_agent_config, ..
+        } => run_agent_config.access.clone(),
+        _ => None,
+    };
 
     let cwd = node.cwd.clone().unwrap_or_else(|| workflow_cwd.to_string());
 
@@ -269,6 +275,7 @@ pub fn resolve_agent_config(
         ephemeral_session: !needs_session_persistence,
         json_schema,
         access_mode,
+        access_profile_override,
         tool_toggles,
         allowed_tools: overrides.and_then(|o| o.allowed_tools.clone()),
         disallowed_tools: overrides.and_then(|o| o.disallowed_tools.clone()),
@@ -869,7 +876,9 @@ pub struct WorkflowV3 {
     pub edges: Vec<WorkflowEdge>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agent_defaults: BTreeMap<String, AgentDefaults>,
-    /// Run-local catalog of saved workflows referenced by subflow/call nodes.
+    /// Root-level catalog of saved workflows referenced by subflow/call nodes.
+    /// Subflow names are globally scoped at the root; nested catalogs on subflow
+    /// bodies are unsupported and rejected at validation ingress.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub subflows: BTreeMap<String, Box<WorkflowV3>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1156,6 +1165,88 @@ fn validate_absolute_cwd(
     }
 }
 
+/// Whether a `WorkflowV3` body is the root document or a nested subflow body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowBodyScope {
+    Root,
+    Subflow,
+}
+
+/// Root-only execution settings that may exist on subflow bodies as dead data.
+fn validate_subflow_body_root_only_fields(
+    workflow: &WorkflowV3,
+    subflow_name: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    if workflow.run_as.is_some() {
+        issues.push(ValidationIssue {
+            severity: "warning".to_string(),
+            node_id: None,
+            scope: None,
+            message: format!(
+                "Subflow \"{subflow_name}\" defines runAs, but only the root workflow runAs is honored at execution time."
+            ),
+        });
+    }
+
+    if workflow.limits != WorkflowLimits::default() {
+        issues.push(ValidationIssue {
+            severity: "warning".to_string(),
+            node_id: None,
+            scope: None,
+            message: format!(
+                "Subflow \"{subflow_name}\" defines custom limits, but only the root workflow limits are honored at execution time."
+            ),
+        });
+    }
+}
+
+fn validate_workflow_body_for_scope(
+    workflow: &WorkflowV3,
+    scope: WorkflowBodyScope,
+    subflow_name: Option<&str>,
+    issues: &mut Vec<ValidationIssue>,
+) -> Result<(), ValidationIssue> {
+    match scope {
+        WorkflowBodyScope::Root => Ok(()),
+        WorkflowBodyScope::Subflow => {
+            let subflow_name = subflow_name.ok_or_else(|| ValidationIssue {
+                severity: "error".to_string(),
+                node_id: None,
+                scope: None,
+                message: "internal error: subflow scope requires a subflow name".to_string(),
+            })?;
+
+            if !workflow.subflows.is_empty() {
+                return Err(ValidationIssue {
+                    severity: "error".to_string(),
+                    node_id: None,
+                    scope: None,
+                    message: format!(
+                        "Subflow \"{subflow_name}\" contains a nested subflow catalog; subflow names are globally scoped at the root and nested catalogs are unsupported."
+                    ),
+                });
+            }
+
+            validate_subflow_body_root_only_fields(workflow, subflow_name, issues);
+            Ok(())
+        }
+    }
+}
+
+fn reject_nested_subflow_catalogs(workflow: &WorkflowV3) -> Result<(), ValidationIssue> {
+    let mut issues = Vec::new();
+    for (subflow_name, subflow) in &workflow.subflows {
+        validate_workflow_body_for_scope(
+            subflow,
+            WorkflowBodyScope::Subflow,
+            Some(subflow_name),
+            &mut issues,
+        )?;
+    }
+    Ok(())
+}
+
 pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
     let workflow = ensure_defaults(workflow);
     if let Err(issue) = validate_workflow_input_bounds(&workflow) {
@@ -1169,6 +1260,10 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
     let mut issues = Vec::new();
 
     validate_run_as_config(workflow.run_as.as_ref(), &mut issues);
+    let _ = validate_workflow_body_for_scope(&workflow, WorkflowBodyScope::Root, None, &mut issues);
+    for (subflow_name, subflow) in &workflow.subflows {
+        validate_subflow_body_root_only_fields(subflow, subflow_name, &mut issues);
+    }
     validate_graph_body(&workflow, &workflow.subflows, "", &mut issues);
 
     let graph = workflow.graph();
@@ -1215,6 +1310,8 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
 }
 
 pub(crate) fn validate_workflow_input_bounds(workflow: &WorkflowV3) -> Result<(), ValidationIssue> {
+    reject_nested_subflow_catalogs(workflow)?;
+
     let subflow_count = workflow.subflows.len();
     if subflow_count > MAX_WORKFLOW_SUBFLOWS {
         return Err(ValidationIssue {
@@ -4109,6 +4206,116 @@ mod tests {
             "got {}",
             cycle_warnings[0].message
         );
+    }
+
+    #[test]
+    fn rejects_nested_subflow_catalogs_at_ingress() {
+        let mut nested = workflow(
+            vec![node("inner", "Inner", WorkflowNodeType::Task)],
+            vec![],
+            "inner",
+        );
+        nested.subflows.insert(
+            "nested".to_string(),
+            Box::new(workflow(
+                vec![node("leaf", "Leaf", WorkflowNodeType::Task)],
+                vec![],
+                "leaf",
+            )),
+        );
+
+        let mut parent = workflow(
+            vec![node("start", "Start", WorkflowNodeType::Task)],
+            vec![],
+            "start",
+        );
+        parent.subflows.insert("outer".to_string(), Box::new(nested));
+
+        let result = validate_workflow(parent);
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.message.contains("nested subflow catalog")
+                && issue.message.contains("globally scoped at the root")
+        }));
+    }
+
+    #[test]
+    fn rejects_nested_subflow_catalog_used_to_bypass_subflow_count_limit() {
+        let mut parent = workflow(
+            vec![node("start", "Start", WorkflowNodeType::Task)],
+            vec![],
+            "start",
+        );
+        for index in 0..MAX_WORKFLOW_SUBFLOWS {
+            let node_id = format!("node-{index}");
+            parent.subflows.insert(
+                format!("subflow-{index}"),
+                Box::new(workflow(
+                    vec![node(&node_id, "Step", WorkflowNodeType::Task)],
+                    vec![],
+                    &node_id,
+                )),
+            );
+        }
+
+        let mut nested_host = workflow(
+            vec![node("host", "Host", WorkflowNodeType::Task)],
+            vec![],
+            "host",
+        );
+        nested_host.subflows.insert(
+            "overflow".to_string(),
+            Box::new(workflow(
+                vec![node("overflow-node", "Overflow", WorkflowNodeType::Task)],
+                vec![],
+                "overflow-node",
+            )),
+        );
+        parent
+            .subflows
+            .insert("nested-host".to_string(), Box::new(nested_host));
+
+        let result = validate_workflow(parent);
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error" && issue.message.contains("nested subflow catalog")
+        }));
+    }
+
+    #[test]
+    fn warns_when_subflow_defines_root_only_run_as_or_limits() {
+        let mut subflow = workflow(
+            vec![node("step", "Step", WorkflowNodeType::Task)],
+            vec![],
+            "step",
+        );
+        subflow.run_as = Some(RunAsConfig {
+            user: Some("sandbox".to_string()),
+            ..Default::default()
+        });
+        subflow.limits = WorkflowLimits {
+            max_total_steps: 99,
+            max_visits_per_node: 9,
+        };
+
+        let mut parent = workflow(
+            vec![node("start", "Start", WorkflowNodeType::Task)],
+            vec![],
+            "start",
+        );
+        parent.subflows.insert("child".to_string(), Box::new(subflow));
+
+        let result = validate_workflow(parent);
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "warning"
+                && issue.message.contains("Subflow \"child\" defines runAs")
+        }));
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "warning"
+                && issue.message.contains("Subflow \"child\" defines custom limits")
+        }));
     }
 
     #[test]

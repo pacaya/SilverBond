@@ -1,5 +1,7 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/svelte";
-import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { tick } from "svelte";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { api, ApiError } from "@/lib/api/client";
 import { store } from "@/lib/stores/workflowStore.svelte";
 import type {
   AgentCapabilities,
@@ -107,8 +109,47 @@ function renderInspector(
 
 describe("InspectorPanel", () => {
   afterEach(() => {
+    vi.restoreAllMocks();
     cleanup();
     store.createWorkflow();
+  });
+
+  it("prompts for an unlock secret and retries a privileged node preview", async () => {
+    const taskNode: WorkflowNode = {
+      id: "preview-task",
+      name: "Preview task",
+      kind: { type: "task" },
+      agent: "echo",
+      prompt: "Preview task",
+      contextSources: [],
+      responseFormat: null,
+    };
+    const testNode = vi.spyOn(api, "testNode")
+      .mockRejectedValueOnce(new ApiError(
+        "Privileged run requires unlock password.",
+        403,
+        { code: "privileged_unlock_required" },
+      ))
+      .mockResolvedValueOnce({ success: true } as never);
+    const prompt = vi.spyOn(window, "prompt").mockReturnValue("preview-unlock");
+
+    renderInspector(workflow({
+      entryNodeId: taskNode.id,
+      nodes: [taskNode],
+    }), taskNode.id);
+
+    await fireEvent.click(screen.getByRole("button", { name: /Test/ }));
+    await fireEvent.click(screen.getByRole("button", { name: "Run preview" }));
+
+    await waitFor(() => expect(testNode).toHaveBeenCalledTimes(2));
+    expect(prompt).toHaveBeenCalledWith("Unlock password");
+    expect(testNode).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ id: "preview-task" }),
+      "",
+      { previousOutput: "" },
+      "preview-unlock",
+    );
   });
 
   it("edits run_agent agent and prompt through runAgentConfig", async () => {
@@ -237,6 +278,30 @@ describe("InspectorPanel", () => {
     expect(storedNode.kind.agentConfig?.accessMode).toBeUndefined();
   });
 
+  it("persists run-as user and socket and clears empty runAs", async () => {
+    const { container } = renderInspector(workflow());
+
+    const userField = Array.from(container.querySelectorAll("label.field")).find(
+      (label) => label.textContent?.includes("User"),
+    );
+    const userInput = userField?.querySelector("input") as HTMLInputElement;
+    await fireEvent.input(userInput, { target: { value: "sandbox" } });
+    expect(store.workflow!.runAs?.user).toBe("sandbox");
+
+    const socketField = Array.from(container.querySelectorAll("label.field")).find(
+      (label) => label.textContent?.includes("Socket"),
+    );
+    const socketInput = socketField?.querySelector("input") as HTMLInputElement;
+    await fireEvent.input(socketInput, { target: { value: "silver" } });
+    expect(store.workflow!.runAs).toEqual({ user: "sandbox", socket: "silver" });
+
+    await fireEvent.input(userInput, { target: { value: "  " } });
+    expect(store.workflow!.runAs).toEqual({ socket: "silver" });
+
+    await fireEvent.input(socketInput, { target: { value: "" } });
+    expect(store.workflow!.runAs).toBeUndefined();
+  });
+
   it("round-trips run-as command prefix as one argv element per line", async () => {
     const { container } = renderInspector(workflow({
       runAs: {
@@ -257,5 +322,64 @@ describe("InspectorPanel", () => {
 
     expect(store.workflow!.runAs?.command).toEqual(["doas", "-u", "Agent User"]);
     expect(screen.getByText("doas -u Agent User tmux -L silver attach -t <session>")).toBeInTheDocument();
+  });
+
+  it("hides Run As and Limits when drilled into a subflow", async () => {
+    const subflowA = workflow({
+      name: "A",
+      entryNodeId: "a1",
+      nodes: [{
+        id: "a1",
+        name: "Step",
+        kind: { type: "task" },
+        agent: "claude",
+        prompt: "Do work",
+        contextSources: [],
+        responseFormat: null,
+      }],
+    });
+    renderInspector(workflow({
+      runAs: { user: "root-user", socket: "root-socket" },
+      limits: { maxTotalSteps: 100, maxVisitsPerNode: 20 },
+      entryNodeId: "call_a",
+      nodes: [{
+        id: "call_a",
+        name: "Call A",
+        kind: {
+          type: "subflow",
+          subflowConfig: { workflowName: "A", inputs: [], maxDepth: 10 },
+        },
+        agent: null,
+        prompt: "",
+        contextSources: [],
+        responseFormat: null,
+      }],
+      subflows: { A: subflowA },
+    }));
+
+    expect(screen.getByText("Run As / Sandbox")).toBeInTheDocument();
+    expect(screen.getByText("Limits")).toBeInTheDocument();
+
+    expect(store.drillIntoSubflow("call_a")).toBe(true);
+    // drillIntoSubflow is called directly here (not via the "Open subgraph"
+    // button's onclick), bypassing the DOM event dispatch that would
+    // otherwise trigger Svelte's synchronous effect flush. A real user
+    // interaction re-renders immediately; a direct store mutation needs an
+    // explicit tick(), matching the pattern used elsewhere in this codebase
+    // (see AppShell.validation.test.ts).
+    await tick();
+
+    expect(screen.queryByText("Run As / Sandbox")).not.toBeInTheDocument();
+    expect(screen.queryByText("Limits")).not.toBeInTheDocument();
+
+    store.updateWorkflow((wf) => {
+      wf.runAs = { user: "subflow-user" };
+      wf.limits = { maxTotalSteps: 999, maxVisitsPerNode: 999 };
+    });
+
+    expect(store.workflow!.runAs).toEqual({ user: "root-user", socket: "root-socket" });
+    expect(store.workflow!.limits).toEqual({ maxTotalSteps: 100, maxVisitsPerNode: 20 });
+    expect(store.activeWorkflow!.runAs).toEqual({ user: "subflow-user" });
+    expect(store.activeWorkflow!.limits).toEqual({ maxTotalSteps: 999, maxVisitsPerNode: 999 });
   });
 });

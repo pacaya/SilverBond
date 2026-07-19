@@ -525,6 +525,21 @@ impl Database {
     pub(crate) async fn list_reapable_tmux_sessions(
         &self,
     ) -> anyhow::Result<Vec<ReapableTmuxSession>> {
+        self.list_reapable_tmux_sessions_for_run_id(None).await
+    }
+
+    pub(crate) async fn list_reapable_tmux_sessions_for_run(
+        &self,
+        run_id: &str,
+    ) -> anyhow::Result<Vec<ReapableTmuxSession>> {
+        self.list_reapable_tmux_sessions_for_run_id(Some(run_id.to_string()))
+            .await
+    }
+
+    async fn list_reapable_tmux_sessions_for_run_id(
+        &self,
+        run_id: Option<String>,
+    ) -> anyhow::Result<Vec<ReapableTmuxSession>> {
         let path = self.path.clone();
         let connection = self.connection.clone();
         spawn_blocking(move || -> anyhow::Result<Vec<ReapableTmuxSession>> {
@@ -541,10 +556,11 @@ impl Database {
                     INNER JOIN run_tmux_sessions
                         ON run_tmux_sessions.run_id = runs.run_id
                     WHERE runs.status IN ('completed', 'failed', 'aborted', 'restarted')
+                        AND (?1 IS NULL OR runs.run_id = ?1)
                     ORDER BY runs.run_id, run_tmux_sessions.session_name
                     "#,
                 )?;
-                let rows = stmt.query_map([], |row| {
+                let rows = stmt.query_map(params![run_id], |row| {
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
@@ -1053,7 +1069,9 @@ fn decode_tmux_invocation(
 fn backfill_legacy_tmux_sessions(conn: &Connection) -> anyhow::Result<()> {
     let transaction = conn.unchecked_transaction()?;
     let legacy_rows = {
-        let mut stmt = transaction.prepare("SELECT run_id, state_json FROM runs")?;
+        let mut stmt = transaction.prepare(
+            "SELECT run_id, state_json FROM runs WHERE state_json LIKE '%tmuxSessions%'",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;

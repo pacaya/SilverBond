@@ -5,6 +5,8 @@ import {
   ensureCanvas,
 } from "@/lib/types/workflow";
 import type {
+  ContextSource,
+  InputBinding,
   RunEvent,
   RunObservability,
   SplitFailurePolicy,
@@ -14,6 +16,7 @@ import type {
   WorkflowEdge,
   WorkflowNode,
   WorkflowNodeType,
+  WorkflowVariable,
 } from "@/lib/types/workflow";
 import { defaultNodeKind, defaultNodeName } from "@/lib/stores/nodeMetadata";
 import { formatTokens } from "@/lib/utils/format";
@@ -37,7 +40,10 @@ type SaveCompoundFailureCode =
   | "invalid_name"
   | "name_in_use"
   | "multiple_entry_nodes"
-  | "multiple_exit_nodes";
+  | "multiple_exit_nodes"
+  | "invalid_outbound_edge"
+  | "non_producible_outcome"
+  | "unsupported_dependency";
 
 export type SaveSelectionAsCompoundResult =
   | { ok: true; nodeId: string }
@@ -95,6 +101,219 @@ function compoundFailure(
   return { ok: false, code, reason };
 }
 
+const COMPOUND_VAR_RE = /\{\{var:([^}]+)\}\}/g;
+const COMPOUND_NODE_OUTPUT_FIELD_RE = /\{\{node:([^.}]+)\.output\.([^}]+)\}\}/g;
+const COMPOUND_NODE_PARSED_FIELD_RE = /\{\{node:([^.}]+)\.parsedOutput\.([^}]+)\}\}/g;
+const COMPOUND_NODE_OUTPUT_RE = /\{\{node:([^.}]+)\.output\}\}/g;
+const COMPOUND_CONTEXT_RE = /\{\{context:([^}]+)\}\}/g;
+
+function compoundNodePrompts(node: WorkflowNode): string[] {
+  const texts = [node.prompt];
+  if (node.kind.type === "decide") {
+    texts.push(node.kind.decideConfig.prompt);
+  }
+  return texts;
+}
+
+function compoundHasFieldPathRefs(text: string): boolean {
+  COMPOUND_NODE_OUTPUT_FIELD_RE.lastIndex = 0;
+  if (COMPOUND_NODE_OUTPUT_FIELD_RE.test(text)) return true;
+  COMPOUND_NODE_PARSED_FIELD_RE.lastIndex = 0;
+  return COMPOUND_NODE_PARSED_FIELD_RE.test(text);
+}
+
+function compoundOutboundOutcomeAllowed(edge: WorkflowEdge): boolean {
+  if (edge.outcome === "success") return true;
+  if (edge.outcome === "branch" && edge.condition != null) return true;
+  return false;
+}
+
+function compoundUniqueVarName(base: string, used: Set<string>): string {
+  const sanitized = base.replace(/[^a-zA-Z0-9_]/g, "_").replace(/^_+|_+$/g, "") || "ref";
+  let candidate = sanitized;
+  let suffix = 2;
+  while (used.has(candidate)) {
+    candidate = `${sanitized}_${suffix}`;
+    suffix += 1;
+  }
+  used.add(candidate);
+  return candidate;
+}
+
+interface CompoundDependencyPlan {
+  compoundId: string;
+  subflowVariables: WorkflowVariable[];
+  callInputs: InputBinding[];
+  movedNodes: WorkflowNode[];
+  outsideNodePatches: Map<string, { prompt?: string; contextSources?: ContextSource[] }>;
+}
+
+function planCompoundDependencies(
+  active: WorkflowDocument,
+  selected: Set<string>,
+  selNodes: WorkflowNode[],
+  exit: WorkflowNode,
+): CompoundDependencyPlan | SaveSelectionAsCompoundResult {
+  const compoundId = createNodeId();
+  const varNames = new Set<string>();
+  const subflowVariables = new Map<string, WorkflowVariable>();
+  const callInputs = new Map<string, InputBinding>();
+  const movedNodes = structuredClone(selNodes) as WorkflowNode[];
+  const movedById = new Map(movedNodes.map((node) => [node.id, node]));
+  const outsideNodePatches = new Map<string, { prompt?: string; contextSources?: ContextSource[] }>();
+
+  const declareBinding = (name: string, source: string) => {
+    if (!subflowVariables.has(name)) {
+      subflowVariables.set(name, { name, default: "" });
+      callInputs.set(name, { name, source });
+    }
+  };
+
+  const reject = (reason: string): SaveSelectionAsCompoundResult =>
+    compoundFailure("unsupported_dependency", reason);
+
+  const rewriteMovedText = (nodeId: string, rewrite: (text: string) => string) => {
+    const node = movedById.get(nodeId);
+    if (!node) return;
+    node.prompt = rewrite(node.prompt);
+    if (node.kind.type === "decide") {
+      node.kind.decideConfig.prompt = rewrite(node.kind.decideConfig.prompt);
+    }
+  };
+
+  const outsideVarByNodeId = new Map<string, string>();
+
+  const bindOutsideNodeOutput = (outsideId: string, targetNodeId: string) => {
+    let varName = outsideVarByNodeId.get(outsideId);
+    if (!varName) {
+      varName = compoundUniqueVarName(`from_${outsideId}`, varNames);
+      outsideVarByNodeId.set(outsideId, varName);
+      declareBinding(varName, `node:${outsideId}.output`);
+    }
+    rewriteMovedText(targetNodeId, (text) =>
+      text
+        .replaceAll(`{{node:${outsideId}.output}}`, `{{var:${varName}}}`)
+        .replaceAll(`{{${outsideId}}}`, `{{var:${varName}}}`),
+    );
+  };
+
+  for (const node of movedNodes) {
+    for (const text of compoundNodePrompts(node)) {
+      if (compoundHasFieldPathRefs(text)) {
+        return reject(
+          `Selection contains a field-path template reference that cannot be preserved across a compound boundary.`,
+        );
+      }
+    }
+
+    for (const text of compoundNodePrompts(node)) {
+      for (const match of text.matchAll(COMPOUND_VAR_RE)) {
+        const varName = match[1];
+        declareBinding(varName, `var:${varName}`);
+      }
+    }
+
+    for (const text of compoundNodePrompts(node)) {
+      for (const match of text.matchAll(COMPOUND_NODE_OUTPUT_RE)) {
+        const refNodeId = match[1];
+        if (selected.has(refNodeId)) continue;
+        bindOutsideNodeOutput(refNodeId, node.id);
+      }
+      for (const refNodeId of active.nodes.map((candidate) => candidate.id)) {
+        if (selected.has(refNodeId)) continue;
+        if (!text.includes(`{{${refNodeId}}}`)) continue;
+        bindOutsideNodeOutput(refNodeId, node.id);
+      }
+    }
+
+    for (const context of node.contextSources ?? []) {
+      if (!context.name) continue;
+      if (selected.has(context.nodeId)) {
+        return reject(
+          `Context source "${context.name}" references a node inside the selection; move the reference to the exit output or remove it before saving.`,
+        );
+      }
+      declareBinding(context.name, `node:${context.nodeId}.output`);
+      rewriteMovedText(node.id, (text) =>
+        text.replaceAll(`{{context:${context.name}}}`, `{{var:${context.name}}}`),
+      );
+      node.contextSources = (node.contextSources ?? []).filter((entry) => entry !== context);
+    }
+  }
+
+  for (const node of active.nodes) {
+    if (selected.has(node.id)) continue;
+
+    for (const text of compoundNodePrompts(node)) {
+      if (compoundHasFieldPathRefs(text)) {
+        return reject(
+          `A node outside the selection uses a field-path template reference to a moved node; compound extraction cannot preserve it.`,
+        );
+      }
+    }
+
+    for (const context of node.contextSources ?? []) {
+      if (!selected.has(context.nodeId)) continue;
+      if (context.nodeId !== exit.id) {
+        return reject(
+          `Context source "${context.name}" on "${node.name}" references a non-exit node inside the selection.`,
+        );
+      }
+    }
+
+    let prompt = node.prompt;
+    let contextSources = node.contextSources;
+    let changed = false;
+
+    for (const match of prompt.matchAll(COMPOUND_NODE_OUTPUT_RE)) {
+      const refNodeId = match[1];
+      if (!selected.has(refNodeId)) continue;
+      if (refNodeId !== exit.id) {
+        return reject(
+          `Node "${node.name}" references "${refNodeId}" inside the selection, but only the exit node may be referenced from outside.`,
+        );
+      }
+      prompt = prompt
+        .replaceAll(`{{node:${refNodeId}.output}}`, `{{node:${compoundId}.output}}`)
+        .replaceAll(`{{${refNodeId}}}`, `{{${compoundId}}}`);
+      changed = true;
+    }
+
+    for (const refNodeId of selNodes.map((candidate) => candidate.id)) {
+      if (!prompt.includes(`{{${refNodeId}}}`)) continue;
+      if (refNodeId !== exit.id) {
+        return reject(
+          `Node "${node.name}" references "${refNodeId}" inside the selection, but only the exit node may be referenced from outside.`,
+        );
+      }
+      prompt = prompt.replaceAll(`{{${refNodeId}}}`, `{{${compoundId}}}`);
+      changed = true;
+    }
+
+    if (contextSources?.some((context) => selected.has(context.nodeId))) {
+      contextSources = contextSources.map((context) =>
+        selected.has(context.nodeId) ? { ...context, nodeId: compoundId } : context,
+      );
+      changed = true;
+    }
+
+    if (changed) {
+      outsideNodePatches.set(node.id, {
+        ...(prompt !== node.prompt ? { prompt } : {}),
+        ...(contextSources !== node.contextSources ? { contextSources } : {}),
+      });
+    }
+  }
+
+  return {
+    compoundId,
+    subflowVariables: [...subflowVariables.values()],
+    callInputs: [...callInputs.values()],
+    movedNodes,
+    outsideNodePatches,
+  };
+}
+
 /* ── Undo stack ─────────────────────────────────────────────────────── */
 
 interface UndoEntry {
@@ -134,6 +353,8 @@ class WorkflowStore {
   interactions = $state<InteractionState[]>([]);
   errorMessage = $state<string>("");
   #errorTimer: ReturnType<typeof setTimeout> | undefined;
+  #runStreamAbort: AbortController | null = null;
+  runEpoch = 0;
 
   /* ── live pane terminal ───────────────────────────────────────────── */
   selectedPane = $state<string>("active");
@@ -452,6 +673,7 @@ class WorkflowStore {
 
     const hasInternalInbound = new Set(internalEdges.map((e) => e.to));
     const inboundTargets = new Set(inboundEdges.map((e) => e.to));
+    // Entry = targeted from outside the selection, or has no inbound edge from within it.
     const entryCandidates = selNodes.filter(
       (n) => inboundTargets.has(n.id) || !hasInternalInbound.has(n.id),
     );
@@ -471,10 +693,33 @@ class WorkflowStore {
       );
     }
 
-    this.pushUndo();
-    const wf = this.resolveActiveMutable(this.workflow);
     const entry = entryCandidates[0];
     const exit = exitCandidates[0];
+
+    for (const edge of outboundEdges) {
+      if (edge.from !== exit.id) {
+        return compoundFailure(
+          "invalid_outbound_edge",
+          `Selection has an outbound edge from "${edge.from}" that is not the exit node "${exit.id}". Only the exit node may connect outside the compound.`,
+        );
+      }
+      if (!compoundOutboundOutcomeAllowed(edge)) {
+        return compoundFailure(
+          "non_producible_outcome",
+          `Outbound edge "${edge.id}" uses outcome "${edge.outcome}" that a compound node cannot produce. Only success and conditioned branch edges are allowed from the exit.`,
+        );
+      }
+    }
+
+    const selNodesPlain = structuredClone($state.snapshot(selNodes)) as WorkflowNode[];
+    const dependencyPlan = planCompoundDependencies(active, selected, selNodesPlain, exit);
+    if ("ok" in dependencyPlan) {
+      return dependencyPlan;
+    }
+    const plan = dependencyPlan;
+
+    this.pushUndo();
+    const wf = this.resolveActiveMutable(this.workflow);
 
     // Build the subflow document (deep clone so it is decoupled from the parent).
     const positions = (active.ui?.canvas ?? defaultCanvas(active)).nodes;
@@ -485,9 +730,9 @@ class WorkflowStore {
       cwd: active.cwd,
       useOrchestrator: false,
       entryNodeId: entry.id,
-      variables: [],
+      variables: plan.subflowVariables,
       limits: { maxTotalSteps: 50, maxVisitsPerNode: 10 },
-      nodes: structuredClone($state.snapshot(selNodes)) as WorkflowNode[],
+      nodes: structuredClone($state.snapshot(plan.movedNodes)) as WorkflowNode[],
       edges: structuredClone($state.snapshot(internalEdges)) as WorkflowEdge[],
       ui: {
         canvas: {
@@ -508,13 +753,18 @@ class WorkflowStore {
       ? { x: pts.reduce((s, p) => s + p.x, 0) / pts.length, y: pts.reduce((s, p) => s + p.y, 0) / pts.length }
       : { x: 200, y: 200 };
 
-    const compoundId = createNodeId();
+    const compoundId = plan.compoundId;
     const compoundNode: WorkflowNode = {
       id: compoundId,
       name,
       kind: {
         type: "subflow",
-        subflowConfig: { workflowName: name, exitNodeId: exit.id, inputs: [], maxDepth: 10 },
+        subflowConfig: {
+          workflowName: name,
+          exitNodeId: exit.id,
+          inputs: plan.callInputs,
+          maxDepth: 10,
+        },
       },
       agent: null,
       prompt: "",
@@ -526,6 +776,13 @@ class WorkflowStore {
     wf.nodes = wf.nodes.filter((n) => !selected.has(n.id));
     wf.edges = wf.edges.filter((e) => !(selected.has(e.from) && selected.has(e.to)));
     wf.nodes.push(compoundNode);
+
+    for (const [nodeId, patch] of plan.outsideNodePatches) {
+      const outsideNode = wf.nodes.find((n) => n.id === nodeId);
+      if (!outsideNode) continue;
+      if (patch.prompt !== undefined) outsideNode.prompt = patch.prompt;
+      if (patch.contextSources !== undefined) outsideNode.contextSources = patch.contextSources;
+    }
 
     // Rewire boundary edges onto the compound node.
     for (const edge of wf.edges) {
@@ -559,7 +816,27 @@ class WorkflowStore {
     this.lines = [];
   }
 
+  private cancelRunStream() {
+    this.#runStreamAbort?.abort();
+    this.#runStreamAbort = null;
+  }
+
+  beginRunStream(): { epoch: number; signal: AbortSignal } {
+    this.cancelRunStream();
+    this.runEpoch += 1;
+    const epoch = this.runEpoch;
+    const controller = new AbortController();
+    this.#runStreamAbort = controller;
+    return { epoch, signal: controller.signal };
+  }
+
+  isRunEpochStale(epoch: number): boolean {
+    return epoch !== this.runEpoch;
+  }
+
   resetRun() {
+    this.cancelRunStream();
+    this.runEpoch += 1;
     this.runId = null;
     this.streamToken = null;
     this.running = false;
@@ -611,7 +888,9 @@ class WorkflowStore {
     }
   }
 
-  applyRunEvent(event: RunEvent) {
+  applyRunEvent(event: RunEvent, epoch?: number) {
+    if (epoch !== undefined && this.isRunEpochStale(epoch)) return;
+
     const nodeId = typeof event.nodeId === "string" ? event.nodeId : null;
     const push = (tone: RunLine["tone"], text: string) => {
       this.lines.push({ tone, text });
@@ -751,7 +1030,7 @@ class WorkflowStore {
         if (typeof event.sessionId === "string" && event.sessionId) {
           this.interactions = this.interactions.filter((item) => item.sessionId !== event.sessionId);
         } else {
-          this.interactions = this.interactions.slice(1);
+          console.warn("agent_interaction_resolved event missing sessionId; ignoring", event);
         }
         break;
       case "done":
@@ -764,7 +1043,12 @@ class WorkflowStore {
         break;
     }
 
-    if (typeof event.runId === "string") this.runId = event.runId;
+    if (
+      typeof event.runId === "string" &&
+      (this.runId === null || event.runId === this.runId)
+    ) {
+      this.runId = event.runId;
+    }
   }
 }
 

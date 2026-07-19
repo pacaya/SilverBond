@@ -1,4 +1,9 @@
 import { defineConfig } from "@playwright/test";
+import { ensureE2EUnlockCredentials } from "./ui/e2e/global-setup";
+
+// Playwright 1.58 starts webServer plugins before invoking globalSetup. Run the
+// same idempotent setup while loading the config so webServer.env gets the pair.
+ensureE2EUnlockCredentials();
 
 const testUnlockPasswordHash =
   process.env.SILVERBOND_UNLOCK_PASSWORD_HASH ??
@@ -11,6 +16,7 @@ const inheritedEnv = Object.fromEntries(
 );
 
 export default defineConfig({
+  globalSetup: "./ui/e2e/global-setup.ts",
   testDir: "./ui/e2e",
   use: {
     baseURL: "http://127.0.0.1:3333",
@@ -24,7 +30,8 @@ export default defineConfig({
       SILVERBOND_UNLOCK_PASSWORD_HASH: testUnlockPasswordHash,
     },
     url: "http://127.0.0.1:3333/api/health",
-    reuseExistingServer: !process.env.CI,
+    // Stop `just server` before `just test-e2e`; a process on :3333 is a hard failure.
+    reuseExistingServer: false,
     timeout: 120_000,
   },
 });

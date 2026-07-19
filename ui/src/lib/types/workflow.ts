@@ -611,9 +611,31 @@ export function normalizeWorkflowNode(node: WorkflowNode): WorkflowNode {
 }
 
 export function normalizeWorkflowNodes(workflow: WorkflowDocument): WorkflowDocument {
+  const nodes = workflow.nodes.map(normalizeWorkflowNode);
+  const nodesChanged = nodes.some((node, i) => node !== workflow.nodes[i]);
+
+  let subflows = workflow.subflows;
+  if (workflow.subflows) {
+    let subflowsChanged = false;
+    const nextSubflows: Record<string, WorkflowDocument> = {};
+    for (const [key, doc] of Object.entries(workflow.subflows)) {
+      const normalized = normalizeWorkflowNodes(doc);
+      if (normalized !== doc) subflowsChanged = true;
+      nextSubflows[key] = normalized;
+    }
+    if (subflowsChanged) {
+      subflows = nextSubflows;
+    }
+  }
+
+  if (!nodesChanged && subflows === workflow.subflows) {
+    return workflow;
+  }
+
   return {
     ...workflow,
-    nodes: workflow.nodes.map(normalizeWorkflowNode),
+    nodes,
+    ...(subflows !== undefined ? { subflows } : {}),
   };
 }
 

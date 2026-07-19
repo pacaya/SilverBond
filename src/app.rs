@@ -1,7 +1,13 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{Router, routing::get};
 use sha2::{Digest, Sha256};
+use tmux_tools_core::TmuxInvocation;
 use tokio::sync::{Mutex, broadcast};
 
 use crate::{
@@ -91,6 +97,11 @@ fn env_config_value(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+// Threat model: the unlock hash is loaded only into the server process environment/config;
+// SecurityConfig is not serializable and is never logged, returned, or persisted. Contained-agent
+// launches use `sudo -u <user> -H --` without `-E`, so sudo's env_reset does not forward the hash.
+// Disclosure therefore already requires the server uid that unlocking grants; global failed-attempt
+// throttling, rather than a KDF, is the control for guesses through the HTTP unlock path.
 fn verify_sha256_unlock_hash(secret: &str, hash: &str) -> bool {
     let Some(expected_hex) = hash.strip_prefix("sha256:") else {
         return false;
@@ -114,6 +125,49 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+const INITIAL_UNLOCK_RETRY_DELAY: Duration = Duration::from_secs(5);
+const MAX_UNLOCK_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Default)]
+pub struct UnlockThrottle {
+    inner: Arc<Mutex<UnlockThrottleState>>,
+}
+
+#[derive(Default)]
+struct UnlockThrottleState {
+    failed_attempts: u32,
+    blocked_until: Option<Instant>,
+}
+
+impl UnlockThrottle {
+    pub(crate) async fn verify_unlock_secret(
+        &self,
+        security: &SecurityConfig,
+        secret: &str,
+    ) -> Result<bool, Duration> {
+        let mut state = self.inner.lock().await;
+        let now = Instant::now();
+        if let Some(blocked_until) = state.blocked_until
+            && blocked_until > now
+        {
+            return Err(blocked_until.duration_since(now));
+        }
+
+        if security.verify_unlock_secret(Some(secret)) {
+            *state = UnlockThrottleState::default();
+            return Ok(true);
+        }
+
+        let multiplier = 1_u32 << state.failed_attempts.min(3);
+        let retry_delay = INITIAL_UNLOCK_RETRY_DELAY
+            .saturating_mul(multiplier)
+            .min(MAX_UNLOCK_RETRY_DELAY);
+        state.failed_attempts = state.failed_attempts.saturating_add(1);
+        state.blocked_until = Some(now + retry_delay);
+        Ok(false)
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub paths: AppPaths,
@@ -122,12 +176,32 @@ pub struct AppState {
     pub runtime: RuntimeContext,
     pub pane_streams: PaneStreamRegistry,
     pub security: SecurityConfig,
+    pub unlock_throttle: UnlockThrottle,
 }
 
 #[derive(Clone)]
 pub struct PaneStreamRegistry {
-    pub(crate) inner: Arc<Mutex<HashMap<String, PaneStreamEntry>>>,
+    pub(crate) inner: Arc<Mutex<HashMap<PaneStreamKey, PaneStreamEntry>>>,
     pub(crate) max_subscribers_per_pane: usize,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct PaneStreamKey {
+    prefix: Vec<String>,
+    socket: Option<String>,
+    tmux_bin: String,
+    pane_target: String,
+}
+
+impl PaneStreamKey {
+    pub(crate) fn new(invocation: &TmuxInvocation, pane_target: &str) -> Self {
+        Self {
+            prefix: invocation.prefix.clone(),
+            socket: invocation.socket.clone(),
+            tmux_bin: invocation.tmux_bin.clone(),
+            pane_target: pane_target.to_string(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -146,45 +220,53 @@ impl Default for PaneStreamRegistry {
 }
 
 impl PaneStreamRegistry {
-    pub(crate) async fn unsubscribe(&self, target: &str, sender: &broadcast::Sender<Vec<u8>>) {
+    pub(crate) async fn unsubscribe(
+        &self,
+        key: &PaneStreamKey,
+        sender: &broadcast::Sender<Vec<u8>>,
+    ) {
         let mut inner = self.inner.lock().await;
-        let Some(entry) = inner.get_mut(target) else {
+        let Some(entry) = inner.get_mut(key) else {
             return;
         };
         if !entry.sender.same_channel(sender) {
             return;
         }
         if entry.refcount <= 1 {
-            inner.remove(target);
+            inner.remove(key);
         } else {
             entry.refcount -= 1;
         }
     }
 
     #[allow(dead_code)]
-    pub(crate) async fn remove_if_sender(&self, target: &str, sender: &broadcast::Sender<Vec<u8>>) {
+    pub(crate) async fn remove_if_sender(
+        &self,
+        key: &PaneStreamKey,
+        sender: &broadcast::Sender<Vec<u8>>,
+    ) {
         let mut inner = self.inner.lock().await;
         let should_remove = inner
-            .get(target)
+            .get(key)
             .map(|entry| entry.refcount == 0 && entry.sender.same_channel(sender))
             .unwrap_or(false);
         if should_remove {
-            inner.remove(target);
+            inner.remove(key);
         }
     }
 
     pub(crate) async fn remove_terminal_sender(
         &self,
-        target: &str,
+        key: &PaneStreamKey,
         sender: &broadcast::Sender<Vec<u8>>,
     ) {
         let mut inner = self.inner.lock().await;
         let should_remove = inner
-            .get(target)
+            .get(key)
             .map(|entry| entry.sender.same_channel(sender))
             .unwrap_or(false);
         if should_remove {
-            inner.remove(target);
+            inner.remove(key);
         }
     }
 }
@@ -223,6 +305,7 @@ impl Application {
             runtime,
             pane_streams: PaneStreamRegistry::default(),
             security: config.security,
+            unlock_throttle: UnlockThrottle::default(),
         };
 
         Ok(Self { state, paths })
@@ -242,5 +325,43 @@ impl Application {
                     },
                 ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_sha256_unlock_hash;
+
+    const PASSWORD_HASH: &str =
+        "sha256:5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8";
+
+    #[test]
+    fn unlock_hash_rejects_missing_prefix() {
+        assert!(!verify_sha256_unlock_hash(
+            "password",
+            "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+        ));
+    }
+
+    #[test]
+    fn unlock_hash_rejects_wrong_length_and_non_hex_digest() {
+        assert!(!verify_sha256_unlock_hash("password", "sha256:1234"));
+        assert!(!verify_sha256_unlock_hash(
+            "password",
+            "sha256:ge884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8"
+        ));
+    }
+
+    #[test]
+    fn unlock_hash_accepts_uppercase_hex_digest() {
+        assert!(verify_sha256_unlock_hash(
+            "password",
+            "sha256:5E884898DA28047151D0E56F8DC6292773603D0D6AABBDD62A11EF721D1542D8"
+        ));
+    }
+
+    #[test]
+    fn unlock_hash_rejects_wrong_secret() {
+        assert!(!verify_sha256_unlock_hash("wrong", PASSWORD_HASH));
     }
 }

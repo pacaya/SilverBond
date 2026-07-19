@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { store } from "@/lib/stores/workflowStore.svelte";
 import type {
   NodeKind,
@@ -83,7 +83,7 @@ function kind(type: WorkflowNodeType): NodeKind {
   }
 }
 
-function edge(id: string, from: string, to: string): WorkflowEdge {
+function edge(id: string, from: string, to: string, patch: Partial<WorkflowEdge> = {}): WorkflowEdge {
   return {
     id,
     from,
@@ -92,6 +92,7 @@ function edge(id: string, from: string, to: string): WorkflowEdge {
     label: null,
     branchId: null,
     condition: null,
+    ...patch,
   };
 }
 
@@ -273,6 +274,42 @@ describe("workflowStore", () => {
     expect(store.activeWorkflow?.name).toBe("B");
   });
 
+  it("does not mutate root runAs or limits when drilled into a subflow", () => {
+    const subflowA = workflow({
+      name: "A",
+      entryNodeId: "a1",
+      nodes: [node("a1")],
+    });
+    store.setWorkflow(
+      workflow({
+        runAs: { user: "root-user" },
+        limits: { maxTotalSteps: 100, maxVisitsPerNode: 20 },
+        entryNodeId: "call_a",
+        nodes: [
+          node("call_a", "subflow", {
+            kind: {
+              type: "subflow",
+              subflowConfig: { workflowName: "A", inputs: [], maxDepth: 10 },
+            },
+          }),
+        ],
+        subflows: { A: subflowA },
+      }),
+    );
+
+    expect(store.drillIntoSubflow("call_a")).toBe(true);
+
+    store.updateWorkflow((wf) => {
+      wf.runAs = { user: "subflow-user" };
+      wf.limits = { maxTotalSteps: 999, maxVisitsPerNode: 999 };
+    });
+
+    expect(store.workflow!.runAs).toEqual({ user: "root-user" });
+    expect(store.workflow!.limits).toEqual({ maxTotalSteps: 100, maxVisitsPerNode: 20 });
+    expect(store.activeWorkflow!.runAs).toEqual({ user: "subflow-user" });
+    expect(store.activeWorkflow!.limits).toEqual({ maxTotalSteps: 999, maxVisitsPerNode: 999 });
+  });
+
   it("rejects compound selections with multiple terminal nodes", () => {
     store.setWorkflow(
       workflow({
@@ -330,6 +367,168 @@ describe("workflowStore", () => {
       exitNodeId: "b",
     });
     expect(store.workflow!.entryNodeId).toBe(store.workflow!.nodes[0].id);
+  });
+
+  it("selects the external inbound node as entry for X→A, A→B", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "x",
+        nodes: [node("x"), node("a"), node("b")],
+        edges: [edge("x-a", "x", "a"), edge("a-b", "a", "b")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "MidGraph");
+
+    expect(result).toMatchObject({ ok: true });
+    expect(store.workflow!.subflows?.MidGraph?.entryNodeId).toBe("a");
+  });
+
+  it("rejects compound selections with multiple external entry points", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "x",
+        nodes: [node("x"), node("y"), node("a"), node("b")],
+        edges: [
+          edge("x-a", "x", "a"),
+          edge("y-b", "y", "b"),
+          edge("a-b", "a", "b"),
+        ],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "TwoEntries");
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("compound save unexpectedly succeeded");
+    expect(result.code).toBe("multiple_entry_nodes");
+  });
+
+  it("rejects outbound edges that do not originate from the exit node", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [node("a", "split"), node("b"), node("x")],
+        edges: [
+          edge("a-b", "a", "b"),
+          edge("a-x", "a", "x", { outcome: "branch", condition: { field: "ok", operator: "eq", value: "true" } }),
+        ],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "SplitBranch");
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("compound save unexpectedly succeeded");
+    expect(result.code).toBe("invalid_outbound_edge");
+  });
+
+  it("rejects non-producible outbound outcomes from the exit node", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [node("a"), node("b", "approval"), node("x")],
+        edges: [edge("a-b", "a", "b"), edge("b-x", "b", "x", { outcome: "reject" })],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "RejectArm");
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("compound save unexpectedly succeeded");
+    expect(result.code).toBe("non_producible_outcome");
+  });
+
+  it("preserves root variables and cross-boundary references when saving a compound", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "x",
+        variables: [{ name: "ROOT_VAR", default: "root-value" }],
+        nodes: [
+          node("x", "task", { prompt: "before" }),
+          node("a", "task", {
+            prompt: "inside {{var:ROOT_VAR}} and {{node:x.output}}",
+            contextSources: [{ name: "upstream", nodeId: "x" }],
+          }),
+          node("b", "task", { prompt: "exit" }),
+          node("after", "task", { prompt: "after {{node:b.output}}", contextSources: [{ name: "compound_out", nodeId: "b" }] }),
+        ],
+        edges: [
+          edge("x-a", "x", "a"),
+          edge("a-b", "a", "b"),
+          edge("b-after", "b", "after"),
+        ],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "Bound");
+
+    expect(result).toMatchObject({ ok: true });
+    const subflow = store.workflow!.subflows?.Bound;
+    expect(subflow?.variables.map((v) => v.name).sort()).toEqual(
+      expect.arrayContaining(["ROOT_VAR", "upstream"]),
+    );
+    const compound = store.workflow!.nodes.find((n) => n.kind.type === "subflow");
+    expect(compound?.kind.type).toBe("subflow");
+    if (compound?.kind.type !== "subflow") throw new Error("expected subflow compound");
+    expect(compound.kind.subflowConfig.inputs).toEqual(
+      expect.arrayContaining([
+        { name: "ROOT_VAR", source: "var:ROOT_VAR" },
+        { name: "upstream", source: "node:x.output" },
+      ]),
+    );
+    const movedA = subflow?.nodes.find((n) => n.id === "a");
+    expect(movedA?.prompt).toContain("{{var:ROOT_VAR}}");
+    expect(movedA?.prompt).not.toContain("{{node:x.output}}");
+    expect(movedA?.contextSources ?? []).toHaveLength(0);
+    const after = store.workflow!.nodes.find((n) => n.id === "after");
+    expect(after?.prompt).toContain(`{{node:${compound.id}.output}}`);
+    expect(after?.contextSources?.[0]?.nodeId).toBe(compound.id);
+  });
+
+  it("rejects field-path template references across a compound boundary", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [
+          node("a", "task", { prompt: "use {{node:x.output.field}}" }),
+          node("b", "task"),
+          node("x", "task"),
+        ],
+        edges: [edge("a-b", "a", "b"), edge("x-a", "x", "a")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "FieldPath");
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("compound save unexpectedly succeeded");
+    expect(result.code).toBe("unsupported_dependency");
+  });
+
+  it("rejects outside references to non-exit nodes inside the selection", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [
+          node("a", "task"),
+          node("b", "task", { prompt: "middle" }),
+          node("c", "task", { prompt: "exit" }),
+          node("after", "task", { prompt: "refs {{node:b.output}}" }),
+        ],
+        edges: [
+          edge("a-b", "a", "b"),
+          edge("b-c", "b", "c"),
+          edge("c-after", "c", "after"),
+        ],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b", "c"], "NonExitRef");
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("compound save unexpectedly succeeded");
+    expect(result.code).toBe("unsupported_dependency");
   });
 
   it("corrects stale selectedPane when observability panes change across runs", () => {
@@ -419,5 +618,94 @@ describe("workflowStore", () => {
     const added = persistedChild.nodes.find((n) => n.id !== "child_task");
     expect(persistedChild.ui?.canvas).toBeDefined();
     expect(persistedChild.ui!.canvas!.nodes[added!.id]).toEqual({ x: 8, y: 9 });
+  });
+
+  it("ignores stale run events after the run epoch advances", () => {
+    const { epoch: epochA } = store.beginRunStream();
+    store.setRunState({ runId: "run-a", running: true });
+    store.beginRunStream();
+    store.setRunState({ runId: "run-b", running: true });
+
+    store.applyRunEvent({ type: "done", runId: "run-a" }, epochA);
+
+    expect(store.runId).toBe("run-b");
+    expect(store.running).toBe(true);
+    expect(store.lines.some((line) => line.text === "Workflow complete")).toBe(false);
+  });
+
+  it("does not adopt runId from a different active run", () => {
+    store.setRunState({ runId: "run-b", running: true });
+    store.applyRunEvent({ type: "node_start", nodeId: "n1", runId: "run-a" });
+    expect(store.runId).toBe("run-b");
+  });
+
+  it("upserts agent_interaction_required events for the same session", () => {
+    store.applyRunEvent({
+      type: "agent_interaction_required",
+      sessionId: "sess-a",
+      description: "first",
+      outputSoFar: "out-1",
+      interactionType: "question",
+    });
+    store.applyRunEvent({
+      type: "agent_interaction_required",
+      sessionId: "sess-a",
+      description: "updated",
+      outputSoFar: "out-2",
+      interactionType: "permission",
+    });
+
+    expect(store.interactions).toHaveLength(1);
+    expect(store.interactions[0]).toMatchObject({
+      sessionId: "sess-a",
+      description: "updated",
+      outputSoFar: "out-2",
+      interactionType: "permission",
+    });
+  });
+
+  it("resolving one session leaves other pending interaction cards intact", () => {
+    store.applyRunEvent({
+      type: "agent_interaction_required",
+      sessionId: "sess-a",
+      description: "wait A",
+      outputSoFar: "",
+      interactionType: "question",
+    });
+    store.applyRunEvent({
+      type: "agent_interaction_required",
+      sessionId: "sess-b",
+      description: "wait B",
+      outputSoFar: "",
+      interactionType: "question",
+    });
+
+    store.applyRunEvent({
+      type: "agent_interaction_resolved",
+      sessionId: "sess-b",
+      description: "wait B",
+    });
+
+    expect(store.interactions.map((item) => item.sessionId)).toEqual(["sess-a"]);
+  });
+
+  it("ignores agent_interaction_resolved events without sessionId", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    store.applyRunEvent({
+      type: "agent_interaction_required",
+      sessionId: "sess-a",
+      description: "wait A",
+      outputSoFar: "",
+      interactionType: "question",
+    });
+    store.applyRunEvent({
+      type: "agent_interaction_resolved",
+      description: "missing session",
+    });
+
+    expect(store.interactions).toHaveLength(1);
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
   });
 });

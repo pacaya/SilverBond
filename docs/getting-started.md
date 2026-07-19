@@ -66,10 +66,12 @@ Process-launching workflows must be configured through one of two paths before t
 
 These variables apply to `just server`, production builds, and the packaged desktop app. With neither variable set, SilverBond rejects process-launching runs with guidance instead of asking for an unlock password that cannot verify.
 
+When `SILVERBOND_AGENT_USER` selects a different OS user, place `SILVERBOND_ROOT` in a location that user can traverse. On macOS, avoid `~/Desktop` and `~/Documents`: TCC can deny a sudo-launched low-privilege process even when POSIX permissions allow access. SilverBond creates cross-user pane-stream FIFOs under `<app-root>/run-states/`.
+
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SILVERBOND_ROOT` | Current working directory | Override the application root directory |
-| `SILVERBOND_UNLOCK_PASSWORD_HASH` | Unset | `sha256:<hex>` hash for the operator unlock password used to authorize privileged process-launching runs |
+| `SILVERBOND_UNLOCK_PASSWORD_HASH` | Unset | `sha256:<hex>` hash for the operator unlock password used to authorize privileged process-launching runs. The hash stays in server-process configuration: it is not logged, returned, serialized, persisted, or forwarded through contained-agent `sudo` environments. Disclosure therefore already requires the server uid that unlocking grants, so global failed-attempt throttling—not a KDF—is the guessing control. |
 | `SILVERBOND_AGENT_USER` | Unset | Low-privilege OS user that receives default process-launching agent runs without an unlock prompt |
 | `RUST_LOG` | `silverbond=info,tower_http=info` | Tracing log filter |
 
@@ -81,6 +83,7 @@ When running, SilverBond uses the following directory layout under the app root:
 <app-root>/
 ├── workflows/           # Saved workflow JSON files
 ├── templates/           # Template workflow files
+├── run-states/          # Ephemeral cross-user pane-stream FIFOs
 └── .silverbond/
     └── silverbond.sqlite  # SQLite database for runs, events, and logs
 ```

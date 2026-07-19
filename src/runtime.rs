@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -23,6 +23,7 @@ use tokio::{
     sync::{Mutex, Notify, broadcast, oneshot},
     task::JoinSet,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::{
@@ -848,10 +849,8 @@ struct ApprovalDecision {
 #[derive(Debug, Clone)]
 struct ActiveRun {
     sender: broadcast::Sender<RuntimeEvent>,
-    abort_flag: Arc<AtomicBool>,
-    abort_notify: Arc<Notify>,
-    drained: Arc<AtomicBool>,
-    drained_notify: Arc<Notify>,
+    abort_token: CancellationToken,
+    drained_token: CancellationToken,
     approval_sender: Arc<Mutex<Option<oneshot::Sender<ApprovalDecision>>>>,
     interaction_senders: Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>,
     active_panes: Arc<Mutex<BTreeMap<String, ActivePaneTarget>>>,
@@ -908,10 +907,8 @@ impl RunRegistry {
             run_id.to_string(),
             ActiveRun {
                 sender,
-                abort_flag: Arc::new(AtomicBool::new(false)),
-                abort_notify: Arc::new(Notify::new()),
-                drained: Arc::new(AtomicBool::new(false)),
-                drained_notify: Arc::new(Notify::new()),
+                abort_token: CancellationToken::new(),
+                drained_token: CancellationToken::new(),
                 approval_sender: Arc::new(Mutex::new(None)),
                 interaction_senders: Arc::new(Mutex::new(HashMap::new())),
                 active_panes: Arc::new(Mutex::new(BTreeMap::new())),
@@ -947,8 +944,7 @@ impl RunRegistry {
 
     async fn set_abort(&self, run_id: &str) {
         if let Some(active) = self.inner.lock().await.get(run_id).cloned() {
-            active.abort_flag.store(true, Ordering::SeqCst);
-            active.abort_notify.notify_waiters();
+            active.abort_token.cancel();
         }
     }
 
@@ -956,16 +952,8 @@ impl RunRegistry {
         let Some(active) = self.inner.lock().await.get(run_id).cloned() else {
             return;
         };
-        active.abort_flag.store(true, Ordering::SeqCst);
-        active.abort_notify.notify_waiters();
-        loop {
-            let drained = active.drained_notify.notified();
-            tokio::pin!(drained);
-            if active.drained.load(Ordering::SeqCst) {
-                return;
-            }
-            drained.await;
-        }
+        active.abort_token.cancel();
+        active.drained_token.cancelled().await;
     }
 
     async fn is_aborted(&self, run_id: &str) -> bool {
@@ -973,19 +961,16 @@ impl RunRegistry {
             .lock()
             .await
             .get(run_id)
-            .map(|active| active.abort_flag.load(Ordering::SeqCst))
+            .map(|active| active.abort_token.is_cancelled())
             .unwrap_or(false)
     }
 
-    pub(crate) async fn abort_signal(
-        &self,
-        run_id: &str,
-    ) -> Option<(Arc<AtomicBool>, Arc<Notify>)> {
+    pub(crate) async fn abort_signal(&self, run_id: &str) -> Option<CancellationToken> {
         self.inner
             .lock()
             .await
             .get(run_id)
-            .map(|active| (active.abort_flag.clone(), active.abort_notify.clone()))
+            .map(|active| active.abort_token.clone())
     }
 
     async fn set_pending_approval(
@@ -1083,8 +1068,7 @@ impl RunRegistry {
 
     async fn clear(&self, run_id: &str) {
         if let Some(active) = self.inner.lock().await.remove(run_id) {
-            active.drained.store(true, Ordering::SeqCst);
-            active.drained_notify.notify_waiters();
+            active.drained_token.cancel();
         }
     }
 
@@ -1601,6 +1585,14 @@ impl RuntimeContext {
         Ok(())
     }
 
+    pub async fn dismiss_run(&self, run_id: &str) -> anyhow::Result<()> {
+        self.db
+            .mark_run_status(run_id, RuntimeStatus::Aborted, Some("aborted".to_string()))
+            .await?;
+        reap_run_tmux_sessions(self, run_id).await;
+        Ok(())
+    }
+
     pub async fn respond_interaction(
         &self,
         run_id: &str,
@@ -1710,6 +1702,7 @@ pub async fn run_node_preview(
     node: &WorkflowNode,
     cwd: &str,
     mock_context: NodeTestContext,
+    invocation: TmuxInvocation,
 ) -> anyhow::Result<NodePreviewResult> {
     let inbound: HashMap<String, Vec<String>> = HashMap::new();
     let mut all_results = BTreeMap::new();
@@ -1757,7 +1750,7 @@ pub async fn run_node_preview(
             &prompt_clone,
             &cwd_string,
             Some(&config_clone),
-            None,
+            invocation,
             None,
         )
     })
@@ -3799,16 +3792,17 @@ async fn run_decide_node(
         ..AgentConfig::default()
     };
     let prompt_for_task = resolved_prompt.clone();
-    let inv = ctx.run_invocation.clone();
+    let inv = ctx
+        .run_invocation
+        .clone()
+        .context("tmux invocation missing for decide node")?;
     let agent_config_clone = agent_config.clone();
-    let abort_signal = ctx.registry.abort_signal(&run_ctx.run_id).await;
-    let abort_flag = abort_signal.as_ref().map(|(flag, _)| flag.clone());
-    let abort_notify = abort_signal.map(|(_, notify)| notify);
-    let interaction = abort_flag.as_ref().map(|_| {
+    let abort_token = ctx.registry.abort_signal(&run_ctx.run_id).await;
+    let interaction = abort_token.as_ref().map(|_| {
         crate::tmux_exec::InteractionEscalation::new(
             ctx.clone(),
             run_ctx.run_id.clone(),
-            abort_flag.clone(),
+            abort_token.clone(),
         )
     });
     let interaction_for_blocking = interaction.clone();
@@ -3822,12 +3816,10 @@ async fn run_decide_node(
             interaction_for_blocking.as_ref(),
         )
     });
-    let result = if let Some(abort_notify) = abort_notify {
-        let abort_notified = abort_notify.notified();
-        tokio::pin!(abort_notified);
+    let result = if let Some(abort_token) = abort_token {
         tokio::select! {
             joined = agent_join => joined.context("join error in decide node")??,
-            _ = &mut abort_notified => NodeResult {
+            _ = abort_token.cancelled() => NodeResult {
                 success: false,
                 output: String::new(),
                 stderr: "Agent run aborted".to_string(),
@@ -4848,7 +4840,7 @@ async fn handle_parallel_batch_node(
     let mut running = JoinSet::new();
     let run_id = checkpoint.run_id.clone();
     let mut batch_aborted = ctx.registry.is_aborted(&run_id).await;
-    let abort_notify = ctx.registry.abort_signal(&run_id).await.map(|(_, notify)| notify);
+    let abort_token = ctx.registry.abort_signal(&run_id).await;
 
     while !batch_aborted && running.len() < max_concurrent {
         let Some((item_index, item_value)) = pending_items.pop_front() else {
@@ -4875,12 +4867,10 @@ async fn handle_parallel_batch_node(
     }
 
     while !batch_aborted {
-        let joined = if let Some(ref abort_notify) = abort_notify {
-            let abort_notified = abort_notify.notified();
-            tokio::pin!(abort_notified);
+        let joined = if let Some(ref abort_token) = abort_token {
             tokio::select! {
                 joined = running.join_next() => joined,
-                _ = &mut abort_notified => {
+                _ = abort_token.cancelled() => {
                     batch_aborted = true;
                     None
                 }
@@ -6198,13 +6188,17 @@ async fn select_next_decision(
                 .or(chosen);
         }
         if chosen.is_none() && workflow.use_orchestrator {
+            let invocation = ctx
+                .run_invocation
+                .clone()
+                .context("tmux invocation missing for orchestrator branch")?;
             let orchestration = run_orchestrator_branch(
                 &workflow.goal,
                 node,
                 &result.output,
                 &branch_edges,
                 &scoped_workflow_cwd(workflow, &checkpoint.cwd),
-                ctx.run_invocation.clone(),
+                invocation,
             )
             .await?;
             let chosen_id = orchestration
@@ -6395,7 +6389,19 @@ fn tmux_invocation_key(invocation: &TmuxInvocation) -> (Vec<String>, Option<Stri
 }
 
 pub async fn reap_stale_tmux_sessions(ctx: &RuntimeContext) {
-    let reapable_sessions = match ctx.db.list_reapable_tmux_sessions().await {
+    reap_tmux_sessions(ctx, None).await;
+}
+
+async fn reap_run_tmux_sessions(ctx: &RuntimeContext, run_id: &str) {
+    reap_tmux_sessions(ctx, Some(run_id)).await;
+}
+
+async fn reap_tmux_sessions(ctx: &RuntimeContext, run_id: Option<&str>) {
+    let reapable_sessions = match run_id {
+        Some(run_id) => ctx.db.list_reapable_tmux_sessions_for_run(run_id).await,
+        None => ctx.db.list_reapable_tmux_sessions().await,
+    };
+    let reapable_sessions = match reapable_sessions {
         Ok(sessions) => sessions,
         Err(error) => {
             tracing::warn!(error = %error, "Skipping stale tmux cleanup after storage error");
@@ -6407,17 +6413,56 @@ pub async fn reap_stale_tmux_sessions(ctx: &RuntimeContext) {
         (Vec<String>, Option<String>, String),
         (TmuxInvocation, HashMap<String, String>),
     >::new();
+    let mut reconstructed_invocations = HashMap::<String, TmuxInvocation>::new();
     for reapable in reapable_sessions {
         if active_run_ids.contains(&reapable.run_id) {
             continue;
         }
-        let Some(invocation) = reapable.tmux_invocation else {
-            tracing::warn!(
-                run_id = %reapable.run_id,
-                session_name = %reapable.session_name,
-                "Skipping stale tmux session without a persisted invocation"
-            );
-            continue;
+        let invocation = match reapable.tmux_invocation {
+            Some(invocation) => invocation,
+            None => {
+                if let Some(invocation) = reconstructed_invocations.get(&reapable.run_id) {
+                    invocation.clone()
+                } else {
+                    let persisted = match ctx.db.get_run(&reapable.run_id).await {
+                        Ok(Some(persisted)) => persisted,
+                        Ok(None) => {
+                            tracing::warn!(
+                                run_id = %reapable.run_id,
+                                session_name = %reapable.session_name,
+                                "Skipping stale tmux session whose run no longer exists"
+                            );
+                            continue;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                run_id = %reapable.run_id,
+                                session_name = %reapable.session_name,
+                                error = %error,
+                                "Skipping stale tmux session after run load failure"
+                            );
+                            continue;
+                        }
+                    };
+                    let invocation = persisted
+                        .workflow
+                        .run_as
+                        .as_ref()
+                        .map(|run_as| {
+                            crate::tmux_exec::build_tmux_invocation_without_resolving(
+                                run_as,
+                                &reapable.run_id,
+                            )
+                        })
+                        .unwrap_or_else(|| TmuxInvocation {
+                            prefix: Vec::new(),
+                            socket: None,
+                            tmux_bin: "tmux".to_string(),
+                        });
+                    reconstructed_invocations.insert(reapable.run_id.clone(), invocation.clone());
+                    invocation
+                }
+            }
         };
         let key = tmux_invocation_key(&invocation);
         let entry = terminal_sessions_by_invocation
@@ -6791,18 +6836,12 @@ pub(crate) async fn escalate_agent_interaction(
         return Err(err);
     }
 
-    let response = if let Some((abort_flag, abort_notify)) = abort_signal {
-        let abort_notified = abort_notify.notified();
-        tokio::pin!(abort_notified);
-        if abort_flag.load(Ordering::SeqCst) {
-            pending.clear_now().await;
-            anyhow::bail!("Interaction aborted");
-        }
+    let response = if let Some(abort_token) = abort_signal {
         tokio::select! {
             response = receiver => {
                 response.map_err(|_| anyhow::anyhow!("Interaction channel closed"))?
             }
-            _ = &mut abort_notified => {
+            _ = abort_token.cancelled() => {
                 pending.clear_now().await;
                 anyhow::bail!("Interaction aborted");
             }
@@ -6924,7 +6963,10 @@ async fn run_orchestrator_refinement(
     let agent = DEFAULT_AGENT.to_string();
     let owned_prompt = prompt.clone();
     let owned_cwd = cwd.to_string();
-    let inv = ctx.run_invocation.clone();
+    let inv = ctx
+        .run_invocation
+        .clone()
+        .context("tmux invocation missing for orchestrator refinement")?;
     tokio::task::spawn_blocking(move || {
         crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None, inv, None)
     })
@@ -6938,7 +6980,7 @@ async fn run_orchestrator_branch(
     output: &str,
     branches: &[&WorkflowEdge],
     cwd: &str,
-    inv: Option<TmuxInvocation>,
+    inv: TmuxInvocation,
 ) -> anyhow::Result<NodeResult> {
     let branch_list = branches
         .iter()
@@ -7596,6 +7638,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn abort_signal_is_latched_before_the_waiter_is_polled() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db);
+        let run_id = "run_latched_abort_signal";
+        ctx.registry.register(run_id).await;
+        let abort_signal = ctx.registry.abort_signal(run_id).await.unwrap();
+
+        ctx.abort_run(run_id).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), abort_signal.cancelled())
+            .await
+            .expect("an abort must remain observable before the waiter is first polled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_and_wait_returns_when_the_run_drains_concurrently() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let registry = RunRegistry::default();
+        let run_id = "run_concurrent_drain";
+        registry.register(run_id).await;
+        let abort_signal = registry.abort_signal(run_id).await.unwrap();
+        let waiting_registry = registry.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_registry.abort_and_wait(run_id).await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), abort_signal.cancelled())
+            .await
+            .expect("abort_and_wait did not request cancellation");
+        registry.clear(run_id).await;
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("abort_and_wait hung after the run drained")
+            .expect("abort_and_wait task panicked");
+    }
+
+    #[tokio::test]
     async fn concurrent_interactions_resolve_by_session_id() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
@@ -7718,8 +7802,8 @@ mod tests {
         assert_eq!(response, "immediate response");
     }
 
-    #[tokio::test]
-    async fn abort_unblocks_pending_agent_interaction() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abort_delivered_as_agent_enters_interaction_wait_terminates_the_node() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
         db.init().await.unwrap();
@@ -8539,6 +8623,114 @@ mod tests {
         assert!(db.list_reapable_tmux_sessions().await.unwrap().is_empty());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_tmux_reaper_reconstructs_legacy_invocation_without_resolving() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("silverbond.db");
+        let db = Database::new(path.clone());
+        db.init().await.unwrap();
+
+        let run_id = "run_legacy_stale_reaper";
+        let socket = "legacy-stale-run-socket";
+        let session = "silverbond-Legacy-Stale";
+        let script = temp.path().join("legacy-tmux-reaper-prefix.sh");
+        let log = temp.path().join("legacy-tmux-reaper-args.log");
+        let resolver_marker = temp.path().join("legacy-tmux-reaper-resolver-ran");
+        fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\nsession=\"$2\"\nresolver_marker=\"$3\"\nshift 3\nif [ \"$1\" = \"zsh\" ]; then touch \"$resolver_marker\"; printf 'SBTMUX:tmux\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n' \"$session\"; fi\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let mut workflow = workflow_from_parts("work", vec![task_node("work", "Work", "")], vec![]);
+        workflow.run_as = Some(model::RunAsConfig {
+            command: Some(vec![
+                script.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+                session.to_string(),
+                resolver_marker.to_string_lossy().into_owned(),
+            ]),
+            user: None,
+            socket: Some(socket.to_string()),
+        });
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.status = RuntimeStatus::Failed;
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: None,
+            checkpoint: checkpoint.clone(),
+            workflow,
+        })
+        .await
+        .unwrap();
+
+        let mut legacy_state = serde_json::to_value(&checkpoint).unwrap();
+        legacy_state["tmuxSessions"] = json!([session]);
+        let connection = rusqlite::Connection::open(db.path()).unwrap();
+        connection
+            .execute("DROP TABLE run_tmux_sessions", [])
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE runs SET state_json = ?2 WHERE run_id = ?1",
+                rusqlite::params![run_id, serde_json::to_string(&legacy_state).unwrap()],
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = Database::new(path);
+        migrated.init().await.unwrap();
+        assert_eq!(
+            migrated
+                .list_reapable_tmux_sessions()
+                .await
+                .unwrap()
+                .first()
+                .and_then(|reapable| reapable.tmux_invocation.as_ref()),
+            None,
+            "legacy-backfilled sessions should exercise the missing-invocation path"
+        );
+
+        reap_stale_tmux_sessions(&RuntimeContext::new(migrated.clone())).await;
+
+        assert!(
+            !resolver_marker.exists(),
+            "legacy invocation reconstruction must not resolve tmux"
+        );
+        let recorded = fs::read_to_string(log).expect("reconstructed invocation should run tmux");
+        let args = recorded.lines().collect::<Vec<_>>();
+        assert!(
+            args.windows(6).any(|window| window
+                == [
+                    "tmux",
+                    "-L",
+                    socket,
+                    "list-sessions",
+                    "-F",
+                    "#{session_name}"
+                ]),
+            "reaper should list sessions under the reconstructed invocation; args={args:?}"
+        );
+        assert!(
+            args.windows(6)
+                .any(|window| window == ["tmux", "-L", socket, "kill-session", "-t", session]),
+            "reaper should kill the legacy session under the reconstructed invocation; args={args:?}"
+        );
+        assert!(
+            migrated
+                .list_reapable_tmux_sessions()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn stale_tmux_reaper_is_best_effort_when_storage_is_unavailable() {
         let temp = TempDir::new().unwrap();
@@ -8782,7 +8974,7 @@ mod tests {
             "task output",
             &branch_refs,
             &temp.path().to_string_lossy(),
-            Some(branch_inv),
+            branch_inv,
         )
         .await;
         assert!(branch.is_err());

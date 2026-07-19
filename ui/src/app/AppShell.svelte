@@ -199,6 +199,7 @@
   }
 
   async function startRun(targetWorkflow: WorkflowDocument) {
+    const { epoch, signal } = store.beginRunStream();
     store.clearLines();
     store.setPanelTab("output");
     store.setRunState({ running: true, approval: null });
@@ -206,21 +207,32 @@
     let hadError = false;
     try {
       const payload = await createRunWithUnlock(targetWorkflow);
+      if (store.isRunEpochStale(epoch)) return;
       store.setRunObservability(observabilityFromPayload(payload));
       store.setRunState({ runId: payload.runId, streamToken: payload.streamToken, running: true });
-      await streamRun(payload.runId, payload.streamToken, (event) => store.applyRunEvent(event));
+      const stream = streamRun(
+        payload.runId,
+        payload.streamToken,
+        (event) => store.applyRunEvent(event, epoch),
+        { signal },
+      );
+      await stream.finished;
     } catch (err) {
+      if (store.isRunEpochStale(epoch)) return;
       hadError = true;
       store.setError(`Run failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
-      store.setRunState({ running: false, approval: null, runId: null });
-      showRunResult(hadError);
-      await queryClient.invalidateQueries({ queryKey: ["logs"] });
-      await queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] });
+      if (!store.isRunEpochStale(epoch)) {
+        store.setRunState({ running: false, approval: null, runId: null });
+        showRunResult(hadError);
+        await queryClient.invalidateQueries({ queryKey: ["logs"] });
+        await queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] });
+      }
     }
   }
 
   async function resumeRun(runId: string) {
+    const { epoch, signal } = store.beginRunStream();
     store.setPanelTab("output");
     store.clearLines();
     store.setRunState({ running: true });
@@ -228,21 +240,32 @@
     let hadError = false;
     try {
       const payload = await api.resumeRun(runId);
+      if (store.isRunEpochStale(epoch)) return;
       store.setRunObservability(observabilityFromPayload(payload));
       store.setRunState({ runId: payload.runId, streamToken: payload.streamToken, running: true });
-      await streamRun(payload.runId, payload.streamToken, (event) => store.applyRunEvent(event));
+      const stream = streamRun(
+        payload.runId,
+        payload.streamToken,
+        (event) => store.applyRunEvent(event, epoch),
+        { signal },
+      );
+      await stream.finished;
     } catch (err) {
+      if (store.isRunEpochStale(epoch)) return;
       hadError = true;
       store.setError(`Resume failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
-      store.setRunState({ running: false, approval: null, runId: null });
-      showRunResult(hadError);
-      await queryClient.invalidateQueries({ queryKey: ["logs"] });
-      await queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] });
+      if (!store.isRunEpochStale(epoch)) {
+        store.setRunState({ running: false, approval: null, runId: null });
+        showRunResult(hadError);
+        await queryClient.invalidateQueries({ queryKey: ["logs"] });
+        await queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] });
+      }
     }
   }
 
   async function restartFromNode(runId: string, nodeId: string) {
+    const { epoch, signal } = store.beginRunStream();
     store.setPanelTab("output");
     store.clearLines();
     store.setRunState({ running: true });
@@ -250,17 +273,27 @@
     let hadError = false;
     try {
       const payload = await api.restartFromNode(runId, nodeId);
+      if (store.isRunEpochStale(epoch)) return;
       store.setRunObservability(observabilityFromPayload(payload));
       store.setRunState({ runId: payload.runId, streamToken: payload.streamToken, running: true });
-      await streamRun(payload.runId, payload.streamToken, (event) => store.applyRunEvent(event));
+      const stream = streamRun(
+        payload.runId,
+        payload.streamToken,
+        (event) => store.applyRunEvent(event, epoch),
+        { signal },
+      );
+      await stream.finished;
     } catch (err) {
+      if (store.isRunEpochStale(epoch)) return;
       hadError = true;
       store.setError(`Restart failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
-      store.setRunState({ running: false, approval: null, runId: null });
-      showRunResult(hadError);
-      await queryClient.invalidateQueries({ queryKey: ["logs"] });
-      await queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] });
+      if (!store.isRunEpochStale(epoch)) {
+        store.setRunState({ running: false, approval: null, runId: null });
+        showRunResult(hadError);
+        await queryClient.invalidateQueries({ queryKey: ["logs"] });
+        await queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] });
+      }
     }
   }
 

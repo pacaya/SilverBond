@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api } from "@/lib/api/client";
+  import { api, ApiError } from "@/lib/api/client";
   import { store } from "@/lib/stores/workflowStore.svelte";
   import type {
     AccessMode,
@@ -66,26 +66,20 @@
 
   function updateRunAs(key: "user" | "socket", value: string) {
     store.updateWorkflow((wf) => {
-      const next: RunAsConfig = { ...(wf.runAs ?? {}) };
-      const trimmed = value.trim();
-      if (trimmed) {
-        next[key] = trimmed;
-      } else {
-        delete next[key];
-      }
+      const next = mergeConfig({} as RunAsConfig, wf.runAs, key, value.trim() || undefined);
       wf.runAs = hasRunAsValues(next) ? next : undefined;
     });
   }
 
   function updateRunAsCommand(value: string) {
     store.updateWorkflow((wf) => {
-      const next: RunAsConfig = { ...(wf.runAs ?? {}) };
       const tokens = value.split(/\n/).filter((line) => line.length > 0);
-      if (tokens.length > 0) {
-        next.command = tokens;
-      } else {
-        delete next.command;
-      }
+      const next = mergeConfig(
+        {} as RunAsConfig,
+        wf.runAs,
+        "command",
+        tokens.length > 0 ? tokens : undefined,
+      );
       wf.runAs = hasRunAsValues(next) ? next : undefined;
     });
   }
@@ -188,6 +182,24 @@
     if (selection.kind !== "node") return null;
     return activeWorkflow.nodes.find((node) => node.id === selection.id) ?? null;
   });
+
+  async function runSelectedNodePreview() {
+    if (!selectedNode) return null;
+    const mockContext = { previousOutput };
+    try {
+      return await api.testNode(selectedNode, activeWorkflow.cwd, mockContext);
+    } catch (error) {
+      if (!(error instanceof ApiError) || error.code !== "privileged_unlock_required") {
+        throw error;
+      }
+      const unlockSecret = window.prompt("Unlock password");
+      if (unlockSecret === null) {
+        throw new Error("Preview cancelled");
+      }
+      return api.testNode(selectedNode, activeWorkflow.cwd, mockContext, unlockSecret);
+    }
+  }
+
   let selectedEdge = $derived.by(() => {
     const selection = store.selection;
     if (selection.kind !== "edge") return null;
@@ -1534,7 +1546,7 @@
               Open subgraph →
             </button>
           {:else if fc.workflowName}
-            <div class="issue issue--warning">Subflow "{fc.workflowName}" is not defined in this activeWorkflow.</div>
+            <div class="issue issue--warning">Subflow "{fc.workflowName}" is not defined in this workflow.</div>
           {/if}
           <label class="field field--split">
             <span>Max depth</span>
@@ -1575,8 +1587,8 @@
               onclick={async () => {
                 testLoading = true;
                 try {
-                  const preview = await api.testNode(selectedNode!, activeWorkflow.cwd, { previousOutput });
-                  testResult = JSON.stringify(preview, null, 2);
+                  const preview = await runSelectedNodePreview();
+                  if (preview) testResult = JSON.stringify(preview, null, 2);
                 } finally {
                   testLoading = false;
                 }
@@ -1722,76 +1734,78 @@
       </label>
     </section>
 
-    <section class="inspectorSection">
-      <div class="inspectorSection__title">Limits</div>
-      <label class="field field--split">
-        <span>Max total steps</span>
-        <input
-          type="number"
-          value={activeWorkflow.limits.maxTotalSteps}
-          oninput={(e) => store.updateWorkflow((wf) => {
-            wf.limits.maxTotalSteps = Number((e.target as HTMLInputElement).value);
-          })}
-        />
-      </label>
-      <label class="field field--split">
-        <span>Max visits per node</span>
-        <input
-          type="number"
-          value={activeWorkflow.limits.maxVisitsPerNode}
-          oninput={(e) => store.updateWorkflow((wf) => {
-            wf.limits.maxVisitsPerNode = Number((e.target as HTMLInputElement).value);
-          })}
-        />
-      </label>
-    </section>
+    {#if !store.isDrilledIn}
+      <section class="inspectorSection">
+        <div class="inspectorSection__title">Limits</div>
+        <label class="field field--split">
+          <span>Max total steps</span>
+          <input
+            type="number"
+            value={activeWorkflow.limits.maxTotalSteps}
+            oninput={(e) => store.updateWorkflow((wf) => {
+              wf.limits.maxTotalSteps = Number((e.target as HTMLInputElement).value);
+            })}
+          />
+        </label>
+        <label class="field field--split">
+          <span>Max visits per node</span>
+          <input
+            type="number"
+            value={activeWorkflow.limits.maxVisitsPerNode}
+            oninput={(e) => store.updateWorkflow((wf) => {
+              wf.limits.maxVisitsPerNode = Number((e.target as HTMLInputElement).value);
+            })}
+          />
+        </label>
+      </section>
 
-    <section class="inspectorSection">
-      <div class="inspectorSection__title">Run As / Sandbox</div>
-      <small class="helperText">
-        Launch spawned panes under a different user, via a custom command prefix,
-        and on a dedicated tmux socket.
-      </small>
-      <label class="field">
-        <span>User</span>
-        <input
-          value={activeWorkflow.runAs?.user ?? ""}
-          placeholder="e.g. sandbox"
-          oninput={(e) => updateRunAs("user", (e.target as HTMLInputElement).value)}
-        />
-      </label>
-      <label class="field">
-        <span>Command prefix</span>
-        <textarea
-          value={(activeWorkflow.runAs?.command ?? []).join("\n")}
-          placeholder={"sudo\n-u\nsandbox"}
-          oninput={(e) => updateRunAsCommand((e.target as HTMLTextAreaElement).value)}
-          class="field--shortTextarea"
-        ></textarea>
-        <small class="helperText">One argv element per line. Takes precedence over "User" when set.</small>
-      </label>
-      <label class="field">
-        <span>Socket</span>
-        <input
-          value={activeWorkflow.runAs?.socket ?? ""}
-          placeholder="e.g. silverbond"
-          oninput={(e) => updateRunAs("socket", (e.target as HTMLInputElement).value)}
-        />
-      </label>
-      <div class="field">
-        <span>Attach hint</span>
-        <div class="attachHint">
-          <code class="attachHint__cmd">{runAsAttachHint}</code>
-          <button
-            class="button button--ghost"
-            type="button"
-            onclick={copyAttachHint}
-          >
-            {attachHintCopied ? "Copied" : "Copy"}
-          </button>
+      <section class="inspectorSection">
+        <div class="inspectorSection__title">Run As / Sandbox</div>
+        <small class="helperText">
+          Launch spawned panes under a different user, via a custom command prefix,
+          and on a dedicated tmux socket.
+        </small>
+        <label class="field">
+          <span>User</span>
+          <input
+            value={activeWorkflow.runAs?.user ?? ""}
+            placeholder="e.g. sandbox"
+            oninput={(e) => updateRunAs("user", (e.target as HTMLInputElement).value)}
+          />
+        </label>
+        <label class="field">
+          <span>Command prefix</span>
+          <textarea
+            value={(activeWorkflow.runAs?.command ?? []).join("\n")}
+            placeholder={"sudo\n-u\nsandbox"}
+            oninput={(e) => updateRunAsCommand((e.target as HTMLTextAreaElement).value)}
+            class="field--shortTextarea"
+          ></textarea>
+          <small class="helperText">One argv element per line. Takes precedence over "User" when set.</small>
+        </label>
+        <label class="field">
+          <span>Socket</span>
+          <input
+            value={activeWorkflow.runAs?.socket ?? ""}
+            placeholder="e.g. silverbond"
+            oninput={(e) => updateRunAs("socket", (e.target as HTMLInputElement).value)}
+          />
+        </label>
+        <div class="field">
+          <span>Attach hint</span>
+          <div class="attachHint">
+            <code class="attachHint__cmd">{runAsAttachHint}</code>
+            <button
+              class="button button--ghost"
+              type="button"
+              onclick={copyAttachHint}
+            >
+              {attachHintCopied ? "Copied" : "Copy"}
+            </button>
+          </div>
         </div>
-      </div>
-    </section>
+      </section>
+    {/if}
 
     <!-- Workflow Agent Defaults -->
     {#if capabilities}

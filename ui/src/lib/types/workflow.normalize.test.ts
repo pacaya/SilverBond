@@ -75,24 +75,66 @@ describe("normalizeWorkflowNode", () => {
   });
 });
 
+function baseWorkflow(
+  patch: Partial<WorkflowDocument> = {},
+): WorkflowDocument {
+  return {
+    version: 4,
+    name: "wf",
+    goal: "",
+    cwd: "",
+    useOrchestrator: false,
+    entryNodeId: "n1",
+    variables: [],
+    limits: { maxTotalSteps: 50, maxVisitsPerNode: 10 },
+    nodes: [],
+    edges: [],
+    ...patch,
+  } as WorkflowDocument;
+}
+
 describe("normalizeWorkflowNodes", () => {
   it("normalizes every node in a workflow document", () => {
-    const workflow = {
-      version: 4,
-      name: "wf",
-      goal: "",
-      cwd: "",
-      useOrchestrator: false,
-      entryNodeId: "n1",
-      variables: [],
-      limits: { maxTotalSteps: 50, maxVisitsPerNode: 10 },
+    const workflow = baseWorkflow({
       nodes: [legacyNode("n1", "task"), v3Node("n2", { type: "split" })],
-      edges: [],
-    } as WorkflowDocument;
+    });
 
     const normalized = normalizeWorkflowNodes(workflow);
     expect(normalized.nodes[0].kind).toEqual({ type: "task" });
     expect(normalized.nodes[1]).toBe(workflow.nodes[1]);
+  });
+
+  it("normalizes legacy nodes inside subflow bodies", () => {
+    const subflows = {
+      Child: baseWorkflow({
+        entryNodeId: "s1",
+        nodes: [legacyNode("s1", "task")],
+      }),
+    };
+    const workflow = baseWorkflow({
+      nodes: [v3Node("n1", { type: "split" })],
+      subflows,
+    });
+
+    const normalized = normalizeWorkflowNodes(workflow);
+    expect(normalized.subflows!.Child.nodes[0].kind).toEqual({ type: "task" });
+    expect(subflows.Child.nodes[0]).toHaveProperty("type", "task");
+  });
+
+  it("keeps an already-normalized subflows record reference-identical", () => {
+    const subflows = {
+      Child: baseWorkflow({
+        entryNodeId: "s1",
+        nodes: [v3Node("s1", { type: "task" })],
+      }),
+    };
+    const workflow = baseWorkflow({
+      nodes: [v3Node("n1", { type: "split" })],
+      subflows,
+    });
+
+    const normalized = normalizeWorkflowNodes(workflow);
+    expect(normalized.subflows).toBe(subflows);
   });
 });
 
