@@ -1384,22 +1384,23 @@ async fn start_pane_stream(
     let cross_user = !invocation.prefix.is_empty();
     let data_path = pane_stream_fifo_path(&root, "fifo");
     let termination_path = pane_stream_fifo_path(&root, "done.fifo");
-    let fifo_guard = PaneStreamFifoGuard {
-        paths: vec![data_path.clone(), termination_path.clone()],
-    };
     let setup_data_path = data_path.clone();
     let setup_termination_path = termination_path.clone();
     let prepare_invocation = setup_invocation.clone();
     let setup_result = async move {
-        let prepared = tokio::time::timeout_at(
+        // `timeout_at` only drops the `JoinHandle`, which detaches the blocking
+        // task rather than aborting it. The task therefore owns the FIFO guard
+        // itself and only hands it over on success, so FIFOs it creates after we
+        // stopped waiting are unlinked when its abandoned result is dropped.
+        let (prepared, fifo_guard) = tokio::time::timeout_at(
             setup_deadline,
             tokio::task::spawn_blocking(move || {
-                ensure_run_as_can_traverse_root(&root, &prepare_invocation)?;
-                prepare_pane_stream(
+                prepare_pane_stream_task(
                     &root,
                     &setup_data_path,
                     &setup_termination_path,
                     cross_user,
+                    &prepare_invocation,
                 )
             }),
         )
@@ -1408,24 +1409,24 @@ async fn start_pane_stream(
         .context("pane stream setup task panicked")??;
 
         let mut stream = PaneStream::new(prepared, fifo_guard)?;
-        if Instant::now() >= setup_deadline {
-            anyhow::bail!("timed out while starting pane stream");
-        }
 
         let data_path = shell_quote(&data_path.to_string_lossy());
         let lifecycle_path = shell_quote(&termination_path.to_string_lossy());
         let shell_command = format!(
             "exec 3> {data_path} && printf r > {lifecycle_path}; cat >&3; printf . > {lifecycle_path}"
         );
+        // The enable must fit inside the shared setup budget, and we always wait
+        // for it to terminate so teardown cannot race a late `pipe-pane`.
+        let enable_budget = setup_deadline.saturating_duration_since(Instant::now());
+        if enable_budget.is_zero() {
+            anyhow::bail!("timed out while starting pane stream");
+        }
         tokio::task::spawn_blocking(move || {
-            with_invocation(setup_invocation, || {
-                tmux::run_checked(&[
-                    "pipe-pane",
-                    "-t",
-                    &setup_pane_target,
-                    &shell_command,
-                ])
-            })
+            run_tmux_checked_with_timeout(
+                &setup_invocation,
+                &["pipe-pane", "-t", &setup_pane_target, &shell_command],
+                enable_budget,
+            )
         })
         .await
         .context("pane stream enable task panicked")??;
@@ -1454,6 +1455,58 @@ async fn start_pane_stream(
             Err(error)
         }
     }
+}
+
+/// Runs a tmux command with an explicit timeout instead of
+/// [`tmux::DEFAULT_TMUX_COMMAND_TIMEOUT`], so callers can bound it by whatever
+/// remains of a shared deadline.
+fn run_tmux_checked_with_timeout(
+    invocation: &TmuxInvocation,
+    args: &[&str],
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let mut command = if invocation.prefix.is_empty() {
+        Command::new(&invocation.tmux_bin)
+    } else {
+        let mut command = Command::new(&invocation.prefix[0]);
+        command.args(&invocation.prefix[1..]);
+        command.arg(&invocation.tmux_bin);
+        command
+    };
+    if let Some(socket) = invocation.socket.as_deref() {
+        command.args(["-L", socket]);
+    }
+    command.args(args);
+
+    let output = tmux::command_output_with_timeout(command, timeout)
+        .with_context(|| format!("failed to run tmux command: tmux {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "tmux command failed (args: {:?}, exit code {}): {}",
+            args,
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// The blocking half of pane-stream setup. It owns the FIFO guard for the paths
+/// it creates and only releases it to the caller on success, so an abandoned
+/// (detached) task still unlinks its FIFOs when its result is dropped.
+fn prepare_pane_stream_task(
+    root: &FsPath,
+    data_path: &FsPath,
+    termination_path: &FsPath,
+    cross_user: bool,
+    invocation: &TmuxInvocation,
+) -> anyhow::Result<(PreparedPaneStream, PaneStreamFifoGuard)> {
+    ensure_run_as_can_traverse_root(root, invocation)?;
+    let fifo_guard = PaneStreamFifoGuard {
+        paths: vec![data_path.to_path_buf(), termination_path.to_path_buf()],
+    };
+    let prepared = prepare_pane_stream(root, data_path, termination_path, cross_user)?;
+    Ok((prepared, fifo_guard))
 }
 
 fn pane_stream_fifo_path(root: &FsPath, suffix: &str) -> PathBuf {
@@ -3827,6 +3880,173 @@ printf 'fallback-session\n'
                 std::fs::read_dir(stream_dir).unwrap().count(),
                 0,
                 "pane-stream FIFOs must not survive timeout cleanup"
+            );
+        }
+    }
+
+    /// Dropping a `JoinHandle` detaches the blocking task instead of aborting
+    /// it, so a setup task abandoned by the setup deadline still runs to
+    /// completion and creates its FIFOs. It must unlink them itself.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn abandoned_pane_stream_setup_task_unlinks_the_fifos_it_creates() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let probe_started = temp.path().join("probe-started");
+        let release_probe = temp.path().join("release-probe");
+        let run_as = temp.path().join("run-as");
+        std::fs::write(
+            &run_as,
+            "#!/bin/sh\nstarted=$1\nrelease=$2\nshift 2\nif [ \"$1\" = /bin/test ]; then\n  : > \"$started\"\n  while [ ! -e \"$release\" ]; do sleep 1; done\n  exit 0\nfi\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&run_as, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = TmuxInvocation {
+            prefix: vec![
+                run_as.to_string_lossy().into_owned(),
+                probe_started.to_string_lossy().into_owned(),
+                release_probe.to_string_lossy().into_owned(),
+            ],
+            socket: None,
+            tmux_bin: "/usr/bin/true".to_string(),
+        };
+
+        let root = temp.path().to_path_buf();
+        let data_path = pane_stream_fifo_path(&root, "fifo");
+        let termination_path = pane_stream_fifo_path(&root, "done.fifo");
+        let task_root = root.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            prepare_pane_stream_task(
+                &task_root,
+                &data_path,
+                &termination_path,
+                true,
+                &invocation,
+            )
+        });
+
+        tokio::time::timeout(PANE_STREAM_TEST_TIMEOUT, async {
+            while !probe_started.exists() {
+                tokio::time::sleep(PANE_STREAM_READ_RETRY_DELAY).await;
+            }
+        })
+        .await
+        .expect("traversability probe must start");
+
+        // This is exactly what an expired `timeout_at` does to the setup task.
+        drop(handle);
+        std::fs::write(&release_probe, b"release").unwrap();
+
+        let stream_dir = root.join("run-states");
+        tokio::time::timeout(PANE_STREAM_TEST_TIMEOUT, async {
+            // The detached task still reaches FIFO creation...
+            while !stream_dir.exists() {
+                tokio::time::sleep(PANE_STREAM_READ_RETRY_DELAY).await;
+            }
+            // ...and must clean up after itself once its result is dropped.
+            while std::fs::read_dir(&stream_dir).unwrap().count() != 0 {
+                tokio::time::sleep(PANE_STREAM_READ_RETRY_DELAY).await;
+            }
+        })
+        .await
+        .expect("an abandoned setup task must unlink the FIFOs it created");
+    }
+
+    /// The pane-stream enable must be bounded by whatever is left of the shared
+    /// setup budget instead of stacking `DEFAULT_TMUX_COMMAND_TIMEOUT` on top of
+    /// it.
+    #[cfg(unix)]
+    #[test]
+    fn tmux_commands_can_be_bounded_below_the_default_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let fake_tmux = temp.path().join("tmux");
+        std::fs::write(&fake_tmux, "#!/bin/sh\nsleep 60 </dev/null >/dev/null 2>&1\n").unwrap();
+        std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = TmuxInvocation {
+            prefix: vec![],
+            socket: None,
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        };
+
+        let started = std::time::Instant::now();
+        let error = run_tmux_checked_with_timeout(
+            &invocation,
+            &["pipe-pane", "-t", "%1", "cat > /dev/null"],
+            Duration::from_millis(300),
+        )
+        .expect_err("a hanging tmux command must fail");
+        let elapsed = started.elapsed();
+
+        assert!(
+            format!("{error:#}").contains("timed out"),
+            "a bounded tmux command must surface a timeout: {error:#}"
+        );
+        assert!(
+            elapsed < tmux::DEFAULT_TMUX_COMMAND_TIMEOUT,
+            "the caller's timeout must win over the default one, took {elapsed:?}"
+        );
+    }
+
+    /// A `pipe-pane` enable that never returns must fail setup inside the setup
+    /// budget, must be waited out (not abandoned) before teardown, and must not
+    /// leave FIFOs behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_stream_slow_enable_fails_setup_without_leaking() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let fake_tmux = temp.path().join("tmux");
+        let ticks_path = temp.path().join("enable-ticks");
+        // The enable carries a shell command argument; teardown does not. While
+        // the enable hangs it appends a tick, so the tick count tells us whether
+        // it was attempted and whether it is still alive after setup failed.
+        std::fs::write(
+            &fake_tmux,
+            format!(
+                "#!/bin/sh\nif [ \"$#\" -le 3 ]; then\n  exit 0\nfi\nexec </dev/null >/dev/null 2>&1\nwhile :; do\n  printf . >> '{}'\n  sleep 0.1\ndone\n",
+                ticks_path.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = TmuxInvocation {
+            prefix: vec![],
+            socket: None,
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        };
+
+        let setup_error = tokio::time::timeout(
+            PANE_STREAM_TEST_TIMEOUT,
+            start_pane_stream(temp.path(), "%1", &invocation),
+        )
+        .await
+        .expect("a slow enable must not outlive the pane-stream test budget")
+        .err()
+        .expect("a slow enable must fail pane-stream setup");
+
+        assert!(
+            format!("{setup_error:#}").contains("timed out"),
+            "a slow enable must surface a timeout: {setup_error:#}"
+        );
+        let ticks = || std::fs::read_to_string(&ticks_path).map(|t| t.len()).unwrap_or(0);
+        let ticks_at_failure = ticks();
+        assert!(ticks_at_failure > 0, "the enable must actually be attempted");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            ticks(),
+            ticks_at_failure,
+            "setup must wait for the enable to terminate before tearing down"
+        );
+        let stream_dir = temp.path().join("run-states");
+        if stream_dir.exists() {
+            assert_eq!(
+                std::fs::read_dir(stream_dir).unwrap().count(),
+                0,
+                "pane-stream FIFOs must not survive a slow-enable timeout"
             );
         }
     }

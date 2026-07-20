@@ -746,7 +746,9 @@ describe("workflowStore", () => {
             prompt: "exit {{node:a.output.summary}}",
             responseFormat: "json",
           }),
-          node("after", "task", { prompt: "whole {{node:b.output}}" }),
+          node("after", "task", {
+            prompt: "whole {{node:b.output}} field {{node:b.output.total}}",
+          }),
           node("after2", "decide", {
             kind: {
               type: "decide",
@@ -791,7 +793,7 @@ describe("workflowStore", () => {
     if (!compound) throw new Error("expected compound");
     const cid = compound.id;
     expect(store.workflow!.nodes.find((n) => n.id === "after")?.prompt).toBe(
-      `whole {{node:${cid}.output}}`,
+      `whole {{node:${cid}.output}} field {{node:${cid}.output.total}}`,
     );
     const after2 = store.workflow!.nodes.find((n) => n.id === "after2");
     expect(after2?.kind.type).toBe("decide");
@@ -802,7 +804,8 @@ describe("workflowStore", () => {
     expect(after3.kind.runAgentConfig?.prompt).toBe(`agent field {{node:${cid}.output.nested}}`);
     const after4 = store.workflow!.nodes.find((n) => n.id === "after4");
     if (after4?.kind.type !== "send") throw new Error("expected send");
-    expect(after4.kind.sendConfig.text).toBe(`send {{node:${cid}.parsedOutput.msg}}`);
+    const after4SendConfig = after4.kind.type === "send" ? after4.kind.sendConfig : undefined;
+    expect(after4SendConfig?.text).toBe(`send {{node:${cid}.parsedOutput.msg}}`);
   });
 
   it("leaves unknown whole-output references verbatim in moved and outside nodes", () => {
@@ -830,6 +833,73 @@ describe("workflowStore", () => {
     const subflow = store.workflow!.subflows?.UnknownWholeOutput;
     expect(subflow?.nodes.find((n) => n.id === "a")?.prompt).toContain(typoRef);
     expect(store.workflow!.nodes.find((n) => n.id === "after")?.prompt).toContain(typoRef);
+  });
+
+  it("rejects unknown field-path references from moved nodes without mutating the workflow", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [
+          node("a", "task", { prompt: "moved {{node:typo-id.output.field}}" }),
+          node("b", "task", { prompt: "exit" }),
+        ],
+        edges: [edge("a-b", "a", "b")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "UnknownMovedFieldPath");
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("compound save unexpectedly succeeded");
+    expect(result.code).toBe("unsupported_dependency");
+    expect(store.workflow!.subflows?.UnknownMovedFieldPath).toBeUndefined();
+    expect(store.workflow!.nodes.some((n) => n.kind.type === "subflow")).toBe(false);
+  });
+
+  it("rejects unknown context sources on moved nodes without mutating the workflow", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [
+          node("a", "task", {
+            prompt: "moved {{context:notes}}",
+            contextSources: [{ name: "notes", nodeId: "typo-id" }],
+          }),
+          node("b", "task", { prompt: "exit" }),
+        ],
+        edges: [edge("a-b", "a", "b")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "UnknownMovedContextSource");
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("compound save unexpectedly succeeded");
+    expect(result.code).toBe("unsupported_dependency");
+    expect(store.workflow!.subflows?.UnknownMovedContextSource).toBeUndefined();
+    expect(store.workflow!.nodes.some((n) => n.kind.type === "subflow")).toBe(false);
+  });
+
+  it("rejects unknown field-path references from outside nodes without mutating the workflow", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [
+          node("a", "task", { prompt: "moved" }),
+          node("b", "task", { prompt: "exit" }),
+          node("after", "task", { prompt: "outside {{node:typo-id.parsedOutput.field}}" }),
+        ],
+        edges: [edge("a-b", "a", "b"), edge("b-after", "b", "after")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "UnknownOutsideFieldPath");
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("compound save unexpectedly succeeded");
+    expect(result.code).toBe("unsupported_dependency");
+    expect(store.workflow!.subflows?.UnknownOutsideFieldPath).toBeUndefined();
+    expect(store.workflow!.nodes.some((n) => n.kind.type === "subflow")).toBe(false);
   });
 
   it("binds positional tokens on the entry node when extracting a middle compound", () => {

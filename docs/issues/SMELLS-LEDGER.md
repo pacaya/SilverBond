@@ -49,4 +49,11 @@ One row per unique key (`file:line` + smell name). Columns:
 | `src/model.rs:990` + Speculative Generality | 1 | 2026-07-19 | open |
 | `ui/src/lib/stores/workflowStore.svelte.ts:401` + Repeated Switches | 1 | 2026-07-19 | retired: duplicate key of workflowStore.svelte.ts:110 (same CompoundPromptField smell, filed at one of its switch sites) |
 | `ui/src/lib/stores/workflowStore.svelte.ts:909` + Speculative Generality | 1 | 2026-07-19 | open |
-| `src/api.rs:1498` + Mysterious Name | 1 | 2026-07-19 | open |
+| `src/api.rs:1498` + Mysterious Name | 2 | 2026-07-20 | open |
+| `ui/src/lib/stores/workflowStore.svelte.ts:325` + Speculative Generality | 1 | 2026-07-19 | open |
+| `ui/src/lib/stores/workflowStore.svelte.ts:147` + Duplicated Code | 1 | 2026-07-19 | open |
+| `src/api.rs:1375` + Divergent Change | 2 | 2026-07-20 | open |
+| `src/runtime.rs:1-12785` + Divergent Change | 1 | 2026-07-20 | open |
+| `src/model.rs:2061` + Feature Envy | 1 | 2026-07-20 | open |
+| `src/driver.rs:291-305` + Primitive Obsession | 1 | 2026-07-20 | open |
+| `ui/src/features/editor/InspectorPanel.svelte:1` + Divergent Change | 1 | 2026-07-20 | open |
