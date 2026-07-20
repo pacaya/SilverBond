@@ -580,6 +580,48 @@ pub trait AgentDriver: Send + Sync {
 /// Driver for the Anthropic **Claude Code** CLI.
 pub struct ClaudeDriver;
 
+fn append_claude_tool_flags(args: &mut Vec<String>, config: &AgentConfig) {
+    if let Some(allowed) = &config.allowed_tools {
+        for tool in allowed {
+            args.push("--allowedTools".to_string());
+            args.push(tool.clone());
+        }
+    }
+    if let Some(disallowed) = &config.disallowed_tools {
+        for tool in disallowed {
+            args.push("--disallowedTools".to_string());
+            args.push(tool.clone());
+        }
+    }
+}
+
+fn resolve_claude_access(config: &AgentConfig) -> anyhow::Result<(String, Vec<String>)> {
+    let (access_profile, access_profile_override_args) =
+        resolve_builtin_access_profile("claude", config)?;
+    let mut args = if let Some(access_args) = access_profile_override_args {
+        access_args
+    } else {
+        match config.access_mode {
+            AccessMode::ReadOnly => vec!["--permission-mode".to_string(), "plan".to_string()],
+            AccessMode::Edit if config.allowed_tools.is_none() => {
+                let mut args = Vec::new();
+                for tool in &["Read", "Edit", "Write", "Glob", "Grep", "Bash(git *)"] {
+                    args.push("--allowedTools".to_string());
+                    args.push(tool.to_string());
+                }
+                args
+            }
+            AccessMode::Edit => Vec::new(),
+            AccessMode::Execute | AccessMode::Unrestricted => {
+                vec!["--dangerously-skip-permissions".to_string()]
+            }
+        }
+    };
+
+    append_claude_tool_flags(&mut args, config);
+    Ok((access_profile, args))
+}
+
 impl AgentDriver for ClaudeDriver {
     fn name(&self) -> &str {
         "claude"
@@ -610,8 +652,7 @@ impl AgentDriver for ClaudeDriver {
 
     fn build_session_args(&self, config: &AgentConfig) -> anyhow::Result<CommandArgs> {
         let mut args = Vec::new();
-        let (access_profile, access_profile_override_args) =
-            resolve_builtin_access_profile(self.name(), config)?;
+        let (access_profile, access_args) = resolve_claude_access(config)?;
 
         // Model selection
         if let Some(model) = &config.model {
@@ -643,52 +684,8 @@ impl AgentDriver for ClaudeDriver {
             args.push("--no-session-persistence".to_string());
         }
 
-        // Access mode / tool control ------------------------------------------------
-        // Fine-grained tool control overrides the access-mode shorthand when present.
-        if let Some(access_args) = access_profile_override_args {
-            args.extend(access_args);
-            if let Some(allowed) = &config.allowed_tools {
-                for tool in allowed {
-                    args.push("--allowedTools".to_string());
-                    args.push(tool.clone());
-                }
-            }
-            if let Some(disallowed) = &config.disallowed_tools {
-                for tool in disallowed {
-                    args.push("--disallowedTools".to_string());
-                    args.push(tool.clone());
-                }
-            }
-        } else if config.allowed_tools.is_some() || config.disallowed_tools.is_some() {
-            if let Some(allowed) = &config.allowed_tools {
-                for tool in allowed {
-                    args.push("--allowedTools".to_string());
-                    args.push(tool.clone());
-                }
-            }
-            if let Some(disallowed) = &config.disallowed_tools {
-                for tool in disallowed {
-                    args.push("--disallowedTools".to_string());
-                    args.push(tool.clone());
-                }
-            }
-        } else {
-            match config.access_mode {
-                AccessMode::ReadOnly => {
-                    args.push("--permission-mode".to_string());
-                    args.push("plan".to_string());
-                }
-                AccessMode::Edit => {
-                    for tool in &["Read", "Edit", "Write", "Glob", "Grep", "Bash(git *)"] {
-                        args.push("--allowedTools".to_string());
-                        args.push(tool.to_string());
-                    }
-                }
-                AccessMode::Execute | AccessMode::Unrestricted => {
-                    args.push("--dangerously-skip-permissions".to_string());
-                }
-            }
-        }
+        // Access mode is the ceiling; explicit tool lists only refine it.
+        args.extend(access_args);
 
         // Web search toggle
         if let Some(false) = config.tool_toggles.web_search {
@@ -1239,6 +1236,22 @@ binary = "agent-two"
     }
 
     #[test]
+    fn claude_read_only_with_disallowed_tools_retains_plan_mode() {
+        let driver = ClaudeDriver;
+        let config = AgentConfig {
+            access_mode: AccessMode::ReadOnly,
+            disallowed_tools: Some(vec!["Bash".into()]),
+            ..default_config()
+        };
+
+        let cmd = driver.build_session_args(&config).unwrap();
+
+        assert_eq!(arg_after(&cmd.args, "--permission-mode"), Some("plan"));
+        assert_eq!(arg_after(&cmd.args, "--disallowedTools"), Some("Bash"));
+        assert_eq!(cmd.access_profile, "read-only");
+    }
+
+    #[test]
     fn claude_access_mode_edit() {
         let driver = ClaudeDriver;
         let config = AgentConfig {
@@ -1291,7 +1304,7 @@ binary = "agent-two"
     }
 
     #[test]
-    fn claude_fine_grained_tools_override_access_mode() {
+    fn claude_allowed_tools_refine_read_only_access_mode() {
         let driver = ClaudeDriver;
         let config = AgentConfig {
             access_mode: AccessMode::ReadOnly,
@@ -1299,8 +1312,7 @@ binary = "agent-two"
             ..default_config()
         };
         let cmd = driver.build_session_args(&config).unwrap();
-        // Should NOT have --permission-mode because fine-grained overrides
-        assert!(!args_contain(&cmd.args, "--permission-mode"));
+        assert_eq!(arg_after(&cmd.args, "--permission-mode"), Some("plan"));
         let allowed: Vec<&str> = cmd
             .args
             .windows(2)
@@ -1313,6 +1325,34 @@ binary = "agent-two"
             })
             .collect();
         assert_eq!(allowed, vec!["Read", "Grep"]);
+        assert_eq!(cmd.access_profile, "read-only");
+    }
+
+    #[test]
+    fn claude_allowed_tools_retain_execute_permission_mode() {
+        let driver = ClaudeDriver;
+        let config = AgentConfig {
+            access_mode: AccessMode::Execute,
+            allowed_tools: Some(vec!["Read".into(), "Bash".into()]),
+            ..default_config()
+        };
+
+        let cmd = driver.build_session_args(&config).unwrap();
+
+        assert!(args_contain(&cmd.args, "--dangerously-skip-permissions"));
+        let allowed: Vec<&str> = cmd
+            .args
+            .windows(2)
+            .filter_map(|w| {
+                if w[0] == "--allowedTools" {
+                    Some(w[1].as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(allowed, vec!["Read", "Bash"]);
+        assert_eq!(cmd.access_profile, "workspace-write");
     }
 
     // -----------------------------------------------------------------------

@@ -7035,8 +7035,9 @@ mod tests {
 
     use super::*;
 
-    const TMUX_CLEANUP_TEST_TIMEOUT: Duration =
-        tmux_tools_core::tmux::DEFAULT_TMUX_COMMAND_TIMEOUT.saturating_mul(3);
+    const TMUX_CLEANUP_TEST_TIMEOUT: Duration = crate::test_support::test_budget(
+        tmux_tools_core::tmux::DEFAULT_TMUX_COMMAND_TIMEOUT,
+    );
 
     thread_local! {
         static ASYNC_WORKER_MARKER: Cell<bool> = const { Cell::new(false) };
@@ -10627,6 +10628,67 @@ mod tests {
         assert!(!second.checkpoint.all_results.contains_key("entry"));
         assert_eq!(first.checkpoint.all_results["after"].output, "done one");
         assert_eq!(second.checkpoint.all_results["after"].output, "done two");
+    }
+
+    #[tokio::test]
+    async fn subflow_entry_resolves_previous_output_from_parent_context() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                (
+                    "upstream".to_string(),
+                    vec![ScriptedStep::success("parent-output")],
+                ),
+                (
+                    "entry parent-output".to_string(),
+                    vec![ScriptedStep::success("entry-seen")],
+                ),
+                (
+                    "exit entry-seen".to_string(),
+                    vec![ScriptedStep::success("sub-result")],
+                ),
+            ])),
+        );
+        let subflow = workflow_from_parts(
+            "entry",
+            vec![
+                // Mirrors post-extraction entry prompt after {{previous_output}} → {{var:…}} rewrite.
+                task_node("entry", "Entry", "entry {{var:previous_output}}"),
+                task_node("exit", "Exit", "exit {{previous_output}}"),
+            ],
+            vec![success_edge("entry_exit", "entry", "exit", None)],
+        );
+
+        let mut workflow = workflow_from_parts(
+            "upstream",
+            vec![
+                task_node("upstream", "Upstream", "upstream"),
+                call_node(
+                    "call",
+                    "echo_subflow",
+                    "exit",
+                    vec![InputBinding {
+                        name: "previous_output".to_string(),
+                        source: "previous_output".to_string(),
+                    }],
+                ),
+            ],
+            vec![
+                success_edge("upstream_call", "upstream", "call", None),
+            ],
+        );
+        workflow
+            .subflows
+            .insert("echo_subflow".to_string(), Box::new(subflow));
+
+        let run_id = runtime.start_run(workflow, BTreeMap::new(), None).await.unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        assert_eq!(persisted.checkpoint.all_results["call"].output, "sub-result");
     }
 
     #[tokio::test]

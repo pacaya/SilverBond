@@ -2619,7 +2619,7 @@ mod tests {
     use crate::model::{RunAsConfig, SplitFailurePolicy};
 
     const TMUX_INTERACTIVE_TEST_TIMEOUT: Duration =
-        tmux::DEFAULT_TMUX_COMMAND_TIMEOUT.saturating_mul(3);
+        crate::test_support::test_budget(tmux::DEFAULT_TMUX_COMMAND_TIMEOUT);
 
     fn control_test_node() -> WorkflowNode {
         WorkflowNode {
@@ -3306,7 +3306,7 @@ exit 0
     }
 
     #[test]
-    fn build_agent_command_appends_resolved_session_safety_args() {
+    fn build_agent_command_composes_access_ceiling_with_tool_lists() {
         let spawn_cfg = SpawnConfig {
             extra_args: vec!["--tail-flag".to_string()],
             ..Default::default()
@@ -3325,9 +3325,10 @@ exit 0
         assert!(built.command.contains("'--allowedTools' 'Grep'"));
         assert!(built.command.contains("'--disallowedTools' 'Bash(rm *)'"));
         assert!(
-            !built.command.contains("'--permission-mode'"),
-            "fine-grained tool control should replace the access-mode shorthand"
+            built.command.contains("'--dangerously-skip-permissions'"),
+            "tool lists must not suppress the execute access ceiling"
         );
+        assert_eq!(built.access_profile.as_deref(), Some("workspace-write"));
         assert!(
             built.command.find("'--model'").unwrap() < built.command.find("'--tail-flag'").unwrap(),
             "driver-rendered session args should precede caller extra args"
@@ -3461,6 +3462,92 @@ exit 0
             !args
                 .windows(2)
                 .any(|window| { window == [names::KEY_ACCESS, "full-access"] })
+        );
+    }
+
+    #[cfg(unix)]
+    fn assert_claude_access_metadata(
+        agent_config: AgentConfig,
+        access_fragments: &[&str],
+        tool_fragments: &[&str],
+        expected_profile: &str,
+    ) {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (invocation, log) = access_metadata_invocation(&temp);
+        let spawn_config = SpawnConfig {
+            agent: Some("claude".to_string()),
+            ..SpawnConfig::default()
+        };
+
+        tmux_tools_core::with_invocation(invocation, || {
+            spawn_pane(
+                Some(&spawn_config),
+                None,
+                "/workspace",
+                Some(&agent_config),
+                None,
+                None,
+            )
+        })
+        .unwrap();
+
+        let recorded = std::fs::read_to_string(log).unwrap();
+        let args = recorded.lines().collect::<Vec<_>>();
+        for fragment in access_fragments.iter().chain(tool_fragments) {
+            assert!(
+                recorded.contains(fragment),
+                "spawned command should contain {fragment}; args={args:?}"
+            );
+        }
+        assert!(
+            args.windows(2)
+                .any(|window| window == [names::KEY_ACCESS, expected_profile]),
+            "pane metadata should match the emitted access mode; args={args:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_pane_stamps_read_only_with_disallowed_tools() {
+        assert_claude_access_metadata(
+            AgentConfig {
+                access_mode: AccessMode::ReadOnly,
+                disallowed_tools: Some(vec!["Bash".to_string()]),
+                ..AgentConfig::default()
+            },
+            &["--permission-mode", "plan"],
+            &["--disallowedTools", "Bash"],
+            "read-only",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_pane_stamps_read_only_with_allowed_tools() {
+        assert_claude_access_metadata(
+            AgentConfig {
+                access_mode: AccessMode::ReadOnly,
+                allowed_tools: Some(vec!["Read".to_string()]),
+                ..AgentConfig::default()
+            },
+            &["--permission-mode", "plan"],
+            &["--allowedTools", "Read"],
+            "read-only",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_pane_stamps_execute_with_allowed_tools() {
+        assert_claude_access_metadata(
+            AgentConfig {
+                access_mode: AccessMode::Execute,
+                allowed_tools: Some(vec!["Read".to_string()]),
+                ..AgentConfig::default()
+            },
+            &["--dangerously-skip-permissions"],
+            &["--allowedTools", "Read"],
+            "workspace-write",
         );
     }
 

@@ -123,6 +123,40 @@ interface CompoundRef {
 interface CompoundBoundary {
   side: (nodeId: string) => CompoundRefSide;
   refsIn: (text: string) => CompoundRef[];
+  retarget: (text: string, fromId: string, toId: string) => string;
+}
+
+const COMPOUND_ALL_PREDECESSORS = "{{all_predecessors}}";
+const COMPOUND_REPRESENTABLE_POSITIONAL_TOKENS = [
+  { token: "{{previous_output}}", source: "previous_output" },
+  { token: "{{branch_origin}}", source: "branch_origin" },
+  { token: "{{branch_choice}}", source: "branch_choice" },
+] as const;
+
+function retargetNodeRefsInText(
+  text: string,
+  fromId: string,
+  targets: {
+    output: string;
+    field: (path: string) => string;
+    parsedField: (path: string) => string;
+    bare: string;
+  },
+): string {
+  let result = text;
+  result = result.replace(COMPOUND_NODE_OUTPUT_FIELD_RE, (match, nodeId: string, path: string) =>
+    nodeId === fromId ? targets.field(path) : match,
+  );
+  result = result.replace(COMPOUND_NODE_PARSED_FIELD_RE, (match, nodeId: string, path: string) =>
+    nodeId === fromId ? targets.parsedField(path) : match,
+  );
+  if (result.includes(`{{node:${fromId}.output}}`)) {
+    result = result.replaceAll(`{{node:${fromId}.output}}`, targets.output);
+  }
+  if (result.includes(`{{${fromId}}}`)) {
+    result = result.replaceAll(`{{${fromId}}}`, targets.bare);
+  }
+  return result;
 }
 
 /** Mirrors prompt_template_for_node: every field that can carry template text. */
@@ -191,6 +225,14 @@ function compoundBoundary(active: WorkflowDocument, selected: Set<string>): Comp
       }
       return refs;
     },
+    retarget(text: string, fromId: string, toId: string): string {
+      return retargetNodeRefsInText(text, fromId, {
+        output: `{{node:${toId}.output}}`,
+        field: (path) => `{{node:${toId}.output.${path}}}`,
+        parsedField: (path) => `{{node:${toId}.parsedOutput.${path}}}`,
+        bare: `{{${toId}}}`,
+      });
+    },
   };
 }
 
@@ -213,10 +255,7 @@ function compoundUniqueVarName(base: string, used: Set<string>): string {
 }
 
 interface OutsideNodePatch {
-  prompt?: string;
-  decidePrompt?: string;
-  runAgentPrompt?: string;
-  sendText?: string;
+  prompts?: CompoundPromptText[];
   contextSources?: ContextSource[];
 }
 
@@ -232,6 +271,7 @@ function planCompoundDependencies(
   active: WorkflowDocument,
   selected: Set<string>,
   selNodes: WorkflowNode[],
+  entry: WorkflowNode,
   exit: WorkflowNode,
 ): CompoundDependencyPlan | SaveSelectionAsCompoundResult {
   const compoundId = createNodeId();
@@ -278,10 +318,14 @@ function planCompoundDependencies(
 
   const bindOutsideNodeOutput = (outsideId: string, targetNodeId: string) => {
     const varName = bindSource(`from_${outsideId}`, `node:${outsideId}.output`);
+    const varRef = `{{var:${varName}}}`;
     rewriteMovedPrompts(targetNodeId, (text) =>
-      text
-        .replaceAll(`{{node:${outsideId}.output}}`, `{{var:${varName}}}`)
-        .replaceAll(`{{${outsideId}}}`, `{{var:${varName}}}`),
+      retargetNodeRefsInText(text, outsideId, {
+        output: varRef,
+        field: () => varRef,
+        parsedField: () => varRef,
+        bare: varRef,
+      }),
     );
   };
 
@@ -320,6 +364,8 @@ function planCompoundDependencies(
       }
     }
 
+    // Unknown-side whole-output/bare refs are left verbatim (runtime keeps non-matching
+    // {{node:…}} / {{id}} literals); field paths must be rejected because they resolve to "".
     for (const { text } of compoundNodePromptTexts(node)) {
       for (const ref of boundary.refsIn(text)) {
         if (ref.form !== "output" && ref.form !== "bare") continue;
@@ -345,8 +391,23 @@ function planCompoundDependencies(
     }
   }
 
+  for (const { text } of compoundNodePromptTexts(entry)) {
+    if (text.includes(COMPOUND_ALL_PREDECESSORS)) {
+      return reject(
+        `Entry node "${entry.name}" uses ${COMPOUND_ALL_PREDECESSORS}, which cannot be preserved when extracting a compound subflow.`,
+      );
+    }
+  }
+  for (const { token, source } of COMPOUND_REPRESENTABLE_POSITIONAL_TOKENS) {
+    for (const { text } of compoundNodePromptTexts(entry)) {
+      if (!text.includes(token)) continue;
+      const varName = bindSource(source, source);
+      rewriteMovedPrompts(entry.id, (t) => t.replaceAll(token, `{{var:${varName}}}`));
+    }
+  }
+
   for (const node of active.nodes) {
-    if (selected.has(node.id)) continue;
+    if (boundary.side(node.id) === "moved") continue;
 
     for (const { text } of compoundNodePromptTexts(node)) {
       for (const ref of boundary.refsIn(text)) {
@@ -366,7 +427,7 @@ function planCompoundDependencies(
     }
 
     for (const context of node.contextSources ?? []) {
-      if (!selected.has(context.nodeId)) continue;
+      if (boundary.side(context.nodeId) !== "moved") continue;
       if (context.nodeId !== exit.id) {
         return reject(
           `Context source "${context.name}" on "${node.name}" references a non-exit node inside the selection.`,
@@ -381,41 +442,25 @@ function planCompoundDependencies(
       let updated = entry.text;
       let fieldChanged = false;
       for (const ref of boundary.refsIn(entry.text)) {
-        if (ref.form !== "output" && ref.form !== "bare") continue;
         if (boundary.side(ref.nodeId) !== "moved") continue;
         if (ref.nodeId !== exit.id) {
           return reject(
             `Node "${node.name}" references "${ref.nodeId}" inside the selection, but only the exit node may be referenced from outside.`,
           );
         }
-        updated = updated
-          .replaceAll(`{{node:${ref.nodeId}.output}}`, `{{node:${compoundId}.output}}`)
-          .replaceAll(`{{${ref.nodeId}}}`, `{{${compoundId}}}`);
+        updated = boundary.retarget(updated, ref.nodeId, compoundId);
         fieldChanged = true;
       }
       if (fieldChanged) {
-        switch (entry.field) {
-          case "prompt":
-            patch.prompt = updated;
-            break;
-          case "decidePrompt":
-            patch.decidePrompt = updated;
-            break;
-          case "runAgentPrompt":
-            patch.runAgentPrompt = updated;
-            break;
-          case "sendText":
-            patch.sendText = updated;
-            break;
-        }
+        (patch.prompts ??= []).push({ field: entry.field, text: updated });
         changed = true;
       }
     }
 
     let contextSources = node.contextSources;
-    if (contextSources?.some((context) => selected.has(context.nodeId))) {
+    if (contextSources?.some((context) => boundary.side(context.nodeId) === "moved")) {
       contextSources = contextSources.map((context) =>
-        selected.has(context.nodeId) ? { ...context, nodeId: compoundId } : context,
+        boundary.side(context.nodeId) === "moved" ? { ...context, nodeId: compoundId } : context,
       );
       patch.contextSources = contextSources;
       changed = true;
@@ -833,7 +878,7 @@ class WorkflowStore {
     }
 
     const selNodesPlain = structuredClone($state.snapshot(selNodes)) as WorkflowNode[];
-    const dependencyPlan = planCompoundDependencies(active, selected, selNodesPlain, exit);
+    const dependencyPlan = planCompoundDependencies(active, selected, selNodesPlain, entry, exit);
     if ("ok" in dependencyPlan) {
       return dependencyPlan;
     }
@@ -901,18 +946,10 @@ class WorkflowStore {
     for (const [nodeId, patch] of plan.outsideNodePatches) {
       const outsideNode = wf.nodes.find((n) => n.id === nodeId);
       if (!outsideNode) continue;
-      if (patch.prompt !== undefined) outsideNode.prompt = patch.prompt;
-      if (patch.decidePrompt !== undefined && outsideNode.kind.type === "decide") {
-        outsideNode.kind.decideConfig.prompt = patch.decidePrompt;
-      }
-      if (patch.runAgentPrompt !== undefined && outsideNode.kind.type === "run_agent") {
-        outsideNode.kind.runAgentConfig = {
-          ...(outsideNode.kind.runAgentConfig ?? { killAfter: true }),
-          prompt: patch.runAgentPrompt,
-        };
-      }
-      if (patch.sendText !== undefined && outsideNode.kind.type === "send") {
-        outsideNode.kind.sendConfig.text = patch.sendText;
+      if (patch.prompts) {
+        for (const p of patch.prompts) {
+          applyCompoundPromptField(outsideNode, p.field, p.text);
+        }
       }
       if (patch.contextSources !== undefined) outsideNode.contextSources = patch.contextSources;
     }

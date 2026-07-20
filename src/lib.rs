@@ -9,3 +9,6 @@ pub mod runtime;
 pub mod storage;
 pub mod tmux_exec;
 pub mod util;
+
+#[cfg(test)]
+mod test_support;

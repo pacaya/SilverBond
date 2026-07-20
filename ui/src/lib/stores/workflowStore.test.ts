@@ -735,6 +735,172 @@ describe("workflowStore", () => {
     expect(result).toMatchObject({ ok: true });
   });
 
+  it("retargets exit field-path references from outside nodes across all prompt fields", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "x",
+        nodes: [
+          node("x", "task", { prompt: "upstream" }),
+          node("a", "task", { prompt: "mid" }),
+          node("b", "task", {
+            prompt: "exit {{node:a.output.summary}}",
+            responseFormat: "json",
+          }),
+          node("after", "task", { prompt: "whole {{node:b.output}}" }),
+          node("after2", "decide", {
+            kind: {
+              type: "decide",
+              decideConfig: {
+                prompt: "field {{node:b.parsedOutput.key}}",
+                inputs: [],
+                outcomes: [],
+              },
+            },
+          }),
+          node("after3", "run_agent", {
+            kind: {
+              type: "run_agent",
+              runAgentConfig: {
+                killAfter: true,
+                prompt: "agent field {{node:b.output.nested}}",
+              },
+            },
+          }),
+          node("after4", "send", {
+            kind: {
+              type: "send",
+              sendConfig: { text: "send {{node:b.parsedOutput.msg}}", enter: true },
+            },
+          }),
+        ],
+        edges: [
+          edge("x-a", "x", "a"),
+          edge("a-b", "a", "b"),
+          edge("b-after", "b", "after"),
+          edge("b-after2", "b", "after2"),
+          edge("b-after3", "b", "after3"),
+          edge("b-after4", "b", "after4"),
+        ],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "ExitFieldPaths");
+
+    expect(result).toMatchObject({ ok: true });
+    const compound = store.workflow!.nodes.find((n) => n.kind.type === "subflow");
+    if (!compound) throw new Error("expected compound");
+    const cid = compound.id;
+    expect(store.workflow!.nodes.find((n) => n.id === "after")?.prompt).toBe(
+      `whole {{node:${cid}.output}}`,
+    );
+    const after2 = store.workflow!.nodes.find((n) => n.id === "after2");
+    expect(after2?.kind.type).toBe("decide");
+    if (after2?.kind.type !== "decide") throw new Error("expected decide");
+    expect(after2.kind.decideConfig.prompt).toBe(`field {{node:${cid}.parsedOutput.key}}`);
+    const after3 = store.workflow!.nodes.find((n) => n.id === "after3");
+    if (after3?.kind.type !== "run_agent") throw new Error("expected run_agent");
+    expect(after3.kind.runAgentConfig?.prompt).toBe(`agent field {{node:${cid}.output.nested}}`);
+    const after4 = store.workflow!.nodes.find((n) => n.id === "after4");
+    if (after4?.kind.type !== "send") throw new Error("expected send");
+    expect(after4.kind.sendConfig.text).toBe(`send {{node:${cid}.parsedOutput.msg}}`);
+  });
+
+  it("leaves unknown whole-output references verbatim in moved and outside nodes", () => {
+    const typoRef = "{{node:typo-id.output}}";
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "x",
+        nodes: [
+          node("x", "task", { prompt: "upstream" }),
+          node("a", "task", { prompt: `moved ${typoRef}` }),
+          node("b", "task", { prompt: "exit" }),
+          node("after", "task", { prompt: `outside ${typoRef}` }),
+        ],
+        edges: [
+          edge("x-a", "x", "a"),
+          edge("a-b", "a", "b"),
+          edge("b-after", "b", "after"),
+        ],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "UnknownWholeOutput");
+
+    expect(result).toMatchObject({ ok: true });
+    const subflow = store.workflow!.subflows?.UnknownWholeOutput;
+    expect(subflow?.nodes.find((n) => n.id === "a")?.prompt).toContain(typoRef);
+    expect(store.workflow!.nodes.find((n) => n.id === "after")?.prompt).toContain(typoRef);
+  });
+
+  it("binds positional tokens on the entry node when extracting a middle compound", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [
+          node("a", "task", { prompt: "upstream" }),
+          node("b", "task", { prompt: "middle {{previous_output}}" }),
+          node("c", "task", { prompt: "downstream" }),
+        ],
+        edges: [edge("a-b", "a", "b"), edge("b-c", "b", "c")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["b"], "MiddleEntryPositional");
+
+    expect(result).toMatchObject({ ok: true });
+    const compound = store.workflow!.nodes.find((n) => n.kind.type === "subflow");
+    if (compound?.kind.type !== "subflow") throw new Error("expected subflow");
+    expect(compound.kind.subflowConfig.inputs).toEqual(
+      expect.arrayContaining([{ name: "previous_output", source: "previous_output" }]),
+    );
+    const subflow = store.workflow!.subflows?.MiddleEntryPositional;
+    const movedB = subflow?.nodes.find((n) => n.id === "b");
+    expect(movedB?.prompt).toContain("{{var:previous_output}}");
+    expect(movedB?.prompt).not.toContain("{{previous_output}}");
+  });
+
+  it("rejects {{all_predecessors}} on the entry node without mutating the workflow", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [
+          node("a", "task", { prompt: "upstream" }),
+          node("b", "task", { prompt: "entry {{all_predecessors}}" }),
+          node("c", "task", { prompt: "exit" }),
+        ],
+        edges: [edge("a-b", "a", "b"), edge("b-c", "b", "c")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["b"], "AllPredecessorsEntry");
+
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("compound save unexpectedly succeeded");
+    expect(result.code).toBe("unsupported_dependency");
+    expect(store.workflow!.subflows?.AllPredecessorsEntry).toBeUndefined();
+    expect(store.workflow!.nodes.some((n) => n.kind.type === "subflow")).toBe(false);
+  });
+
+  it("does not rewrite positional tokens on non-entry moved nodes", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [
+          node("a", "task", { prompt: "entry" }),
+          node("b", "task", { prompt: "inner {{previous_output}}" }),
+          node("c", "task", { prompt: "exit" }),
+        ],
+        edges: [edge("a-b", "a", "b"), edge("b-c", "b", "c")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b", "c"], "NonEntryPositional");
+
+    expect(result).toMatchObject({ ok: true });
+    const subflow = store.workflow!.subflows?.NonEntryPositional;
+    expect(subflow?.nodes.find((n) => n.id === "b")?.prompt).toContain("{{previous_output}}");
+  });
+
   it("corrects stale selectedPane when observability panes change across runs", () => {
     store.selectPane("cursor:old-node");
     expect(store.selectedPane).toBe("cursor:old-node");

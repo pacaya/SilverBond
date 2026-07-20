@@ -198,7 +198,7 @@
     }
   }
 
-  async function startRun(targetWorkflow: WorkflowDocument) {
+  async function runLifecycle(label: string, kickoff: () => Promise<RunActionResponse>) {
     const { epoch, signal } = store.beginRunStream();
     store.clearLines();
     store.setPanelTab("output");
@@ -206,7 +206,7 @@
     runStartTime = Date.now();
     let hadError = false;
     try {
-      const payload = await createRunWithUnlock(targetWorkflow);
+      const payload = await kickoff();
       if (store.isRunEpochStale(epoch)) return;
       store.setRunObservability(observabilityFromPayload(payload));
       store.setRunState({ runId: payload.runId, streamToken: payload.streamToken, running: true });
@@ -220,7 +220,7 @@
     } catch (err) {
       if (store.isRunEpochStale(epoch)) return;
       hadError = true;
-      store.setError(`Run failed: ${err instanceof Error ? err.message : "Unknown error"}`);
+      store.setError(`${label} failed: ${err instanceof Error ? err.message : "Unknown error"}`);
     } finally {
       if (!store.isRunEpochStale(epoch)) {
         store.setRunState({ running: false, approval: null, runId: null });
@@ -229,72 +229,18 @@
         await queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] });
       }
     }
+  }
+
+  async function startRun(targetWorkflow: WorkflowDocument) {
+    await runLifecycle("Run", () => createRunWithUnlock(targetWorkflow));
   }
 
   async function resumeRun(runId: string) {
-    const { epoch, signal } = store.beginRunStream();
-    store.setPanelTab("output");
-    store.clearLines();
-    store.setRunState({ running: true });
-    runStartTime = Date.now();
-    let hadError = false;
-    try {
-      const payload = await api.resumeRun(runId);
-      if (store.isRunEpochStale(epoch)) return;
-      store.setRunObservability(observabilityFromPayload(payload));
-      store.setRunState({ runId: payload.runId, streamToken: payload.streamToken, running: true });
-      const stream = streamRun(
-        payload.runId,
-        payload.streamToken,
-        (event) => store.applyRunEvent(event, epoch),
-        { signal },
-      );
-      await stream.finished;
-    } catch (err) {
-      if (store.isRunEpochStale(epoch)) return;
-      hadError = true;
-      store.setError(`Resume failed: ${err instanceof Error ? err.message : "Unknown error"}`);
-    } finally {
-      if (!store.isRunEpochStale(epoch)) {
-        store.setRunState({ running: false, approval: null, runId: null });
-        showRunResult(hadError);
-        await queryClient.invalidateQueries({ queryKey: ["logs"] });
-        await queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] });
-      }
-    }
+    await runLifecycle("Resume", () => api.resumeRun(runId));
   }
 
   async function restartFromNode(runId: string, nodeId: string) {
-    const { epoch, signal } = store.beginRunStream();
-    store.setPanelTab("output");
-    store.clearLines();
-    store.setRunState({ running: true });
-    runStartTime = Date.now();
-    let hadError = false;
-    try {
-      const payload = await api.restartFromNode(runId, nodeId);
-      if (store.isRunEpochStale(epoch)) return;
-      store.setRunObservability(observabilityFromPayload(payload));
-      store.setRunState({ runId: payload.runId, streamToken: payload.streamToken, running: true });
-      const stream = streamRun(
-        payload.runId,
-        payload.streamToken,
-        (event) => store.applyRunEvent(event, epoch),
-        { signal },
-      );
-      await stream.finished;
-    } catch (err) {
-      if (store.isRunEpochStale(epoch)) return;
-      hadError = true;
-      store.setError(`Restart failed: ${err instanceof Error ? err.message : "Unknown error"}`);
-    } finally {
-      if (!store.isRunEpochStale(epoch)) {
-        store.setRunState({ running: false, approval: null, runId: null });
-        showRunResult(hadError);
-        await queryClient.invalidateQueries({ queryKey: ["logs"] });
-        await queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] });
-      }
-    }
+    await runLifecycle("Restart", () => api.restartFromNode(runId, nodeId));
   }
 
   /* ── keyboard shortcuts ───────────────────────────────────────────── */
