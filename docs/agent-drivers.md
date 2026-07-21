@@ -18,9 +18,9 @@ Runtime (tmux_exec.rs)
   │
   ├── resolve_agent_config()   # Merge node → workflow → driver defaults
   │
-  ├── build_tmux_invocation()  # runAs → sudo prefix + socket selection
+  ├── build_tmux_invocation()  # runAs → sudo prefix + automatic run socket
   │
-  ├── tmux server (per-user socket) → pane per agent invocation
+  ├── tmux server (per-run socket) → pane per agent invocation
   │
   └── AgentDriver trait
         ├── ClaudeDriver           # claude CLI
@@ -32,8 +32,8 @@ Runtime (tmux_exec.rs)
 
 The user switch happens **once** at the tmux server boundary, not per pane:
 
-- **Per-UID sockets** — each target user gets their own tmux server socket (mode `0700`), isolating sessions between users.
-- **Control commands** — tmux control operations (`new-session`, `send-keys`, `capture-pane`, etc.) run as the target user via a `sudo -u <user> -H --` prefix and `-L <socket>`.
+- **Per-run sockets** — each run gets its own tmux server socket under the target user's per-UID socket directory (mode `0700`), isolating sessions between runs and users.
+- **Control commands** — tmux control operations (`new-session`, `send-keys`, `capture-pane`, etc.) run as the target user via a `sudo -u <user> -H --` prefix and `-L silverbond-<run-id>`.
 - **Workloads** — agent CLIs launch through the target user's login+interactive shell: `zsh -lic`.
 
 Workflows can set a top-level `runAs` field to control this behavior:
@@ -41,8 +41,7 @@ Workflows can set a top-level `runAs` field to control this behavior:
 ```json
 {
   "runAs": {
-    "user": "agent-sandbox",
-    "socket": "silverbond"
+    "user": "agent-sandbox"
   }
 }
 ```
@@ -51,14 +50,13 @@ Workflows can set a top-level `runAs` field to control this behavior:
 |-------|--------|
 | `user` | Synthesizes a `sudo -u <user> -H --` prefix for tmux control commands |
 | `command` | Verbatim argv-prefix escape hatch (overrides the synthesized `sudo` prefix) |
-| `socket` | Override the tmux socket name (defaults to `silverbond`; normally derived from user) |
 
-When both `user` and `command` are set, `command` takes precedence.
+When both `user` and `command` are set, `command` takes precedence. SilverBond always assigns a dedicated `silverbond-<run-id>` socket.
 
 To observe a running agent pane:
 
 ```
-sudo -u <user> tmux -L <socket> attach -t <session>
+sudo -u <user> tmux -L silverbond-<run-id> attach -t <session>
 ```
 
 The `GET /api/capabilities` endpoint exposes a `features.runAs` flag and per-run `attachCommand` hints for observability. Session history is no longer served via a dedicated API endpoint — attach to the tmux pane directly.

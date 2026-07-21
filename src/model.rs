@@ -5,13 +5,21 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::driver::{AccessMode, AgentConfig, ReasoningLevel, ToolToggles};
+use crate::driver::{self, AccessMode, AgentConfig, ReasoningLevel, ToolToggles};
 
 pub const WORKFLOW_SCHEMA_VERSION: u32 = 4;
 const LEGACY_WORKFLOW_SCHEMA_VERSION: u64 = 2;
 const FLAT_NODE_WORKFLOW_SCHEMA_VERSION: u64 = 3;
 pub(crate) const MAX_WORKFLOW_SUBFLOWS: usize = 1_024;
 pub(crate) const MAX_SUBFLOW_CALL_EDGES: usize = 4_096;
+pub(crate) const MAX_WORKFLOW_NODES: usize = 50_000;
+pub(crate) const MAX_WORKFLOW_EDGES: usize = 100_000;
+pub(crate) const MAX_NODE_RETRY_COUNT: u32 = 10;
+
+/// Maximum agent attempts for a task node (initial run plus retries).
+pub(crate) fn max_node_retry_attempts(retry_count: Option<u32>) -> u32 {
+    retry_count.unwrap_or(0).min(MAX_NODE_RETRY_COUNT) + 1
+}
 
 // ---------------------------------------------------------------------------
 // Orchestrator configuration
@@ -48,6 +56,55 @@ pub struct OrchestratorConfig {
 
 /// Default agent used when a node has no explicit `agent` field.
 pub const DEFAULT_AGENT: &str = "claude";
+
+/// Returns the agent that will actually execute an agent-running node.
+pub fn agent_name_for_node(node: &WorkflowNode) -> String {
+    match &node.kind {
+        NodeKind::RunAgent {
+            run_agent_config, ..
+        } => run_agent_config
+            .agent
+            .clone()
+            .or_else(|| node.agent.clone())
+            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
+        NodeKind::Spawn { spawn_config } => spawn_config
+            .agent
+            .clone()
+            .or_else(|| node.agent.clone())
+            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
+        NodeKind::Send { .. }
+        | NodeKind::Wait { .. }
+        | NodeKind::Capture { .. }
+        | NodeKind::Kill { .. } => "tmux".to_string(),
+        NodeKind::Task { .. }
+        | NodeKind::Approval
+        | NodeKind::Split
+        | NodeKind::Collector
+        | NodeKind::Decide { .. }
+        | NodeKind::ParallelBatch { .. }
+        | NodeKind::Subflow { .. }
+        | NodeKind::Call { .. } => node
+            .agent
+            .clone()
+            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
+    }
+}
+
+fn working_directory_for_node(workflow_cwd: &str, node: &WorkflowNode) -> String {
+    match &node.kind {
+        NodeKind::RunAgent {
+            run_agent_config, ..
+        } => run_agent_config
+            .cwd
+            .clone()
+            .or_else(|| node.cwd.clone())
+            .unwrap_or_else(|| workflow_cwd.to_string()),
+        _ => node
+            .cwd
+            .clone()
+            .unwrap_or_else(|| workflow_cwd.to_string()),
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
@@ -220,7 +277,6 @@ pub struct AgentDefaults {
 pub struct RunAsConfig {
     pub user: Option<String>,
     pub command: Option<Vec<String>>,
-    pub socket: Option<String>,
 }
 
 /// Per-node agent configuration override. Extends `AgentDefaults` with fine-grained tool control.
@@ -265,6 +321,7 @@ pub fn resolve_agent_config(
         NodeKind::RunAgent {
             run_agent_config, ..
         } => run_agent_config.access.clone(),
+        NodeKind::Spawn { spawn_config } => spawn_config.access.clone(),
         _ => None,
     };
 
@@ -308,32 +365,47 @@ where
     Ok(opt.unwrap_or_else(default_split_failure_policy))
 }
 
-/// Deserializes `output_schema` accepting both the legacy `{"field": "type"}` format
-/// and full JSON Schema objects. Legacy format is auto-converted to a proper JSON Schema.
+/// Deserializes `output_schema` as a raw JSON value.
+/// Legacy `{"field": "type"}` shorthand is converted only during v2/v3 → v4 migration
+/// in [`migrate_workflow_value_to_v4`], never on the deserialization hot path.
 fn deserialize_output_schema<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
-        return Ok(None);
-    };
-    Ok(Some(migrate_output_schema(value)))
+    Option::<Value>::deserialize(deserializer)
 }
 
-/// If value is a flat `{"field": "type"}` object (legacy format), convert to JSON Schema.
-/// Otherwise, return as-is (already a proper JSON Schema).
+const JSON_SCHEMA_PRIMITIVE_TYPES: &[&str] = &[
+    "string", "number", "integer", "boolean", "object", "array", "null",
+];
+
+fn is_plain_identifier(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_legacy_output_schema_shorthand(obj: &Map<String, Value>) -> bool {
+    !obj.is_empty()
+        && obj.keys().all(|k| is_plain_identifier(k))
+        && obj.values().all(|v| {
+            v.as_str()
+                .is_some_and(|ty| JSON_SCHEMA_PRIMITIVE_TYPES.contains(&ty))
+        })
+}
+
+/// If value is a flat `{"field": "type"}` legacy shorthand, convert to JSON Schema.
+/// Otherwise return as-is. Call only from v2/v3 → v4 migration — not for canonical v4.
 pub fn migrate_output_schema(value: Value) -> Value {
     let Some(obj) = value.as_object() else {
         return value;
     };
-    // Detect legacy format: all values are plain strings (not objects/arrays)
-    // and the object has no "type" key (which would indicate it's already a JSON Schema).
-    let is_legacy =
-        !obj.is_empty() && !obj.contains_key("type") && obj.values().all(|v| v.is_string());
-    if !is_legacy {
+    if !is_legacy_output_schema_shorthand(obj) {
         return value;
     }
-    // Convert legacy {"field": "type_hint"} → JSON Schema
     let properties: serde_json::Map<String, Value> = obj
         .iter()
         .map(|(field, ty)| {
@@ -940,6 +1012,15 @@ pub struct WorkflowGraph<'a> {
     pub inbound: HashMap<&'a str, Vec<&'a WorkflowEdge>>,
 }
 
+#[derive(Debug, Clone)]
+struct SubflowFacts {
+    entry_node_valid: bool,
+    terminal_node_ids: Vec<String>,
+    node_ids: BTreeSet<String>,
+    nodes_with_outgoing: BTreeSet<String>,
+    variable_names: BTreeSet<String>,
+}
+
 impl WorkflowV3 {
     pub fn graph(&self) -> WorkflowGraph<'_> {
         let mut node_map = HashMap::new();
@@ -958,6 +1039,47 @@ impl WorkflowV3 {
             inbound,
         }
     }
+
+    fn subflow_facts(&self) -> SubflowFacts {
+        let node_ids = self
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<BTreeSet<_>>();
+        let nodes_with_outgoing = self
+            .edges
+            .iter()
+            .map(|edge| edge.from.clone())
+            .collect::<BTreeSet<_>>();
+        let terminal_node_ids = self
+            .nodes
+            .iter()
+            .filter(|node| !nodes_with_outgoing.contains(&node.id))
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        let entry_node_valid = node_ids.contains(&self.entry_node_id);
+        let variable_names = self
+            .variables
+            .iter()
+            .map(|variable| variable.name.clone())
+            .collect::<BTreeSet<_>>();
+        SubflowFacts {
+            entry_node_valid,
+            terminal_node_ids,
+            node_ids,
+            nodes_with_outgoing,
+            variable_names,
+        }
+    }
+}
+
+fn build_subflow_facts_catalog(
+    subflows: &BTreeMap<String, Box<WorkflowV3>>,
+) -> BTreeMap<String, SubflowFacts> {
+    subflows
+        .iter()
+        .map(|(name, subflow)| (name.clone(), subflow.subflow_facts()))
+        .collect()
 }
 
 impl<'a> WorkflowGraph<'a> {
@@ -1025,6 +1147,12 @@ fn migrate_workflow_value_to_v4(value: &mut Value) -> anyhow::Result<u64> {
 
     migrate_v2_nodes_to_v3_kind(workflow)?;
 
+    // Legacy outputSchema shorthand is migrated only for pre-v4 imports. Canonical v4
+    // documents keep authored schemas byte-stable (including $ref / $schema-only forms).
+    if version < WORKFLOW_SCHEMA_VERSION as u64 {
+        migrate_legacy_output_schemas_in_workflow(workflow)?;
+    }
+
     if let Some(subflows) = workflow.get_mut("subflows") {
         let subflows = subflows
             .as_object_mut()
@@ -1037,6 +1165,32 @@ fn migrate_workflow_value_to_v4(value: &mut Value) -> anyhow::Result<u64> {
 
     workflow.insert("version".to_string(), Value::from(WORKFLOW_SCHEMA_VERSION));
     Ok(version)
+}
+
+fn migrate_legacy_output_schemas_in_workflow(workflow: &mut Map<String, Value>) -> anyhow::Result<()> {
+    let Some(nodes) = workflow.get_mut("nodes") else {
+        return Ok(());
+    };
+    let nodes = nodes
+        .as_array_mut()
+        .context("workflow nodes must be a JSON array")?;
+    for node in nodes {
+        let Some(node_object) = node.as_object_mut() else {
+            continue;
+        };
+        // Accept either camelCase (wire) or snake_case keys if present.
+        let key = if node_object.contains_key("outputSchema") {
+            "outputSchema"
+        } else if node_object.contains_key("output_schema") {
+            "output_schema"
+        } else {
+            continue;
+        };
+        if let Some(schema) = node_object.remove(key) {
+            node_object.insert(key.to_string(), migrate_output_schema(schema));
+        }
+    }
+    Ok(())
 }
 
 fn migrate_v2_nodes_to_v3_kind(workflow: &mut Map<String, Value>) -> anyhow::Result<()> {
@@ -1272,13 +1426,20 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
         };
     }
     let mut issues = Vec::new();
+    let subflow_facts = build_subflow_facts_catalog(&workflow.subflows);
 
     validate_run_as_config(workflow.run_as.as_ref(), &mut issues);
     let _ = validate_workflow_body_for_scope(&workflow, WorkflowBodyScope::Root, None, &mut issues);
     for (subflow_name, subflow) in &workflow.subflows {
         validate_subflow_body_root_only_fields(subflow, subflow_name, &mut issues);
     }
-    validate_graph_body(&workflow, &workflow.subflows, "", &mut issues);
+    validate_graph_body(
+        &workflow,
+        &workflow.subflows,
+        &subflow_facts,
+        "",
+        &mut issues,
+    );
 
     let graph = workflow.graph();
     if graph
@@ -1297,7 +1458,7 @@ pub fn validate_workflow(workflow: WorkflowV3) -> ValidationResult {
         });
     }
 
-    validate_subflow_catalog(&workflow, &mut issues);
+    validate_subflow_catalog(&workflow, &subflow_facts, &mut issues);
     validate_subflow_call_cycles(&workflow, &mut issues);
 
     let graph_meta = compute_graph_metadata(&workflow);
@@ -1359,12 +1520,59 @@ pub(crate) fn validate_workflow_input_bounds(workflow: &WorkflowV3) -> Result<()
         });
     }
 
+    let workflow_bodies = std::iter::once(workflow).chain(workflow.subflows.values().map(|s| s.as_ref()));
+    let (total_nodes, total_edges) = workflow_bodies
+        .clone()
+        .map(|candidate| (candidate.nodes.len(), candidate.edges.len()))
+        .fold((0_usize, 0_usize), |(nodes, edges), (node_count, edge_count)| {
+            (nodes + node_count, edges + edge_count)
+        });
+    if total_nodes > MAX_WORKFLOW_NODES {
+        return Err(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: None,
+            scope: None,
+            message: format!(
+                "Workflow contains {total_nodes} nodes across the root workflow and subflow catalog; at most {MAX_WORKFLOW_NODES} are allowed."
+            ),
+        });
+    }
+    if total_edges > MAX_WORKFLOW_EDGES {
+        return Err(ValidationIssue {
+            severity: "error".to_string(),
+            node_id: None,
+            scope: None,
+            message: format!(
+                "Workflow contains {total_edges} edges across the root workflow and subflow catalog; at most {MAX_WORKFLOW_EDGES} are allowed."
+            ),
+        });
+    }
+
+    for candidate in workflow_bodies {
+        for node in &candidate.nodes {
+            if let Some(retry_count) = node.retry_count {
+                if retry_count > MAX_NODE_RETRY_COUNT {
+                    return Err(ValidationIssue {
+                        severity: "error".to_string(),
+                        node_id: Some(node.id.clone()),
+                        scope: None,
+                        message: format!(
+                            "\"{}\" retryCount is {retry_count}; at most {MAX_NODE_RETRY_COUNT} is allowed.",
+                            node.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
 fn validate_graph_body(
     workflow: &WorkflowV3,
     subflows: &BTreeMap<String, Box<WorkflowV3>>,
+    subflow_facts: &BTreeMap<String, SubflowFacts>,
     prefix: &str,
     issues: &mut Vec<ValidationIssue>,
 ) {
@@ -1481,9 +1689,20 @@ fn validate_graph_body(
                 validate_batch_node_config(node, batch_config, &graph, issues);
             }
             NodeKind::Subflow { subflow_config } | NodeKind::Call { subflow_config } => {
-                validate_subflow_node_config(node, subflow_config, subflows, issues);
+                validate_subflow_node_config(
+                    node,
+                    subflow_config,
+                    subflows,
+                    subflow_facts,
+                    issues,
+                );
             }
             NodeKind::Spawn { spawn_config } => {
+                let agent = spawn_config
+                    .agent
+                    .as_deref()
+                    .or(node.agent.as_deref())
+                    .unwrap_or(DEFAULT_AGENT);
                 let has_agent = spawn_config
                     .agent
                     .as_deref()
@@ -1512,6 +1731,16 @@ fn validate_graph_body(
                         issues,
                     );
                 }
+                validate_agent_launch_config(
+                    agent,
+                    (!has_command)
+                        .then_some(spawn_config.access.as_deref())
+                        .flatten(),
+                    &spawn_config.extra_args,
+                    &node.id,
+                    &node.name,
+                    issues,
+                );
             }
             NodeKind::Send { send_config } => {
                 let text = if send_config.text.is_empty() {
@@ -1542,6 +1771,11 @@ fn validate_graph_body(
             NodeKind::RunAgent {
                 run_agent_config, ..
             } => {
+                let agent = run_agent_config
+                    .agent
+                    .as_deref()
+                    .or(node.agent.as_deref())
+                    .unwrap_or(DEFAULT_AGENT);
                 let has_agent = run_agent_config
                     .agent
                     .as_deref()
@@ -1582,6 +1816,14 @@ fn validate_graph_body(
                     false,
                     run_agent_config.idle_seconds,
                     run_agent_config.ready_stable_seconds,
+                    issues,
+                );
+                validate_agent_launch_config(
+                    agent,
+                    run_agent_config.access.as_deref(),
+                    &run_agent_config.extra_args,
+                    &node.id,
+                    &node.name,
                     issues,
                 );
             }
@@ -1804,8 +2046,8 @@ fn validate_graph_body(
                     });
                 }
                 // Must use the same agent
-                let current_agent = node.agent.as_deref().unwrap_or(DEFAULT_AGENT);
-                let source_agent = source_node.agent.as_deref().unwrap_or(DEFAULT_AGENT);
+                let current_agent = agent_name_for_node(node);
+                let source_agent = agent_name_for_node(source_node);
                 if current_agent != source_agent {
                     issues.push(ValidationIssue {
                         severity: "error".to_string(),
@@ -1814,6 +2056,55 @@ fn validate_graph_body(
                         message: format!(
                             "\"{}\" continues session from \"{}\" but they use different agents ({} vs {}).",
                             node.name, source_node.name, current_agent, source_agent
+                        ),
+                    });
+                }
+                let current_config = resolve_agent_config(
+                    &workflow.agent_defaults,
+                    &workflow.cwd,
+                    &current_agent,
+                    node,
+                    None,
+                    false,
+                    None,
+                );
+                let source_config = resolve_agent_config(
+                    &workflow.agent_defaults,
+                    &workflow.cwd,
+                    &source_agent,
+                    source_node,
+                    None,
+                    false,
+                    None,
+                );
+                if let (
+                    Ok((current_profile, current_privilege)),
+                    Ok((source_profile, source_privilege)),
+                ) = (
+                    driver::resolved_access_profile(&current_agent, &current_config),
+                    driver::resolved_access_profile(&source_agent, &source_config),
+                ) && source_privilege > current_privilege
+                {
+                    issues.push(ValidationIssue {
+                        severity: "error".to_string(),
+                        node_id: Some(node.id.clone()),
+                        scope: None,
+                        message: format!(
+                            "\"{}\" continues session from \"{}\" with a broader access profile ({} vs {}).",
+                            node.name, source_node.name, current_profile, source_profile
+                        ),
+                    });
+                }
+                let current_cwd = working_directory_for_node(&workflow.cwd, node);
+                let source_cwd = working_directory_for_node(&workflow.cwd, source_node);
+                if current_cwd != source_cwd {
+                    issues.push(ValidationIssue {
+                        severity: "error".to_string(),
+                        node_id: Some(node.id.clone()),
+                        scope: None,
+                        message: format!(
+                            "\"{}\" continues session from \"{}\" but they use different working directories ({} vs {}).",
+                            node.name, source_node.name, current_cwd, source_cwd
                         ),
                     });
                 }
@@ -1945,6 +2236,101 @@ fn is_run_as_user_shell_metachar(ch: char) -> bool {
         )
 }
 
+fn validate_agent_launch_config(
+    agent: &str,
+    access: Option<&str>,
+    extra_args: &[String],
+    node_id: &str,
+    node_name: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    const CLAUDE_ACCESS_FLAGS: &[&str] = &[
+        "--dangerously-skip-permissions",
+        "--permission-mode",
+        "--allowedTools",
+        "--disallowedTools",
+    ];
+    const CODEX_ACCESS_FLAGS: &[&str] = &[
+        "--sandbox",
+        "--ask-for-approval",
+        "--full-auto",
+        "--dangerously-bypass-approvals-and-sandbox",
+    ];
+
+    if let Some(access) = access {
+        let access_profiles = driver::agent_access_profile_names(agent);
+        match driver::get_driver(agent) {
+            Some(_) if !access_profiles.iter().any(|profile| profile == access) => {
+                issues.push(ValidationIssue {
+                    severity: "error".to_string(),
+                    node_id: Some(node_id.to_string()),
+                    scope: None,
+                    message: format!(
+                        "\"{node_name}\" access profile \"{access}\" is not defined for agent {agent}."
+                    ),
+                });
+            }
+            None => issues.push(ValidationIssue {
+                severity: "warning".to_string(),
+                node_id: Some(node_id.to_string()),
+                scope: None,
+                message: format!(
+                    "\"{node_name}\" access profile \"{access}\" cannot be verified because agent {agent} is not registered."
+                ),
+            }),
+            Some(_) => {}
+        }
+    }
+
+    for (index, arg) in extra_args.iter().enumerate() {
+        let (flag, inline_value) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
+        let is_config_flag = flag == "-c" || matches_long_flag(flag, &["--config"]);
+        let access_config_override = (agent == "codex" && is_config_flag)
+            .then(|| {
+                inline_value
+                    .or_else(|| extra_args.get(index + 1).map(String::as_str))
+            })
+            .flatten()
+            .filter(|value| config_override_changes_access(value));
+        let changes_access_flag = match agent {
+            "claude" => matches_long_flag(flag, CLAUDE_ACCESS_FLAGS),
+            "codex" => {
+                matches!(flag, "-s" | "-a") || matches_long_flag(flag, CODEX_ACCESS_FLAGS)
+            }
+            _ => false,
+        };
+        if changes_access_flag || access_config_override.is_some() {
+            let rejected = access_config_override.unwrap_or(arg);
+            issues.push(ValidationIssue {
+                severity: "error".to_string(),
+                node_id: Some(node_id.to_string()),
+                scope: None,
+                message: format!(
+                    "\"{node_name}\" extraArgs cannot override agent access with {rejected}."
+                ),
+            });
+        }
+    }
+}
+
+fn matches_long_flag(candidate: &str, flags: &[&str]) -> bool {
+    candidate.starts_with("--")
+        && candidate != "--"
+        && flags
+            .iter()
+            .filter(|flag| flag.starts_with(candidate))
+            .count()
+            == 1
+}
+
+fn config_override_changes_access(value: &str) -> bool {
+    let key = value.split_once('=').map_or(value, |(key, _)| key);
+    let key = key.to_ascii_lowercase();
+    key.contains("sandbox") || key.contains("approval")
+}
+
 fn validate_wait_timing_and_marker(
     node_id: &str,
     node_name: &str,
@@ -1997,14 +2383,17 @@ fn validate_wait_timing_and_marker(
     }
 }
 
-fn validate_subflow_catalog(workflow: &WorkflowV3, issues: &mut Vec<ValidationIssue>) {
+fn validate_subflow_catalog(
+    workflow: &WorkflowV3,
+    subflow_facts: &BTreeMap<String, SubflowFacts>,
+    issues: &mut Vec<ValidationIssue>,
+) {
     for (subflow_name, subflow) in &workflow.subflows {
-        let subflow_graph = subflow.graph();
-        if subflow_graph
-            .node_map
-            .get(subflow.entry_node_id.as_str())
-            .is_none()
-        {
+        let entry_valid = subflow_facts
+            .get(subflow_name.as_str())
+            .map(|facts| facts.entry_node_valid)
+            .unwrap_or(false);
+        if !entry_valid {
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: None,
@@ -2017,7 +2406,13 @@ fn validate_subflow_catalog(workflow: &WorkflowV3, issues: &mut Vec<ValidationIs
         }
 
         let prefix = format!("subflow:{subflow_name}");
-        validate_graph_body(subflow, &workflow.subflows, &prefix, issues);
+        validate_graph_body(
+            subflow,
+            &workflow.subflows,
+            subflow_facts,
+            &prefix,
+            issues,
+        );
     }
 }
 
@@ -2025,6 +2420,7 @@ fn validate_subflow_node_config(
     node: &WorkflowNode,
     config: &SubflowConfig,
     subflows: &BTreeMap<String, Box<WorkflowV3>>,
+    subflow_facts: &BTreeMap<String, SubflowFacts>,
     issues: &mut Vec<ValidationIssue>,
 ) {
     let workflow_name = config.workflow_name.trim();
@@ -2058,12 +2454,11 @@ fn validate_subflow_node_config(
         return;
     };
 
-    let subflow_graph = subflow.graph();
-    if subflow_graph
-        .node_map
-        .get(subflow.entry_node_id.as_str())
-        .is_none()
-    {
+    let Some(facts) = subflow_facts.get(workflow_name) else {
+        return;
+    };
+
+    if !facts.entry_node_valid {
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
@@ -2075,12 +2470,7 @@ fn validate_subflow_node_config(
         });
     }
 
-    let terminal_node_ids = subflow
-        .nodes
-        .iter()
-        .filter(|candidate| subflow_graph.outgoing_for(&candidate.id).is_empty())
-        .map(|candidate| candidate.id.as_str())
-        .collect::<Vec<_>>();
+    let terminal_node_ids = &facts.terminal_node_ids;
     if terminal_node_ids.len() != 1 {
         issues.push(ValidationIssue {
             severity: "error".to_string(),
@@ -2101,8 +2491,8 @@ fn validate_subflow_node_config(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        match subflow_graph.node_map.get(exit_node_id) {
-            Some(_) if !subflow_graph.outgoing_for(exit_node_id).is_empty() => {
+        match facts.node_ids.get(exit_node_id) {
+            Some(_) if facts.nodes_with_outgoing.contains(exit_node_id) => {
                 issues.push(ValidationIssue {
                     severity: "error".to_string(),
                     node_id: Some(node.id.clone()),
@@ -2146,11 +2536,7 @@ fn validate_subflow_node_config(
     }
 
     let mut seen_inputs = BTreeSet::new();
-    let subflow_variables = subflow
-        .variables
-        .iter()
-        .map(|variable| variable.name.as_str())
-        .collect::<BTreeSet<_>>();
+    let subflow_variables = &facts.variable_names;
     for input in &config.inputs {
         if input.name.trim().is_empty() || input.source.trim().is_empty() {
             issues.push(ValidationIssue {
@@ -2202,25 +2588,40 @@ fn validate_subflow_node_config(
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum SubflowCallVertex {
+    Root,
+    Subflow(String),
+}
+
+fn format_subflow_call_vertex(vertex: &SubflowCallVertex, workflow: &WorkflowV3) -> String {
+    match vertex {
+        SubflowCallVertex::Root => workflow
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("root workflow")
+            .to_string(),
+        SubflowCallVertex::Subflow(name) => name.clone(),
+    }
+}
+
 fn validate_subflow_call_cycles(workflow: &WorkflowV3, issues: &mut Vec<ValidationIssue>) {
-    let root_name = workflow
-        .name
-        .as_deref()
-        .filter(|name| !name.trim().is_empty())
-        .unwrap_or("__root__")
-        .to_string();
-    let mut graph: BTreeMap<String, Vec<(String, String, u32)>> = BTreeMap::new();
-    collect_subflow_calls(&root_name, workflow, &mut graph);
+    let mut graph: BTreeMap<SubflowCallVertex, Vec<(SubflowCallVertex, String, u32)>> =
+        BTreeMap::new();
+    collect_subflow_calls(SubflowCallVertex::Root, workflow, &mut graph);
     for (name, subflow) in &workflow.subflows {
-        collect_subflow_calls(name, subflow, &mut graph);
+        collect_subflow_calls(SubflowCallVertex::Subflow(name.clone()), subflow, &mut graph);
     }
 
     for component in subflow_strongly_connected_components(&graph) {
         let members = component.iter().cloned().collect::<BTreeSet<_>>();
         let self_loop = component.len() == 1
-            && graph
-                .get(&component[0])
-                .is_some_and(|edges| edges.iter().any(|(callee, _, _)| callee == &component[0]));
+            && graph.get(&component[0]).is_some_and(|edges| {
+                edges
+                    .iter()
+                    .any(|(callee, _, _)| callee == &component[0])
+            });
         if component.len() == 1 && !self_loop {
             continue;
         }
@@ -2232,29 +2633,32 @@ fn validate_subflow_call_cycles(workflow: &WorkflowV3, issues: &mut Vec<Validati
                     edges
                         .iter()
                         .find(|(callee, _, _)| members.contains(callee))
-                        .map(|(_, node_id, max_depth)| (node_id, max_depth))
+                        .map(|(_, node_id, max_depth)| (node_id.clone(), *max_depth))
                 })
             })
             .expect("a cyclic component must contain an internal call edge");
+        let member_labels = component
+            .iter()
+            .map(|vertex| format_subflow_call_vertex(vertex, workflow))
+            .collect::<Vec<_>>();
         issues.push(ValidationIssue {
             severity: "warning".to_string(),
-            node_id: Some(node_id.clone()),
+            node_id: Some(node_id),
             scope: None,
             message: format!(
-                "Subflow call cycle detected among subflows {{{}}}. maxDepth ({}) bounds recursion at runtime.",
-                component.join(", "),
-                max_depth
+                "Subflow call cycle detected among subflows {{{}}}. maxDepth ({max_depth}) bounds recursion at runtime.",
+                member_labels.join(", ")
             ),
         });
     }
 }
 
 fn collect_subflow_calls(
-    workflow_name: &str,
+    caller: SubflowCallVertex,
     workflow: &WorkflowV3,
-    graph: &mut BTreeMap<String, Vec<(String, String, u32)>>,
+    graph: &mut BTreeMap<SubflowCallVertex, Vec<(SubflowCallVertex, String, u32)>>,
 ) {
-    graph.entry(workflow_name.to_string()).or_default();
+    graph.entry(caller.clone()).or_default();
     for node in &workflow.nodes {
         let config = match &node.kind {
             NodeKind::Subflow { subflow_config } | NodeKind::Call { subflow_config } => {
@@ -2277,22 +2681,25 @@ fn collect_subflow_calls(
         if callee.is_empty() {
             continue;
         }
-        graph.entry(workflow_name.to_string()).or_default().push((
-            callee.to_string(),
-            node.id.clone(),
-            config.max_depth,
-        ));
+        graph
+            .entry(caller.clone())
+            .or_default()
+            .push((
+                SubflowCallVertex::Subflow(callee.to_string()),
+                node.id.clone(),
+                config.max_depth,
+            ));
     }
 }
 
 fn subflow_strongly_connected_components(
-    graph: &BTreeMap<String, Vec<(String, String, u32)>>,
-) -> Vec<Vec<String>> {
+    graph: &BTreeMap<SubflowCallVertex, Vec<(SubflowCallVertex, String, u32)>>,
+) -> Vec<Vec<SubflowCallVertex>> {
     // Tarjan's SCC algorithm with explicit DFS frames avoids native recursion.
     struct DfsFrame {
-        vertex: String,
+        vertex: SubflowCallVertex,
         next_edge: usize,
-        parent: Option<String>,
+        parent: Option<SubflowCallVertex>,
     }
 
     let mut vertices = BTreeSet::new();
@@ -2891,6 +3298,243 @@ mod tests {
         assert!(empty_user.issues.iter().any(|issue| {
             issue.severity == "error" && issue.message.contains("runAs.user must not be empty")
         }));
+    }
+
+    #[test]
+    fn validates_spawn_extra_args_rejects_claude_access_flag() {
+        let mut spawn = node("spawn", "Spawn", WorkflowNodeType::Spawn);
+        spawn.kind = NodeKind::Spawn {
+            spawn_config: SpawnConfig {
+                agent: Some("claude".to_string()),
+                extra_args: vec![
+                    "--dangerously-skip-permissions".to_string(),
+                    "true".to_string(),
+                ],
+                ..SpawnConfig::default()
+            },
+        };
+
+        let result = validate_workflow(workflow(vec![spawn], vec![], "spawn"));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.node_id.as_deref() == Some("spawn")
+                && issue.message.contains("extraArgs")
+                && issue
+                    .message
+                    .contains("--dangerously-skip-permissions")
+        }));
+    }
+
+    #[test]
+    fn validates_run_agent_extra_args_rejects_access_flag_with_equals() {
+        let mut run_agent = node("run", "Run", WorkflowNodeType::RunAgent);
+        run_agent.kind = NodeKind::RunAgent {
+            run_agent_config: RunAgentConfig {
+                agent: Some("codex".to_string()),
+                extra_args: vec!["--sandbox=danger-full-access".to_string()],
+                ..RunAgentConfig::default()
+            },
+            agent_config: None,
+        };
+
+        let result = validate_workflow(workflow(vec![run_agent], vec![], "run"));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.node_id.as_deref() == Some("run")
+                && issue.message.contains("extraArgs")
+                && issue.message.contains("--sandbox=danger-full-access")
+        }));
+    }
+
+    #[test]
+    fn validates_run_agent_extra_args_rejects_abbreviated_access_flag() {
+        let mut run_agent = node("run", "Run", WorkflowNodeType::RunAgent);
+        run_agent.kind = NodeKind::RunAgent {
+            run_agent_config: RunAgentConfig {
+                agent: Some("codex".to_string()),
+                extra_args: vec!["--sand=danger-full-access".to_string()],
+                ..RunAgentConfig::default()
+            },
+            agent_config: None,
+        };
+
+        let result = validate_workflow(workflow(vec![run_agent], vec![], "run"));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.node_id.as_deref() == Some("run")
+                && issue.message.contains("--sand=danger-full-access")
+        }));
+    }
+
+    #[test]
+    fn validates_run_agent_extra_args_rejects_access_config_override() {
+        let mut run_agent = node("run", "Run", WorkflowNodeType::RunAgent);
+        run_agent.kind = NodeKind::RunAgent {
+            run_agent_config: RunAgentConfig {
+                agent: Some("codex".to_string()),
+                extra_args: vec![
+                    "-c".to_string(),
+                    "sandbox_mode=danger-full-access".to_string(),
+                ],
+                ..RunAgentConfig::default()
+            },
+            agent_config: None,
+        };
+
+        let result = validate_workflow(workflow(vec![run_agent], vec![], "run"));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.node_id.as_deref() == Some("run")
+                && issue.message.contains("sandbox_mode=danger-full-access")
+        }));
+    }
+
+    #[test]
+    fn validates_extra_args_rejects_every_supported_access_flag() {
+        let cases = [
+            ("claude", vec!["--permission-mode", "plan"], "--permission-mode"),
+            ("claude", vec!["--allowedTools", "Read"], "--allowedTools"),
+            ("claude", vec!["--disallowedTools", "Bash"], "--disallowedTools"),
+            ("codex", vec!["-s", "danger-full-access"], "-s"),
+            ("codex", vec!["-a", "never"], "-a"),
+            ("codex", vec!["--ask-for-approval", "never"], "--ask-for-approval"),
+            ("codex", vec!["--full-auto"], "--full-auto"),
+            (
+                "codex",
+                vec!["--dangerously-bypass-approvals-and-sandbox"],
+                "--dangerously-bypass-approvals-and-sandbox",
+            ),
+            (
+                "codex",
+                vec!["--config=approval_policy=never"],
+                "approval_policy=never",
+            ),
+        ];
+
+        for (agent, args, rejected) in cases {
+            let mut run_agent = node("run", "Run", WorkflowNodeType::RunAgent);
+            run_agent.kind = NodeKind::RunAgent {
+                run_agent_config: RunAgentConfig {
+                    agent: Some(agent.to_string()),
+                    extra_args: args.into_iter().map(str::to_string).collect(),
+                    ..RunAgentConfig::default()
+                },
+                agent_config: None,
+            };
+
+            let result = validate_workflow(workflow(vec![run_agent], vec![], "run"));
+
+            assert!(
+                result.issues.iter().any(|issue| {
+                    issue.severity == "error" && issue.message.contains(rejected)
+                }),
+                "{agent} extraArgs should reject {rejected}; issues={:?}",
+                result.issues
+            );
+        }
+    }
+
+    #[test]
+    fn validates_extra_args_allows_benign_model_flags() {
+        let mut spawn = node("spawn", "Spawn", WorkflowNodeType::Spawn);
+        spawn.kind = NodeKind::Spawn {
+            spawn_config: SpawnConfig {
+                agent: Some("codex".to_string()),
+                extra_args: vec![
+                    "--model".to_string(),
+                    "o3".to_string(),
+                    "-c".to_string(),
+                    "model_reasoning_effort=high".to_string(),
+                ],
+                ..SpawnConfig::default()
+            },
+        };
+
+        let result = validate_workflow(workflow(vec![spawn], vec![], "spawn"));
+
+        assert!(!result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.node_id.as_deref() == Some("spawn")
+                && issue.message.contains("extraArgs")
+        }));
+    }
+
+    #[test]
+    fn validates_spawn_rejects_unknown_registered_access_profile() {
+        let mut spawn = node("spawn", "Spawn", WorkflowNodeType::Spawn);
+        spawn.kind = NodeKind::Spawn {
+            spawn_config: SpawnConfig {
+                agent: Some("codex".to_string()),
+                access: Some("read_only".to_string()),
+                ..SpawnConfig::default()
+            },
+        };
+
+        let result = validate_workflow(workflow(vec![spawn], vec![], "spawn"));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.node_id.as_deref() == Some("spawn")
+                && issue.message.contains("read_only")
+                && issue.message.contains("access profile")
+        }));
+    }
+
+    #[test]
+    fn validates_spawn_warns_about_unverifiable_unregistered_access_profile() {
+        let mut spawn = node("spawn", "Spawn", WorkflowNodeType::Spawn);
+        spawn.kind = NodeKind::Spawn {
+            spawn_config: SpawnConfig {
+                agent: Some("custom-agent".to_string()),
+                access: Some("custom-access".to_string()),
+                ..SpawnConfig::default()
+            },
+        };
+
+        let result = validate_workflow(workflow(vec![spawn], vec![], "spawn"));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "warning"
+                && issue.node_id.as_deref() == Some("spawn")
+                && issue.message.contains("custom-agent")
+                && issue.message.contains("cannot be verified")
+        }));
+        assert!(!result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.node_id.as_deref() == Some("spawn")
+                && issue.message.contains("custom-access")
+        }));
+    }
+
+    #[test]
+    fn resolve_agent_config_uses_spawn_access_profile_override() {
+        let mut spawn = node("spawn", "Spawn", WorkflowNodeType::Spawn);
+        spawn.kind = NodeKind::Spawn {
+            spawn_config: SpawnConfig {
+                agent: Some("codex".to_string()),
+                access: Some("read-only".to_string()),
+                ..SpawnConfig::default()
+            },
+        };
+
+        let config = resolve_agent_config(
+            &BTreeMap::new(),
+            "/workspace",
+            "codex",
+            &spawn,
+            None,
+            false,
+            None,
+        );
+
+        assert_eq!(
+            config.access_profile_override.as_deref(),
+            Some("read-only")
+        );
     }
 
     #[test]
@@ -3882,9 +4526,29 @@ mod tests {
     }
 
     #[test]
-    fn legacy_output_schema_deserialized_as_json_schema() {
+    fn migrate_output_schema_passes_through_ref_only_schema() {
+        let schema = json!({"$ref": "#/defs/X"});
+        let result = super::migrate_output_schema(schema.clone());
+        assert_eq!(result, schema);
+    }
+
+    #[test]
+    fn migrate_output_schema_passes_through_schema_meta_only() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.com/schemas/item.json",
+            "title": "Item",
+            "description": "An item"
+        });
+        let result = super::migrate_output_schema(schema.clone());
+        assert_eq!(result, schema);
+    }
+
+    #[test]
+    fn legacy_output_schema_on_v3_workflow_migrates_to_json_schema() {
+        // Shorthand conversion runs only for pre-v4 imports (v3 fixture).
         let json = json!({
-            "version": 4,
+            "version": 3,
             "goal": "test",
             "cwd": "/tmp",
             "useOrchestrator": false,
@@ -3903,10 +4567,101 @@ mod tests {
             "edges": []
         });
         let result = normalize_workflow_value(json).unwrap();
+        assert_eq!(result.workflow.version, 4);
         let schema = result.workflow.nodes[0].output_schema.as_ref().unwrap();
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["name"]["type"], "string");
         assert_eq!(schema["properties"]["score"]["type"], "number");
+    }
+
+    #[test]
+    fn v4_legacy_shorthand_output_schema_is_not_migrated() {
+        let shorthand = json!({"name": "string", "score": "number"});
+        let json = json!({
+            "version": 4,
+            "goal": "test",
+            "cwd": "/tmp",
+            "useOrchestrator": false,
+            "entryNodeId": "n1",
+            "variables": [],
+            "limits": { "maxTotalSteps": 10, "maxVisitsPerNode": 5 },
+            "nodes": [{
+                "id": "n1",
+                "name": "Step 1",
+                "agent": "claude",
+                "prompt": "hello",
+                "responseFormat": "json",
+                "outputSchema": shorthand.clone(),
+                "kind": { "type": "task" }
+            }],
+            "edges": []
+        });
+        let result = normalize_workflow_value(json).unwrap();
+        let schema = result.workflow.nodes[0].output_schema.as_ref().unwrap();
+        assert_eq!(schema, &shorthand);
+        assert!(schema.get("type").is_none());
+        assert!(schema.get("properties").is_none());
+    }
+
+    #[test]
+    fn v4_ref_only_output_schema_round_trips_unchanged() {
+        let ref_schema = json!({"$ref": "#/defs/X"});
+        let json = json!({
+            "version": 4,
+            "goal": "test",
+            "cwd": "/tmp",
+            "useOrchestrator": false,
+            "entryNodeId": "n1",
+            "variables": [],
+            "limits": { "maxTotalSteps": 10, "maxVisitsPerNode": 5 },
+            "nodes": [{
+                "id": "n1",
+                "name": "Step 1",
+                "agent": "claude",
+                "prompt": "hello",
+                "responseFormat": "json",
+                "outputSchema": ref_schema.clone(),
+                "kind": { "type": "task" }
+            }],
+            "edges": []
+        });
+        let result = normalize_workflow_value(json).unwrap();
+        assert_eq!(
+            result.workflow.nodes[0].output_schema.as_ref().unwrap(),
+            &ref_schema
+        );
+    }
+
+    #[test]
+    fn v4_schema_meta_only_output_schema_round_trips_unchanged() {
+        let meta_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.com/schemas/item.json"
+        });
+        let json = json!({
+            "version": 4,
+            "goal": "test",
+            "cwd": "/tmp",
+            "useOrchestrator": false,
+            "entryNodeId": "n1",
+            "variables": [],
+            "limits": { "maxTotalSteps": 10, "maxVisitsPerNode": 5 },
+            "nodes": [{
+                "id": "n1",
+                "name": "Step 1",
+                "agent": "claude",
+                "prompt": "hello",
+                "responseFormat": "json",
+                "outputSchema": meta_schema.clone(),
+                "kind": { "type": "task" }
+            }],
+            "edges": []
+        });
+        let result = normalize_workflow_value(json).unwrap();
+        assert_eq!(
+            result.workflow.nodes[0].output_schema.as_ref().unwrap(),
+            &meta_schema
+        );
     }
 
     #[test]
@@ -3982,6 +4737,91 @@ mod tests {
                 .iter()
                 .any(|i| { i.severity == "error" && i.message.contains("different agents") })
         );
+    }
+
+    #[test]
+    fn validates_continue_session_from_run_agent_effective_agent_override() {
+        let mut source = node("source", "Source", WorkflowNodeType::Task);
+        source.agent = Some("claude".to_string());
+        let mut continuation = node("continuation", "Continuation", WorkflowNodeType::RunAgent);
+        continuation.agent = Some("claude".to_string());
+        let NodeKind::RunAgent {
+            run_agent_config, ..
+        } = &mut continuation.kind
+        else {
+            unreachable!();
+        };
+        run_agent_config.agent = Some("codex".to_string());
+        continuation.continue_session_from = Some("source".to_string());
+
+        let result = validate_workflow(workflow(
+            vec![source, continuation],
+            vec![success_edge("edge", "source", "continuation", None)],
+            "source",
+        ));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.message.contains("different agents (codex vs claude)")
+        }));
+    }
+
+    #[test]
+    fn validates_continue_session_from_broader_access_profile() {
+        let mut source = node("source", "Source", WorkflowNodeType::Task);
+        source.agent = Some("claude".to_string());
+        source.kind.set_agent_config(Some(AgentNodeConfig {
+            base: AgentDefaults {
+                access_mode: Some(AccessMode::Unrestricted),
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let mut continuation = node("continuation", "Continuation", WorkflowNodeType::Task);
+        continuation.agent = Some("claude".to_string());
+        continuation.continue_session_from = Some("source".to_string());
+
+        let result = validate_workflow(workflow(
+            vec![source, continuation],
+            vec![success_edge("edge", "source", "continuation", None)],
+            "source",
+        ));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.message.contains("broader access profile")
+                && issue.message.contains("workspace-write vs full-access")
+        }));
+    }
+
+    #[test]
+    fn validates_continue_session_from_run_agent_effective_cwd_override() {
+        let mut source = node("source", "Source", WorkflowNodeType::Task);
+        source.agent = Some("claude".to_string());
+        source.cwd = Some("/source".to_string());
+        let mut continuation = node("continuation", "Continuation", WorkflowNodeType::RunAgent);
+        continuation.agent = Some("claude".to_string());
+        continuation.cwd = Some("/source".to_string());
+        let NodeKind::RunAgent {
+            run_agent_config, ..
+        } = &mut continuation.kind
+        else {
+            unreachable!();
+        };
+        run_agent_config.cwd = Some("/target".to_string());
+        continuation.continue_session_from = Some("source".to_string());
+
+        let result = validate_workflow(workflow(
+            vec![source, continuation],
+            vec![success_edge("edge", "source", "continuation", None)],
+            "source",
+        ));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.message.contains("different working directories")
+                && issue.message.contains("/target vs /source")
+        }));
     }
 
     #[test]
@@ -4724,7 +5564,6 @@ mod tests {
             run_as: Some(RunAsConfig {
                 user: Some("agent".to_string()),
                 command: None,
-                socket: Some("test-socket".to_string()),
             }),
             entry_node_id: "n1".to_string(),
             variables: Vec::new(),
@@ -4746,7 +5585,6 @@ mod tests {
         );
         let run_as_val = &serialized["runAs"];
         assert_eq!(run_as_val["user"], "agent");
-        assert_eq!(run_as_val["socket"], "test-socket");
         // command is None → serialized as null (no skip_serializing_if on RunAsConfig fields)
         assert!(
             run_as_val["command"].is_null(),
@@ -4760,7 +5598,6 @@ mod tests {
         assert_eq!(workflow, deserialized);
         let run_as = deserialized.run_as.as_ref().unwrap();
         assert_eq!(run_as.user.as_deref(), Some("agent"));
-        assert_eq!(run_as.socket.as_deref(), Some("test-socket"));
         assert!(run_as.command.is_none());
     }
 
@@ -4780,7 +5617,6 @@ mod tests {
                     "exec".to_string(),
                     "box".to_string(),
                 ]),
-                socket: None,
             }),
             entry_node_id: "n1".to_string(),
             variables: Vec::new(),
@@ -4798,12 +5634,7 @@ mod tests {
             run_as_val["command"],
             serde_json::json!(["docker", "exec", "box"])
         );
-        // socket is None → serialized as null (no skip_serializing_if on RunAsConfig fields)
-        assert!(
-            run_as_val["socket"].is_null(),
-            "None socket should serialize as null, got: {:?}",
-            run_as_val["socket"]
-        );
+        assert!(run_as_val.get("socket").is_none());
 
         let deserialized: WorkflowV3 =
             serde_json::from_value(serialized).expect("deserialization must succeed");
@@ -4880,6 +5711,153 @@ mod tests {
         let meta = compute_graph_metadata(&wf);
         assert!(meta.reachable_node_ids.contains(&"body".to_string()));
         assert!(!meta.unreachable_node_ids.contains(&"body".to_string()));
+    }
+
+    #[test]
+    fn max_node_retry_attempts_clamps_huge_values() {
+        assert_eq!(max_node_retry_attempts(Some(1_000)), 11);
+        assert_eq!(max_node_retry_attempts(Some(u32::MAX)), 11);
+        assert_eq!(max_node_retry_attempts(None), 1);
+        assert_eq!(max_node_retry_attempts(Some(10)), 11);
+    }
+
+    #[test]
+    fn rejects_excessive_retry_count_at_ingress() {
+        let mut task = node("task", "Task", WorkflowNodeType::Task);
+        task.retry_count = Some(MAX_NODE_RETRY_COUNT + 1);
+        let err = validate_workflow_input_bounds(&workflow(vec![task], vec![], "task")).unwrap_err();
+        assert!(err.message.contains("retryCount"));
+        assert!(err.message.contains(&MAX_NODE_RETRY_COUNT.to_string()));
+    }
+
+    fn linear_task_subflow(node_count: usize) -> (WorkflowV3, String) {
+        let mut nodes = Vec::with_capacity(node_count);
+        let mut edges = Vec::new();
+        for index in 0..node_count {
+            let id = format!("n{index}");
+            let mut step = node(&id, "Step", WorkflowNodeType::Task);
+            step.agent = Some("echo".to_string());
+            nodes.push(step);
+            if index > 0 {
+                edges.push(success_edge(
+                    &format!("e{index}"),
+                    &format!("n{}", index - 1),
+                    &id,
+                    None,
+                ));
+            }
+        }
+        let exit_id = format!("n{}", node_count.saturating_sub(1));
+        (workflow(nodes, edges, "n0"), exit_id)
+    }
+
+    fn call_node(id: &str, subflow_name: &str, exit_node_id: &str) -> WorkflowNode {
+        let mut call = node(id, "Call", WorkflowNodeType::Call);
+        call.kind = NodeKind::Call {
+            subflow_config: SubflowConfig {
+                workflow_name: subflow_name.to_string(),
+                exit_node_id: Some(exit_node_id.to_string()),
+                inputs: Vec::new(),
+                max_depth: default_max_call_depth(),
+            },
+        };
+        call
+    }
+
+    #[test]
+    fn validate_workflow_many_calls_against_large_subflow_within_budget() {
+        use std::time::{Duration, Instant};
+
+        const CALL_COUNT: usize = 800;
+        const SUBFLOW_NODES: usize = 2_000;
+        const BUDGET: Duration = Duration::from_secs(15);
+
+        let (large_subflow, exit_id) = linear_task_subflow(SUBFLOW_NODES);
+        let calls = (0..CALL_COUNT)
+            .map(|index| call_node(&format!("call-{index}"), "big", &exit_id))
+            .collect::<Vec<_>>();
+        let mut parent = workflow(calls, vec![], "call-0");
+        parent.subflows.insert("big".to_string(), Box::new(large_subflow));
+
+        let started = Instant::now();
+        let result = validate_workflow(parent);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < BUDGET,
+            "validate_workflow took {:?}, expected under {BUDGET:?}",
+            elapsed
+        );
+        assert!(
+            !result.issues.iter().any(|issue| issue.severity == "error"),
+            "unexpected validation errors: {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn rejects_hydrated_catalog_exceeding_node_cap() {
+        let (oversized, _) = linear_task_subflow(MAX_WORKFLOW_NODES + 1);
+        let mut parent = workflow(
+            vec![node("start", "Start", WorkflowNodeType::Task)],
+            vec![],
+            "start",
+        );
+        parent
+            .subflows
+            .insert("oversized".to_string(), Box::new(oversized));
+
+        let err = validate_workflow_input_bounds(&parent).unwrap_err();
+        assert!(err.message.contains("nodes"));
+        assert!(err.message.contains(&MAX_WORKFLOW_NODES.to_string()));
+    }
+
+    #[test]
+    fn no_cycle_warning_when_root_name_matches_subflow_catalog_key() {
+        let sub = workflow(
+            vec![node("entry", "Entry", WorkflowNodeType::Task)],
+            vec![],
+            "entry",
+        );
+        let call = call_node("call", "alpha", "entry");
+        let mut parent = workflow(vec![call], vec![], "call");
+        parent.name = Some("alpha".to_string());
+        parent.subflows.insert("alpha".to_string(), Box::new(sub));
+
+        let result = validate_workflow(parent);
+        assert!(
+            !result.issues.iter().any(|issue| {
+                issue.message.contains("Subflow call cycle detected")
+            }),
+            "got {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn no_cycle_warning_for_catalog_named_root_sentinel_with_blank_root_name() {
+        let sub = workflow(
+            vec![node("entry", "Entry", WorkflowNodeType::Task)],
+            vec![],
+            "entry",
+        );
+        let mut parent = workflow(
+            vec![node("start", "Start", WorkflowNodeType::Task)],
+            vec![],
+            "start",
+        );
+        parent.name = None;
+        parent
+            .subflows
+            .insert("__root__".to_string(), Box::new(sub));
+
+        let result = validate_workflow(parent);
+        assert!(
+            !result.issues.iter().any(|issue| {
+                issue.message.contains("Subflow call cycle detected")
+            }),
+            "got {:?}",
+            result.issues
+        );
     }
 
     #[test]

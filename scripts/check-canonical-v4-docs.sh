@@ -7,19 +7,14 @@ cd "$ROOT"
 
 PATTERN='v3-only workflow schema|The only accepted workflow format is version `3`|Complete v3 workflow format reference|Import v3 JSON|canonical v3'
 
-if command -v rg >/dev/null 2>&1; then
-  MATCHES="$(rg -n --pcre2 "$PATTERN" \
-    --glob '!docs/issues/**' \
-    --glob '!docs/tasks/**' \
-    --glob '!scripts/check-canonical-v4-docs.sh' \
-    . || true)"
-else
-  MATCHES="$(grep -RInE "$PATTERN" \
-    --exclude-dir=docs/issues \
-    --exclude-dir=docs/tasks \
-    --exclude=check-canonical-v4-docs.sh \
-    . || true)"
-fi
+MATCHES="$(
+  git ls-files -z -- \
+    ':!docs/issues/**' \
+    ':!docs/tasks/**' \
+    ':!scripts/check-canonical-v4-docs.sh' \
+    | xargs -0 -r grep -InE "$PATTERN" \
+    || true
+)"
 
 if [[ -n "$MATCHES" ]]; then
   echo "Found stale v3 canonical-format references (canonical format is v4):" >&2

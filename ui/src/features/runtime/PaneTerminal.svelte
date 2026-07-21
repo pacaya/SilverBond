@@ -165,11 +165,10 @@
   });
 
   function resync() {
-    term?.reset();
-    if (store.paneStatus === "unavailable" || store.paneStatus === "stalled") {
-      handle?.reconnect();
-    } else {
+    if (store.paneStatus === "open") {
       handle?.requestResync();
+    } else {
+      handle?.reconnect();
     }
   }
 </script>

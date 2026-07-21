@@ -6,8 +6,9 @@ use std::{
 };
 
 use include_dir::{Dir, include_dir};
-use r2d2::Pool;
+use r2d2::{ManageConnection, Pool};
 use r2d2_sqlite::SqliteConnectionManager;
+use tokio::io::AsyncWriteExt;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -25,7 +26,61 @@ use crate::{
 #[derive(Clone)]
 pub struct Database {
     path: Arc<PathBuf>,
-    connection: Pool<SqliteConnectionManager>,
+    connection: Pool<ManagedSqliteConnectionManager>,
+}
+
+#[derive(Debug)]
+struct ManagedSqliteConnectionManager {
+    inner: SqliteConnectionManager,
+    path: PathBuf,
+    parent: Option<PathBuf>,
+}
+
+impl ManagedSqliteConnectionManager {
+    fn file(path: &Path) -> Self {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf);
+        Self {
+            inner: SqliteConnectionManager::file(path).with_init(configure_connection),
+            path: path.to_path_buf(),
+            parent,
+        }
+    }
+}
+
+impl ManageConnection for ManagedSqliteConnectionManager {
+    type Connection = Connection;
+    type Error = rusqlite::Error;
+
+    fn connect(&self) -> Result<Connection, rusqlite::Error> {
+        if let Some(parent) = &self.parent {
+            ensure_dir(parent).map_err(cantopen)?;
+        }
+        // Create/lock down the database file before SQLite ever opens it, so it is
+        // never briefly readable by group or other.
+        secure_database_files(&self.path).map_err(cantopen)?;
+        let connection = self.inner.connect()?;
+        // Opening in WAL mode materializes the -wal/-shm sidecars; secure those too.
+        secure_database_files(&self.path).map_err(cantopen)?;
+        Ok(connection)
+    }
+
+    fn is_valid(&self, conn: &mut Connection) -> Result<(), rusqlite::Error> {
+        self.inner.is_valid(conn)
+    }
+
+    fn has_broken(&self, conn: &mut Connection) -> bool {
+        self.inner.has_broken(conn)
+    }
+}
+
+fn cantopen(error: impl std::fmt::Display) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+        Some(error.to_string()),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,7 +151,7 @@ pub fn seed_bundled_templates(dir: &Path) -> anyhow::Result<()> {
 impl Database {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let manager = SqliteConnectionManager::file(&path).with_init(configure_connection);
+        let manager = ManagedSqliteConnectionManager::file(&path);
         let connection = Pool::builder()
             .max_size(8)
             .min_idle(Some(0))
@@ -113,10 +168,9 @@ impl Database {
     }
 
     pub async fn init(&self) -> anyhow::Result<()> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         spawn_blocking(move || -> anyhow::Result<()> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 conn.execute_batch(
                     r#"
                 CREATE TABLE IF NOT EXISTS runs (
@@ -166,6 +220,7 @@ impl Database {
                 ensure_runs_stream_token_column(conn)?;
                 ensure_runs_tmux_invocation_columns(conn)?;
                 backfill_legacy_tmux_sessions(conn)?;
+                upgrade_run_workflow_json(conn)?;
                 Ok(())
             })
         })
@@ -174,11 +229,16 @@ impl Database {
     }
 
     pub async fn upsert_run(&self, persisted: &PersistedRun) -> anyhow::Result<()> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         let persisted = persisted.clone();
         spawn_blocking(move || -> anyhow::Result<()> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
+                // Canonicalize at first INSERT so new rows are born at the current schema.
+                // workflow_json / stream_token stay frozen on conflict (immutable snapshot);
+                // the only other write to workflow_json is upgrade_run_workflow_json in init().
+                let workflow_json = serde_json::to_string(
+                    &normalize_workflow_value(serde_json::to_value(&persisted.workflow)?)?.workflow,
+                )?;
                 conn.execute(
                     r#"
                 INSERT INTO runs (
@@ -188,8 +248,8 @@ impl Database {
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                 -- workflow_json and stream_token are intentionally frozen at first INSERT and are
                 -- NOT updated on conflict; this is an immutable-snapshot invariant, not an oversight.
-                -- The only sanctioned write-back to workflow_json is H3's one-time startup upgrade
-                -- (which stamps version: 4), not a per-upsert or per-read write-back.
+                -- Durable repair of legacy workflow_json happens once in Database::init via
+                -- upgrade_run_workflow_json — never on the get_run read path.
                 ON CONFLICT(run_id) DO UPDATE SET
                     status = excluded.status,
                     workflow_name = excluded.workflow_name,
@@ -219,7 +279,7 @@ impl Database {
                             .map(serde_json::to_string)
                             .transpose()?,
                         serde_json::to_string(&persisted.checkpoint)?,
-                        serde_json::to_string(&persisted.workflow)?,
+                        workflow_json,
                         persisted.checkpoint.execution_log.terminal_reason,
                         persisted
                             .tmux_invocation
@@ -247,11 +307,10 @@ impl Database {
         &self,
         checkpoint: &RuntimeCheckpoint,
     ) -> anyhow::Result<bool> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         let checkpoint = checkpoint.clone();
         spawn_blocking(move || -> anyhow::Result<bool> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 let updated = conn.execute(
                     r#"
                     UPDATE runs SET
@@ -292,11 +351,10 @@ impl Database {
     }
 
     pub async fn get_run(&self, run_id: &str) -> anyhow::Result<Option<PersistedRun>> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         let run_id = run_id.to_string();
         spawn_blocking(move || -> anyhow::Result<Option<PersistedRun>> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 let row = conn
                     .query_row(
                         "SELECT stream_token, state_json, workflow_json, tmux_bin, tmux_socket, tmux_prefix_json FROM runs WHERE run_id = ?1",
@@ -325,22 +383,11 @@ impl Database {
                     return Ok(None);
                 };
                 let workflow_value: Value = serde_json::from_str(&workflow_json)?;
-                // Migrate-on-read normalization for the in-memory PersistedRun only: recomputed on
-                // every read and intentionally NOT persisted back (no read-path write-back).
-                // Persisting per-read would race with M3's wholesale state_json overwrite and would
-                // break the stores_run_records test's immutable-snapshot assertions; the durable
-                // repair is H3's one-time startup upgrade (CAS below), not this read path.
+                // Migrate-on-read for the in-memory PersistedRun only. Recomputed each read and
+                // intentionally NOT persisted here — read paths stay pure. Rows written by older
+                // binaries are repaired once by upgrade_run_workflow_json during Database::init;
+                // new rows are born canonical via upsert_run's INSERT normalization.
                 let workflow = normalize_workflow_value(workflow_value)?.workflow;
-                let normalized_workflow_json = serde_json::to_string(&workflow)?;
-                if normalized_workflow_json != workflow_json {
-                    // Compare-and-swap keeps concurrent readers/processes from replacing a
-                    // workflow that changed after this read. Once upgraded, subsequent loads
-                    // see the canonical JSON and skip the write.
-                    conn.execute(
-                        "UPDATE runs SET workflow_json = ?1 WHERE run_id = ?2 AND workflow_json = ?3",
-                        params![normalized_workflow_json, run_id, workflow_json],
-                    )?;
-                }
                 Ok(Some(PersistedRun {
                     stream_token,
                     tmux_invocation: decode_tmux_invocation(
@@ -361,12 +408,11 @@ impl Database {
         run_id: &str,
         invocation: &tmux_tools_core::TmuxInvocation,
     ) -> anyhow::Result<bool> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         let run_id = run_id.to_string();
         let invocation = invocation.clone();
         spawn_blocking(move || -> anyhow::Result<bool> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 let updated = conn.execute(
                     r#"
                     UPDATE runs SET
@@ -395,12 +441,11 @@ impl Database {
         status: RuntimeStatus,
         terminal_reason: Option<String>,
     ) -> anyhow::Result<()> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         let run_id = run_id.to_string();
         let status = status_as_str(&status).to_string();
         spawn_blocking(move || -> anyhow::Result<()> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 conn.execute(
                     "UPDATE runs SET status = ?2, terminal_reason = ?3, updated_at = ?4 WHERE run_id = ?1",
                     params![run_id, status, terminal_reason, now_iso()],
@@ -412,37 +457,48 @@ impl Database {
         Ok(())
     }
 
-    pub async fn append_event(&self, run_id: &str, event: &RuntimeEvent) -> anyhow::Result<()> {
-        let path = self.path.clone();
+    pub async fn append_event(&self, run_id: &str, event: &RuntimeEvent) -> anyhow::Result<u64> {
         let connection = self.connection.clone();
         let run_id = run_id.to_string();
         let event = event.clone();
-        spawn_blocking(move || -> anyhow::Result<()> {
-            with_connection(&connection, path.as_path(), |conn| {
+        let row_id = spawn_blocking(move || -> anyhow::Result<u64> {
+            with_connection(&connection, |conn| {
                 conn.execute(
                     "INSERT INTO run_events (run_id, event_json, created_at) VALUES (?1, ?2, ?3)",
                     params![run_id, serde_json::to_string(&event)?, now_iso()],
                 )?;
-                Ok(())
+                let row_id = conn.last_insert_rowid() as u64;
+                let stamped = event.with_seq(row_id);
+                conn.execute(
+                    "UPDATE run_events SET event_json = ?1 WHERE id = ?2",
+                    params![serde_json::to_string(&stamped)?, row_id],
+                )?;
+                Ok(row_id)
             })
         })
         .await??;
-        Ok(())
+        Ok(row_id)
     }
 
     pub async fn list_events(&self, run_id: &str) -> anyhow::Result<Vec<RuntimeEvent>> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         let run_id = run_id.to_string();
         spawn_blocking(move || -> anyhow::Result<Vec<RuntimeEvent>> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 let mut stmt = conn.prepare(
-                    "SELECT event_json FROM run_events WHERE run_id = ?1 ORDER BY id ASC",
+                    "SELECT id, event_json FROM run_events WHERE run_id = ?1 ORDER BY id ASC",
                 )?;
-                let rows = stmt.query_map(params![run_id], |row| row.get::<_, String>(0))?;
+                let rows = stmt.query_map(params![run_id], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?;
                 let mut events = Vec::new();
                 for row in rows {
-                    events.push(serde_json::from_str(&row?)?);
+                    let (row_id, json) = row?;
+                    let mut event: RuntimeEvent = serde_json::from_str(&json)?;
+                    if event.seq.is_none() {
+                        event.seq = Some(row_id as u64);
+                    }
+                    events.push(event);
                 }
                 Ok(events)
             })
@@ -455,12 +511,11 @@ impl Database {
         run_id: &str,
         session_name: &str,
     ) -> anyhow::Result<bool> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         let run_id = run_id.to_string();
         let session_name = session_name.to_string();
         spawn_blocking(move || -> anyhow::Result<bool> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 let inserted = conn.execute(
                     r#"
                     INSERT INTO run_tmux_sessions (run_id, session_name)
@@ -484,12 +539,11 @@ impl Database {
         if session_names.is_empty() {
             return Ok(());
         }
-        let path = self.path.clone();
         let connection = self.connection.clone();
         let run_id = run_id.to_string();
         let session_names = session_names.clone();
         spawn_blocking(move || -> anyhow::Result<()> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 let transaction = conn.unchecked_transaction()?;
                 for session_name in session_names {
                     transaction.execute(
@@ -506,11 +560,10 @@ impl Database {
     }
 
     pub async fn list_run_tmux_session_names(&self, run_id: &str) -> anyhow::Result<Vec<String>> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         let run_id = run_id.to_string();
         spawn_blocking(move || -> anyhow::Result<Vec<String>> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT session_name FROM run_tmux_sessions \
                      WHERE run_id = ?1 ORDER BY session_name",
@@ -540,10 +593,9 @@ impl Database {
         &self,
         run_id: Option<String>,
     ) -> anyhow::Result<Vec<ReapableTmuxSession>> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         spawn_blocking(move || -> anyhow::Result<Vec<ReapableTmuxSession>> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 let mut stmt = conn.prepare(
                     r#"
                     SELECT
@@ -557,6 +609,16 @@ impl Database {
                         ON run_tmux_sessions.run_id = runs.run_id
                     WHERE runs.status IN ('completed', 'failed', 'aborted', 'restarted')
                         AND (?1 IS NULL OR runs.run_id = ?1)
+                        AND NOT EXISTS (
+                            SELECT 1
+                            FROM run_tmux_sessions AS nonterminal_sessions
+                            INNER JOIN runs AS nonterminal_runs
+                                ON nonterminal_runs.run_id = nonterminal_sessions.run_id
+                            WHERE nonterminal_sessions.session_name = run_tmux_sessions.session_name
+                                AND nonterminal_runs.status NOT IN (
+                                    'completed', 'failed', 'aborted', 'restarted'
+                                )
+                        )
                     ORDER BY runs.run_id, run_tmux_sessions.session_name
                     "#,
                 )?;
@@ -589,10 +651,9 @@ impl Database {
     }
 
     pub async fn list_interrupted_runs(&self) -> anyhow::Result<Vec<InterruptedRunSummary>> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         spawn_blocking(move || -> anyhow::Result<Vec<InterruptedRunSummary>> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT run_id, status, workflow_name, current_node_id, current_node_name, \
                  total_executed, started_at, updated_at, pending_approval_json \
@@ -647,12 +708,11 @@ impl Database {
     }
 
     pub async fn save_execution_log(&self, id: &str, log: &ExecutionLog) -> anyhow::Result<()> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         let id = safe_name(id)?;
         let log_value = serde_json::to_value(log)?;
         spawn_blocking(move || -> anyhow::Result<()> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 conn.execute(
                     r#"
                 INSERT INTO logs (
@@ -694,10 +754,9 @@ impl Database {
     }
 
     pub async fn list_logs(&self) -> anyhow::Result<Vec<LogListItem>> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         spawn_blocking(move || -> anyhow::Result<Vec<LogListItem>> {
-            let rows = with_connection(&connection, path.as_path(), |conn| {
+            let rows = with_connection(&connection, |conn| {
                 let mut stmt = conn.prepare(
                     "SELECT id, filename, workflow_name, goal, start_time, end_time, total_duration, aborted, run_id, data_json FROM logs ORDER BY start_time DESC",
                 )?;
@@ -792,11 +851,10 @@ impl Database {
     }
 
     pub async fn get_log(&self, id: &str) -> anyhow::Result<Option<Value>> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         let id = safe_name(id)?;
         spawn_blocking(move || -> anyhow::Result<Option<Value>> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 let data_json = conn
                     .query_row(
                         "SELECT data_json FROM logs WHERE id = ?1",
@@ -813,11 +871,10 @@ impl Database {
     }
 
     pub async fn delete_log(&self, id: &str) -> anyhow::Result<()> {
-        let path = self.path.clone();
         let connection = self.connection.clone();
         let id = safe_name(id)?;
         spawn_blocking(move || -> anyhow::Result<()> {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 conn.execute("DELETE FROM logs WHERE id = ?1", params![id])?;
                 Ok(())
             })
@@ -842,13 +899,49 @@ impl WorkflowStore {
         let mut entries = tokio::fs::read_dir(self.dir()).await?;
         let mut workflows = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
-            if !entry.file_name().to_string_lossy().ends_with(".json") {
+            let filename = entry.file_name().to_string_lossy().to_string();
+            if filename.ends_with(".json.tmp") {
+                if let Err(error) = tokio::fs::remove_file(entry.path()).await {
+                    tracing::warn!(
+                        workflow_file = %filename,
+                        "Could not remove stale workflow temp file: {error}"
+                    );
+                }
                 continue;
             }
-            let filename = entry.file_name().to_string_lossy().to_string();
-            let contents = tokio::fs::read_to_string(entry.path()).await?;
-            let value: Value = serde_json::from_str(&contents)?;
-            let normalized = normalize_workflow_value(value)?;
+            if !filename.ends_with(".json") {
+                continue;
+            }
+            let contents = match tokio::fs::read_to_string(entry.path()).await {
+                Ok(contents) => contents,
+                Err(error) => {
+                    tracing::warn!(
+                        workflow_file = %filename,
+                        "Skipping workflow that could not be read: {error}"
+                    );
+                    continue;
+                }
+            };
+            let value: Value = match serde_json::from_str(&contents) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(
+                        workflow_file = %filename,
+                        "Skipping workflow with invalid JSON: {error}"
+                    );
+                    continue;
+                }
+            };
+            let normalized = match normalize_workflow_value(value) {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    tracing::warn!(
+                        workflow_file = %filename,
+                        "Skipping workflow with invalid workflow schema: {error}"
+                    );
+                    continue;
+                }
+            };
             workflows.push(StoredWorkflowItem {
                 name: filename.trim_end_matches(".json").to_string(),
                 filename,
@@ -881,8 +974,13 @@ impl WorkflowStore {
         let safe = safe_name(name)?;
         ensure_dir(self.dir())?;
         let path = self.dir().join(format!("{}.json", safe));
+        let tmp_path = self.dir().join(format!("{}.json.tmp", safe));
         let data = serde_json::to_vec_pretty(&normalized.workflow)?;
-        tokio::fs::write(path, data).await?;
+        let mut file = tokio::fs::File::create(&tmp_path).await?;
+        file.write_all(&data).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp_path, &path).await?;
         Ok(safe)
     }
 
@@ -974,18 +1072,52 @@ fn value_str<'a>(value: &'a Value, key: &str) -> &'a str {
 }
 
 fn with_connection<T>(
-    connection: &Pool<SqliteConnectionManager>,
-    path: &Path,
+    connection: &Pool<ManagedSqliteConnectionManager>,
     operation: impl FnOnce(&Connection) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        ensure_dir(parent)?;
-    }
     let connection = connection.get()?;
     operation(&connection)
+}
+
+#[cfg(unix)]
+fn secure_database_files(path: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let database = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)?;
+    let mut permissions = database.metadata()?.permissions();
+    permissions.set_mode(0o600);
+    database.set_permissions(permissions)?;
+
+    for sidecar in [
+        sqlite_sidecar_path(path, "-wal"),
+        sqlite_sidecar_path(path, "-shm"),
+    ] {
+        if !sidecar.exists() {
+            continue;
+        }
+        let mut permissions = std::fs::metadata(&sidecar)?.permissions();
+        permissions.set_mode(0o600);
+        std::fs::set_permissions(sidecar, permissions)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn secure_database_files(_path: &Path) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    sidecar.into()
 }
 
 fn configure_connection(conn: &mut Connection) -> rusqlite::Result<()> {
@@ -1107,6 +1239,32 @@ fn backfill_legacy_tmux_sessions(conn: &Connection) -> anyhow::Result<()> {
     }
 
     transaction.commit()?;
+    Ok(())
+}
+
+/// One-time startup upgrade: normalize each stored workflow_json and CAS-update rows that differ.
+/// Runs in Database::init (a write context) so failures are loud rather than poisoning get_run.
+fn upgrade_run_workflow_json(conn: &Connection) -> anyhow::Result<()> {
+    let rows = {
+        let mut stmt = conn.prepare("SELECT run_id, workflow_json FROM runs")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    for (run_id, workflow_json) in rows {
+        let workflow_value: Value = serde_json::from_str(&workflow_json)?;
+        let normalized = normalize_workflow_value(workflow_value)?.workflow;
+        let normalized_json = serde_json::to_string(&normalized)?;
+        if normalized_json == workflow_json {
+            continue;
+        }
+        conn.execute(
+            "UPDATE runs SET workflow_json = ?1 WHERE run_id = ?2 AND workflow_json = ?3",
+            params![normalized_json, run_id, workflow_json],
+        )?;
+    }
     Ok(())
 }
 
@@ -1264,6 +1422,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lists_workflows_and_skips_invalid_files() {
+        let temp = TempDir::new().unwrap();
+        let store = WorkflowStore::new(temp.path());
+        let valid = sample_workflow();
+        store
+            .save(
+                "valid",
+                NormalizedWorkflow {
+                    workflow: valid.clone(),
+                    notices: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        tokio::fs::write(
+            temp.path().join("invalid.json"),
+            br#"{ "_version": 2, "steps": [] }"#,
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(temp.path().join("stale.json.tmp"), b"partial")
+            .await
+            .unwrap();
+
+        let workflows = store.list().await.unwrap();
+
+        assert_eq!(workflows.len(), 1);
+        assert_eq!(workflows[0].filename, "valid.json");
+        assert_eq!(workflows[0].name, "valid");
+        assert_eq!(workflows[0].workflow, valid);
+        assert!(!temp.path().join("stale.json.tmp").exists());
+    }
+
+    #[tokio::test]
     async fn lists_templates_and_skips_invalid_files() {
         let temp = TempDir::new().unwrap();
         let store = TemplateStore::new(temp.path());
@@ -1377,6 +1569,39 @@ mod tests {
         assert_eq!(loaded.stream_token, persisted.stream_token);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn database_and_wal_sidecars_are_not_group_or_world_accessible() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("silverbond.db");
+        let db = Database::new(path.clone());
+        db.init().await.unwrap();
+        db.upsert_run(&sample_persisted_run("permissions"))
+            .await
+            .unwrap();
+
+        with_connection(&db.connection, |_| {
+            for protected_path in [
+                path.clone(),
+                sqlite_sidecar_path(&path, "-wal"),
+                sqlite_sidecar_path(&path, "-shm"),
+            ] {
+                let mode = std::fs::metadata(&protected_path)?.permissions().mode();
+                assert_eq!(
+                    mode & 0o077,
+                    0,
+                    "{} must not be group- or world-accessible; mode was {:o}",
+                    protected_path.display(),
+                    mode & 0o777,
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
     #[tokio::test]
     async fn stores_resolved_tmux_invocation_with_run() {
         let temp = TempDir::new().unwrap();
@@ -1393,6 +1618,23 @@ mod tests {
 
         let loaded = db.get_run("run-with-invocation").await.unwrap().unwrap();
         assert_eq!(loaded.tmux_invocation, persisted.tmux_invocation);
+    }
+
+    #[tokio::test]
+    async fn runtime_tmux_registration_reports_missing_run() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+
+        let registered =
+            crate::runtime::register_tmux_session(&db, "missing-run", "silverbond-unreapable")
+                .await
+                .unwrap();
+
+        assert!(
+            !registered,
+            "a missing run must be observable to the caller"
+        );
     }
 
     #[tokio::test]
@@ -1474,6 +1716,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn excludes_terminal_session_name_registered_to_nonterminal_run() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let session = "silverbond-shared-explicit-name";
+        let mut terminal = sample_persisted_run("terminal-run");
+        terminal.checkpoint.status = RuntimeStatus::Completed;
+        db.upsert_run(&terminal).await.unwrap();
+        db.upsert_run(&sample_persisted_run("active-run"))
+            .await
+            .unwrap();
+        db.register_tmux_session("terminal-run", session)
+            .await
+            .unwrap();
+        db.register_tmux_session("active-run", session)
+            .await
+            .unwrap();
+
+        let reapable = db.list_reapable_tmux_sessions().await.unwrap();
+
+        assert!(
+            reapable.is_empty(),
+            "a terminal row must not target a session name registered to a nonterminal run"
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_tmux_registrations_accumulate_and_active_runs_are_filtered() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
@@ -1552,7 +1821,7 @@ mod tests {
         let mut persisted = sample_persisted_run("legacy-terminal-run");
         persisted.checkpoint.status = RuntimeStatus::Failed;
         db.upsert_run(&persisted).await.unwrap();
-        with_connection(&db.connection, db.path(), |conn| {
+        with_connection(&db.connection, |conn| {
             let mut state = serde_json::to_value(&persisted.checkpoint)?;
             state["tmuxSessions"] =
                 serde_json::json!(["silverbond-legacy-alpha", "silverbond-legacy-beta"]);
@@ -1584,7 +1853,7 @@ mod tests {
                 },
             ]
         );
-        let state_json = with_connection(&migrated.connection, migrated.path(), |conn| {
+        let state_json = with_connection(&migrated.connection, |conn| {
             Ok(conn.query_row(
                 "SELECT state_json FROM runs WHERE run_id = ?1",
                 params!["legacy-terminal-run"],
@@ -1606,11 +1875,10 @@ mod tests {
             .unwrap();
 
         let connection = db.connection.clone();
-        let path = db.path.clone();
         let (read_started_tx, read_started_rx) = std::sync::mpsc::channel();
         let (release_read_tx, release_read_rx) = std::sync::mpsc::channel();
         let held_read = spawn_blocking(move || {
-            with_connection(&connection, path.as_path(), |conn| {
+            with_connection(&connection, |conn| {
                 conn.query_row("SELECT COUNT(*) FROM runs", [], |row| row.get::<_, i64>(0))?;
                 read_started_tx.send(()).unwrap();
                 release_read_rx.recv().unwrap();
@@ -1636,9 +1904,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_run_persists_structurally_migrated_v3_workflow_as_v4() {
+    async fn init_persists_structurally_migrated_v3_workflow_as_v4() {
         let temp = TempDir::new().unwrap();
-        let db = Database::new(temp.path().join("silverbond.db"));
+        let path = temp.path().join("silverbond.db");
+        let db = Database::new(path.clone());
         db.init().await.unwrap();
         db.upsert_run(&sample_persisted_run("legacy-run"))
             .await
@@ -1663,7 +1932,7 @@ mod tests {
             }],
             "edges": []
         });
-        with_connection(&db.connection, db.path(), |conn| {
+        with_connection(&db.connection, |conn| {
             conn.execute(
                 "UPDATE runs SET workflow_json = ?2 WHERE run_id = ?1",
                 params!["legacy-run", serde_json::to_string(&legacy_workflow)?],
@@ -1672,15 +1941,11 @@ mod tests {
         })
         .unwrap();
 
-        let loaded = db.get_run("legacy-run").await.unwrap().unwrap();
-        assert_eq!(loaded.workflow.version, 4);
-        assert!(matches!(
-            &loaded.workflow.nodes[0].kind,
-            crate::model::NodeKind::Decide { decide_config }
-                if decide_config.outcomes == vec!["yes".to_string()]
-        ));
+        // Startup migration must canonicalize without any get_run call.
+        let upgraded = Database::new(path);
+        upgraded.init().await.unwrap();
 
-        let stored_workflow_json = with_connection(&db.connection, db.path(), |conn| {
+        let stored_workflow_json = with_connection(&upgraded.connection, |conn| {
             Ok(conn.query_row(
                 "SELECT workflow_json FROM runs WHERE run_id = ?1",
                 params!["legacy-run"],
@@ -1742,9 +2007,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_run_leaves_canonical_v4_workflow_unchanged() {
+    async fn init_leaves_canonical_v4_workflow_unchanged() {
         let temp = TempDir::new().unwrap();
-        let db = Database::new(temp.path().join("silverbond.db"));
+        let path = temp.path().join("silverbond.db");
+        let db = Database::new(path.clone());
         db.init().await.unwrap();
         db.upsert_run(&sample_persisted_run("current-run"))
             .await
@@ -1753,7 +2019,7 @@ mod tests {
         let current_workflow = canonical_v4_decide_workflow();
         let canonical_json = serde_json::to_string(&current_workflow).unwrap();
         let original_workflow: Value = serde_json::from_str(&canonical_json).unwrap();
-        with_connection(&db.connection, db.path(), |conn| {
+        with_connection(&db.connection, |conn| {
             conn.execute(
                 "UPDATE runs SET workflow_json = ?2 WHERE run_id = ?1",
                 params!["current-run", canonical_json.clone()],
@@ -1762,15 +2028,10 @@ mod tests {
         })
         .unwrap();
 
-        let loaded = db.get_run("current-run").await.unwrap().unwrap();
-        assert_eq!(loaded.workflow.version, 4);
-        assert!(matches!(
-            &loaded.workflow.nodes[0].kind,
-            crate::model::NodeKind::Decide { decide_config }
-                if decide_config.outcomes == vec!["yes".to_string()]
-        ));
+        let upgraded = Database::new(path);
+        upgraded.init().await.unwrap();
 
-        let stored_workflow_json = with_connection(&db.connection, db.path(), |conn| {
+        let stored_workflow_json = with_connection(&upgraded.connection, |conn| {
             Ok(conn.query_row(
                 "SELECT workflow_json FROM runs WHERE run_id = ?1",
                 params!["current-run"],
@@ -1781,7 +2042,7 @@ mod tests {
         let stored_workflow: Value = serde_json::from_str(&stored_workflow_json).unwrap();
         assert_eq!(
             original_workflow, stored_workflow,
-            "get_run must not rewrite a fully canonical v4 workflow"
+            "init must not rewrite a fully canonical v4 workflow"
         );
         assert_eq!(stored_workflow["nodes"][0]["kind"]["type"], "decide");
         assert_eq!(
@@ -1789,5 +2050,60 @@ mod tests {
             serde_json::json!(["yes"])
         );
         assert!(stored_workflow["nodes"][0].get("type").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_run_does_not_persist_normalized_workflow() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        db.upsert_run(&sample_persisted_run("legacy-run"))
+            .await
+            .unwrap();
+
+        let legacy_workflow = serde_json::json!({
+            "version": 3,
+            "goal": "legacy run",
+            "cwd": "/tmp",
+            "useOrchestrator": false,
+            "entryNodeId": "decide",
+            "variables": [],
+            "limits": { "maxTotalSteps": 10, "maxVisitsPerNode": 5 },
+            "nodes": [{
+                "id": "decide",
+                "name": "Pick",
+                "type": "decide",
+                "decideConfig": {
+                    "prompt": "Pick one",
+                    "outcomes": ["yes"]
+                }
+            }],
+            "edges": []
+        });
+        let legacy_json = serde_json::to_string(&legacy_workflow).unwrap();
+        with_connection(&db.connection, |conn| {
+            conn.execute(
+                "UPDATE runs SET workflow_json = ?2 WHERE run_id = ?1",
+                params!["legacy-run", legacy_json.clone()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let loaded = db.get_run("legacy-run").await.unwrap().unwrap();
+        assert_eq!(loaded.workflow.version, 4);
+
+        let stored_workflow_json = with_connection(&db.connection, |conn| {
+            Ok(conn.query_row(
+                "SELECT workflow_json FROM runs WHERE run_id = ?1",
+                params!["legacy-run"],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .unwrap();
+        assert_eq!(
+            stored_workflow_json, legacy_json,
+            "get_run must remain a pure read and must not CAS-write workflow_json"
+        );
     }
 }

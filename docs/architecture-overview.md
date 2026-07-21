@@ -47,7 +47,7 @@ SilverBond is a local-first graph workflow runner. It lets users visually author
          workloads via zsh -lic in each pane
 ```
 
-Each target user has their own tmux server on a dedicated socket (mode `0700`). The backend issues control commands through `sudo -u <user>` (or a workflow `runAs.command` override) and launches agent workloads through `zsh -lic`. Workflows can set `runAs: { user?, command?, socket? }` to run under a dedicated agent-user sandbox.
+Each run has its own tmux server on a `silverbond-<run-id>` socket in the target user's per-UID socket directory (mode `0700`). The backend issues control commands through `sudo -u <user>` (or a workflow `runAs.command` override) and launches agent workloads through `zsh -lic`. Workflows can set `runAs: { user?, command? }` to run under a dedicated agent-user sandbox.
 
 ## Deployment Modes
 
@@ -96,7 +96,7 @@ SilverBond/
 2. **Validation**: The frontend sends the workflow to `POST /api/validate-workflow`. The backend runs graph analysis (reachability, dead-ends, duplicate IDs, missing prompts) and returns issues.
 3. **Persistence**: `POST /api/workflows` saves the workflow as a JSON file in the `workflows/` directory.
 4. **Execution**: `POST /api/runs` creates a run. The runtime validates the workflow, creates an initial checkpoint, and begins graph traversal.
-5. **Agent Calls**: For each task node, the runtime resolves the prompt (variable substitution, context sources), selects the appropriate agent driver, builds CLI arguments, and launches the agent in a tmux pane (respecting workflow `runAs` for user/socket selection). Lightweight classifier calls (orchestrator) use the same tmux path.
+5. **Agent Calls**: For each task node, the runtime resolves the prompt (variable substitution, context sources), selects the appropriate agent driver, builds CLI arguments, and launches the agent in a tmux pane (respecting workflow `runAs` for user selection and assigning the run-scoped socket automatically). Lightweight classifier calls (orchestrator) use the same tmux path.
 6. **Events**: Runtime decisions are emitted as events, persisted to SQLite, and streamed to the frontend via SSE.
 7. **Checkpoints**: After each node execution, the runtime persists a checkpoint to SQLite. This enables resume after process restart.
 8. **History**: When a run completes, a durable execution log is persisted for later review.

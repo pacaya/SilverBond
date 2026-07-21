@@ -138,6 +138,13 @@ export type RunStreamHandle = {
   finished: Promise<void>;
 };
 
+const RUN_STREAM_RESYNC_TYPE = "stream_resync";
+
+function runEventSeq(event: RunEvent): number {
+  const seq = event.seq;
+  return typeof seq === "number" && Number.isFinite(seq) ? seq : 0;
+}
+
 export function streamRun(
   runId: string,
   streamToken: string,
@@ -148,6 +155,30 @@ export function streamRun(
   const signal = options?.signal ?? ownedController!.signal;
   let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
   let closed = false;
+  let lastSeq = 0;
+
+  const applyRunStreamEvent = (event: RunEvent) => {
+    if (event.type === RUN_STREAM_RESYNC_TYPE) {
+      void resyncFromJournal();
+      return;
+    }
+    const seq = runEventSeq(event);
+    if (seq > 0) {
+      if (seq <= lastSeq) return;
+      lastSeq = seq;
+    }
+    onEvent(event);
+  };
+
+  const resyncFromJournal = async () => {
+    const events = await api.runEvents(runId, streamToken);
+    for (const event of events) {
+      const seq = runEventSeq(event);
+      if (seq > 0 && seq <= lastSeq) continue;
+      if (seq > lastSeq) lastSeq = seq;
+      onEvent(event);
+    }
+  };
 
   const finished = (async () => {
     try {
@@ -162,6 +193,7 @@ export function streamRun(
       reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let pendingId: number | null = null;
 
       while (!signal.aborted) {
         const { done, value } = await reader.read();
@@ -170,9 +202,19 @@ export function streamRun(
         const chunks = buffer.split("\n");
         buffer = chunks.pop() ?? "";
         for (const chunk of chunks) {
+          if (chunk.startsWith("id: ")) {
+            const parsed = Number(chunk.slice(4).trim());
+            pendingId = Number.isFinite(parsed) ? parsed : null;
+            continue;
+          }
           if (!chunk.startsWith("data: ")) continue;
           try {
-            onEvent(JSON.parse(chunk.slice(6)) as RunEvent);
+            const event = JSON.parse(chunk.slice(6)) as RunEvent;
+            if (pendingId !== null && runEventSeq(event) === 0) {
+              event.seq = pendingId;
+            }
+            pendingId = null;
+            applyRunStreamEvent(event);
           } catch {
             // Ignore malformed chunks; the stream continues.
           }
@@ -383,7 +425,7 @@ export function streamPane(
           now - resyncRequestedAt > PANE_RESYNC_TIMEOUT_MS
         ) {
           handlers.onStatus?.("stalled");
-          reconnect();
+          setTimeout(() => reconnect(), 0);
           return;
         }
         if (now - lastFrameTime > PANE_HEARTBEAT_TIMEOUT_MS) {

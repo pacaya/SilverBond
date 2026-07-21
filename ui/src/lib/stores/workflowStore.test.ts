@@ -369,6 +369,29 @@ describe("workflowStore", () => {
     expect(store.workflow!.entryNodeId).toBe(store.workflow!.nodes[0].id);
   });
 
+  it("copies agentDefaults and useOrchestrator into an extracted compound subflow", () => {
+    store.setWorkflow(
+      workflow({
+        goal: "parent goal must not leak",
+        useOrchestrator: true,
+        agentDefaults: {
+          claude: { accessMode: "read_only" },
+        },
+        entryNodeId: "a",
+        nodes: [node("a"), node("b")],
+        edges: [edge("a-b", "a", "b")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "ScopedDefaults");
+
+    expect(result).toMatchObject({ ok: true });
+    const subflow = store.workflow!.subflows?.ScopedDefaults;
+    expect(subflow?.useOrchestrator).toBe(true);
+    expect(subflow?.agentDefaults?.claude?.accessMode).toBe("read_only");
+    expect(subflow?.goal).toBe("");
+  });
+
   it("selects the external inbound node as entry for X→A, A→B", () => {
     store.setWorkflow(
       workflow({
@@ -544,7 +567,10 @@ describe("workflowStore", () => {
             },
           }),
           node("b", "send", {
-            kind: { type: "send", sendConfig: { text: "send {{node:x.output}}", enter: true } },
+            kind: {
+              type: "send",
+              sendConfig: { target: "editor", text: "send {{node:x.output}}", enter: false },
+            },
           }),
           node("after", "run_agent", {
             kind: {
@@ -573,13 +599,35 @@ describe("workflowStore", () => {
     expect(movedA.kind.runAgentConfig?.prompt).not.toContain("{{node:x.output}}");
     expect(movedB?.kind.type).toBe("send");
     if (movedB?.kind.type !== "send") throw new Error("expected send");
+    if (!movedB.kind.sendConfig) throw new Error("expected send config");
     expect(movedB.kind.sendConfig.text).toContain("{{var:");
     expect(movedB.kind.sendConfig.text).not.toContain("{{node:x.output}}");
+    expect(movedB.kind.sendConfig.target).toBe("editor");
+    expect(movedB.kind.sendConfig.enter).toBe(false);
     const compound = store.workflow!.nodes.find((n) => n.kind.type === "subflow");
     const after = store.workflow!.nodes.find((n) => n.id === "after");
     expect(after?.kind.type).toBe("run_agent");
     if (after?.kind.type !== "run_agent") throw new Error("expected run_agent");
     expect(after.kind.runAgentConfig?.prompt).toContain(`{{node:${compound!.id}.output}}`);
+  });
+
+  it("extracts a compound containing a send node with omitted default config", () => {
+    store.setWorkflow(
+      workflow({
+        entryNodeId: "a",
+        nodes: [
+          node("a", "send", { kind: { type: "send" } }),
+          node("b", "task"),
+        ],
+        edges: [edge("a-b", "a", "b")],
+      }),
+    );
+
+    const result = store.saveSelectionAsCompound(["a", "b"], "DefaultSend");
+
+    expect(result).toMatchObject({ ok: true });
+    const movedSend = store.workflow!.subflows?.DefaultSend.nodes.find((n) => n.id === "a");
+    expect(movedSend?.kind).toEqual({ type: "send" });
   });
 
   it("rejects cross-boundary field-path refs in run_agent and send prompt fields", () => {
@@ -969,6 +1017,35 @@ describe("workflowStore", () => {
     expect(result).toMatchObject({ ok: true });
     const subflow = store.workflow!.subflows?.NonEntryPositional;
     expect(subflow?.nodes.find((n) => n.id === "b")?.prompt).toContain("{{previous_output}}");
+  });
+
+  it("clears stale pane selection when a new run stream begins without kickoff panes", () => {
+    store.selectPane("cursor:stale-from-prior-run");
+    store.setRunObservability({
+      panes: [
+        {
+          pane: "cursor:stale-from-prior-run",
+          sessionName: "old-sess",
+          attachCommand: "tmux attach -t old-sess",
+        },
+      ],
+    });
+
+    store.beginRunStream();
+
+    expect(store.selectedPane).toBe("active");
+    expect(store.runObservability).toBeNull();
+
+    store.setRunObservability({
+      panes: [
+        {
+          pane: "cursor:fresh-node",
+          sessionName: "new-sess",
+          attachCommand: "tmux attach -t new-sess",
+        },
+      ],
+    });
+    expect(store.selectedPane).toBe("cursor:fresh-node");
   });
 
   it("corrects stale selectedPane when observability panes change across runs", () => {

@@ -36,7 +36,7 @@ SilverBond uses a graph-native workflow schema. The canonical format is version 
 | `goal` | `string` | Yes | High-level description of what the workflow achieves |
 | `cwd` | `string` | No | Default working directory for agent execution |
 | `useOrchestrator` | `boolean` | No | Enable orchestrator for prompt refinement, branch choice, and loop verdicts |
-| `runAs` | `RunAsConfig` | No | User/socket sandbox for tmux-based agent execution (see below) |
+| `runAs` | `RunAsConfig` | No | User sandbox for tmux-based agent execution (see below) |
 | `entryNodeId` | `string` | Yes | ID of the first node to execute |
 | `variables` | `Variable[]` | No | Workflow-level variables available in prompt templates |
 | `limits` | `Limits` | No | Execution guardrails |
@@ -66,14 +66,13 @@ Guards against runaway execution. If either limit is hit, the run fails.
 
 ### Run As (`runAs`)
 
-Workflow-level sandbox configuration for tmux-based agent execution. All agents — worker tasks and lightweight classifier calls — run in tmux panes under the identity and socket specified here.
+Workflow-level sandbox configuration for tmux-based agent execution. All agents — worker tasks and lightweight classifier calls — run in tmux panes under the identity specified here and an automatic per-run socket.
 
 ```json
 {
   "runAs": {
     "user": "agent-sandbox",
-    "command": ["sudo", "-u", "agent-sandbox", "-H", "--"],
-    "socket": "silverbond"
+    "command": ["sudo", "-u", "agent-sandbox", "-H", "--"]
   }
 }
 ```
@@ -82,16 +81,15 @@ Workflow-level sandbox configuration for tmux-based agent execution. All agents 
 |-------|------|-------------|
 | `user` | `string` | Synthesizes a `sudo -u <user> -H --` prefix for tmux control commands |
 | `command` | `string[]` | Verbatim argv-prefix escape hatch; overrides the synthesized `sudo` prefix when set |
-| `socket` | `string` | Override the tmux socket name (defaults to `silverbond`) |
 
-When both `user` and `command` are set, `command` takes precedence. The user switch happens once at the tmux server boundary: each target user gets a per-UID socket (mode `0700`), control commands run through the prefix, and agent workloads launch via `zsh -lic`.
+When both `user` and `command` are set, `command` takes precedence. The user switch happens once at the tmux server boundary: every run gets a dedicated `silverbond-<run-id>` socket in the target user's per-UID socket directory (mode `0700`), control commands run through the prefix, and agent workloads launch via `zsh -lic`.
 
 **Execution modes:** SilverBond currently runs all agents in interactive CLI TUI mode (tmux panes). A future direct-API mode (headless, no tmux) is planned but not yet implemented.
 
 **Observability:** To watch a running agent pane, attach with:
 
 ```
-sudo -u <user> tmux -L <socket> attach -t <session>
+sudo -u <user> tmux -L silverbond-<run-id> attach -t <session>
 ```
 
 The capabilities endpoint (`GET /api/capabilities`) exposes `features.runAs` and per-run `attachCommand` hints. Session observability is via tmux attach, not a dedicated history API.
@@ -389,4 +387,4 @@ The backend validates workflows and returns issues with severity and location:
 - **Warnings**: Unreachable nodes, dead-end nodes (no outgoing edges)
 - **Info**: Graph metadata (reachable nodes, entry point analysis)
 
-Legacy `outputSchema` in `{"field": "type"}` format is automatically migrated to full JSON Schema format.
+Legacy `outputSchema` in `{"field": "type"}` format is automatically migrated to full JSON Schema format when importing workflow versions 2 or 3. Canonical version-4 documents are left unchanged (including `$ref`-only and `$schema`/`$id` schemas).

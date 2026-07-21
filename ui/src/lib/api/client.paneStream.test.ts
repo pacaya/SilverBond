@@ -610,7 +610,40 @@ describe("streamPane client", () => {
     vi.advanceTimersByTime(20_000);
 
     expect(onStatus).toHaveBeenCalledWith("stalled");
-    expect(MockWebSocket.instances.length).toBeGreaterThan(1);
+    expect(MockWebSocket.instances.length).toBe(1);
+
+    vi.advanceTimersByTime(0);
+
+    expect(onStatus).toHaveBeenCalledWith("connecting");
+
+    handle.close();
+  });
+
+  it("15. stalled status is observable before deferred reconnect", () => {
+    const statusLog: string[] = [];
+    const onStatus = vi.fn((status: string) => {
+      statusLog.push(status);
+    });
+    const handle = streamPane("run-1", "pane-0", "stream-token-1", {
+      onSnapshot: vi.fn(),
+      onData: vi.fn(),
+      onStatus,
+    });
+
+    const ws = MockWebSocket.last();
+    ws.simulateOpen();
+    ws.simulateMessage(frame("snapshot", 0, b64("base")));
+    ws.simulateMessage(frame("data", 1, b64("a")));
+    ws.simulateMessage(frame("data", 5, b64("gap")));
+
+    vi.advanceTimersByTime(20_000);
+
+    const stalledIndex = statusLog.indexOf("stalled");
+    expect(stalledIndex).toBeGreaterThanOrEqual(0);
+    expect(statusLog.slice(stalledIndex + 1)).not.toContain("connecting");
+
+    vi.advanceTimersByTime(0);
+    expect(statusLog).toContain("connecting");
 
     handle.close();
   });

@@ -8,7 +8,8 @@ use std::{
 use axum::{Router, routing::get};
 use sha2::{Digest, Sha256};
 use tmux_tools_core::TmuxInvocation;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::{Mutex, broadcast, watch};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     api, frontend,
@@ -204,10 +205,71 @@ impl PaneStreamKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PaneStreamLifecycle {
+    Active,
+    Draining,
+    Terminating,
+}
+
 #[derive(Clone)]
 pub(crate) struct PaneStreamEntry {
     pub(crate) sender: broadcast::Sender<Vec<u8>>,
     pub(crate) refcount: usize,
+    lifecycle: PaneStreamLifecycle,
+    drain_signal: watch::Sender<bool>,
+    owner_done: CancellationToken,
+}
+
+impl PaneStreamEntry {
+    pub(crate) fn new(sender: broadcast::Sender<Vec<u8>>, refcount: usize) -> Self {
+        let draining = refcount == 0;
+        let (drain_signal, _) = watch::channel(draining);
+        Self {
+            sender,
+            refcount,
+            lifecycle: if draining {
+                PaneStreamLifecycle::Draining
+            } else {
+                PaneStreamLifecycle::Active
+            },
+            drain_signal,
+            owner_done: CancellationToken::new(),
+        }
+    }
+
+    pub(crate) fn is_draining(&self) -> bool {
+        self.lifecycle == PaneStreamLifecycle::Draining
+    }
+
+    pub(crate) fn is_terminating(&self) -> bool {
+        self.lifecycle == PaneStreamLifecycle::Terminating
+    }
+
+    pub(crate) fn mark_draining(&mut self) {
+        if self.lifecycle == PaneStreamLifecycle::Terminating {
+            return;
+        }
+        self.lifecycle = PaneStreamLifecycle::Draining;
+        self.drain_signal.send_replace(true);
+    }
+
+    pub(crate) fn revive(&mut self) {
+        self.lifecycle = PaneStreamLifecycle::Active;
+        self.drain_signal.send_replace(false);
+    }
+
+    pub(crate) fn begin_termination(&mut self) {
+        self.lifecycle = PaneStreamLifecycle::Terminating;
+    }
+
+    pub(crate) fn drain_receiver(&self) -> watch::Receiver<bool> {
+        self.drain_signal.subscribe()
+    }
+
+    pub(crate) fn owner_done(&self) -> CancellationToken {
+        self.owner_done.clone()
+    }
 }
 
 impl Default for PaneStreamRegistry {
@@ -233,25 +295,10 @@ impl PaneStreamRegistry {
             return;
         }
         if entry.refcount <= 1 {
-            inner.remove(key);
+            entry.refcount = 0;
+            entry.mark_draining();
         } else {
             entry.refcount -= 1;
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn remove_if_sender(
-        &self,
-        key: &PaneStreamKey,
-        sender: &broadcast::Sender<Vec<u8>>,
-    ) {
-        let mut inner = self.inner.lock().await;
-        let should_remove = inner
-            .get(key)
-            .map(|entry| entry.refcount == 0 && entry.sender.same_channel(sender))
-            .unwrap_or(false);
-        if should_remove {
-            inner.remove(key);
         }
     }
 

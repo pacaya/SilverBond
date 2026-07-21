@@ -12,11 +12,13 @@ const streamPaneMock = vi.hoisted(() =>
   })),
 );
 
+const terminalResetMock = vi.hoisted(() => vi.fn());
+
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
     loadAddon = vi.fn();
     open = vi.fn();
-    reset = vi.fn();
+    reset = terminalResetMock;
     write = vi.fn();
     dispose = vi.fn();
   },
@@ -108,6 +110,7 @@ describe("PaneTerminal", () => {
     store.setPaneStatus("idle");
     store.setPaneError("");
     streamPaneMock.mockClear();
+    terminalResetMock.mockClear();
     vi.stubGlobal("ResizeObserver", MockResizeObserver);
   });
 
@@ -140,5 +143,29 @@ describe("PaneTerminal", () => {
       "stream-token-1",
       expect.any(Object),
     );
+  });
+
+  it("resync while connecting reconnects without clearing the terminal", async () => {
+    store.setRunState({ runId: "run-1", streamToken: "stream-token-1", running: false });
+    store.setPaneStatus("connecting");
+
+    render(PaneTerminal, {
+      props: {
+        runId: "run-1",
+        streamToken: "stream-token-1",
+        workflow: dualReviewWorkflow,
+      },
+    });
+
+    const handle = streamPaneMock.mock.results.at(-1)?.value as {
+      requestResync: ReturnType<typeof vi.fn>;
+      reconnect: ReturnType<typeof vi.fn>;
+    };
+
+    const resetsBefore = terminalResetMock.mock.calls.length;
+    await screen.getByRole("button", { name: "Resync" }).click();
+
+    expect(terminalResetMock.mock.calls.length).toBe(resetsBefore);
+    expect(handle.requestResync).not.toHaveBeenCalled();
   });
 });

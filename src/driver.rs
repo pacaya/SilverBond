@@ -266,6 +266,101 @@ fn access_mode_profile_name(mode: &AccessMode) -> &'static str {
     }
 }
 
+/// Ordered privilege carried by an agent access profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AccessPrivilege {
+    ReadOnly,
+    WorkspaceWrite,
+    FullAccess,
+}
+
+impl AccessMode {
+    pub(crate) fn privilege(&self) -> AccessPrivilege {
+        match self {
+            Self::ReadOnly => AccessPrivilege::ReadOnly,
+            Self::Edit | Self::Execute => AccessPrivilege::WorkspaceWrite,
+            Self::Unrestricted => AccessPrivilege::FullAccess,
+        }
+    }
+}
+
+fn declared_profile_privilege(
+    spec: &agents::AgentSpec,
+    profile_name: &str,
+) -> Option<AccessPrivilege> {
+    let declared = match profile_name {
+        "read-only" => Some(AccessPrivilege::ReadOnly),
+        "workspace-write" => Some(AccessPrivilege::WorkspaceWrite),
+        "full-access" => Some(AccessPrivilege::FullAccess),
+        _ => None,
+    };
+    if declared.is_some() {
+        return declared;
+    }
+
+    if spec.name == "cursor"
+        && profile_name == "plan"
+        && spec
+            .access_profiles
+            .get(profile_name)
+            .is_some_and(|profile| profile.args == ["--mode", "plan"])
+    {
+        return Some(AccessPrivilege::ReadOnly);
+    }
+
+    // The pinned core crate does not yet attach privilege metadata to AccessProfile.
+    // For non-canonical names, accept only an exact shape already declared by this
+    // agent under a canonical ranked profile. This is a closed set comparison, not
+    // inference from free-form argv.
+    let profile = spec.access_profiles.get(profile_name)?;
+    let mut matched = None;
+    for (canonical_name, privilege) in [
+        ("read-only", AccessPrivilege::ReadOnly),
+        ("workspace-write", AccessPrivilege::WorkspaceWrite),
+        ("full-access", AccessPrivilege::FullAccess),
+    ] {
+        if spec.access_profiles.get(canonical_name) == Some(profile) {
+            if matched.is_some_and(|previous| previous != privilege) {
+                return None;
+            }
+            matched = Some(privilege);
+        }
+    }
+    matched
+}
+
+pub(crate) fn access_profile_privilege(
+    agent: &str,
+    profile_name: &str,
+) -> anyhow::Result<AccessPrivilege> {
+    let registry = load_agent_registry()?;
+    let spec = registry
+        .get(agent)
+        .ok_or_else(|| anyhow::anyhow!("unknown agent {agent}"))?;
+    declared_profile_privilege(spec, profile_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "agent {agent} access profile {profile_name} has no declared privilege rank"
+        )
+    })
+}
+
+pub(crate) fn resolved_access_profile(
+    agent: &str,
+    config: &AgentConfig,
+) -> anyhow::Result<(String, AccessPrivilege)> {
+    let registry = load_agent_registry()?;
+    let profile_name = resolve_registry_access_profile(&registry, agent, config)?;
+    let spec = registry
+        .get(agent)
+        .ok_or_else(|| anyhow::anyhow!("unknown agent {agent}"))?;
+    let privilege = declared_profile_privilege(spec, &profile_name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "agent {agent} access profile {profile_name} has no declared privilege rank"
+        )
+    })?;
+    Ok((profile_name, privilege))
+}
+
 /// Access-profile keys declared for an agent in the tmux-tools registry.
 pub fn agent_access_profile_names(name: &str) -> Vec<String> {
     let Ok(registry) = load_agent_registry() else {
@@ -292,12 +387,12 @@ fn resolve_registry_access_profile(
         if !spec.access_profiles.contains_key(profile) {
             anyhow::bail!("agent {agent} has no access profile {profile}");
         }
-        let widens_access = match config.access_mode {
-            AccessMode::ReadOnly => profile != "read-only",
-            AccessMode::Edit | AccessMode::Execute => profile == "full-access",
-            AccessMode::Unrestricted => false,
-        };
-        if widens_access {
+        let profile_privilege = declared_profile_privilege(spec, profile).ok_or_else(|| {
+            anyhow::anyhow!(
+                "agent {agent} access profile {profile} has no declared privilege rank"
+            )
+        })?;
+        if profile_privilege > config.access_mode.privilege() {
             anyhow::bail!(
                 "access profile {profile} would widen {:?} access mode for agent {agent}",
                 config.access_mode
@@ -311,13 +406,23 @@ fn resolve_registry_access_profile(
         return Ok(selected.to_string());
     }
 
-    // A default profile may safely reduce or preserve privileges for the
-    // write-capable modes, but it must never turn read-only into write access.
+    // Read-only never falls back: an explicitly ranked read-only profile is required.
     if config.access_mode == AccessMode::ReadOnly {
         anyhow::bail!("agent {agent} has no read-only access profile");
     }
     if spec.access_profiles.contains_key("default") {
-        return Ok("default".to_string());
+        let default_privilege = declared_profile_privilege(spec, "default").ok_or_else(|| {
+            anyhow::anyhow!(
+                "agent {agent} default access profile has no declared privilege rank"
+            )
+        })?;
+        if default_privilege <= config.access_mode.privilege() {
+            return Ok("default".to_string());
+        }
+        anyhow::bail!(
+            "agent {agent} default access profile would widen {:?} access mode",
+            config.access_mode
+        );
     }
 
     anyhow::bail!("agent {agent} has no access profile {mapped} and no default profile");
@@ -510,11 +615,10 @@ pub struct AgentOutput {
 // Command args returned by build_session_args
 // ---------------------------------------------------------------------------
 
-/// CLI arguments and extra environment variables produced by [`AgentDriver::build_session_args`].
+/// CLI arguments produced by [`AgentDriver::build_session_args`].
 #[derive(Debug, Clone)]
 pub struct CommandArgs {
     pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
     /// Registry profile used to render the command's access arguments.
     pub access_profile: String,
     /// Temporary directory to clean up after the agent process exits.
@@ -697,7 +801,6 @@ impl AgentDriver for ClaudeDriver {
 
         Ok(CommandArgs {
             args,
-            env: Vec::new(),
             access_profile,
             temp_dir: None,
         })
@@ -856,7 +959,6 @@ impl AgentDriver for CodexDriver {
 
         Ok(CommandArgs {
             args,
-            env: Vec::new(),
             access_profile,
             temp_dir: None,
         })
@@ -984,7 +1086,6 @@ impl AgentDriver for RegistryProfileDriver {
         let (_binary, args) = registry.launch_argv(&self.name, Some(&profile))?;
         Ok(CommandArgs {
             args,
-            env: Vec::new(),
             access_profile: profile,
             temp_dir: None,
         })
@@ -1835,6 +1936,68 @@ binary = "agent-two"
         };
         let cmd = driver.build_session_args(&config).unwrap();
         assert!(args_contain(&cmd.args, "--dangerously-skip-permissions"));
+    }
+
+    #[test]
+    fn registry_edit_rejects_unranked_default_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agents.toml");
+        std::fs::write(
+            &path,
+            r#"
+[custom]
+binary = "custom-agent"
+
+[custom.access.default]
+args = ["--dangerously-write-anywhere"]
+"#,
+        )
+        .unwrap();
+        let (registry, warnings) = agents::Registry::load_with_user_path(Some(&path)).unwrap();
+        assert!(warnings.is_empty());
+        let config = AgentConfig {
+            access_mode: AccessMode::Edit,
+            ..default_config()
+        };
+
+        let error = resolve_registry_access_profile(&registry, "custom", &config).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("default access profile has no declared privilege rank"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn registry_edit_accepts_narrow_ranked_default_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agents.toml");
+        std::fs::write(
+            &path,
+            r#"
+[custom]
+binary = "custom-agent"
+
+[custom.access.default]
+args = ["--read-only"]
+
+[custom.access.read-only]
+args = ["--read-only"]
+"#,
+        )
+        .unwrap();
+        let (registry, warnings) = agents::Registry::load_with_user_path(Some(&path)).unwrap();
+        assert!(warnings.is_empty());
+        let config = AgentConfig {
+            access_mode: AccessMode::Edit,
+            ..default_config()
+        };
+
+        let profile = resolve_registry_access_profile(&registry, "custom", &config).unwrap();
+
+        assert_eq!(profile, "default");
     }
 
     #[test]

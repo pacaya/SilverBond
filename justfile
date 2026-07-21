@@ -20,6 +20,11 @@ server:
 build:
     npm run build
 
+# Install repository-managed Git hooks
+install-hooks:
+    git config core.hooksPath .githooks
+    @echo "Installed Git hooks from .githooks/"
+
 # Full release build (frontend + Rust)
 build-release:
     npm run build

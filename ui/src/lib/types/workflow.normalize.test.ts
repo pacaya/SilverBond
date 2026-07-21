@@ -64,6 +64,48 @@ describe("normalizeWorkflowNode", () => {
     });
   });
 
+  it("defaults subflow config for legacy and kind-shaped nodes", () => {
+    const expected = { workflowName: "", inputs: [], maxDepth: 10 };
+
+    expect(normalizeWorkflowNode(legacyNode("s1", "subflow")).kind).toEqual({
+      type: "subflow",
+      subflowConfig: expected,
+    });
+    expect(
+      normalizeWorkflowNode(
+        v3Node("s2", { type: "subflow" } as WorkflowNode["kind"]),
+      ).kind,
+    ).toEqual({ type: "subflow", subflowConfig: expected });
+  });
+
+  it("defaults decide config for legacy and kind-shaped nodes", () => {
+    const expected = { prompt: "", inputs: [], outcomes: [] };
+
+    expect(normalizeWorkflowNode(legacyNode("d2", "decide")).kind).toEqual({
+      type: "decide",
+      decideConfig: expected,
+    });
+    expect(
+      normalizeWorkflowNode(
+        v3Node("d3", { type: "decide" } as WorkflowNode["kind"]),
+      ).kind,
+    ).toEqual({ type: "decide", decideConfig: expected });
+  });
+
+  it("defaults parallel batch config for legacy and kind-shaped nodes", () => {
+    const expected = { itemsBinding: "", maxConcurrent: 4, itemVar: "item", bodyEntry: "" };
+
+    expect(normalizeWorkflowNode(legacyNode("b1", "parallel_batch")).kind).toEqual({
+      type: "parallel_batch",
+      batchConfig: expected,
+    });
+    expect(
+      normalizeWorkflowNode(
+        v3Node("b2", { type: "parallel_batch" } as WorkflowNode["kind"]),
+      ).kind,
+    ).toEqual({ type: "parallel_batch", batchConfig: expected });
+  });
+
   it("leaves v3 nodes untouched", () => {
     const node = v3Node("v1", { type: "approval" });
     expect(normalizeWorkflowNode(node)).toBe(node);

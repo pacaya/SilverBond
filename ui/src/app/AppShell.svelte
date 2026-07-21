@@ -15,9 +15,17 @@
   import PaneTerminal from "@/features/runtime/PaneTerminal.svelte";
   import HistoryPanel from "@/features/history/HistoryPanel.svelte";
   import ConfirmDialog from "@/lib/components/ConfirmDialog.svelte";
+  import PasswordDialog from "@/lib/components/PasswordDialog.svelte";
+  import { createPasswordPrompt } from "@/lib/components/passwordPrompt.svelte";
   import ReferencePanel from "@/features/reference/ReferencePanel.svelte";
 
   const queryClient = useQueryClient();
+
+  const guard = (label: string, p: Promise<unknown>) => {
+    void p.catch((e) =>
+      store.setError(`${label} failed: ${e instanceof Error ? e.message : "Unknown error"}`),
+    );
+  };
 
   function collectVariableOverrides(workflow: WorkflowDocument): Record<string, string> {
     return Object.fromEntries(
@@ -72,6 +80,9 @@
   const validateMutation = createMutation(() => ({
     mutationFn: (wf: WorkflowDocument) => api.validateWorkflow(wf),
     onSuccess: (data: Awaited<ReturnType<typeof api.validateWorkflow>>) => store.setValidation(data),
+    onError: (err: Error) => {
+      store.setError(`Validate failed: ${err.message}`);
+    },
   }));
 
   /* ── debounced validation (no dependency array footgun!) ──────────── */
@@ -129,6 +140,10 @@
     confirmOpen = false;
     confirmAction = null;
   }
+
+  /* ── unlock password dialog ──────────────────────────────────────── */
+
+  const unlockPrompt = createPasswordPrompt();
 
   /* ── actions ──────────────────────────────────────────────────────── */
 
@@ -190,7 +205,10 @@
       if (!(err instanceof ApiError) || err.code !== "privileged_unlock_required") {
         throw err;
       }
-      const unlockSecret = window.prompt("Unlock password");
+      const unlockSecret = await unlockPrompt.request({
+        title: "Unlock password",
+        message: "This workflow launches processes. Enter the unlock password to continue.",
+      });
       if (unlockSecret === null) {
         throw new Error("Run cancelled");
       }
@@ -443,13 +461,15 @@
         isRunning={store.running}
         onRun={() => store.workflow && startRun(store.workflow)}
         onAbort={() => {
-          if (store.runId) api.abortRun(store.runId);
+          if (store.runId) guard("Abort", api.abortRun(store.runId));
         }}
         onApproval={(approved, userInput) => {
-          if (store.runId) api.approveRun(store.runId, approved, userInput);
+          if (store.runId) guard("Approve", api.approveRun(store.runId, approved, userInput));
         }}
         onInteractionResponse={(sessionId, response) => {
-          if (store.runId && sessionId) api.respondToInteraction(store.runId, sessionId, response);
+          if (store.runId && sessionId) {
+            guard("Respond", api.respondToInteraction(store.runId, sessionId, response));
+          }
         }}
       />
     {:else if store.panelTab === "terminal"}
@@ -458,7 +478,13 @@
       <HistoryPanel
         onResume={(runId) => resumeRun(runId)}
         onRestart={(runId, nodeId) => restartFromNode(runId, nodeId)}
-        onDismiss={(runId) => api.dismissRun(runId).then(() => queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] }))}
+        onDismiss={(runId) =>
+          guard(
+            "Dismiss",
+            api.dismissRun(runId).then(() =>
+              queryClient.invalidateQueries({ queryKey: ["interrupted-runs"] }),
+            ),
+          )}
       />
     {:else if store.panelTab === "reference"}
       <ReferencePanel workflow={store.workflow} />
@@ -473,4 +499,12 @@
   confirmLabel="Discard"
   onconfirm={handleConfirm}
   oncancel={handleCancel}
+/>
+
+<PasswordDialog
+  open={unlockPrompt.open}
+  title={unlockPrompt.title}
+  message={unlockPrompt.message}
+  onsubmit={(value) => unlockPrompt.submit(value)}
+  oncancel={() => unlockPrompt.cancel()}
 />

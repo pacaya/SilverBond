@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Keep the staged embedded frontend bundle in sync with UI source changes.
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+if git diff --cached --quiet -- ui/src/; then
+  exit 0
+fi
+
+if git diff --cached --quiet -- public/; then
+  echo "Staged ui/src changes require a staged public/ bundle update." >&2
+  echo "Run 'just build', stage public/, and retry the commit." >&2
+  exit 1
+fi
+
+if [[ ! -d node_modules ]]; then
+  echo "Frontend dependencies are missing. Run 'npm install' and retry the commit." >&2
+  exit 1
+fi
+
+STAGED_SNAPSHOT="$(mktemp -d "${TMPDIR:-/tmp}/silverbond-pre-commit.XXXXXX")"
+cleanup() {
+  rm -rf "$STAGED_SNAPSHOT"
+}
+trap cleanup EXIT
+
+git checkout-index --all --prefix="$STAGED_SNAPSHOT/"
+
+npm run build
+
+if ! diff -qr "$STAGED_SNAPSHOT/public" "$ROOT/public" >/dev/null; then
+  echo "Staged public/ assets do not match the bundle built from the working tree." >&2
+  echo "Stage the intended ui/src and public/ changes, then retry the commit." >&2
+  exit 1
+fi
+
+echo "Staged frontend bundle is fresh."

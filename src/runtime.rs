@@ -10,7 +10,6 @@ use std::{
 };
 
 use anyhow::Context;
-use chrono::Utc;
 use futures::{FutureExt, future::BoxFuture};
 use regex::Regex;
 use serde::{
@@ -30,22 +29,33 @@ use crate::{
     driver::{self, AgentConfig, NodeOutcome},
     model::{
         self, ContextSource, NodeKind, ResponseFormat, SplitFailurePolicy, WorkflowEdge,
-        WorkflowEdgeOutcome, WorkflowGraph, WorkflowNode, WorkflowV3, evaluate_condition,
-        get_nested_field,
+        WorkflowEdgeOutcome, WorkflowGraph, WorkflowNode, WorkflowV3, agent_name_for_node,
+        evaluate_condition, get_nested_field,
     },
     storage::Database,
     util::{djb2, now_iso, slugify_filename},
 };
 
-use model::{DEFAULT_AGENT, MAX_PARALLEL_BATCH_CONCURRENT};
+use model::{DEFAULT_AGENT, MAX_PARALLEL_BATCH_CONCURRENT, max_node_retry_attempts};
 
 const STAGNATION_WINDOW: usize = 3;
+
+/// Bound for `abort_and_wait` when the run task never reaches `finalize_run` (panic or wedged tmux cleanup).
+fn abort_and_wait_drain_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(250)
+    } else {
+        Duration::from_secs(600)
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeEvent {
     #[serde(rename = "type")]
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
     #[serde(flatten)]
     pub data: Map<String, Value>,
 }
@@ -54,8 +64,14 @@ impl RuntimeEvent {
     pub fn new(kind: impl Into<String>) -> Self {
         Self {
             kind: kind.into(),
+            seq: None,
             data: Map::new(),
         }
+    }
+
+    pub fn with_seq(mut self, seq: u64) -> Self {
+        self.seq = Some(seq);
+        self
     }
 
     pub fn with(mut self, key: impl Into<String>, value: impl Serialize) -> Self {
@@ -224,8 +240,6 @@ pub struct SplitFamilyState {
     pub split_node_id: String,
     pub execution_epoch: u64,
     pub failure_policy: SplitFailurePolicy,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub member_cursor_ids: Vec<String>,
     #[serde(default)]
     pub force_failed: bool,
 }
@@ -429,6 +443,10 @@ pub struct CollectorBarrierState {
     pub arrivals: BTreeMap<String, CollectorInputStatus>,
     #[serde(default)]
     pub waiting_cursor_ids: Vec<String>,
+    /// The first terminal arrival supplies cursor-scoped state when no live waiter survives.
+    /// Its variable snapshot may be stale if another branch mutates globals after capture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub representative_snapshot: Option<CursorState>,
     #[serde(default)]
     pub released: bool,
 }
@@ -925,6 +943,11 @@ impl RunRegistry {
         let _ = self.register(run_id).await;
     }
 
+    #[cfg(test)]
+    pub(crate) async fn send_test_event(&self, run_id: &str, event: RuntimeEvent) {
+        self.send_event(run_id, event).await;
+    }
+
     pub(crate) async fn subscribe(
         &self,
         run_id: &str,
@@ -953,7 +976,17 @@ impl RunRegistry {
             return;
         };
         active.abort_token.cancel();
-        active.drained_token.cancelled().await;
+        if tokio::time::timeout(abort_and_wait_drain_timeout(), active.drained_token.cancelled())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                run_id = %run_id,
+                timeout_secs = abort_and_wait_drain_timeout().as_secs(),
+                "abort_and_wait drain timed out; force-clearing registry entry"
+            );
+            self.clear(run_id).await;
+        }
     }
 
     async fn is_aborted(&self, run_id: &str) -> bool {
@@ -1322,6 +1355,7 @@ pub struct RuntimeContext {
     pub registry: RunRegistry,
     runner: Arc<dyn NodeRunner>,
     pub run_invocation: Option<TmuxInvocation>,
+    checkpoint_persist_hashes: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl RuntimeContext {
@@ -1332,6 +1366,7 @@ impl RuntimeContext {
             registry: RunRegistry::default(),
             runner,
             run_invocation: None,
+            checkpoint_persist_hashes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1342,6 +1377,7 @@ impl RuntimeContext {
             registry: RunRegistry::default(),
             runner,
             run_invocation: None,
+            checkpoint_persist_hashes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1382,9 +1418,7 @@ impl RuntimeContext {
             run_invocation: Some(tmux_invocation),
             ..self.clone()
         };
-        tokio::spawn(async move {
-            execute_workflow_to_terminal(ctx, workflow, checkpoint, false).await;
-        });
+        spawn_supervised_run(ctx, workflow, checkpoint, false);
         Ok(run_id)
     }
 
@@ -1421,9 +1455,7 @@ impl RuntimeContext {
             run_invocation: Some(tmux_invocation),
             ..self.clone()
         };
-        tokio::spawn(async move {
-            execute_workflow_to_terminal(ctx, persisted.workflow, persisted.checkpoint, true).await;
-        });
+        spawn_supervised_run(ctx, persisted.workflow, persisted.checkpoint, true);
         Ok(())
     }
 
@@ -1563,9 +1595,7 @@ impl RuntimeContext {
             run_invocation: Some(tmux_invocation),
             ..self.clone()
         };
-        tokio::spawn(async move {
-            execute_workflow_to_terminal(ctx, persisted.workflow, checkpoint, true).await;
-        });
+        spawn_supervised_run(ctx, persisted.workflow, checkpoint, true);
         Ok(new_run_id)
     }
 
@@ -1744,6 +1774,7 @@ pub async fn run_node_preview(
     let prompt_clone = resolved_prompt.clone();
     let cwd_string = cwd.to_string();
     let config_clone = config.clone();
+    let preview_timeout = timeout_for_node(node);
     let mut result = tokio::task::spawn_blocking(move || {
         crate::tmux_exec::run_tmux_oneshot(
             &agent_name,
@@ -1752,6 +1783,7 @@ pub async fn run_node_preview(
             Some(&config_clone),
             invocation,
             None,
+            preview_timeout,
         )
     })
     .await
@@ -1900,6 +1932,7 @@ fn new_collector_barrier_state(
         required_inputs: collector_required_inputs(graph, collector_id),
         arrivals: BTreeMap::new(),
         waiting_cursor_ids: Vec::new(),
+        representative_snapshot: None,
         released: false,
     }
 }
@@ -1915,23 +1948,21 @@ fn reset_released_collector_barrier(
     barrier.required_inputs = collector_required_inputs(graph, collector_id);
     barrier.arrivals.clear();
     barrier.waiting_cursor_ids.clear();
+    barrier.representative_snapshot = None;
     barrier.released = false;
 }
 
 fn evict_idle_split_families(checkpoint: &mut RuntimeCheckpoint, allow_force_failed: bool) {
-    let active_cursor_ids = checkpoint
+    let referenced_family_ids = checkpoint
         .active_cursors
         .iter()
-        .map(|cursor| cursor.cursor_id.as_str())
+        .flat_map(|cursor| cursor.split_family_ids.iter().cloned())
         .collect::<HashSet<_>>();
-    checkpoint.split_families.retain(|_, family| {
+    checkpoint.split_families.retain(|family_id, family| {
         if family.force_failed && !allow_force_failed {
             return true;
         }
-        family
-            .member_cursor_ids
-            .iter()
-            .any(|member_id| active_cursor_ids.contains(member_id.as_str()))
+        referenced_family_ids.contains(family_id)
     });
 }
 
@@ -2072,38 +2103,6 @@ fn prompt_template_for_node(node: &WorkflowNode) -> &str {
         | NodeKind::Wait { .. }
         | NodeKind::Capture { .. }
         | NodeKind::Kill { .. } => &node.prompt,
-    }
-}
-
-fn agent_name_for_node(node: &WorkflowNode) -> String {
-    match &node.kind {
-        NodeKind::RunAgent {
-            run_agent_config, ..
-        } => run_agent_config
-            .agent
-            .clone()
-            .or_else(|| node.agent.clone())
-            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
-        NodeKind::Spawn { spawn_config } => spawn_config
-            .agent
-            .clone()
-            .or_else(|| node.agent.clone())
-            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
-        NodeKind::Send { .. }
-        | NodeKind::Wait { .. }
-        | NodeKind::Capture { .. }
-        | NodeKind::Kill { .. } => "tmux".to_string(),
-        NodeKind::Task { .. }
-        | NodeKind::Approval
-        | NodeKind::Split
-        | NodeKind::Collector
-        | NodeKind::Decide { .. }
-        | NodeKind::ParallelBatch { .. }
-        | NodeKind::Subflow { .. }
-        | NodeKind::Call { .. } => node
-            .agent
-            .clone()
-            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
     }
 }
 
@@ -2323,6 +2322,145 @@ async fn drop_inconsistent_pending_approval(
     .await?;
     checkpoint.pending_approval = None;
     Ok(())
+}
+
+fn cursor_has_own_queued_approval(
+    queued_approvals: &[QueuedApproval],
+    cursor_id: &str,
+) -> bool {
+    queued_approvals
+        .iter()
+        .any(|queued| queued.approval.cursor_id == cursor_id)
+}
+
+fn waiting_approval_cursor_matches_pending_fallback(
+    queued_approvals: &[QueuedApproval],
+    pending: &PendingApproval,
+    cursor: &CursorState,
+) -> bool {
+    cursor.state == CursorRuntimeState::WaitingApproval
+        && !pending.cursor_id.is_empty()
+        && pending.cursor_id != cursor.cursor_id
+        && pending.node_id == cursor.node_id
+        && !cursor_has_own_queued_approval(queued_approvals, &cursor.cursor_id)
+}
+
+async fn drop_inconsistent_waiting_approval_cursors(
+    ctx: &RuntimeContext,
+    workflow: &WorkflowV3,
+    checkpoint: &mut RuntimeCheckpoint,
+) -> anyhow::Result<()> {
+    let pending = checkpoint.pending_approval.clone();
+    let queued = checkpoint.queued_approvals.clone();
+    let mut dropped = Vec::new();
+    checkpoint.active_cursors.retain(|cursor| {
+        if cursor.state != CursorRuntimeState::WaitingApproval {
+            return true;
+        }
+        let matches_pending = pending.as_ref().is_some_and(|pending| {
+            pending.node_id == cursor.node_id
+                && (pending.cursor_id.is_empty() || pending.cursor_id == cursor.cursor_id)
+        });
+        let matches_queued = queued.iter().any(|queued| {
+            queued.approval.node_id == cursor.node_id
+                && (queued.approval.cursor_id.is_empty()
+                    || queued.approval.cursor_id == cursor.cursor_id)
+        });
+        let matches_pending_fallback = pending.as_ref().is_some_and(|pending| {
+            waiting_approval_cursor_matches_pending_fallback(&queued, pending, cursor)
+        });
+        if matches_pending || matches_queued || matches_pending_fallback {
+            return true;
+        }
+        dropped.push(cursor.clone());
+        false
+    });
+    for cursor in dropped {
+        let node_name = workflow
+            .nodes
+            .iter()
+            .find(|node| node.id == cursor.node_id)
+            .map(|node| node.name.clone())
+            .unwrap_or_else(|| cursor.node_id.clone());
+        tracing::warn!(
+            run_id = %checkpoint.run_id,
+            node_id = %cursor.node_id,
+            cursor_id = %cursor.cursor_id,
+            "dropping WaitingApproval cursor with no pending or queued approval"
+        );
+        emit_event(
+            ctx,
+            &checkpoint.run_id,
+            RuntimeEvent::new("workflow_warn")
+                .with(
+                    "message",
+                    format!(
+                        "Dropped approval wait on node \"{}\" due to inconsistent persisted state",
+                        node_name
+                    ),
+                )
+                .with("nodeId", cursor.node_id.clone())
+                .with("cursorId", cursor.cursor_id.clone()),
+        )
+        .await?;
+    }
+    if checkpoint.active_cursors.is_empty()
+        && checkpoint.execution_log.terminal_reason.is_none()
+        && !checkpoint.all_results.values().any(|result| result.success)
+    {
+        emit_event(
+            ctx,
+            &checkpoint.run_id,
+            RuntimeEvent::new("workflow_error").with(
+                "message",
+                "Run could not continue after inconsistent approval cursor state was removed.",
+            ),
+        )
+        .await?;
+        checkpoint.status = RuntimeStatus::Failed;
+        checkpoint.execution_log.terminal_reason = Some("failed".to_string());
+    }
+    Ok(())
+}
+
+async fn fail_run_on_idle_unschedulable_cursors(
+    ctx: &RuntimeContext,
+    workflow: &WorkflowV3,
+    checkpoint: &mut RuntimeCheckpoint,
+    run_id: &str,
+) -> anyhow::Result<bool> {
+    let Some(cursor) = checkpoint
+        .active_cursors
+        .iter()
+        .find(|cursor| cursor.state != CursorRuntimeState::WaitingCollector)
+    else {
+        return Ok(false);
+    };
+    let node_name = workflow
+        .nodes
+        .iter()
+        .find(|node| node.id == cursor.node_id)
+        .map(|node| node.name.clone())
+        .unwrap_or_else(|| cursor.node_id.clone());
+    emit_event(
+        ctx,
+        run_id,
+        RuntimeEvent::new("workflow_error")
+            .with("cursorId", cursor.cursor_id.clone())
+            .with("nodeId", cursor.node_id.clone())
+            .with(
+                "message",
+                format!(
+                    "Scheduler stalled on cursor \"{}\" at node \"{}\" in state {:?}",
+                    cursor.cursor_id, node_name, cursor.state
+                ),
+            ),
+    )
+    .await?;
+    checkpoint.status = RuntimeStatus::Failed;
+    checkpoint.execution_log.terminal_reason = Some("failed".to_string());
+    checkpoint.active_cursors.clear();
+    Ok(true)
 }
 
 fn update_checkpoint_summary(workflow: &WorkflowV3, checkpoint: &mut RuntimeCheckpoint) {
@@ -2637,6 +2775,7 @@ async fn execute_workflow(
     if let Some(pending) = rehydrate_checkpoint_for_execution(&workflow, &mut checkpoint) {
         drop_inconsistent_pending_approval(&ctx, &mut checkpoint, pending).await?;
     }
+    drop_inconsistent_waiting_approval_cursors(&ctx, &workflow, &mut checkpoint).await?;
     let skip_regex_cache = compile_skip_regex_cache(&workflow)?;
     let start_instant = std::time::Instant::now();
     let mut running_tasks = JoinSet::new();
@@ -2650,7 +2789,8 @@ async fn execute_workflow(
         )
         .await?;
         if checkpoint.pending_approval.is_some() {
-            restore_pending_approval(&ctx, &mut checkpoint, &mut active_approval).await?;
+            restore_pending_approval(&ctx, &workflow, &mut checkpoint, &mut active_approval)
+                .await?;
         }
     } else {
         emit_event(
@@ -2820,7 +2960,11 @@ async fn execute_workflow(
                 break;
             }
 
-            continue;
+            if fail_run_on_idle_unschedulable_cursors(&ctx, &workflow, &mut checkpoint, &run_id)
+                .await?
+            {
+                break;
+            }
         }
 
         if active_approval.is_some() {
@@ -2923,6 +3067,30 @@ async fn fail_workflow_after_error(
     checkpoint.pending_approval = None;
     checkpoint.queued_approvals.clear();
     finalize_run(ctx, &workflow, checkpoint, duration).await
+}
+
+fn spawn_supervised_run(
+    ctx: RuntimeContext,
+    workflow: WorkflowV3,
+    checkpoint: RuntimeCheckpoint,
+    resumed: bool,
+) {
+    let registry = ctx.registry.clone();
+    let run_id = checkpoint.run_id.clone();
+    tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
+            execute_workflow_to_terminal(ctx, workflow, checkpoint, resumed).await;
+        });
+        if let Err(join_error) = handle.await {
+            tracing::warn!(
+                run_id = %run_id,
+                panic = join_error.is_panic(),
+                cancelled = join_error.is_cancelled(),
+                "run task exited before finalize_run; clearing registry entry (DB status may remain Running)"
+            );
+            registry.clear(&run_id).await;
+        }
+    });
 }
 
 async fn process_immediate_cursors(
@@ -3466,32 +3634,78 @@ async fn activate_next_approval(
     Ok(true)
 }
 
+fn resolve_restore_approval_cursor<'a>(
+    checkpoint: &'a RuntimeCheckpoint,
+    pending: &PendingApproval,
+) -> Result<Option<&'a CursorState>, Vec<String>> {
+    if let Some(cursor) = checkpoint.active_cursors.iter().find(|cursor| {
+        cursor.state == CursorRuntimeState::WaitingApproval
+            && (pending.cursor_id.is_empty() || cursor.cursor_id == pending.cursor_id)
+    }) {
+        return Ok(Some(cursor));
+    }
+    if pending.cursor_id.is_empty() {
+        return Ok(None);
+    }
+    let candidates: Vec<_> = checkpoint
+        .active_cursors
+        .iter()
+        .filter(|cursor| {
+            waiting_approval_cursor_matches_pending_fallback(
+                &checkpoint.queued_approvals,
+                pending,
+                cursor,
+            )
+        })
+        .collect();
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(Some(candidates[0])),
+        _ => Err(candidates
+            .iter()
+            .map(|cursor| cursor.cursor_id.clone())
+            .collect()),
+    }
+}
+
 async fn restore_pending_approval(
     ctx: &RuntimeContext,
+    workflow: &WorkflowV3,
     checkpoint: &mut RuntimeCheckpoint,
     active_approval: &mut Option<ActiveApprovalWait>,
 ) -> anyhow::Result<()> {
     let Some(pending) = checkpoint.pending_approval.clone() else {
         return Ok(());
     };
-    let Some(cursor_id) = checkpoint
-        .active_cursors
-        .iter()
-        .find(|cursor| {
-            cursor.state == CursorRuntimeState::WaitingApproval
-                && (pending.cursor_id.is_empty() || cursor.cursor_id == pending.cursor_id)
-        })
-        .or_else(|| {
-            checkpoint
-                .active_cursors
-                .iter()
-                .find(|cursor| cursor.state == CursorRuntimeState::WaitingApproval)
-        })
-        .map(|cursor| cursor.cursor_id.clone())
-    else {
+    let bound_cursor = match resolve_restore_approval_cursor(checkpoint, &pending) {
+        Ok(Some(cursor)) => Some(cursor.clone()),
+        Ok(None) => None,
+        Err(candidate_ids) => {
+            tracing::warn!(
+                run_id = %checkpoint.run_id,
+                node_id = %pending.node_id,
+                cursor_id = %pending.cursor_id,
+                ?candidate_ids,
+                "ambiguous pending_approval restore: multiple waiting cursors match node_id"
+            );
+            None
+        }
+    };
+    let Some(cursor) = bound_cursor else {
         drop_inconsistent_pending_approval(ctx, checkpoint, pending).await?;
         return Ok(());
     };
+    let node = workflow
+        .nodes
+        .iter()
+        .find(|node| node.id == cursor.node_id);
+    let node_id = cursor.node_id.clone();
+    let node_name = node
+        .map(|node| node.name.clone())
+        .unwrap_or_else(|| pending.node_name.clone());
+    let prompt = node
+        .map(|node| node.prompt.clone())
+        .unwrap_or_else(|| pending.prompt.clone());
     let (sender, receiver) = oneshot::channel();
     ctx.registry
         .set_pending_approval(&checkpoint.run_id, sender)
@@ -3501,15 +3715,15 @@ async fn restore_pending_approval(
         &checkpoint.run_id,
         RuntimeEvent::new("approval_required")
             .with("runId", checkpoint.run_id.clone())
-            .with("cursorId", cursor_id.clone())
-            .with("nodeId", pending.node_id.clone())
-            .with("nodeName", pending.node_name.clone())
-            .with("prompt", pending.prompt.clone())
-            .with("lastOutput", pending.last_output.clone()),
+            .with("cursorId", cursor.cursor_id.clone())
+            .with("nodeId", node_id)
+            .with("nodeName", node_name)
+            .with("prompt", prompt)
+            .with("lastOutput", cursor.last_output.clone()),
     )
     .await?;
     *active_approval = Some(ActiveApprovalWait {
-        cursor_id,
+        cursor_id: cursor.cursor_id,
         receiver,
     });
     Ok(())
@@ -3693,7 +3907,7 @@ async fn run_cursor_task(
     .await?;
 
     let mut attempts = 0;
-    let max_attempts = node.retry_count.unwrap_or(0) + 1;
+    let max_attempts = max_node_retry_attempts(node.retry_count);
     let mut result = loop {
         attempts += 1;
         let step_result = ctx
@@ -3797,6 +4011,7 @@ async fn run_decide_node(
         .clone()
         .context("tmux invocation missing for decide node")?;
     let agent_config_clone = agent_config.clone();
+    let decide_timeout = timeout_for_node(&node);
     let abort_token = ctx.registry.abort_signal(&run_ctx.run_id).await;
     let interaction = abort_token.as_ref().map(|_| {
         crate::tmux_exec::InteractionEscalation::new(
@@ -3814,6 +4029,7 @@ async fn run_decide_node(
             Some(&agent_config_clone),
             inv,
             interaction_for_blocking.as_ref(),
+            decide_timeout,
         )
     });
     let result = if let Some(abort_token) = abort_token {
@@ -3840,41 +4056,15 @@ async fn run_decide_node(
             .await
             .context("join error in decide node")??
     };
-    let response = result.output;
     let duration = format!("{:.1}", start.elapsed().as_secs_f64());
-    let parsed_response = parse_decide_structured_response(&node, &response);
-    let selected = select_decide_outcome(&config.outcomes, &response, parsed_response.as_ref());
-    let (success, output, stderr) = if let Some(selected) = selected {
-        (true, selected, String::new())
-    } else {
-        (
-            false,
-            response.clone(),
-            format!(
-                "LLM response did not match any decide outcome: {}",
-                config.outcomes.join(", ")
-            ),
-        )
-    };
-
-    let result = NodeResult {
-        success,
-        output: output.clone(),
-        stderr,
-        exit_code: if success { 0 } else { 1 },
+    let result = apply_decide_outcome_to_agent_result(
+        result,
+        &node,
+        &config,
+        &bindings,
+        &resolved_prompt,
         duration,
-        agent: "llm".to_string(),
-        prompt: config.prompt.clone(),
-        raw_output: Some(response.clone()),
-        parsed_output: Some(json!({
-            "outcome": if success { Some(output.clone()) } else { None },
-            "response": response,
-            "inputs": bindings,
-            "agent": DEFAULT_AGENT,
-        })),
-        resolved_prompt: Some(resolved_prompt.clone()),
-        ..Default::default()
-    };
+    );
 
     Ok(CursorTaskResult {
         cursor_id: cursor.cursor_id,
@@ -4053,18 +4243,119 @@ fn parse_decide_structured_response(node: &WorkflowNode, response: &str) -> Opti
     result.parsed_output
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecideOutcomeSelection {
+    Matched(String),
+    Failed(DecideOutcomeFailure),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DecideOutcomeFailure {
+    Unmatched,
+    StructuredLabelMismatch,
+    StructuredNonScalar { json_type: &'static str },
+}
+
+fn coerce_decide_outcome_scalar(outcome_value: &Value) -> Result<String, &'static str> {
+    match outcome_value {
+        Value::String(label) => Ok(label.clone()),
+        Value::Number(number) => Ok(number.to_string()),
+        Value::Bool(_) => Err("boolean"),
+        Value::Array(_) => Err("array"),
+        Value::Object(_) => Err("object"),
+        Value::Null => Err("null"),
+    }
+}
+
+fn decide_outcome_failure_stderr(failure: DecideOutcomeFailure, outcomes: &[String]) -> String {
+    let labels = outcomes.join(", ");
+    match failure {
+        DecideOutcomeFailure::Unmatched | DecideOutcomeFailure::StructuredLabelMismatch => {
+            format!("LLM response did not match any decide outcome: {labels}")
+        }
+        DecideOutcomeFailure::StructuredNonScalar { json_type } => format!(
+            "decide agent emitted a non-string outcome (got {json_type}); expected one of: {labels}"
+        ),
+    }
+}
+
+fn apply_decide_outcome_to_agent_result(
+    mut result: NodeResult,
+    node: &WorkflowNode,
+    config: &model::DecideConfig,
+    bindings: &BTreeMap<String, String>,
+    resolved_prompt: &str,
+    duration: String,
+) -> NodeResult {
+    result.duration = duration;
+    result.resolved_prompt = Some(resolved_prompt.to_string());
+
+    if !result.success {
+        let response = result.output.clone();
+        result.parsed_output = Some(json!({
+            "outcome": None::<String>,
+            "response": response,
+            "inputs": bindings,
+            "agent": DEFAULT_AGENT,
+        }));
+        return result;
+    }
+
+    let response = result.output.clone();
+    let parsed_response = parse_decide_structured_response(node, &response);
+    let selection =
+        select_decide_outcome(&config.outcomes, &response, parsed_response.as_ref());
+    match selection {
+        DecideOutcomeSelection::Matched(selected) => {
+            result.success = true;
+            result.output = selected.clone();
+            result.stderr.clear();
+            result.exit_code = 0;
+            result.parsed_output = Some(json!({
+                "outcome": Some(selected),
+                "response": response,
+                "inputs": bindings,
+                "agent": DEFAULT_AGENT,
+            }));
+        }
+        DecideOutcomeSelection::Failed(failure) => {
+            result.success = false;
+            result.stderr = decide_outcome_failure_stderr(failure, &config.outcomes);
+            result.exit_code = 1;
+            result.parsed_output = Some(json!({
+                "outcome": None::<String>,
+                "response": response,
+                "inputs": bindings,
+                "agent": DEFAULT_AGENT,
+            }));
+        }
+    }
+    if result.raw_output.is_none() {
+        result.raw_output = Some(response.clone());
+    }
+    result
+}
+
 fn select_decide_outcome(
     outcomes: &[String],
     response: &str,
     structured_output: Option<&Value>,
-) -> Option<String> {
+) -> DecideOutcomeSelection {
     if let Some(parsed) = structured_output {
         if let Some(outcome_value) = parsed.get("outcome") {
-            let outcome_label = outcome_value.as_str()?;
-            return outcomes
-                .iter()
-                .find(|outcome| outcome.as_str() == outcome_label)
-                .cloned();
+            return match coerce_decide_outcome_scalar(outcome_value) {
+                Ok(outcome_label) => outcomes
+                    .iter()
+                    .find(|outcome| outcome.as_str() == outcome_label)
+                    .cloned()
+                    .map(DecideOutcomeSelection::Matched)
+                    .unwrap_or(DecideOutcomeSelection::Failed(
+                        DecideOutcomeFailure::StructuredLabelMismatch,
+                    )),
+                Err(json_type) => DecideOutcomeSelection::Failed(
+                    DecideOutcomeFailure::StructuredNonScalar { json_type },
+                ),
+            };
         }
     }
 
@@ -4075,7 +4366,7 @@ fn select_decide_outcome(
         .trim_matches('`')
         .trim();
     if let Some(outcome) = outcomes.iter().find(|outcome| outcome.as_str() == trimmed) {
-        return Some(outcome.clone());
+        return DecideOutcomeSelection::Matched(outcome.clone());
     }
 
     let mut matches = Vec::new();
@@ -4090,7 +4381,7 @@ fn select_decide_outcome(
     }
 
     if matches.is_empty() {
-        return None;
+        return DecideOutcomeSelection::Failed(DecideOutcomeFailure::Unmatched);
     }
 
     matches.sort_by(|(offset_a, len_a, label_a), (offset_b, len_b, label_b)| {
@@ -4106,10 +4397,10 @@ fn select_decide_outcome(
         .filter(|(offset, len, _)| *offset == *best_offset && *len == *best_len)
         .collect::<Vec<_>>();
     if tied_at_best.len() > 1 {
-        return None;
+        return DecideOutcomeSelection::Failed(DecideOutcomeFailure::Unmatched);
     }
 
-    Some(best_label.clone())
+    DecideOutcomeSelection::Matched(best_label.clone())
 }
 
 async fn apply_join_result(
@@ -4248,7 +4539,14 @@ async fn apply_join_result(
             checkpoint.active_cursors.clear();
             return Ok(());
         }
-        let status = if task_result.result.exit_code == -2 {
+        let status = if task_result.result.exit_code == -2
+            || task_result
+                .result
+                .metadata
+                .error_type
+                .as_deref()
+                .is_some_and(|error_type| error_type == "timeout")
+        {
             CursorTerminalStatus::Timeout
         } else {
             CursorTerminalStatus::Failure
@@ -5425,7 +5723,6 @@ async fn handle_split_node(
             split_node_id: node.id.clone(),
             execution_epoch: checkpoint.execution_epoch,
             failure_policy: node.split_failure_policy.clone(),
-            member_cursor_ids: child_cursor_ids.clone(),
             force_failed: false,
         },
     );
@@ -5672,6 +5969,7 @@ async fn release_collectors_if_ready(
         barrier.released = true;
         let waiting_cursor_ids = barrier.waiting_cursor_ids.clone();
         let arrivals = barrier.arrivals.clone();
+        let representative_snapshot = barrier.representative_snapshot.clone();
         let required_len = barrier.required_inputs.len();
         let collector_id = barrier_key.collector_id.clone();
         let Some(node) = graph
@@ -5703,12 +6001,35 @@ async fn release_collectors_if_ready(
             resolved_prompt: Some(node.prompt.clone()),
             ..Default::default()
         };
+        let mut representative_state = waiting_cursor_ids
+            .iter()
+            .find_map(|waiting_cursor_id| {
+                checkpoint
+                    .active_cursors
+                    .iter()
+                    .find(|cursor| cursor.cursor_id == *waiting_cursor_id)
+                    .cloned()
+            })
+            .or(representative_snapshot);
         let representative_cursor_id = waiting_cursor_ids
             .iter()
             .find(|waiting_cursor_id| find_cursor_index(checkpoint, waiting_cursor_id).is_some())
             .cloned()
-            .or_else(|| waiting_cursor_ids.first().cloned())
             .unwrap_or_else(new_cursor_id);
+        if find_cursor_index(checkpoint, &representative_cursor_id).is_none() {
+            if let Some(mut released_cursor) = representative_state.clone() {
+                released_cursor.cursor_id = representative_cursor_id.clone();
+                released_cursor.node_id = collector_id.clone();
+                released_cursor.state = CursorRuntimeState::WaitingCollector;
+                checkpoint.active_cursors.push(released_cursor);
+            } else {
+                tracing::warn!(
+                    collector_id = %collector_id,
+                    cursor_id = %representative_cursor_id,
+                    "collector released without a live cursor or representative snapshot"
+                );
+            }
+        }
         if let Some(representative_index) = find_cursor_index(checkpoint, &representative_cursor_id)
         {
             insert_result_for_cursor_index(
@@ -5717,6 +6038,7 @@ async fn release_collectors_if_ready(
                 collector_id.clone(),
                 collector_result.clone(),
             );
+            representative_state = Some(checkpoint.active_cursors[representative_index].clone());
         } else {
             checkpoint
                 .all_results
@@ -5739,13 +6061,6 @@ async fn release_collectors_if_ready(
         )
         .await?;
 
-        let representative_state = waiting_cursor_ids.iter().find_map(|waiting_cursor_id| {
-            checkpoint
-                .active_cursors
-                .iter()
-                .find(|cursor| cursor.cursor_id == *waiting_cursor_id)
-                .cloned()
-        });
         for waiting_cursor_id in waiting_cursor_ids
             .iter()
             .filter(|waiting_cursor_id| *waiting_cursor_id != &representative_cursor_id)
@@ -5919,6 +6234,9 @@ async fn handle_terminal_cursor_status(
                 .entry(barrier_key)
                 .or_insert_with(|| new_collector_barrier_state(graph, &target.collector_id));
             reset_released_collector_barrier(barrier, graph, &target.collector_id);
+            if barrier.representative_snapshot.is_none() {
+                barrier.representative_snapshot = Some(cursor.clone());
+            }
             insert_collector_arrival(
                 barrier,
                 &target.collector_id,
@@ -5949,6 +6267,12 @@ async fn handle_terminal_cursor_status(
                         fail_run = true;
                     }
                 }
+            } else {
+                tracing::warn!(
+                    family_id = %family_id,
+                    cursor_id = %cursor_id,
+                    "cursor references missing split family"
+                );
             }
         }
         if fail_run {
@@ -6277,7 +6601,7 @@ async fn finalize_run(
         .clone()
         .or_else(|| Some("completed".to_string()));
 
-    let log_id = build_log_id(&checkpoint.execution_log.workflow_name);
+    let log_id = build_log_id(&checkpoint.execution_log.workflow_name, &run_id);
     let completed_results = checkpoint.all_results.clone();
     let persistence_result: anyhow::Result<()> = async {
         ctx.db
@@ -6349,13 +6673,8 @@ async fn cleanup_terminal_active_panes(
         return;
     }
 
-    let killed_sessions = targets
-        .iter()
-        .filter_map(|target| target.session_name.clone())
-        .collect::<BTreeSet<_>>();
-
     let inv = ctx.run_invocation.clone();
-    let _ = tokio::task::spawn_blocking(move || {
+    let cleanup_verdicts = tokio::task::spawn_blocking(move || {
         if let Some(inv) = inv {
             tmux_tools_core::with_invocation(inv, || crate::tmux_exec::cleanup_panes(&targets))
         } else {
@@ -6363,21 +6682,60 @@ async fn cleanup_terminal_active_panes(
         }
     })
     .await;
+    let cleanup_verdicts = match cleanup_verdicts {
+        Ok(verdicts) => verdicts,
+        Err(error) => {
+            tracing::warn!(
+                run_id = %run_id,
+                error = %error,
+                "Terminal tmux cleanup task failed; retaining session registrations"
+            );
+            return;
+        }
+    };
+
+    for verdict in cleanup_verdicts.iter().filter(|verdict| !verdict.absent) {
+        if let Some(session_name) = verdict.target.session_name.as_deref() {
+            tracing::warn!(
+                run_id = %run_id,
+                session_name = %session_name,
+                "Terminal tmux cleanup could not confirm session absence; retaining registration"
+            );
+        } else {
+            tracing::warn!(
+                run_id = %run_id,
+                pane_id = %verdict.target.pane_id,
+                "Terminal tmux cleanup could not confirm pane absence"
+            );
+        }
+    }
+
+    let killed_sessions = cleanup_verdicts
+        .into_iter()
+        .filter(|verdict| verdict.absent)
+        .filter_map(|verdict| verdict.target.session_name)
+        .collect::<BTreeSet<_>>();
 
     if killed_sessions.is_empty() {
         return;
     }
 
-    let _ = ctx.db.remove_tmux_sessions(run_id, &killed_sessions).await;
+    if let Err(error) = ctx.db.remove_tmux_sessions(run_id, &killed_sessions).await {
+        tracing::warn!(
+            run_id = %run_id,
+            session_names = ?killed_sessions,
+            error = %error,
+            "Terminal tmux sessions are absent but their registrations remain"
+        );
+    }
 }
 
 pub(crate) async fn register_tmux_session(
     db: &Database,
     run_id: &str,
     session_name: &str,
-) -> anyhow::Result<()> {
-    db.register_tmux_session(run_id, session_name).await?;
-    Ok(())
+) -> anyhow::Result<bool> {
+    db.register_tmux_session(run_id, session_name).await
 }
 
 fn tmux_invocation_key(invocation: &TmuxInvocation) -> (Vec<String>, Option<String>, String) {
@@ -6411,7 +6769,7 @@ async fn reap_tmux_sessions(ctx: &RuntimeContext, run_id: Option<&str>) {
     let active_run_ids = ctx.registry.active_run_ids().await;
     let mut terminal_sessions_by_invocation = HashMap::<
         (Vec<String>, Option<String>, String),
-        (TmuxInvocation, HashMap<String, String>),
+        (TmuxInvocation, HashMap<String, BTreeSet<String>>),
     >::new();
     let mut reconstructed_invocations = HashMap::<String, TmuxInvocation>::new();
     for reapable in reapable_sessions {
@@ -6468,7 +6826,11 @@ async fn reap_tmux_sessions(ctx: &RuntimeContext, run_id: Option<&str>) {
         let entry = terminal_sessions_by_invocation
             .entry(key)
             .or_insert_with(|| (invocation, HashMap::new()));
-        entry.1.insert(reapable.session_name, reapable.run_id);
+        entry
+            .1
+            .entry(reapable.session_name)
+            .or_default()
+            .insert(reapable.run_id);
     }
 
     for (_, (invocation, terminal_session_runs)) in terminal_sessions_by_invocation {
@@ -6500,18 +6862,26 @@ async fn reap_tmux_sessions(ctx: &RuntimeContext, run_id: Option<&str>) {
                 continue;
             }
         };
-        if live_sessions.is_empty() {
-            continue;
-        }
+        let live_sessions = live_sessions.into_iter().collect::<HashSet<_>>();
 
-        for session in live_sessions {
-            if !terminal_session_runs.contains_key(&session) {
+        for (session, session_run_ids) in terminal_session_runs {
+            if !live_sessions.contains(&session) {
+                for run_id in session_run_ids {
+                    if let Err(error) = ctx
+                        .db
+                        .remove_tmux_sessions(&run_id, &BTreeSet::from([session.clone()]))
+                        .await
+                    {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            session_name = %session,
+                            error = %error,
+                            "Absent tmux session registration could not be reconciled"
+                        );
+                    }
+                }
                 continue;
             }
-            let session = session.clone();
-            let Some(run_id) = terminal_session_runs.get(&session).cloned() else {
-                continue;
-            };
             let invocation = invocation.clone();
             let session_to_kill = session.clone();
             let killed = tokio::task::spawn_blocking(move || {
@@ -6522,30 +6892,40 @@ async fn reap_tmux_sessions(ctx: &RuntimeContext, run_id: Option<&str>) {
             .await;
             match killed {
                 Ok(true) => {
-                    if let Err(error) = ctx
-                        .db
-                        .remove_tmux_sessions(&run_id, &BTreeSet::from([session.clone()]))
-                        .await
-                    {
+                    for run_id in session_run_ids {
+                        if let Err(error) = ctx
+                            .db
+                            .remove_tmux_sessions(&run_id, &BTreeSet::from([session.clone()]))
+                            .await
+                        {
+                            tracing::warn!(
+                                run_id = %run_id,
+                                session_name = %session,
+                                error = %error,
+                                "Stale tmux session was killed but its registration remains"
+                            );
+                        }
+                    }
+                }
+                Ok(false) => {
+                    for run_id in session_run_ids {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            session_name = %session,
+                            "Failed to kill stale tmux session; retaining registration"
+                        );
+                    }
+                }
+                Err(error) => {
+                    for run_id in session_run_ids {
                         tracing::warn!(
                             run_id = %run_id,
                             session_name = %session,
                             error = %error,
-                            "Stale tmux session was killed but its registration remains"
+                            "Stale tmux kill task failed; retaining registration"
                         );
                     }
                 }
-                Ok(false) => tracing::warn!(
-                    run_id = %run_id,
-                    session_name = %session,
-                    "Failed to kill stale tmux session"
-                ),
-                Err(error) => tracing::warn!(
-                    run_id = %run_id,
-                    session_name = %session,
-                    error = %error,
-                    "Stale tmux kill task failed"
-                ),
             }
         }
     }
@@ -6558,7 +6938,7 @@ async fn kill_active_run_panes(ctx: &RuntimeContext, run_id: &str) {
     }
 
     let inv = ctx.run_invocation.clone();
-    let _ = tokio::task::spawn_blocking(move || {
+    let cleanup_verdicts = tokio::task::spawn_blocking(move || {
         if let Some(inv) = inv {
             tmux_tools_core::with_invocation(inv, || crate::tmux_exec::cleanup_panes(&targets))
         } else {
@@ -6566,12 +6946,38 @@ async fn kill_active_run_panes(ctx: &RuntimeContext, run_id: &str) {
         }
     })
     .await;
+    match cleanup_verdicts {
+        Ok(verdicts) => {
+            for verdict in verdicts.into_iter().filter(|verdict| !verdict.absent) {
+                tracing::warn!(
+                    run_id = %run_id,
+                    pane_id = %verdict.target.pane_id,
+                    session_name = ?verdict.target.session_name,
+                    "Abort cleanup could not confirm tmux target absence; registration will be reconciled by the reaper"
+                );
+            }
+        }
+        Err(error) => tracing::warn!(
+            run_id = %run_id,
+            error = %error,
+            "Abort tmux cleanup task failed; registrations will be reconciled by the reaper"
+        ),
+    }
 }
 
-async fn emit_event(ctx: &RuntimeContext, run_id: &str, event: RuntimeEvent) -> anyhow::Result<()> {
-    ctx.db.append_event(run_id, &event).await?;
+async fn emit_event(ctx: &RuntimeContext, run_id: &str, mut event: RuntimeEvent) -> anyhow::Result<()> {
+    let seq = ctx.db.append_event(run_id, &event).await?;
+    event.seq = Some(seq);
     ctx.registry.send_event(run_id, event).await;
     Ok(())
+}
+
+fn checkpoint_content_hash(checkpoint: &RuntimeCheckpoint) -> u32 {
+    let mut snapshot = checkpoint.clone();
+    snapshot.updated_at.clear();
+    djb2(
+        &serde_json::to_string(&snapshot).expect("RuntimeCheckpoint should serialize for hashing"),
+    )
 }
 
 async fn persist_checkpoint(
@@ -6579,8 +6985,19 @@ async fn persist_checkpoint(
     workflow: &WorkflowV3,
     checkpoint: &mut RuntimeCheckpoint,
 ) -> anyhow::Result<()> {
+    let content_hash = checkpoint_content_hash(checkpoint);
+    {
+        let hashes = ctx.checkpoint_persist_hashes.lock().await;
+        if hashes.get(&checkpoint.run_id) == Some(&content_hash) {
+            return Ok(());
+        }
+    }
     checkpoint.updated_at = now_iso();
     if ctx.db.update_run_checkpoint(checkpoint).await? {
+        ctx.checkpoint_persist_hashes
+            .lock()
+            .await
+            .insert(checkpoint.run_id.clone(), content_hash);
         return Ok(());
     }
     ctx.db
@@ -6590,7 +7007,12 @@ async fn persist_checkpoint(
             checkpoint: checkpoint.clone(),
             workflow: workflow.clone(),
         })
+        .await?;
+    ctx.checkpoint_persist_hashes
+        .lock()
         .await
+        .insert(checkpoint.run_id.clone(), content_hash);
+    Ok(())
 }
 
 fn resolve_template_vars(prompt: &str, context: &TemplateRuntimeContext<'_>) -> String {
@@ -6800,9 +7222,9 @@ fn collect_descendants(workflow: &WorkflowV3, start_node_id: &str) -> BTreeSet<S
     visited
 }
 
-fn build_log_id(workflow_name: &str) -> String {
+fn build_log_id(workflow_name: &str, run_id: &str) -> String {
     let slug = slugify_filename(workflow_name);
-    format!("{}_{}", slug, Utc::now().format("%Y-%m-%dT%H-%M-%S"))
+    format!("{}_{}", slug, run_id.trim_start_matches("run_"))
 }
 
 /// Escalate an agent interaction through the runtime event/channel path.
@@ -6968,7 +7390,7 @@ async fn run_orchestrator_refinement(
         .clone()
         .context("tmux invocation missing for orchestrator refinement")?;
     tokio::task::spawn_blocking(move || {
-        crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None, inv, None)
+        crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None, inv, None, None)
     })
     .await
     .context("join error in orchestrator")?
@@ -7001,7 +7423,7 @@ async fn run_orchestrator_branch(
     let owned_prompt = prompt.clone();
     let owned_cwd = cwd.to_string();
     tokio::task::spawn_blocking(move || {
-        crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None, inv, None)
+        crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None, inv, None, None)
     })
     .await
     .context("join error in orchestrator")?
@@ -7041,6 +7463,18 @@ mod tests {
 
     thread_local! {
         static ASYNC_WORKER_MARKER: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn decide_matched(label: &str) -> DecideOutcomeSelection {
+        DecideOutcomeSelection::Matched(label.to_string())
+    }
+
+    fn decide_unmatched() -> DecideOutcomeSelection {
+        DecideOutcomeSelection::Failed(DecideOutcomeFailure::Unmatched)
+    }
+
+    fn decide_structured_label_mismatch() -> DecideOutcomeSelection {
+        DecideOutcomeSelection::Failed(DecideOutcomeFailure::StructuredLabelMismatch)
     }
 
     #[derive(Clone, Default)]
@@ -7687,6 +8121,224 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn abort_and_wait_force_clears_when_drain_never_arrives() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let registry = RunRegistry::default();
+        let run_id = "run_drain_timeout";
+        registry.register(run_id).await;
+
+        let started = Instant::now();
+        registry.abort_and_wait(run_id).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "abort_and_wait should return within the configured drain timeout, took {:?}",
+            elapsed
+        );
+        assert!(
+            !registry.active_run_ids().await.contains(run_id),
+            "registry entry should be force-cleared after drain timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_task_supervisor_clears_registry_on_panic() {
+        let registry = RunRegistry::default();
+        let run_id = "run_supervisor_panic";
+        registry.register(run_id).await;
+
+        let registry_supervisor = registry.clone();
+        let run_id_supervisor = run_id.to_string();
+        let supervisor = tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
+                panic!("simulated run task panic");
+            });
+            let Err(join_error) = handle.await else {
+                return;
+            };
+            tracing::warn!(
+                run_id = %run_id_supervisor,
+                panic = join_error.is_panic(),
+                "run task exited before finalize_run; clearing registry entry (DB status may remain Running)"
+            );
+            registry_supervisor.clear(&run_id_supervisor).await;
+        });
+        supervisor.await.unwrap();
+
+        assert!(
+            !registry.active_run_ids().await.contains(run_id),
+            "panic should clear the registry so resume is not blocked by AlreadyActive"
+        );
+
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::new(db.clone());
+        let workflow = workflow_from_parts("work", vec![task_node("work", "Work", "go")], vec![]);
+        let checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: None,
+            checkpoint,
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+        runtime.resume_run(run_id).await.expect("resume after panic clear");
+        runtime.registry.clear(run_id).await;
+    }
+
+    #[tokio::test]
+    async fn persist_checkpoint_skips_redundant_writes_when_unchanged() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db.clone());
+        let workflow = workflow_from_parts("work", vec![task_node("work", "Work", "go")], vec![]);
+        let run_id = "run_persist_dedup";
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: None,
+            checkpoint: checkpoint.clone(),
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+
+        persist_checkpoint(&ctx, &workflow, &mut checkpoint)
+            .await
+            .unwrap();
+        let first_updated = checkpoint.updated_at.clone();
+        let db_after_first = db.get_run(run_id).await.unwrap().unwrap();
+        let db_updated_after_first = db_after_first.checkpoint.updated_at.clone();
+
+        for _ in 0..5 {
+            persist_checkpoint(&ctx, &workflow, &mut checkpoint)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            checkpoint.updated_at, first_updated,
+            "unchanged checkpoint should not advance updated_at in memory"
+        );
+        let db_after_idle = db.get_run(run_id).await.unwrap().unwrap();
+        assert_eq!(
+            db_after_idle.checkpoint.updated_at, db_updated_after_first,
+            "unchanged checkpoint should not produce additional DB writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_waiting_approval_cursor_is_reconciled_on_resume() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([(
+                "after".to_string(),
+                vec![ScriptedStep::success("done")],
+            )])),
+        );
+        let workflow = workflow_from_parts(
+            "approve",
+            vec![
+                approval_node("gate", "Gate", "approve?"),
+                task_node("after", "After", "after"),
+            ],
+            vec![success_edge("gate_after", "gate", "after", None)],
+        );
+        let run_id = "run_orphan_waiting_approval";
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.status = RuntimeStatus::Paused;
+        checkpoint.active_cursors = vec![CursorState {
+            cursor_id: "cursor-orphan".to_string(),
+            node_id: "gate".to_string(),
+            execution_epoch: checkpoint.execution_epoch,
+            parent_cursor_id: None,
+            incoming_edge_id: None,
+            incoming_node_id: None,
+            split_family_ids: Vec::new(),
+            last_output: String::new(),
+            loop_counters: BTreeMap::new(),
+            visit_counters: BTreeMap::new(),
+            var_map: BTreeMap::new(),
+            call_stack: Vec::new(),
+            last_branch_origin_id: None,
+            last_branch_choice: None,
+            cancel_requested: false,
+            state: CursorRuntimeState::WaitingApproval,
+        }];
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: None,
+            checkpoint,
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+
+        runtime.resume_run(run_id).await.unwrap();
+        let events = wait_for_event(&db, run_id, "workflow_warn").await;
+        let warn = events
+            .iter()
+            .find(|event| event.kind == "workflow_warn")
+            .expect("expected workflow_warn for orphan WaitingApproval cursor");
+        assert_eq!(warn.data.get("nodeId").and_then(Value::as_str), Some("gate"));
+        assert_eq!(
+            warn.data.get("cursorId").and_then(Value::as_str),
+            Some("cursor-orphan")
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_unschedulable_cursors_fail_instead_of_spinning() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db.clone());
+        let workflow = workflow_from_parts("work", vec![task_node("work", "Work", "go")], vec![]);
+        let run_id = "run_idle_stuck";
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.active_cursors = vec![CursorState {
+            cursor_id: "cursor-stuck".to_string(),
+            node_id: "work".to_string(),
+            execution_epoch: checkpoint.execution_epoch,
+            parent_cursor_id: None,
+            incoming_edge_id: None,
+            incoming_node_id: None,
+            split_family_ids: Vec::new(),
+            last_output: String::new(),
+            loop_counters: BTreeMap::new(),
+            visit_counters: BTreeMap::new(),
+            var_map: BTreeMap::new(),
+            call_stack: Vec::new(),
+            last_branch_origin_id: None,
+            last_branch_choice: None,
+            cancel_requested: false,
+            state: CursorRuntimeState::WaitingApproval,
+        }];
+
+        let failed =
+            fail_run_on_idle_unschedulable_cursors(&ctx, &workflow, &mut checkpoint, run_id)
+                .await
+                .unwrap();
+        assert!(failed);
+        assert_eq!(checkpoint.status, RuntimeStatus::Failed);
+        assert!(checkpoint.active_cursors.is_empty());
+        let events = wait_for_event(&db, run_id, "workflow_error").await;
+        assert!(
+            events.iter().any(|event| event.kind == "workflow_error"),
+            "stuck scheduler path should emit workflow_error"
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_interactions_resolve_by_session_id() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
@@ -7866,7 +8518,6 @@ mod tests {
         let run_as = model::RunAsConfig {
             command: Some(vec!["sandbox-prefix".to_string()]),
             user: None,
-            socket: Some("run-as-socket".to_string()),
         };
 
         let resolved = resolve_workflow_invocation_with(
@@ -7881,10 +8532,7 @@ mod tests {
                 );
                 TmuxInvocation {
                     prefix: run_as.command.clone().unwrap_or_default(),
-                    socket: run_as
-                        .socket
-                        .clone()
-                        .or_else(|| Some(format!("silverbond-{run_id}"))),
+                    socket: Some(format!("silverbond-{run_id}")),
                     tmux_bin: "tmux-from-builder".to_string(),
                 }
             },
@@ -7895,7 +8543,7 @@ mod tests {
 
         ASYNC_WORKER_MARKER.with(|marker| marker.set(false));
         assert_eq!(resolved.prefix, vec!["sandbox-prefix"]);
-        assert_eq!(resolved.socket.as_deref(), Some("run-as-socket"));
+        assert_eq!(resolved.socket.as_deref(), Some("silverbond-run_blocking"));
         assert_eq!(resolved.tmux_bin, "tmux-from-builder");
     }
 
@@ -7930,7 +8578,6 @@ mod tests {
                 lookup_log.to_string_lossy().into_owned(),
             ]),
             user: None,
-            socket: Some("persisted-socket".to_string()),
         });
 
         let run_id = runtime
@@ -7946,7 +8593,7 @@ mod tests {
                     script.to_string_lossy().into_owned(),
                     lookup_log.to_string_lossy().into_owned(),
                 ],
-                socket: Some("persisted-socket".to_string()),
+                socket: Some(format!("silverbond-{run_id}")),
                 tmux_bin: "/custom/bin/tmux".to_string(),
             })
         );
@@ -7987,7 +8634,6 @@ mod tests {
                 lookup_log.to_string_lossy().into_owned(),
             ]),
             user: None,
-            socket: Some("legacy-socket".to_string()),
         });
         db.upsert_run(&PersistedRun {
             stream_token: new_stream_token(),
@@ -8008,7 +8654,7 @@ mod tests {
                     script.to_string_lossy().into_owned(),
                     lookup_log.to_string_lossy().into_owned(),
                 ],
-                socket: Some("legacy-socket".to_string()),
+                socket: Some(format!("silverbond-{run_id}")),
                 tmux_bin: "/legacy/bin/tmux".to_string(),
             })
         );
@@ -8049,7 +8695,6 @@ mod tests {
                 lookup_log.to_string_lossy().into_owned(),
             ]),
             user: None,
-            socket: Some("restart-socket".to_string()),
         });
         db.upsert_run(&PersistedRun {
             stream_token: new_stream_token(),
@@ -8074,7 +8719,7 @@ mod tests {
                     script.to_string_lossy().into_owned(),
                     lookup_log.to_string_lossy().into_owned(),
                 ],
-                socket: Some("restart-socket".to_string()),
+                socket: Some(format!("silverbond-{new_run_id}")),
                 tmux_bin: "/restart/bin/tmux".to_string(),
             })
         );
@@ -8084,11 +8729,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn fake_run_as_config(
-        temp: &TempDir,
-        stem: &str,
-        socket: &str,
-    ) -> (model::RunAsConfig, PathBuf) {
+    fn fake_run_as_config(temp: &TempDir, stem: &str) -> (model::RunAsConfig, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
         let script = temp.path().join(format!("{stem}-prefix.sh"));
@@ -8110,19 +8751,14 @@ mod tests {
                     "sandbox-prefix".to_string(),
                 ]),
                 user: None,
-                socket: Some(socket.to_string()),
             },
             log,
         )
     }
 
     #[cfg(unix)]
-    fn fake_run_as_invocation(
-        temp: &TempDir,
-        stem: &str,
-        socket: &str,
-    ) -> (TmuxInvocation, PathBuf) {
-        let (run_as, log) = fake_run_as_config(temp, stem, socket);
+    fn fake_run_as_invocation(temp: &TempDir, stem: &str) -> (TmuxInvocation, PathBuf) {
+        let (run_as, log) = fake_run_as_config(temp, stem);
         let inv = crate::tmux_exec::build_tmux_invocation(&run_as, stem);
         let _ = fs::remove_file(&log);
 
@@ -8531,6 +9167,273 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn stale_tmux_reaper_does_not_kill_name_registered_to_nonterminal_run() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let session = "silverbond-shared-live-name";
+        let kill_marker = temp.path().join("shared-name-killed");
+        let script = temp.path().join("tmux-shared-live-name.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nmarker=\"$1\"\nshift\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n' '{}'; exit 0; fi\nif [ \"$1\" = \"kill-session\" ]; then touch \"$marker\"; exit 0; fi\nexit 0\n",
+                session
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = TmuxInvocation {
+            prefix: vec![
+                script.to_string_lossy().into_owned(),
+                kill_marker.to_string_lossy().into_owned(),
+            ],
+            socket: None,
+            tmux_bin: "tmux".to_string(),
+        };
+        let workflow = workflow_from_parts("work", vec![task_node("work", "Work", "")], vec![]);
+        for (run_id, status) in [
+            ("terminal-run", RuntimeStatus::Completed),
+            ("nonterminal-run", RuntimeStatus::Running),
+        ] {
+            let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+            checkpoint.status = status;
+            db.upsert_run(&PersistedRun {
+                stream_token: new_stream_token(),
+                tmux_invocation: Some(invocation.clone()),
+                checkpoint,
+                workflow: workflow.clone(),
+            })
+            .await
+            .unwrap();
+            db.register_tmux_session(run_id, session).await.unwrap();
+        }
+
+        reap_stale_tmux_sessions(&RuntimeContext::new(db.clone())).await;
+
+        assert!(
+            !kill_marker.exists(),
+            "a terminal row must not kill a name also registered to a nonterminal run"
+        );
+        assert_eq!(
+            db.list_run_tmux_session_names("terminal-run")
+                .await
+                .unwrap(),
+            vec![session.to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_tmux_reaper_retains_registration_when_listing_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let script = temp.path().join("tmux-failed-reaper-list.sh");
+        fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = TmuxInvocation {
+            prefix: vec![script.to_string_lossy().into_owned()],
+            socket: None,
+            tmux_bin: "tmux".to_string(),
+        };
+        let ctx = RuntimeContext::new(db.clone());
+        let run_id = "run_failed_stale_listing";
+        let session = "silverbond-unknown-after-list-failure";
+        let workflow = workflow_from_parts("work", vec![task_node("work", "Work", "")], vec![]);
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.status = RuntimeStatus::Failed;
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: Some(invocation),
+            checkpoint,
+            workflow,
+        })
+        .await
+        .unwrap();
+        db.register_tmux_session(run_id, session).await.unwrap();
+
+        reap_stale_tmux_sessions(&ctx).await;
+
+        assert_eq!(
+            db.list_run_tmux_session_names(run_id).await.unwrap(),
+            vec![session.to_string()],
+            "a failed listing must not reconcile registrations against unknown tmux state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_tmux_reaper_retains_registration_when_kill_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let session = "silverbond-live-after-rejected-reap";
+        let script = temp.path().join("tmux-rejected-reaper-kill.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n' '{}'; exit 0; fi\nif [ \"$1\" = \"kill-session\" ]; then exit 1; fi\nif [ \"$1\" = \"has-session\" ]; then exit 0; fi\nexit 2\n",
+                session
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = TmuxInvocation {
+            prefix: vec![script.to_string_lossy().into_owned()],
+            socket: None,
+            tmux_bin: "tmux".to_string(),
+        };
+        let ctx = RuntimeContext::new(db.clone());
+        let run_id = "run_rejected_stale_kill";
+        let workflow = workflow_from_parts("work", vec![task_node("work", "Work", "")], vec![]);
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.status = RuntimeStatus::Aborted;
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: Some(invocation),
+            checkpoint,
+            workflow,
+        })
+        .await
+        .unwrap();
+        db.register_tmux_session(run_id, session).await.unwrap();
+
+        reap_stale_tmux_sessions(&ctx).await;
+
+        assert_eq!(
+            db.list_run_tmux_session_names(run_id).await.unwrap(),
+            vec![session.to_string()],
+            "a rejected kill must retain the row while has-session confirms the session is live"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stale_tmux_reaper_removes_registration_for_absent_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let script = temp.path().join("tmux-empty-list.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"list-sessions\" ]; then exit 0; fi\nexit 2\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = TmuxInvocation {
+            prefix: vec![script.to_string_lossy().into_owned()],
+            socket: None,
+            tmux_bin: "tmux".to_string(),
+        };
+        let ctx = RuntimeContext::new(db.clone());
+        let run_id = "run_absent_stale_session";
+        let session = "silverbond-already-absent";
+        let workflow = workflow_from_parts("work", vec![task_node("work", "Work", "")], vec![]);
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.status = RuntimeStatus::Completed;
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: Some(invocation),
+            checkpoint,
+            workflow,
+        })
+        .await
+        .unwrap();
+        db.register_tmux_session(run_id, session).await.unwrap();
+
+        reap_stale_tmux_sessions(&ctx).await;
+
+        assert!(
+            db.list_run_tmux_session_names(run_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a successful empty listing should reconcile an already-absent session registration"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn terminal_cleanup_retains_registration_when_session_remains_live() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let script = temp.path().join("tmux-terminal-rejected-kill.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"kill-session\" ]; then exit 1; fi\nif [ \"$1\" = \"has-session\" ]; then exit 0; fi\nexit 2\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = TmuxInvocation {
+            prefix: vec![script.to_string_lossy().into_owned()],
+            socket: None,
+            tmux_bin: "tmux".to_string(),
+        };
+        let ctx = RuntimeContext {
+            run_invocation: Some(invocation.clone()),
+            ..RuntimeContext::new(db.clone())
+        };
+        let run_id = "run_terminal_rejected_kill";
+        let session = "silverbond-terminal-still-live";
+        let workflow = workflow_from_parts("work", vec![task_node("work", "Work", "")], vec![]);
+        let checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: Some(invocation),
+            checkpoint,
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+        assert!(db.register_tmux_session(run_id, session).await.unwrap());
+        ctx.registry.register(run_id).await;
+        ctx.registry
+            .set_active_pane_with_session(
+                run_id,
+                &active_pane_key("cursor", "work"),
+                "%terminal-pane",
+                Some(session.to_string()),
+            )
+            .await;
+
+        cleanup_terminal_active_panes(&ctx, run_id, &workflow, &BTreeMap::new()).await;
+
+        assert_eq!(
+            db.list_run_tmux_session_names(run_id).await.unwrap(),
+            vec![session.to_string()],
+            "terminal cleanup must retain a registration while the session is still present"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn stale_tmux_reaper_batches_by_persisted_invocation_without_resolving() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -8547,7 +9450,7 @@ mod tests {
         let resolver_marker = temp.path().join("tmux-reaper-resolver-ran");
         fs::write(
             &script,
-            "#!/bin/sh\nlog=\"$1\"\nfirst=\"$2\"\nsecond=\"$3\"\nresolver_marker=\"$4\"\nshift 4\nif [ \"$1\" = \"zsh\" ]; then touch \"$resolver_marker\"; printf 'SBTMUX:tmux\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n%s\\n' \"$first\" \"$second\"; fi\nexit 0\n",
+            "#!/bin/sh\nlog=\"$1\"\nfirst=\"$2\"\nsecond=\"$3\"\nresolver_marker=\"$4\"\nshift 4\nif [ \"$1\" = \"zsh\" ]; then touch \"$resolver_marker\"; printf 'SBTMUX:tmux\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n%s\\n' \"$first\" \"$second\"; fi\nif [ \"$1\" = \"has-session\" ]; then exit 1; fi\nexit 0\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&script).unwrap().permissions();
@@ -8564,7 +9467,6 @@ mod tests {
                 resolver_marker.to_string_lossy().into_owned(),
             ]),
             user: None,
-            socket: Some(socket.to_string()),
         });
         let invocation = TmuxInvocation {
             prefix: workflow.run_as.as_ref().unwrap().command.clone().unwrap(),
@@ -8641,14 +9543,15 @@ mod tests {
         db.init().await.unwrap();
 
         let run_id = "run_legacy_stale_reaper";
-        let socket = "legacy-stale-run-socket";
+        let legacy_socket = "legacy-stale-run-socket";
+        let run_socket = format!("silverbond-{run_id}");
         let session = "silverbond-Legacy-Stale";
         let script = temp.path().join("legacy-tmux-reaper-prefix.sh");
         let log = temp.path().join("legacy-tmux-reaper-args.log");
         let resolver_marker = temp.path().join("legacy-tmux-reaper-resolver-ran");
         fs::write(
             &script,
-            "#!/bin/sh\nlog=\"$1\"\nsession=\"$2\"\nresolver_marker=\"$3\"\nshift 3\nif [ \"$1\" = \"zsh\" ]; then touch \"$resolver_marker\"; printf 'SBTMUX:tmux\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n' \"$session\"; fi\nexit 0\n",
+            "#!/bin/sh\nlog=\"$1\"\nsession=\"$2\"\nresolver_marker=\"$3\"\nshift 3\nif [ \"$1\" = \"zsh\" ]; then touch \"$resolver_marker\"; printf 'SBTMUX:tmux\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n' \"$session\"; fi\nif [ \"$1\" = \"has-session\" ]; then exit 1; fi\nexit 0\n",
         )
         .unwrap();
         let mut permissions = fs::metadata(&script).unwrap().permissions();
@@ -8664,7 +9567,6 @@ mod tests {
                 resolver_marker.to_string_lossy().into_owned(),
             ]),
             user: None,
-            socket: Some(socket.to_string()),
         });
         let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
         checkpoint.status = RuntimeStatus::Failed;
@@ -8680,13 +9582,26 @@ mod tests {
         let mut legacy_state = serde_json::to_value(&checkpoint).unwrap();
         legacy_state["tmuxSessions"] = json!([session]);
         let connection = rusqlite::Connection::open(db.path()).unwrap();
+        let workflow_json: String = connection
+            .query_row(
+                "SELECT workflow_json FROM runs WHERE run_id = ?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut legacy_workflow: Value = serde_json::from_str(&workflow_json).unwrap();
+        legacy_workflow["runAs"]["socket"] = json!(legacy_socket);
         connection
             .execute("DROP TABLE run_tmux_sessions", [])
             .unwrap();
         connection
             .execute(
-                "UPDATE runs SET state_json = ?2 WHERE run_id = ?1",
-                rusqlite::params![run_id, serde_json::to_string(&legacy_state).unwrap()],
+                "UPDATE runs SET state_json = ?2, workflow_json = ?3 WHERE run_id = ?1",
+                rusqlite::params![
+                    run_id,
+                    serde_json::to_string(&legacy_state).unwrap(),
+                    serde_json::to_string(&legacy_workflow).unwrap()
+                ],
             )
             .unwrap();
         drop(connection);
@@ -8717,7 +9632,7 @@ mod tests {
                 == [
                     "tmux",
                     "-L",
-                    socket,
+                    run_socket.as_str(),
                     "list-sessions",
                     "-F",
                     "#{session_name}"
@@ -8725,8 +9640,15 @@ mod tests {
             "reaper should list sessions under the reconstructed invocation; args={args:?}"
         );
         assert!(
-            args.windows(6)
-                .any(|window| window == ["tmux", "-L", socket, "kill-session", "-t", session]),
+            args.windows(6).any(|window| window
+                == [
+                    "tmux",
+                    "-L",
+                    run_socket.as_str(),
+                    "kill-session",
+                    "-t",
+                    session
+                ]),
             "reaper should kill the legacy session under the reconstructed invocation; args={args:?}"
         );
         assert!(
@@ -8877,8 +9799,8 @@ mod tests {
         let db = Database::new(temp.path().join("silverbond.db"));
         db.init().await.unwrap();
 
-        let socket = "decide-sandbox";
-        let (run_as, log) = fake_run_as_config(&temp, "decide", socket);
+        let socket = "silverbond-run_decide";
+        let (run_as, log) = fake_run_as_config(&temp, "decide");
 
         let mut node = task_node("decide", "Decide", "");
         node.kind = NodeKind::Decide {
@@ -8914,9 +9836,9 @@ mod tests {
     async fn run_as_orchestrator_oneshots_use_invocation_prefix_and_socket() {
         let temp = TempDir::new().unwrap();
 
-        let refinement_socket = "orchestrator-refinement-sandbox";
+        let refinement_socket = "silverbond-run_orchestrator_refinement";
         let (refinement_run_as, refinement_log) =
-            fake_run_as_config(&temp, "orchestrator-refinement", refinement_socket);
+            fake_run_as_config(&temp, "orchestrator-refinement");
         let refinement_db = Database::new(temp.path().join("orchestrator-refinement.db"));
         refinement_db.init().await.unwrap();
         let mut refinement_workflow = workflow_from_parts(
@@ -8961,9 +9883,8 @@ mod tests {
         .await;
         assert_recorded_run_as_tmux_args(&refinement_log, refinement_socket);
 
-        let branch_socket = "orchestrator-branch-sandbox";
-        let (branch_inv, branch_log) =
-            fake_run_as_invocation(&temp, "orchestrator-branch", branch_socket);
+        let branch_socket = "silverbond-orchestrator-branch";
+        let (branch_inv, branch_log) = fake_run_as_invocation(&temp, "orchestrator-branch");
         let node = task_node("task", "Task", "prompt");
         let branch_edge = WorkflowEdge {
             id: "edge_branch".to_string(),
@@ -9035,6 +9956,43 @@ mod tests {
             .unwrap();
         let persisted = db.get_run(&run_id).await.unwrap();
         assert!(persisted.is_some());
+    }
+
+    #[test]
+    fn pre_snapshot_checkpoint_deserializes_with_legacy_split_members() {
+        let workflow = workflow_from_parts(
+            "work",
+            vec![task_node("work", "Work", "work")],
+            Vec::new(),
+        );
+        let mut checkpoint =
+            build_initial_checkpoint(&workflow, "run_legacy_barrier", BTreeMap::new(), None);
+        checkpoint.split_families.insert(
+            "family".to_string(),
+            SplitFamilyState {
+                family_id: "family".to_string(),
+                split_node_id: "split".to_string(),
+                execution_epoch: 1,
+                failure_policy: SplitFailurePolicy::BestEffortContinue,
+                force_failed: false,
+            },
+        );
+        let barrier_key = CollectorBarrierKey::new("root", "collector", 1);
+        checkpoint
+            .collector_barriers
+            .insert(barrier_key.clone(), CollectorBarrierState::default());
+
+        let mut legacy_checkpoint = serde_json::to_value(checkpoint).unwrap();
+        legacy_checkpoint["splitFamilies"]["family"]["memberCursorIds"] =
+            json!(["legacy-cursor"]);
+
+        let restored: RuntimeCheckpoint = serde_json::from_value(legacy_checkpoint).unwrap();
+
+        assert!(restored.split_families.contains_key("family"));
+        assert_eq!(
+            restored.collector_barriers[&barrier_key].representative_snapshot,
+            None
+        );
     }
 
     #[test]
@@ -9634,6 +10592,294 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn finalize_run_distinct_logs_for_same_workflow_same_second() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::new(db.clone());
+        let workflow = workflow_from_parts("wf", vec![task_node("work", "Work", "")], vec![]);
+        for run_id in ["run_log_collision_a", "run_log_collision_b"] {
+            let mut checkpoint =
+                build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+            checkpoint.status = RuntimeStatus::Completed;
+            checkpoint.active_cursors.clear();
+            finalize_run(
+                &runtime,
+                &workflow,
+                checkpoint,
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap();
+        }
+        let logs = db.list_logs().await.unwrap();
+        assert_eq!(logs.len(), 2, "expected two distinct history rows");
+        assert_ne!(logs[0].id, logs[1].id);
+        let run_ids: BTreeSet<String> = logs
+            .iter()
+            .filter_map(|log| log.run_id.clone())
+            .collect();
+        assert_eq!(
+            run_ids,
+            BTreeSet::from([
+                "run_log_collision_a".to_string(),
+                "run_log_collision_b".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn build_log_id_derives_from_run_id() {
+        let id = build_log_id(
+            "My Flow!",
+            "run_018f1234-5678-7abc-def0-123456789abc",
+        );
+        assert_eq!(
+            id,
+            "My Flow__018f1234-5678-7abc-def0-123456789abc"
+        );
+        assert!(crate::util::safe_name(&id).is_ok());
+    }
+
+    fn waiting_approval_cursor(
+        checkpoint: &RuntimeCheckpoint,
+        cursor_id: &str,
+        node_id: &str,
+    ) -> CursorState {
+        CursorState {
+            cursor_id: cursor_id.to_string(),
+            node_id: node_id.to_string(),
+            execution_epoch: checkpoint.execution_epoch,
+            parent_cursor_id: None,
+            incoming_edge_id: None,
+            incoming_node_id: None,
+            split_family_ids: Vec::new(),
+            last_output: String::new(),
+            loop_counters: BTreeMap::new(),
+            visit_counters: BTreeMap::new(),
+            var_map: BTreeMap::new(),
+            call_stack: Vec::new(),
+            last_branch_origin_id: None,
+            last_branch_choice: None,
+            cancel_requested: false,
+            state: CursorRuntimeState::WaitingApproval,
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_pending_approval_fallback_binds_rehydrated_cursor_once() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([(
+                "after".to_string(),
+                vec![ScriptedStep::success("done")],
+            )])),
+        );
+        let workflow = workflow_from_parts(
+            "approve",
+            vec![
+                approval_node("gate", "Gate", "approve?"),
+                task_node("after", "After", "after"),
+            ],
+            vec![success_edge("gate_after", "gate", "after", None)],
+        );
+        let run_id = "run_restore_fallback_bind";
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.status = RuntimeStatus::Paused;
+        checkpoint.pending_approval = Some(PendingApproval {
+            cursor_id: "stale-cursor-id".to_string(),
+            node_id: "gate".to_string(),
+            node_name: "Gate".to_string(),
+            prompt: "approve?".to_string(),
+            last_output: String::new(),
+        });
+        checkpoint.current_node_id = Some("gate".to_string());
+        checkpoint.current_node_name = Some("Gate".to_string());
+        checkpoint.active_cursors.clear();
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: None,
+            checkpoint,
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+
+        runtime.resume_run(run_id).await.unwrap();
+        let events = wait_for_event(&db, run_id, "approval_required").await;
+        let required = events
+            .iter()
+            .find(|event| event.kind == "approval_required")
+            .expect("expected approval_required after fallback bind");
+        let persisted = wait_for_run(&db, run_id, |persisted| {
+            persisted
+                .checkpoint
+                .active_cursors
+                .iter()
+                .any(|cursor| cursor.state == CursorRuntimeState::WaitingApproval)
+        })
+        .await;
+        let bound_cursor_id = persisted
+            .checkpoint
+            .active_cursors
+            .iter()
+            .find(|cursor| cursor.state == CursorRuntimeState::WaitingApproval)
+            .map(|cursor| cursor.cursor_id.as_str())
+            .expect("expected waiting cursor after rehydration");
+        assert_eq!(
+            required.data.get("cursorId").and_then(Value::as_str),
+            Some(bound_cursor_id)
+        );
+        assert_eq!(
+            required.data.get("nodeId").and_then(Value::as_str),
+            Some("gate")
+        );
+
+        runtime
+            .approve_run(run_id, true, String::new())
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, run_id).await;
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        assert_eq!(
+            persisted
+                .checkpoint
+                .all_results
+                .get("gate")
+                .map(|result| result.agent.as_str()),
+            Some("user")
+        );
+        let approval_events = db.list_events(run_id).await.unwrap();
+        assert_eq!(
+            approval_events
+                .iter()
+                .filter(|event| event.kind == "approval_required")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_pending_approval_fallback_drops_on_node_id_mismatch() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([(
+                "after".to_string(),
+                vec![ScriptedStep::success("done")],
+            )])),
+        );
+        let workflow = workflow_from_parts(
+            "approve",
+            vec![
+                approval_node("gate", "Gate", "approve?"),
+                task_node("after", "After", "after"),
+            ],
+            vec![success_edge("gate_after", "gate", "after", None)],
+        );
+        let run_id = "run_restore_fallback_mismatch";
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.status = RuntimeStatus::Paused;
+        checkpoint.pending_approval = Some(PendingApproval {
+            cursor_id: "stale-cursor-id".to_string(),
+            node_id: "gate".to_string(),
+            node_name: "Gate".to_string(),
+            prompt: "approve?".to_string(),
+            last_output: String::new(),
+        });
+        checkpoint.active_cursors = vec![waiting_approval_cursor(
+            &checkpoint,
+            "other-cursor",
+            "after",
+        )];
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: None,
+            checkpoint,
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+
+        runtime.resume_run(run_id).await.unwrap();
+        let events = wait_for_event(&db, run_id, "workflow_warn").await;
+        assert!(
+            events.iter().any(|event| event.kind == "workflow_warn"),
+            "expected workflow_warn when fallback cannot bind"
+        );
+        assert!(
+            !events.iter().any(|event| event.kind == "approval_required"),
+            "must not emit approval_required for mismatched node"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_pending_approval_fallback_drops_when_cursor_has_queued_approval() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([(
+                "after".to_string(),
+                vec![ScriptedStep::success("done")],
+            )])),
+        );
+        let workflow = workflow_from_parts(
+            "approve",
+            vec![
+                approval_node("gate", "Gate", "approve?"),
+                task_node("after", "After", "after"),
+            ],
+            vec![success_edge("gate_after", "gate", "after", None)],
+        );
+        let run_id = "run_restore_fallback_queued_owner";
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.status = RuntimeStatus::Paused;
+        checkpoint.pending_approval = Some(PendingApproval {
+            cursor_id: "stale-cursor-id".to_string(),
+            node_id: "gate".to_string(),
+            node_name: "Gate".to_string(),
+            prompt: "approve?".to_string(),
+            last_output: String::new(),
+        });
+        checkpoint.active_cursors = vec![waiting_approval_cursor(
+            &checkpoint,
+            "owned-cursor",
+            "gate",
+        )];
+        checkpoint.queued_approvals.push(QueuedApproval {
+            approval: PendingApproval {
+                cursor_id: "owned-cursor".to_string(),
+                node_id: "gate".to_string(),
+                node_name: "Gate".to_string(),
+                prompt: "approve?".to_string(),
+                last_output: String::new(),
+            },
+        });
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: None,
+            checkpoint,
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+
+        runtime.resume_run(run_id).await.unwrap();
+        let events = wait_for_event(&db, run_id, "workflow_warn").await;
+        assert!(
+            events.iter().any(|event| event.kind == "workflow_warn"),
+            "cursor with its own queued approval must not be rebound via fallback"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn abort_kills_active_panes_before_draining_running_tasks() {
@@ -9684,13 +10930,16 @@ mod tests {
 
         assert_eq!(
             select_decide_outcome(&outcomes, "revise", None),
-            Some("revise".to_string())
+            decide_matched("revise")
         );
         assert_eq!(
             select_decide_outcome(&outcomes, "I would approve this path.", None),
-            Some("approve".to_string())
+            decide_matched("approve")
         );
-        assert_eq!(select_decide_outcome(&outcomes, "unknown", None), None);
+        assert_eq!(
+            select_decide_outcome(&outcomes, "unknown", None),
+            decide_unmatched()
+        );
     }
 
     #[tokio::test]
@@ -9973,7 +11222,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
         db.init().await.unwrap();
-        let (run_as, _) = fake_run_as_config(&temp, "orch-fail", "orch-socket");
+        let (run_as, _) = fake_run_as_config(&temp, "orch-fail");
         let runtime = RuntimeContext::with_runner(
             db.clone(),
             Arc::new(ScriptedRunner::new([
@@ -10833,6 +12082,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subflow_exit_collector_returns_when_all_branches_fail() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                (
+                    "sub-a".to_string(),
+                    vec![ScriptedStep::failure("alpha failed", "alpha boom")],
+                ),
+                (
+                    "sub-b".to_string(),
+                    vec![ScriptedStep::failure("beta failed", "beta boom").with_delay(5)],
+                ),
+                (
+                    "parent-after".to_string(),
+                    vec![ScriptedStep::success("parent done")],
+                ),
+            ])),
+        );
+        let subflow = workflow_from_parts(
+            "split",
+            vec![
+                split_node("split", SplitFailurePolicy::BestEffortContinue),
+                task_node("branch_a", "Branch A", "sub-a"),
+                task_node("branch_b", "Branch B", "sub-b"),
+                collector_node("collector"),
+            ],
+            vec![
+                success_edge("split_a", "split", "branch_a", Some("alpha")),
+                success_edge("split_b", "split", "branch_b", Some("beta")),
+                success_edge("join_a", "branch_a", "collector", Some("alpha")),
+                success_edge("join_b", "branch_b", "collector", Some("beta")),
+            ],
+        );
+        let mut workflow = workflow_from_parts(
+            "call",
+            vec![
+                call_node("call", "failing_collector", "collector", Vec::new()),
+                task_node("after", "After", "parent-after"),
+            ],
+            vec![success_edge("call_after", "call", "after", None)],
+        );
+        workflow
+            .subflows
+            .insert("failing_collector".to_string(), Box::new(subflow));
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        let call_result = persisted.checkpoint.all_results.get("call").unwrap();
+        assert_eq!(
+            call_result.parsed_output.as_ref().unwrap()["summary"]["failed"],
+            json!(2)
+        );
+        assert!(persisted.checkpoint.all_results.contains_key("after"));
+        assert!(!persisted.checkpoint.all_results.contains_key("collector"));
+    }
+
+    #[tokio::test]
     async fn collector_barriers_are_scoped_per_subflow_call_frame() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
@@ -11179,6 +12493,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn best_effort_continue_keeps_policy_after_all_branches_fail() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                (
+                    "branch-a".to_string(),
+                    vec![ScriptedStep::failure("alpha failed", "alpha boom")],
+                ),
+                (
+                    "branch-b".to_string(),
+                    vec![ScriptedStep::failure("beta failed", "beta boom").with_delay(5)],
+                ),
+                (
+                    "after".to_string(),
+                    vec![ScriptedStep::failure("after failed", "after boom")],
+                ),
+            ])),
+        );
+        let workflow = workflow_from_parts(
+            "split",
+            vec![
+                split_node("split", SplitFailurePolicy::BestEffortContinue),
+                task_node("branch_a", "Branch A", "branch-a"),
+                task_node("branch_b", "Branch B", "branch-b"),
+                collector_node("collector"),
+                task_node("after", "After", "after"),
+            ],
+            vec![
+                success_edge("split_a", "split", "branch_a", Some("alpha")),
+                success_edge("split_b", "split", "branch_b", Some("beta")),
+                success_edge("join_a", "branch_a", "collector", Some("alpha")),
+                success_edge("join_b", "branch_b", "collector", Some("beta")),
+                success_edge("after_edge", "collector", "after", None),
+            ],
+        );
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Completed);
+        assert!(persisted.checkpoint.all_results.contains_key("after"));
+        let collector = persisted.checkpoint.all_results.get("collector").unwrap();
+        assert_eq!(
+            collector.parsed_output.as_ref().unwrap()["summary"]["failed"],
+            json!(2)
+        );
+    }
+
+    #[tokio::test]
     async fn drain_then_fail_waits_for_siblings_before_failing_run() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
@@ -11273,6 +12642,61 @@ mod tests {
         assert_eq!(persisted.checkpoint.status, RuntimeStatus::Failed);
         assert!(persisted.checkpoint.all_results.contains_key("fast"));
         assert!(!persisted.checkpoint.all_results.contains_key("slow"));
+    }
+
+    #[tokio::test]
+    async fn nested_fail_fast_split_keeps_outer_policy_and_cancels_siblings() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::with_runner(
+            db.clone(),
+            Arc::new(ScriptedRunner::new([
+                (
+                    "outer-sibling".to_string(),
+                    vec![ScriptedStep::success("outer done").with_delay(5)],
+                ),
+                (
+                    "inner-fail".to_string(),
+                    vec![ScriptedStep::failure("failed", "boom").with_delay(30)],
+                ),
+                (
+                    "inner-slow".to_string(),
+                    vec![ScriptedStep::success("slow done").with_delay(200)],
+                ),
+            ])),
+        );
+        let workflow = workflow_from_parts(
+            "outer_split",
+            vec![
+                split_node("outer_split", SplitFailurePolicy::FailFastCancel),
+                split_node("inner_split", SplitFailurePolicy::BestEffortContinue),
+                task_node("outer_sibling", "Outer Sibling", "outer-sibling"),
+                task_node("inner_fail", "Inner Fail", "inner-fail"),
+                task_node("inner_slow", "Inner Slow", "inner-slow"),
+            ],
+            vec![
+                success_edge("outer_inner", "outer_split", "inner_split", Some("inner")),
+                success_edge(
+                    "outer_sibling_edge",
+                    "outer_split",
+                    "outer_sibling",
+                    Some("sibling"),
+                ),
+                success_edge("inner_fail_edge", "inner_split", "inner_fail", Some("fail")),
+                success_edge("inner_slow_edge", "inner_split", "inner_slow", Some("slow")),
+            ],
+        );
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+        let persisted = wait_for_terminal_run(&db, &run_id).await;
+
+        assert_eq!(persisted.checkpoint.status, RuntimeStatus::Failed);
+        assert!(persisted.checkpoint.all_results.contains_key("inner_fail"));
+        assert!(!persisted.checkpoint.all_results.contains_key("inner_slow"));
     }
 
     #[tokio::test]
@@ -12093,15 +13517,18 @@ mod tests {
         // Exact match
         assert_eq!(
             select_decide_outcome(&outcomes, "revise", None),
-            Some("revise".to_string())
+            decide_matched("revise")
         );
         // Substring match when no exact match
         assert_eq!(
             select_decide_outcome(&outcomes, "I would approve this.", None),
-            Some("approve".to_string())
+            decide_matched("approve")
         );
         // No match
-        assert_eq!(select_decide_outcome(&outcomes, "unknown", None), None);
+        assert_eq!(
+            select_decide_outcome(&outcomes, "unknown", None),
+            decide_unmatched()
+        );
     }
 
     #[test]
@@ -12113,11 +13540,11 @@ mod tests {
         ];
         assert_eq!(
             select_decide_outcome(&outcomes, "  \"NEXT_STORY\"  ", None),
-            Some("NEXT_STORY".to_string())
+            decide_matched("NEXT_STORY")
         );
         assert_eq!(
             select_decide_outcome(&outcomes, "`DONE`", None),
-            Some("DONE".to_string())
+            decide_matched("DONE")
         );
     }
 
@@ -12146,7 +13573,7 @@ mod tests {
         assert_eq!(response.trim(), "reject");
         assert_eq!(
             select_decide_outcome(&outcomes, &response, None),
-            Some("reject".to_string())
+            decide_matched("reject")
         );
     }
 
@@ -12159,7 +13586,7 @@ mod tests {
 
         assert_eq!(
             select_decide_outcome(&outcomes, response, parsed.as_ref()),
-            Some("approve".to_string())
+            decide_matched("approve")
         );
     }
 
@@ -12172,7 +13599,7 @@ mod tests {
 
         assert_eq!(
             select_decide_outcome(&outcomes, response, parsed.as_ref()),
-            None
+            decide_structured_label_mismatch()
         );
     }
 
@@ -12181,11 +13608,11 @@ mod tests {
         let outcomes = vec!["approve".to_string(), "approve_with_changes".to_string()];
         assert_eq!(
             select_decide_outcome(&outcomes, "approve_with_changes", None),
-            Some("approve_with_changes".to_string())
+            decide_matched("approve_with_changes")
         );
         assert_eq!(
             select_decide_outcome(&outcomes, "My decision is approve_with_changes.", None),
-            Some("approve_with_changes".to_string())
+            decide_matched("approve_with_changes")
         );
     }
 
@@ -12194,7 +13621,7 @@ mod tests {
         let outcomes = vec!["revise".to_string(), "approve".to_string()];
         assert_eq!(
             select_decide_outcome(&outcomes, "I approve this revision.", None),
-            Some("approve".to_string())
+            decide_matched("approve")
         );
     }
 
@@ -12203,20 +13630,166 @@ mod tests {
         let outcomes = vec!["approve".to_string(), "approve-with-changes".to_string()];
         assert_eq!(
             select_decide_outcome(&outcomes, "approve-with-changes", None),
-            Some("approve-with-changes".to_string())
+            decide_matched("approve-with-changes")
         );
 
         let outcomes = vec!["yes".to_string(), "no".to_string()];
         assert_eq!(
             select_decide_outcome(&outcomes, "yes and no are both valid", None),
-            Some("yes".to_string())
+            decide_matched("yes")
         );
 
         let outcomes = vec!["pick".to_string(), "pick".to_string()];
         assert_eq!(
             select_decide_outcome(&outcomes, "I choose pick.", None),
-            None
+            decide_unmatched()
         );
+    }
+
+    #[test]
+    fn decide_routing_numeric_json_outcome_matches_numeric_label() {
+        let outcomes = vec!["1".to_string(), "2".to_string()];
+        let parsed: Value = json!({"outcome": 1});
+        assert_eq!(
+            select_decide_outcome(&outcomes, "", Some(&parsed)),
+            decide_matched("1")
+        );
+    }
+
+    #[test]
+    fn decide_routing_boolean_json_outcome_reports_type_specific_failure() {
+        let outcomes = vec!["approve".to_string(), "reject".to_string()];
+        let parsed: Value = json!({"outcome": true});
+        assert_eq!(
+            select_decide_outcome(&outcomes, "", Some(&parsed)),
+            DecideOutcomeSelection::Failed(DecideOutcomeFailure::StructuredNonScalar {
+                json_type: "boolean"
+            })
+        );
+    }
+
+    #[test]
+    fn decide_routing_object_json_outcome_does_not_fall_back_to_prose() {
+        let outcomes = vec!["approve".to_string(), "reject".to_string()];
+        let response = r#"{"outcome":{"choice":"approve"},"reason":"approve"}"#;
+        let parsed: Value = serde_json::from_str(response).unwrap();
+        assert_eq!(
+            select_decide_outcome(&outcomes, response, Some(&parsed)),
+            DecideOutcomeSelection::Failed(DecideOutcomeFailure::StructuredNonScalar {
+                json_type: "object"
+            })
+        );
+    }
+
+    #[test]
+    fn decide_agent_failure_skips_outcome_routing_even_when_output_matches() {
+        let mut node = task_node("decide", "Decide", "prompt");
+        node.kind = NodeKind::Decide {
+            decide_config: model::DecideConfig {
+                prompt: "pick".to_string(),
+                outcomes: vec!["approve".to_string(), "reject".to_string()],
+                inputs: vec![],
+                model: None,
+            },
+        };
+        let config = match &node.kind {
+            NodeKind::Decide { decide_config } => decide_config.clone(),
+            _ => unreachable!(),
+        };
+        let agent_result = NodeResult {
+            success: false,
+            output: "approve".to_string(),
+            stderr: "Timeout waiting for agent response".to_string(),
+            exit_code: -2,
+            duration: "1.0".to_string(),
+            agent: "llm".to_string(),
+            prompt: config.prompt.clone(),
+            metadata: AgentExecutionMetadata {
+                error_type: Some("timeout".to_string()),
+                agent_session_id: Some("%pane".to_string()),
+                cost_usd: Some(0.42),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged = apply_decide_outcome_to_agent_result(
+            agent_result,
+            &node,
+            &config,
+            &BTreeMap::new(),
+            "resolved",
+            "2.0".to_string(),
+        );
+        assert!(!merged.success);
+        assert_eq!(merged.exit_code, -2);
+        assert_eq!(merged.output, "approve");
+        assert_eq!(
+            merged.metadata.error_type.as_deref(),
+            Some("timeout")
+        );
+        assert_eq!(merged.metadata.agent_session_id.as_deref(), Some("%pane"));
+        assert_eq!(merged.metadata.cost_usd, Some(0.42));
+    }
+
+    #[test]
+    fn decide_success_preserves_agent_metadata_and_applies_outcome() {
+        let mut node = task_node("decide", "Decide", "prompt");
+        node.kind = NodeKind::Decide {
+            decide_config: model::DecideConfig {
+                prompt: "pick".to_string(),
+                outcomes: vec!["approve".to_string(), "reject".to_string()],
+                inputs: vec![],
+                model: None,
+            },
+        };
+        let config = match &node.kind {
+            NodeKind::Decide { decide_config } => decide_config.clone(),
+            _ => unreachable!(),
+        };
+        let agent_result = NodeResult {
+            success: true,
+            output: "approve".to_string(),
+            exit_code: 0,
+            duration: "1.0".to_string(),
+            agent: "llm".to_string(),
+            prompt: config.prompt.clone(),
+            metadata: AgentExecutionMetadata {
+                agent_session_id: Some("%pane".to_string()),
+                cost_usd: Some(1.25),
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let merged = apply_decide_outcome_to_agent_result(
+            agent_result,
+            &node,
+            &config,
+            &BTreeMap::new(),
+            "resolved",
+            "2.0".to_string(),
+        );
+        assert!(merged.success);
+        assert_eq!(merged.output, "approve");
+        assert_eq!(merged.metadata.agent_session_id.as_deref(), Some("%pane"));
+        assert_eq!(merged.metadata.cost_usd, Some(1.25));
+        assert_eq!(merged.metadata.input_tokens, Some(100));
+    }
+
+    #[test]
+    fn timeout_for_node_decide_uses_configured_node_timeout() {
+        let mut node = task_node("decide", "Decide", "prompt");
+        node.timeout = Some(12);
+        node.kind = NodeKind::Decide {
+            decide_config: model::DecideConfig {
+                prompt: "pick".to_string(),
+                outcomes: vec!["a".to_string()],
+                inputs: vec![],
+                model: None,
+            },
+        };
+        assert_eq!(timeout_for_node(&node), Some(12));
     }
 
     // -----------------------------------------------------------------------

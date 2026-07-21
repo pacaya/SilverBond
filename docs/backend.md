@@ -103,7 +103,7 @@ Runs agent and control-flow nodes inside detached tmux panes via `tmux-tools-cor
 
 - **Pane lifecycle**: `spawn_pane()` creates detached tmux sessions, registers them in the runtime's per-run `active_panes` map (`runtime.rs`), and tears them down on completion or abort
 - **Node routing**: `run_tmux_node()` dispatches `Task`, `RunAgent`, `Spawn`, `Send`, `Wait`, `Capture`, and `Kill` nodes to the appropriate tmux helpers
-- **Invocation context**: `build_tmux_invocation()` translates workflow `runAs` config into a `TmuxInvocation` (command prefix, optional `-L` socket, resolved `tmux` binary)
+- **Invocation context**: `build_tmux_invocation()` translates workflow `runAs` config into a `TmuxInvocation` (command prefix, automatic per-run `-L` socket, resolved `tmux` binary)
 - **Interactive prompt handling**: `poll_agent_interactive()` watches pane output for agent trust/permission prompts and applies the 4-tier escalation model
 - **Interaction resolution**: `respond_to_interaction()` in `runtime.rs` forwards human replies into the active pane via tmux `send-keys`
 - **Streaming**: pane output is captured for SSE/WebSocket delivery; the API resolves the active pane target from the run registry when serving live streams

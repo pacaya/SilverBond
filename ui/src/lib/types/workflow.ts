@@ -1,3 +1,5 @@
+import { defaultNodeKind } from "@/lib/stores/nodeMetadata";
+
 export type WorkflowNodeType =
   | "task"
   | "approval"
@@ -102,13 +104,12 @@ export interface WorkflowLimits {
 /**
  * Workflow-level "run as" / sandbox configuration. Mirrors the backend
  * `RunAsConfig` (serialized camelCase). Controls how spawned panes are launched:
- * under a different user, via a custom command prefix, and on a dedicated tmux
- * socket.
+ * under a different user or via a custom command prefix. Each run always uses
+ * its own dedicated tmux socket.
  */
 export interface RunAsConfig {
   user?: string;
   command?: string[];
-  socket?: string;
 }
 
 export interface WorkflowUiCanvasNode {
@@ -355,6 +356,7 @@ export interface TemplateItem {
 
 export interface RunEvent {
   type: string;
+  seq?: number;
   [key: string]: unknown;
 }
 
@@ -506,6 +508,38 @@ type LegacyWorkflowNode = Omit<WorkflowNode, "kind"> & {
   type?: string;
 } & Partial<Record<(typeof LEGACY_NODE_CONFIG_FIELDS)[number], unknown>>;
 
+function backfillRequiredKindConfig(node: WorkflowNode): WorkflowNode {
+  const kind = node.kind as unknown as Record<string, unknown>;
+  let configField: "decideConfig" | "batchConfig" | "subflowConfig" | undefined;
+  switch (kind.type) {
+    case "decide":
+      configField = "decideConfig";
+      break;
+    case "parallel_batch":
+      configField = "batchConfig";
+      break;
+    case "subflow":
+    case "call":
+      configField = "subflowConfig";
+      break;
+    default:
+      return node;
+  }
+
+  if (kind[configField] != null) {
+    return node;
+  }
+
+  const defaultKind = defaultNodeKind(kind.type as WorkflowNodeType) as unknown as Record<
+    string,
+    unknown
+  >;
+  return {
+    ...node,
+    kind: { ...kind, [configField]: defaultKind[configField] } as NodeKind,
+  };
+}
+
 function moveV2ConfigField(
   node: Record<string, unknown>,
   kind: Record<string, unknown>,
@@ -543,7 +577,7 @@ function moveV2BatchConfigField(
 export function normalizeWorkflowNode(node: WorkflowNode): WorkflowNode {
   const raw = node as LegacyWorkflowNode;
   if (raw.kind != null && typeof raw.kind === "object") {
-    return node;
+    return backfillRequiredKindConfig(node);
   }
 
   if (typeof raw.type !== "string") {
@@ -607,7 +641,7 @@ export function normalizeWorkflowNode(node: WorkflowNode): WorkflowNode {
     delete next[field];
   }
 
-  return { ...next, kind: kind as NodeKind } as WorkflowNode;
+  return backfillRequiredKindConfig({ ...next, kind: kind as NodeKind } as WorkflowNode);
 }
 
 export function normalizeWorkflowNodes(workflow: WorkflowDocument): WorkflowDocument {

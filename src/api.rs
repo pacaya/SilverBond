@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Read},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt},
+        process::CommandExt,
+    },
     path::{Path as FsPath, PathBuf},
     pin::Pin,
     process::{Command, Stdio},
@@ -37,9 +40,10 @@ use tmux_tools_core::{
 };
 use tokio::{
     io::{AsyncRead, AsyncReadExt, ReadBuf, unix::AsyncFd},
-    sync::broadcast,
+    sync::{broadcast, oneshot, watch},
     time::Instant,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     app::{AppState, PaneStreamEntry, PaneStreamKey, SecurityConfig, UnlockThrottle},
@@ -49,7 +53,7 @@ use crate::{
     },
     runtime::{
         InterruptedRunSummary, NodeTestContext, PaneCandidate, PersistedRun, RunControlError,
-        RuntimeCheckpoint, RuntimeStatus, available_agents, check_cli,
+        RuntimeCheckpoint, RuntimeEvent, RuntimeStatus, available_agents, check_cli,
         load_or_resolve_run_tmux_invocation, run_node_preview,
     },
     util::constant_time_eq,
@@ -68,6 +72,13 @@ const STREAM_TOKEN_HEADER: &str = "x-stream-token";
 enum PaneStreamTaskExit {
     NoSubscribers,
     Terminal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneStreamOwnerAction {
+    Continue,
+    Teardown,
+    Stale,
 }
 
 struct PaneStreamGuard {
@@ -788,7 +799,6 @@ async fn authorize_and_prepare_run_security(
             workflow.run_as = Some(RunAsConfig {
                 user: Some(agent_user.to_owned()),
                 command: None,
-                socket: None,
             });
         }
     }
@@ -870,15 +880,23 @@ async fn stream_run(
 ) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
     let token_candidates = header_stream_token_candidates(&headers, STREAM_TOKEN_HEADER);
     require_run_stream_token(&state, &run_id, &token_candidates).await?;
-    let replay = state.runtime.db.list_events(&run_id).await?;
     let receiver = state.runtime.registry.subscribe(&run_id).await;
+    let replay = state.runtime.db.list_events(&run_id).await?;
+    let db = state.runtime.db.clone();
+    let run_id_for_stream = run_id.clone();
     let stream = stream! {
         let mut done_seen = false;
+        let mut max_seq = 0u64;
+
         for event in replay {
+            let seq = runtime_event_seq(&event);
+            if seq > max_seq {
+                max_seq = seq;
+            }
             if event.kind == "done" {
                 done_seen = true;
             }
-            yield Ok(Event::default().data(serde_json::to_string(&event).unwrap_or_default()));
+            yield Ok(run_stream_sse_event(&event));
         }
 
         if done_seen {
@@ -886,22 +904,153 @@ async fn stream_run(
         }
 
         if let Some(mut receiver) = receiver {
+            for item in drain_buffered_run_events(&mut receiver, &mut max_seq) {
+                match item {
+                    RunStreamBufferedItem::Resync => {
+                        yield Ok(run_stream_resync_sse_event());
+                        match resync_run_stream_from_journal(&db, &run_id_for_stream, &mut max_seq).await {
+                            Ok(events) => {
+                                for item in events {
+                                    if item.is_done {
+                                        yield Ok(item.sse);
+                                        return;
+                                    }
+                                    yield Ok(item.sse);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    RunStreamBufferedItem::Event { sse, is_done } => {
+                        if is_done {
+                            yield Ok(sse);
+                            return;
+                        }
+                        yield Ok(sse);
+                    }
+                }
+            }
+
             loop {
                 match receiver.recv().await {
                     Ok(event) => {
+                        let seq = runtime_event_seq(&event);
+                        if seq <= max_seq {
+                            continue;
+                        }
+                        max_seq = seq;
                         let is_done = event.kind == "done";
-                        yield Ok(Event::default().data(serde_json::to_string(&event).unwrap_or_default()));
+                        yield Ok(run_stream_sse_event(&event));
                         if is_done {
                             break;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        yield Ok(run_stream_resync_sse_event());
+                        match resync_run_stream_from_journal(&db, &run_id_for_stream, &mut max_seq).await {
+                            Ok(events) => {
+                                for item in events {
+                                    if item.is_done {
+                                        yield Ok(item.sse);
+                                        return;
+                                    }
+                                    yield Ok(item.sse);
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         }
     };
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+}
+
+const RUN_STREAM_RESYNC_EVENT: &str = "stream_resync";
+
+fn runtime_event_seq(event: &RuntimeEvent) -> u64 {
+    event.seq.unwrap_or(0)
+}
+
+fn run_stream_sse_event(event: &RuntimeEvent) -> Event {
+    let payload = serde_json::to_string(event).unwrap_or_default();
+    let mut sse = Event::default().data(payload);
+    let seq = runtime_event_seq(event);
+    if seq > 0 {
+        sse = sse.id(seq.to_string());
+    }
+    sse
+}
+
+fn run_stream_resync_sse_event() -> Event {
+    Event::default().data(
+        serde_json::json!({ "type": RUN_STREAM_RESYNC_EVENT })
+            .to_string(),
+    )
+}
+
+struct RunStreamJournalItem {
+    sse: Event,
+    is_done: bool,
+}
+
+enum RunStreamBufferedItem {
+    Event { sse: Event, is_done: bool },
+    Resync,
+}
+
+fn drain_buffered_run_events(
+    receiver: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
+    max_seq: &mut u64,
+) -> Vec<RunStreamBufferedItem> {
+    use tokio::sync::broadcast::error::TryRecvError;
+    let mut out = Vec::new();
+    loop {
+        match receiver.try_recv() {
+            Ok(event) => {
+                let seq = runtime_event_seq(&event);
+                if seq <= *max_seq {
+                    continue;
+                }
+                *max_seq = seq;
+                let is_done = event.kind == "done";
+                out.push(RunStreamBufferedItem::Event {
+                    sse: run_stream_sse_event(&event),
+                    is_done,
+                });
+            }
+            Err(TryRecvError::Lagged(_)) => {
+                out.push(RunStreamBufferedItem::Resync);
+                break;
+            }
+            Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => break,
+        }
+    }
+    out
+}
+
+async fn resync_run_stream_from_journal(
+    db: &crate::storage::Database,
+    run_id: &str,
+    max_seq: &mut u64,
+) -> anyhow::Result<Vec<RunStreamJournalItem>> {
+    let replay = db.list_events(run_id).await?;
+    let mut out = Vec::new();
+    for event in replay {
+        let seq = runtime_event_seq(&event);
+        if seq <= *max_seq {
+            continue;
+        }
+        *max_seq = seq;
+        let is_done = event.kind == "done";
+        out.push(RunStreamJournalItem {
+            sse: run_stream_sse_event(&event),
+            is_done,
+        });
+    }
+    Ok(out)
 }
 
 pub async fn pane_stream_ws(
@@ -1415,21 +1564,13 @@ async fn start_pane_stream(
         let shell_command = format!(
             "exec 3> {data_path} && printf r > {lifecycle_path}; cat >&3; printf . > {lifecycle_path}"
         );
-        // The enable must fit inside the shared setup budget, and we always wait
-        // for it to terminate so teardown cannot race a late `pipe-pane`.
-        let enable_budget = setup_deadline.saturating_duration_since(Instant::now());
-        if enable_budget.is_zero() {
-            anyhow::bail!("timed out while starting pane stream");
-        }
-        tokio::task::spawn_blocking(move || {
-            run_tmux_checked_with_timeout(
-                &setup_invocation,
-                &["pipe-pane", "-t", &setup_pane_target, &shell_command],
-                enable_budget,
-            )
-        })
-        .await
-        .context("pane stream enable task panicked")??;
+        run_tmux_status_until(
+            &setup_invocation,
+            &["pipe-pane", "-t", &setup_pane_target, &shell_command],
+            setup_deadline,
+            "starting pane stream",
+        )
+        .await?;
 
         if Instant::now() >= setup_deadline {
             anyhow::bail!("timed out while starting pane stream");
@@ -1457,14 +1598,39 @@ async fn start_pane_stream(
     }
 }
 
-/// Runs a tmux command with an explicit timeout instead of
-/// [`tmux::DEFAULT_TMUX_COMMAND_TIMEOUT`], so callers can bound it by whatever
-/// remains of a shared deadline.
-fn run_tmux_checked_with_timeout(
+async fn run_tmux_status_until(
     invocation: &TmuxInvocation,
     args: &[&str],
-    timeout: Duration,
+    deadline: Instant,
+    operation: &'static str,
 ) -> anyhow::Result<()> {
+    let invocation = invocation.clone();
+    let args = args
+        .iter()
+        .map(|arg| (*arg).to_string())
+        .collect::<Vec<_>>();
+    let deadline = deadline.into_std();
+    let (result_sender, result_receiver) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("pane-stream-tmux".to_string())
+        .spawn(move || {
+            let timeout = deadline.saturating_duration_since(std::time::Instant::now());
+            let result = if timeout.is_zero() {
+                Err(anyhow::anyhow!("timed out while {operation}"))
+            } else {
+                let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+                run_tmux_status_with_timeout(&invocation, &args, timeout, operation)
+            };
+            let _ = result_sender.send(result);
+        })
+        .with_context(|| format!("failed to spawn tmux thread while {operation}"))?;
+
+    result_receiver
+        .await
+        .with_context(|| format!("tmux thread exited without a result while {operation}"))?
+}
+
+fn tmux_command(invocation: &TmuxInvocation, args: &[&str]) -> Command {
     let mut command = if invocation.prefix.is_empty() {
         Command::new(&invocation.tmux_bin)
     } else {
@@ -1477,18 +1643,58 @@ fn run_tmux_checked_with_timeout(
         command.args(["-L", socket]);
     }
     command.args(args);
+    command
+}
 
-    let output = tmux::command_output_with_timeout(command, timeout)
-        .with_context(|| format!("failed to run tmux command: tmux {}", args.join(" ")))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "tmux command failed (args: {:?}, exit code {}): {}",
-            args,
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+fn run_tmux_status_with_timeout(
+    invocation: &TmuxInvocation,
+    args: &[&str],
+    timeout: Duration,
+    operation: &str,
+) -> anyhow::Result<()> {
+    let mut command = tmux_command(invocation, args);
+    command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn tmux while {operation}"))?;
+    let process_group = i32::try_from(child.id()).context("tmux pid exceeded i32")?;
+    let deadline = std::time::Instant::now() + timeout;
+
+    loop {
+        match child
+            .try_wait()
+            .with_context(|| format!("failed to wait for tmux while {operation}"))?
+        {
+            Some(status) if status.success() => return Ok(()),
+            Some(status) => {
+                anyhow::bail!(
+                    "tmux command failed with exit code {} while {operation}",
+                    status.code().unwrap_or(-1)
+                );
+            }
+            None if std::time::Instant::now() >= deadline => {
+                // The child is its own process-group leader, so a negative pid
+                // cannot signal SilverBond's process group.
+                unsafe {
+                    libc::kill(-process_group, libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("timed out while {operation} after {timeout:?}");
+            }
+            None => {
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(std::time::Instant::now())
+                        .min(Duration::from_millis(10)),
+                );
+            }
+        }
     }
-    Ok(())
 }
 
 /// The blocking half of pane-stream setup. It owns the FIFO guard for the paths
@@ -1548,19 +1754,13 @@ fn ensure_run_as_can_traverse_root(
 }
 
 async fn stop_pane_stream(pane_target: &str, invocation: &TmuxInvocation) -> anyhow::Result<()> {
-    let pane_target = pane_target.to_string();
-    let invocation = invocation.clone();
-    tokio::time::timeout(
-        PANE_STREAM_SETUP_TIMEOUT,
-        tokio::task::spawn_blocking(move || {
-            with_invocation(invocation, || {
-                tmux::run(&["pipe-pane", "-t", &pane_target]).map(|_| ())
-            })
-        }),
+    run_tmux_status_until(
+        invocation,
+        &["pipe-pane", "-t", pane_target],
+        Instant::now() + PANE_STREAM_SETUP_TIMEOUT,
+        "stopping pane stream",
     )
     .await
-    .context("timed out while stopping pane stream")?
-    .context("pane stream teardown task panicked")?
 }
 
 struct PaneStreamFifoGuard {
@@ -1802,46 +2002,54 @@ async fn subscribe_pane_stream(
     PaneStreamSubscribeError,
 > {
     let key = PaneStreamKey::new(invocation, pane_target);
-    let mut streams = state.pane_streams.inner.lock().await;
     let subscriber_limit = state.pane_streams.max_subscribers_per_pane;
-    if let Some(entry) = streams.get_mut(&key) {
-        if entry.refcount >= subscriber_limit {
+    loop {
+        let mut streams = state.pane_streams.inner.lock().await;
+        if let Some(entry) = streams.get_mut(&key) {
+            if entry.is_terminating() {
+                let owner_done = entry.owner_done();
+                drop(streams);
+                owner_done.cancelled().await;
+                continue;
+            }
+            if entry.refcount >= subscriber_limit {
+                return Err(PaneStreamSubscribeError::TooManySubscribers {
+                    limit: subscriber_limit,
+                });
+            }
+            entry.refcount = entry.refcount.saturating_add(1);
+            entry.revive();
+            let sender = entry.sender.clone();
+            return Ok((sender.subscribe(), sender, key));
+        }
+
+        if subscriber_limit == 0 {
             return Err(PaneStreamSubscribeError::TooManySubscribers {
                 limit: subscriber_limit,
             });
         }
-        entry.refcount = entry.refcount.saturating_add(1);
-        let sender = entry.sender.clone();
-        return Ok((sender.subscribe(), sender, key));
+
+        let (sender, receiver) = broadcast::channel::<Vec<u8>>(256);
+        let entry = PaneStreamEntry::new(sender.clone(), 1);
+        let drain_signal = entry.drain_receiver();
+        let owner_done = entry.owner_done();
+        streams.insert(key.clone(), entry);
+        drop(streams);
+
+        spawn_pane_stream_task(
+            state.clone(),
+            run_id.to_string(),
+            pane.to_string(),
+            pane_target.to_string(),
+            key.clone(),
+            invocation.clone(),
+            sender.clone(),
+            drain_signal,
+            owner_done,
+        );
+
+        return Ok((receiver, sender, key));
     }
-
-    if subscriber_limit == 0 {
-        return Err(PaneStreamSubscribeError::TooManySubscribers {
-            limit: subscriber_limit,
-        });
-    }
-
-    let (sender, receiver) = broadcast::channel::<Vec<u8>>(256);
-    streams.insert(
-        key.clone(),
-        PaneStreamEntry {
-            sender: sender.clone(),
-            refcount: 1,
-        },
-    );
-    drop(streams);
-
-    spawn_pane_stream_task(
-        state.clone(),
-        run_id.to_string(),
-        pane.to_string(),
-        pane_target.to_string(),
-        key.clone(),
-        invocation.clone(),
-        sender.clone(),
-    );
-
-    Ok((receiver, sender, key))
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1853,6 +2061,7 @@ enum PaneStreamSubscribeError {
 async fn pump_pane_stream<R>(
     pane_reader: &mut R,
     sender: &broadcast::Sender<Vec<u8>>,
+    drain_signal: &mut watch::Receiver<bool>,
     run_id: &str,
     pane: &str,
     pane_target: &str,
@@ -1865,14 +2074,16 @@ where
     let mut consecutive_read_errors = 0_usize;
     loop {
         tokio::select! {
-            _ = sender.closed() => {
-                tracing::debug!(
-                    run_id = %run_id,
-                    pane = %pane,
-                    pane_target = %pane_target,
-                    "pane stream has no subscribers"
-                );
-                break PaneStreamTaskExit::NoSubscribers;
+            drain_result = drain_signal.changed() => {
+                if drain_result.is_err() || *drain_signal.borrow() {
+                    tracing::debug!(
+                        run_id = %run_id,
+                        pane = %pane,
+                        pane_target = %pane_target,
+                        "pane stream is draining"
+                    );
+                    break PaneStreamTaskExit::NoSubscribers;
+                }
             }
             read_result = pane_reader.read(&mut buffer) => {
                 match read_result {
@@ -1921,14 +2132,16 @@ where
                             "pane stream read failed; retrying"
                         );
                         tokio::select! {
-                            _ = sender.closed() => {
-                                tracing::debug!(
-                                    run_id = %run_id,
-                                    pane = %pane,
-                                    pane_target = %pane_target,
-                                    "pane stream has no subscribers"
-                                );
-                                break PaneStreamTaskExit::NoSubscribers;
+                            drain_result = drain_signal.changed() => {
+                                if drain_result.is_err() || *drain_signal.borrow() {
+                                    tracing::debug!(
+                                        run_id = %run_id,
+                                        pane = %pane,
+                                        pane_target = %pane_target,
+                                        "pane stream is draining"
+                                    );
+                                    break PaneStreamTaskExit::NoSubscribers;
+                                }
                             }
                             _ = tokio::time::sleep(retry_delay) => {}
                         }
@@ -1947,30 +2160,40 @@ fn spawn_pane_stream_task(
     key: PaneStreamKey,
     invocation: TmuxInvocation,
     sender: broadcast::Sender<Vec<u8>>,
+    mut drain_signal: watch::Receiver<bool>,
+    owner_done: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let exit = match start_pane_stream(&state.paths.root, &pane_target, &invocation).await {
-            Ok(mut pane_reader) => {
+        let owns_entry = match start_pane_stream(&state.paths.root, &pane_target, &invocation).await
+        {
+            Ok(mut pane_reader) => loop {
                 let exit = pump_pane_stream(
                     &mut pane_reader,
                     &sender,
+                    &mut drain_signal,
                     &run_id,
                     &pane,
                     &pane_target,
                     PANE_STREAM_READ_RETRY_DELAY,
                 )
                 .await;
-                if let Err(error) = stop_pane_stream(&pane_target, &invocation).await {
-                    tracing::debug!(
-                        run_id = %run_id,
-                        pane = %pane,
-                        pane_target = %pane_target,
-                        error = %error,
-                        "failed to stop pane stream pipe"
-                    );
+                match claim_pane_stream_task_exit(&state.pane_streams, &key, &sender, exit).await {
+                    PaneStreamOwnerAction::Continue => continue,
+                    PaneStreamOwnerAction::Stale => break false,
+                    PaneStreamOwnerAction::Teardown => {
+                        if let Err(error) = stop_pane_stream(&pane_target, &invocation).await {
+                            tracing::debug!(
+                                run_id = %run_id,
+                                pane = %pane,
+                                pane_target = %pane_target,
+                                error = %error,
+                                "failed to stop pane stream pipe"
+                            );
+                        }
+                        break true;
+                    }
                 }
-                exit
-            }
+            },
             Err(error) => {
                 tracing::warn!(
                     run_id = %run_id,
@@ -1979,25 +2202,53 @@ fn spawn_pane_stream_task(
                     error = %error,
                     "failed to start pane stream"
                 );
-                PaneStreamTaskExit::Terminal
+                matches!(
+                    claim_pane_stream_task_exit(
+                        &state.pane_streams,
+                        &key,
+                        &sender,
+                        PaneStreamTaskExit::Terminal,
+                    )
+                    .await,
+                    PaneStreamOwnerAction::Teardown
+                )
             }
         };
 
-        cleanup_pane_stream_task_exit(&state.pane_streams, &key, &sender, exit).await;
+        if owns_entry {
+            state
+                .pane_streams
+                .remove_terminal_sender(&key, &sender)
+                .await;
+        }
+        owner_done.cancel();
     });
 }
 
-async fn cleanup_pane_stream_task_exit(
+async fn claim_pane_stream_task_exit(
     pane_streams: &crate::app::PaneStreamRegistry,
     key: &PaneStreamKey,
     sender: &broadcast::Sender<Vec<u8>>,
     exit: PaneStreamTaskExit,
-) {
-    match exit {
-        PaneStreamTaskExit::NoSubscribers | PaneStreamTaskExit::Terminal => {
-            pane_streams.remove_terminal_sender(key, sender).await;
-        }
+) -> PaneStreamOwnerAction {
+    let mut streams = pane_streams.inner.lock().await;
+    let Some(entry) = streams.get_mut(key) else {
+        return PaneStreamOwnerAction::Stale;
+    };
+    if !entry.sender.same_channel(sender) {
+        return PaneStreamOwnerAction::Stale;
     }
+
+    match exit {
+        PaneStreamTaskExit::NoSubscribers => {
+            if entry.refcount != 0 || !entry.is_draining() {
+                return PaneStreamOwnerAction::Continue;
+            }
+        }
+        PaneStreamTaskExit::Terminal => {}
+    }
+    entry.begin_termination();
+    PaneStreamOwnerAction::Teardown
 }
 
 fn match_pane_candidate(
@@ -2139,19 +2390,6 @@ async fn send_frame(
         Ok(result) => result.map_err(PaneWsSendError::Send),
         Err(_) => Err(PaneWsSendError::Backpressure),
     }
-}
-
-async fn send_socket_error_and_close(socket: &mut WebSocket, seq: u64, error: &str) {
-    let frame = PaneWsFrame {
-        kind: "error",
-        seq,
-        data: None,
-        error: Some(error),
-    };
-    if let Ok(payload) = serde_json::to_string(&frame) {
-        let _ = socket.send(Message::Text(payload.into())).await;
-    }
-    let _ = socket.send(Message::Close(None)).await;
 }
 
 fn is_resync_request(message: &Message) -> bool {
@@ -2524,7 +2762,6 @@ mod tests {
             run_as: Some(RunAsConfig {
                 user: None,
                 command: Some(command),
-                socket: Some("observability-test".to_string()),
             }),
             entry_node_id: "approve".to_string(),
             variables: Vec::new(),
@@ -3159,6 +3396,56 @@ mod tests {
         assert_eq!(missing_run_response.status(), StatusCode::FORBIDDEN);
     }
 
+    #[tokio::test]
+    async fn run_stream_dedupes_buffered_live_event_after_replay() {
+        let (_temp, state) = create_test_state(SecurityConfig::default()).await;
+        let run_id = "run-stream-dedupe";
+        state.runtime.registry.register_test_run(run_id).await;
+        let mut receiver = state
+            .runtime
+            .registry
+            .subscribe(run_id)
+            .await
+            .expect("registered run");
+
+        let base = RuntimeEvent::new("node_start").with("runId", run_id);
+        let seq = state
+            .runtime
+            .db
+            .append_event(run_id, &base)
+            .await
+            .unwrap();
+        state
+            .runtime
+            .registry
+            .send_test_event(run_id, base.with_seq(seq))
+            .await;
+
+        let replay = state.runtime.db.list_events(run_id).await.unwrap();
+        let mut max_seq = runtime_event_seq(&replay[0]);
+        let drained = drain_buffered_run_events(&mut receiver, &mut max_seq);
+        assert!(
+            drained.is_empty(),
+            "live broadcast duplicate must be dropped after replay"
+        );
+    }
+
+    #[test]
+    fn run_stream_buffered_drain_signals_resync_on_lagged() {
+        let (tx, mut rx) = broadcast::channel(1);
+        let _ = tx.send(RuntimeEvent::new("first").with_seq(1));
+        let _ = tx.send(RuntimeEvent::new("second").with_seq(2));
+
+        let mut max_seq = 0u64;
+        let items = drain_buffered_run_events(&mut rx, &mut max_seq);
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, RunStreamBufferedItem::Resync)),
+            "expected resync after broadcast lag"
+        );
+    }
+
     #[test]
     fn build_attach_command_omits_socket_flag_for_default_invocation() {
         let invocation = TmuxInvocation::default();
@@ -3352,13 +3639,13 @@ printf 'fallback-session\n'
         let running_run_id = "run_still_running";
         let dismissed_session = "silverbond-Interrupted-Dismissed";
         let running_session = "silverbond-Still-Running";
-        let socket = "dismissed-run-socket";
+        let socket = format!("silverbond-{dismissed_run_id}");
         let script = temp.path().join("dismiss-tmux-prefix.sh");
         let log = temp.path().join("dismiss-tmux-args.log");
         let resolver_marker = temp.path().join("dismiss-tmux-resolver-ran");
         std::fs::write(
             &script,
-            "#!/bin/sh\nlog=\"$1\"\ndismissed=\"$2\"\nrunning=\"$3\"\nresolver_marker=\"$4\"\nshift 4\nif [ \"$1\" = \"zsh\" ]; then touch \"$resolver_marker\"; printf 'SBTMUX:tmux\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n%s\\n' \"$dismissed\" \"$running\"; fi\nexit 0\n",
+            "#!/bin/sh\nlog=\"$1\"\ndismissed=\"$2\"\nrunning=\"$3\"\nresolver_marker=\"$4\"\nshift 4\nif [ \"$1\" = \"zsh\" ]; then touch \"$resolver_marker\"; printf 'SBTMUX:tmux\\n'; exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n%s\\n' \"$dismissed\" \"$running\"; fi\nif [ \"$1\" = \"has-session\" ]; then exit 1; fi\nexit 0\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
@@ -3372,8 +3659,6 @@ printf 'fallback-session\n'
             running_session.to_string(),
             resolver_marker.to_string_lossy().into_owned(),
         ]);
-        let mut workflow = workflow;
-        workflow.run_as.as_mut().unwrap().socket = Some(socket.to_string());
         for (run_id, session) in [
             (dismissed_run_id, dismissed_session),
             (running_run_id, running_session),
@@ -3448,7 +3733,7 @@ printf 'fallback-session\n'
                 == [
                     "tmux",
                     "-L",
-                    socket,
+                    socket.as_str(),
                     "list-sessions",
                     "-F",
                     "#{session_name}"
@@ -3460,7 +3745,7 @@ printf 'fallback-session\n'
                 == [
                     "tmux",
                     "-L",
-                    socket,
+                    socket.as_str(),
                     "kill-session",
                     "-t",
                     dismissed_session
@@ -3468,10 +3753,15 @@ printf 'fallback-session\n'
             "dismissal should kill the interrupted run session; args={args:?}"
         );
         assert!(
-            !args
-                .windows(6)
-                .any(|window| window
-                    == ["tmux", "-L", socket, "kill-session", "-t", running_session]),
+            !args.windows(6).any(|window| window
+                == [
+                    "tmux",
+                    "-L",
+                    socket.as_str(),
+                    "kill-session",
+                    "-t",
+                    running_session
+                ]),
             "dismissal must not kill another running run session; args={args:?}"
         );
     }
@@ -3659,13 +3949,7 @@ printf 'fallback-session\n'
         let (sender, mut first_receiver) = broadcast::channel::<Vec<u8>>(256);
         let mut second_receiver = {
             let mut streams = registry.inner.lock().await;
-            streams.insert(
-                key.clone(),
-                PaneStreamEntry {
-                    sender: sender.clone(),
-                    refcount: 1,
-                },
-            );
+            streams.insert(key.clone(), PaneStreamEntry::new(sender.clone(), 1));
             let entry = streams.get_mut(&key).expect("pane stream entry exists");
             entry.refcount += 1;
             entry.sender.subscribe()
@@ -3687,6 +3971,16 @@ printf 'fallback-session\n'
         );
 
         registry.unsubscribe(&key, &sender).await;
+        {
+            let streams = registry.inner.lock().await;
+            let entry = streams
+                .get(&key)
+                .expect("draining owner remains registered");
+            assert_eq!(entry.refcount, 0);
+            assert!(entry.is_draining());
+        }
+
+        registry.remove_terminal_sender(&key, &sender).await;
         assert!(!registry.inner.lock().await.contains_key(&key));
     }
 
@@ -3747,6 +4041,78 @@ printf 'fallback-session\n'
         );
 
         std::fs::write(release, b"done").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_stream_fast_reconnect_reuses_setup_in_progress() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let setup_started = temp.path().join("setup-started");
+        let release_setup = temp.path().join("release-setup");
+        let tmux_log = temp.path().join("tmux.log");
+        let fake_tmux = temp.path().join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            format!(
+                "#!/bin/sh\nif [ \"$#\" -eq 3 ]; then printf 'stop\\n' >> '{}'; exit 0; fi\nprintf 'enable\\n' >> '{}'\n: > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\nexit 1\n",
+                tmux_log.display(),
+                tmux_log.display(),
+                setup_started.display(),
+                release_setup.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let registry = PaneStreamRegistry::default();
+        let state = test_app_state(registry.clone());
+        let invocation = TmuxInvocation {
+            prefix: Vec::new(),
+            socket: None,
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        };
+        let (first_receiver, first_sender, key) =
+            subscribe_pane_stream(&state, "run-test", "pane-test", "%1", &invocation)
+                .await
+                .unwrap();
+
+        tokio::time::timeout(PANE_STREAM_TEST_TIMEOUT, async {
+            while !setup_started.exists() {
+                tokio::time::sleep(PANE_STREAM_READ_RETRY_DELAY).await;
+            }
+        })
+        .await
+        .expect("the first pane-stream setup must start");
+
+        drop(first_receiver);
+        registry.unsubscribe(&key, &first_sender).await;
+        let (second_receiver, second_sender, second_key) =
+            subscribe_pane_stream(&state, "run-test", "pane-test", "%1", &invocation)
+                .await
+                .unwrap();
+        tokio::time::sleep(PANE_STREAM_READ_RETRY_DELAY).await;
+
+        let reused_owner = first_sender.same_channel(&second_sender);
+        let enable_count = std::fs::read_to_string(&tmux_log)
+            .unwrap()
+            .lines()
+            .filter(|line| *line == "enable")
+            .count();
+
+        drop(second_receiver);
+        registry.unsubscribe(&second_key, &second_sender).await;
+        std::fs::write(release_setup, b"release").unwrap();
+
+        assert!(
+            reused_owner,
+            "a reconnect during setup must reuse the current pane-stream owner"
+        );
+        assert_eq!(
+            enable_count, 1,
+            "a reconnect during setup must not start a second pipe-pane"
+        );
     }
 
     #[cfg(unix)]
@@ -3884,6 +4250,125 @@ printf 'fallback-session\n'
         }
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pane_stream_enable_descendant_pipe_cannot_outlive_setup_deadline() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let fake_tmux = temp.path().join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            "#!/bin/sh\nif [ \"$#\" -eq 3 ]; then exit 0; fi\n(sleep 9) &\nsleep 9\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = TmuxInvocation {
+            prefix: Vec::new(),
+            socket: None,
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        };
+
+        let result = tokio::time::timeout(
+            PANE_STREAM_SETUP_TIMEOUT + Duration::from_secs(2),
+            start_pane_stream(temp.path(), "%1", &invocation),
+        )
+        .await
+        .expect("pane-stream enable must not outlive the shared setup deadline");
+        let Err(result) = result else {
+            panic!("the hung fake tmux command must fail pane-stream setup");
+        };
+
+        assert!(
+            format!("{result:#}").contains("timed out while starting pane stream"),
+            "hung enable must surface the pane-stream setup timeout: {result:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_pane_stream_enable_cannot_replace_a_newer_pipe() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let tmux_log = temp.path().join("tmux.log");
+        let fake_tmux = temp.path().join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            format!(
+                "#!/bin/sh\nif [ \"$#\" -eq 3 ]; then printf 'stop\\n' >> '{}'; else printf 'enable\\n' >> '{}'; fi\n",
+                tmux_log.display(),
+                tmux_log.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run_as = temp.path().join("run-as");
+        std::fs::write(
+            &run_as,
+            "#!/bin/sh\nif [ \"$#\" -eq 5 ]; then\n  (sleep 7; exec \"$@\") &\n  sleep 8 >/dev/null 2>&1\n  exit 0\nfi\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&run_as, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = TmuxInvocation {
+            prefix: vec![run_as.to_string_lossy().into_owned()],
+            socket: None,
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        };
+
+        let result = start_pane_stream(temp.path(), "%1", &invocation).await;
+        assert!(result.is_err(), "the delayed enable must fail setup");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        assert_eq!(
+            std::fs::read_to_string(tmux_log).unwrap(),
+            "stop\n",
+            "an expired enable must never run after setup cleanup"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_pane_stream_stop_cannot_run_after_owner_exits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let stop_log = temp.path().join("stop.log");
+        let fake_tmux = temp.path().join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            format!("#!/bin/sh\nprintf 'stop\\n' >> '{}'\n", stop_log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run_as = temp.path().join("run-as");
+        std::fs::write(
+            &run_as,
+            "#!/bin/sh\n(sleep 7; exec \"$@\") &\nsleep 8 >/dev/null 2>&1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&run_as, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = TmuxInvocation {
+            prefix: vec![run_as.to_string_lossy().into_owned()],
+            socket: None,
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        };
+
+        let error = stop_pane_stream("%1", &invocation)
+            .await
+            .expect_err("the delayed teardown wrapper must time out");
+        assert!(
+            format!("{error:#}").contains("timed out while stopping pane stream"),
+            "delayed teardown must surface a timeout: {error:#}"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        assert!(
+            !stop_log.exists(),
+            "a teardown that lost ownership must not run pipe-pane later"
+        );
+    }
+
     /// Dropping a `JoinHandle` detaches the blocking task instead of aborting
     /// it, so a setup task abandoned by the setup deadline still runs to
     /// completion and creates its FIFOs. It must unlink them itself.
@@ -3972,10 +4457,11 @@ printf 'fallback-session\n'
         };
 
         let started = std::time::Instant::now();
-        let error = run_tmux_checked_with_timeout(
+        let error = run_tmux_status_with_timeout(
             &invocation,
             &["pipe-pane", "-t", "%1", "cat > /dev/null"],
             Duration::from_millis(300),
+            "starting pane stream",
         )
         .expect_err("a hanging tmux command must fail");
         let elapsed = started.elapsed();
@@ -4446,10 +4932,7 @@ printf 'fallback-session\n'
             let mut streams = registry.inner.lock().await;
             streams.insert(
                 key.clone(),
-                PaneStreamEntry {
-                    sender: replacement_sender.clone(),
-                    refcount: 1,
-                },
+                PaneStreamEntry::new(replacement_sender.clone(), 1),
             );
         }
 
@@ -4469,13 +4952,7 @@ printf 'fallback-session\n'
         let (sender, _receiver) = broadcast::channel::<Vec<u8>>(16);
         {
             let mut streams = registry.inner.lock().await;
-            streams.insert(
-                key.clone(),
-                PaneStreamEntry {
-                    sender: sender.clone(),
-                    refcount: 1,
-                },
-            );
+            streams.insert(key.clone(), PaneStreamEntry::new(sender.clone(), 1));
         }
         let state = test_app_state(registry.clone());
 
@@ -4506,6 +4983,7 @@ printf 'fallback-session\n'
     #[tokio::test]
     async fn pane_stream_retry_keeps_receivers_after_transient_read_error() {
         let (sender, mut receiver) = broadcast::channel::<Vec<u8>>(16);
+        let (_drain_sender, mut drain_signal) = watch::channel(false);
         let mut reader = ScriptedReader::new(vec![
             Err(io::Error::new(io::ErrorKind::Interrupted, "temporary")),
             Ok(b"chunk".to_vec()),
@@ -4515,6 +4993,7 @@ printf 'fallback-session\n'
         let exit = pump_pane_stream(
             &mut reader,
             &sender,
+            &mut drain_signal,
             "run-test",
             "pane-test",
             "%1",
@@ -4527,8 +5006,34 @@ printf 'fallback-session\n'
     }
 
     #[tokio::test]
+    async fn pane_stream_pump_honors_explicit_drain_with_receiver_alive() {
+        let (sender, _receiver) = broadcast::channel::<Vec<u8>>(16);
+        let (drain_sender, mut drain_signal) = watch::channel(false);
+        let (_writer, mut reader) = tokio::io::duplex(1);
+        drain_sender.send_replace(true);
+
+        let exit = tokio::time::timeout(
+            Duration::from_secs(1),
+            pump_pane_stream(
+                &mut reader,
+                &sender,
+                &mut drain_signal,
+                "run-test",
+                "pane-test",
+                "%1",
+                Duration::ZERO,
+            ),
+        )
+        .await
+        .expect("an explicit registry drain must stop the pane-stream pump");
+
+        assert_eq!(exit, PaneStreamTaskExit::NoSubscribers);
+    }
+
+    #[tokio::test]
     async fn pane_stream_read_errors_stop_after_retry_limit() {
         let (sender, mut receiver) = broadcast::channel::<Vec<u8>>(16);
+        let (_drain_sender, mut drain_signal) = watch::channel(false);
         let mut reader = ScriptedReader::new(
             (0..=PANE_STREAM_READ_MAX_RETRIES)
                 .map(|attempt| {
@@ -4543,6 +5048,7 @@ printf 'fallback-session\n'
         let exit = pump_pane_stream(
             &mut reader,
             &sender,
+            &mut drain_signal,
             "run-test",
             "pane-test",
             "%1",
@@ -4558,74 +5064,132 @@ printf 'fallback-session\n'
     }
 
     #[tokio::test]
-    async fn pane_stream_registry_remove_if_sender_keeps_live_subscribers() {
+    async fn pane_stream_task_no_subscribers_claims_teardown_before_owner_cleanup() {
         let registry = PaneStreamRegistry::default();
         let key = test_pane_stream_key("%1");
         let (sender, _receiver) = broadcast::channel::<Vec<u8>>(16);
         {
             let mut streams = registry.inner.lock().await;
-            streams.insert(
-                key.clone(),
-                PaneStreamEntry {
-                    sender: sender.clone(),
-                    refcount: 2,
-                },
-            );
+            streams.insert(key.clone(), PaneStreamEntry::new(sender.clone(), 0));
         }
 
-        registry.remove_if_sender(&key, &sender).await;
-        assert_eq!(
+        let action = claim_pane_stream_task_exit(
+            &registry,
+            &key,
+            &sender,
+            PaneStreamTaskExit::NoSubscribers,
+        )
+        .await;
+        assert_eq!(action, PaneStreamOwnerAction::Teardown);
+        assert!(
             registry
                 .inner
                 .lock()
                 .await
                 .get(&key)
-                .map(|entry| entry.refcount),
-            Some(2)
+                .is_some_and(PaneStreamEntry::is_terminating),
+            "the owner keeps its terminating entry until teardown completes"
         );
 
         registry.remove_terminal_sender(&key, &sender).await;
-        assert!(!registry.inner.lock().await.contains_key(&key));
-    }
-
-    #[tokio::test]
-    async fn pane_stream_task_no_subscribers_uses_terminal_sender_cleanup() {
-        let registry = PaneStreamRegistry::default();
-        let key = test_pane_stream_key("%1");
-        let (sender, _receiver) = broadcast::channel::<Vec<u8>>(16);
-        {
-            let mut streams = registry.inner.lock().await;
-            streams.insert(
-                key.clone(),
-                PaneStreamEntry {
-                    sender: sender.clone(),
-                    refcount: 2,
-                },
-            );
-        }
-
-        cleanup_pane_stream_task_exit(&registry, &key, &sender, PaneStreamTaskExit::NoSubscribers)
-            .await;
         assert!(!registry.inner.lock().await.contains_key(&key));
 
         let (new_sender, _new_receiver) = broadcast::channel::<Vec<u8>>(16);
         {
             let mut streams = registry.inner.lock().await;
-            streams.insert(
-                key.clone(),
-                PaneStreamEntry {
-                    sender: new_sender.clone(),
-                    refcount: 1,
-                },
-            );
+            streams.insert(key.clone(), PaneStreamEntry::new(new_sender.clone(), 1));
         }
 
-        cleanup_pane_stream_task_exit(&registry, &key, &sender, PaneStreamTaskExit::NoSubscribers)
-            .await;
+        let action = claim_pane_stream_task_exit(
+            &registry,
+            &key,
+            &sender,
+            PaneStreamTaskExit::NoSubscribers,
+        )
+        .await;
+        assert_eq!(action, PaneStreamOwnerAction::Stale);
         let streams = registry.inner.lock().await;
         let entry = streams.get(&key).expect("new pane stream entry remains");
         assert!(entry.sender.same_channel(&new_sender));
         assert_eq!(entry.refcount, 1);
+    }
+
+    #[tokio::test]
+    async fn pane_stream_stale_no_subscribers_exit_keeps_revived_owner() {
+        let registry = PaneStreamRegistry::default();
+        let key = test_pane_stream_key("%1");
+        let (sender, _receiver) = broadcast::channel::<Vec<u8>>(16);
+        {
+            let mut streams = registry.inner.lock().await;
+            streams.insert(key.clone(), PaneStreamEntry::new(sender.clone(), 1));
+        }
+
+        let action = claim_pane_stream_task_exit(
+            &registry,
+            &key,
+            &sender,
+            PaneStreamTaskExit::NoSubscribers,
+        )
+        .await;
+        assert_eq!(action, PaneStreamOwnerAction::Continue);
+
+        let streams = registry.inner.lock().await;
+        let entry = streams
+            .get(&key)
+            .expect("revived pane-stream owner remains");
+        assert!(entry.sender.same_channel(&sender));
+        assert_eq!(entry.refcount, 1);
+        assert!(!entry.is_draining());
+    }
+
+    #[tokio::test]
+    async fn pane_stream_subscribe_waits_for_terminal_owner_exit() {
+        let registry = PaneStreamRegistry::default();
+        let state = test_app_state(registry.clone());
+        let invocation = TmuxInvocation {
+            prefix: Vec::new(),
+            socket: None,
+            tmux_bin: "/usr/bin/false".to_string(),
+        };
+        let key = PaneStreamKey::new(&invocation, "%1");
+        let (old_sender, _old_receiver) = broadcast::channel::<Vec<u8>>(16);
+        let owner_done = {
+            let mut entry = PaneStreamEntry::new(old_sender.clone(), 1);
+            entry.begin_termination();
+            let owner_done = entry.owner_done();
+            registry.inner.lock().await.insert(key.clone(), entry);
+            owner_done
+        };
+        registry.unsubscribe(&key, &old_sender).await;
+
+        let subscribe_state = state.clone();
+        let subscribe_invocation = invocation.clone();
+        let subscribe = tokio::spawn(async move {
+            subscribe_pane_stream(
+                &subscribe_state,
+                "run-test",
+                "pane-test",
+                "%1",
+                &subscribe_invocation,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !subscribe.is_finished(),
+            "a terminal pane-stream owner must not be revived"
+        );
+
+        registry.remove_terminal_sender(&key, &old_sender).await;
+        owner_done.cancel();
+        let (_receiver, new_sender, _new_key) =
+            tokio::time::timeout(Duration::from_secs(1), subscribe)
+                .await
+                .expect("subscription must resume after the terminal owner exits")
+                .expect("subscription task must not panic")
+                .expect("replacement pane-stream subscription must succeed");
+
+        assert!(!old_sender.same_channel(&new_sender));
     }
 
     fn test_checkpoint() -> RuntimeCheckpoint {

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     process::Command,
     thread::sleep,
     time::{Duration, Instant},
@@ -62,6 +62,12 @@ impl PaneCleanupTarget {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct PaneCleanupVerdict {
+    pub(crate) target: PaneCleanupTarget,
+    pub(crate) absent: bool,
+}
+
 pub fn build_tmux_invocation(run_as: &RunAsConfig, run_id: &str) -> TmuxInvocation {
     let mut invocation = build_tmux_invocation_without_resolving(run_as, run_id);
     invocation.tmux_bin = resolve_tmux_bin(&invocation.prefix);
@@ -86,14 +92,9 @@ pub(crate) fn build_tmux_invocation_without_resolving(
         Vec::new()
     };
 
-    let socket = run_as
-        .socket
-        .clone()
-        .unwrap_or_else(|| format!("silverbond-{run_id}"));
-
     TmuxInvocation {
         prefix,
-        socket: Some(socket),
+        socket: Some(format!("silverbond-{run_id}")),
         tmux_bin: "tmux".to_string(),
     }
 }
@@ -315,7 +316,14 @@ fn run_tmux_node(
             interaction.as_ref(),
         ),
         NodeKind::Spawn { spawn_config } => {
-            execute_spawn(&node, spawn_config, &agent, &cwd, active_pane.as_ref())
+            execute_spawn(
+                &node,
+                spawn_config,
+                &agent,
+                &cwd,
+                config,
+                active_pane.as_ref(),
+            )
         }
         NodeKind::Send { send_config } => execute_send(
             &node,
@@ -405,6 +413,13 @@ impl<'a> PaneGuard<'a> {
     ) -> anyhow::Result<Self> {
         let reused_pane = resolve_reused_pane(active_pane, continue_session_from)?;
         let (pane_id, session_name, reused) = if let Some(pane_id) = reused_pane {
+            ensure_reused_pane_compatible(
+                &pane_id,
+                effective_agent,
+                effective_cwd,
+                spawn_cfg,
+                config,
+            )?;
             if let Some(active_pane) = active_pane {
                 active_pane.set(&pane_id);
             }
@@ -463,6 +478,60 @@ impl Drop for PaneGuard<'_> {
     }
 }
 
+fn ensure_reused_pane_compatible(
+    pane_id: &str,
+    effective_agent: &str,
+    effective_cwd: &str,
+    spawn_cfg: &SpawnConfig,
+    config: Option<&AgentConfig>,
+) -> anyhow::Result<()> {
+    let registered = names::read(pane_id)
+        .with_context(|| format!("failed to read metadata for reused pane {pane_id}"))?;
+    let recorded_agent = registered.agent.as_deref().ok_or_else(|| {
+        anyhow!("reused pane {pane_id} has no recorded agent; refusing session continuation")
+    })?;
+    anyhow::ensure!(
+        recorded_agent == effective_agent,
+        "reused pane {pane_id} runs agent {recorded_agent}, expected {effective_agent}"
+    );
+
+    let expected = build_agent_command(effective_agent, Some(spawn_cfg), config)?;
+    let expected_access = expected.access_profile.as_deref().ok_or_else(|| {
+        anyhow!(
+            "reused pane {pane_id} cannot be continued because its command has no declared access profile"
+        )
+    })?;
+    let recorded_access = registered.access.as_deref().ok_or_else(|| {
+        anyhow!(
+            "reused pane {pane_id} has no recorded access profile; command-override panes cannot be continued"
+        )
+    })?;
+    let expected_privilege = driver::access_profile_privilege(effective_agent, expected_access)?;
+    let recorded_privilege = driver::access_profile_privilege(effective_agent, recorded_access)?;
+    anyhow::ensure!(
+        recorded_privilege <= expected_privilege,
+        "reused pane {pane_id} has broader access profile {recorded_access}, expected no broader than {expected_access}"
+    );
+    if effective_cwd.trim().is_empty() {
+        anyhow::ensure!(
+            registered.cwd.is_none(),
+            "reused pane {pane_id} has an explicit working directory, expected none"
+        );
+    } else {
+        let recorded_cwd = registered.cwd.as_deref().ok_or_else(|| {
+            anyhow!(
+                "reused pane {pane_id} has no recorded working directory, expected {effective_cwd}"
+            )
+        })?;
+        anyhow::ensure!(
+            recorded_cwd == effective_cwd,
+            "reused pane {pane_id} uses working directory {recorded_cwd}, expected {effective_cwd}"
+        );
+    }
+
+    Ok(())
+}
+
 /// Returns true when called from within a Tokio async task (not a `spawn_blocking` thread).
 fn in_current_task() -> bool {
     tokio::task::try_id().is_some()
@@ -514,7 +583,20 @@ impl ActivePaneRegistration {
                 .set_active_pane_with_session(&run_id, &key, &target, session_name.clone())
                 .await;
             if let Some(session_name) = session_name {
-                let _ = register_tmux_session(&db, &run_id, &session_name).await;
+                match register_tmux_session(&db, &run_id, &session_name).await {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        run_id = %run_id,
+                        session_name = %session_name,
+                        "Tmux session registration skipped because the run row is absent; session is not reapable"
+                    ),
+                    Err(error) => tracing::warn!(
+                        run_id = %run_id,
+                        session_name = %session_name,
+                        error = %error,
+                        "Tmux session registration failed; session is not reapable"
+                    ),
+                }
             }
         });
     }
@@ -658,6 +740,7 @@ fn execute_spawn(
     cfg: &SpawnConfig,
     default_agent: &str,
     default_cwd: &str,
+    config: Option<&AgentConfig>,
     active_pane: Option<&ActivePaneRegistration>,
 ) -> anyhow::Result<NodeResult> {
     let start = Instant::now();
@@ -675,7 +758,19 @@ fn execute_spawn(
         .as_deref()
         .or(node.cwd.as_deref())
         .unwrap_or(default_cwd);
-    let spawned = spawn_pane(Some(cfg), agent.as_deref(), cwd, None, None, None)?;
+    let registered_agent_config = agent
+        .as_deref()
+        .is_some_and(|agent| driver::get_driver(agent).is_some())
+        .then_some(config)
+        .flatten();
+    let spawned = spawn_pane(
+        Some(cfg),
+        agent.as_deref(),
+        cwd,
+        registered_agent_config,
+        None,
+        None,
+    )?;
     if let Some(active_pane) = active_pane {
         active_pane.register_owned_target(&spawned.pane_id, Some(&spawned.session_name));
         active_pane.set_with_session(&spawned.pane_id, Some(&spawned.session_name));
@@ -1102,7 +1197,7 @@ fn run_agent_interactive(
         InteractivePollResult::TimedOut(response) => {
             let mut result = failed_result(
                 "Timeout waiting for agent response",
-                -1,
+                -2,
                 &effective_agent,
                 &effective_prompt,
                 start.elapsed(),
@@ -1171,13 +1266,14 @@ pub(crate) fn run_tmux_oneshot(
     config: Option<&AgentConfig>,
     inv: TmuxInvocation,
     interaction: Option<&InteractionEscalation>,
+    timeout_secs: Option<u64>,
 ) -> anyhow::Result<NodeResult> {
     let run = || {
         run_agent_interactive(
             agent.to_string(),
             prompt.to_string(),
             cwd.to_string(),
-            None,
+            timeout_secs,
             None,
             config,
             None,
@@ -1190,10 +1286,7 @@ pub(crate) fn run_tmux_oneshot(
 }
 
 pub(crate) fn list_silverbond_tmux_sessions() -> anyhow::Result<Vec<String>> {
-    let output = match tmux::run_checked(&["list-sessions", "-F", "#{session_name}"]) {
-        Ok(output) => output,
-        Err(_) => return Ok(Vec::new()),
-    };
+    let output = tmux::run_checked(&["list-sessions", "-F", "#{session_name}"])?;
     Ok(output
         .lines()
         .map(str::trim)
@@ -1203,22 +1296,40 @@ pub(crate) fn list_silverbond_tmux_sessions() -> anyhow::Result<Vec<String>> {
 }
 
 pub(crate) fn kill_tmux_session(session_name: &str) -> bool {
-    tmux::run(&["kill-session", "-t", session_name]).is_ok()
+    let _ = tmux::run(&["kill-session", "-t", session_name]);
+    tmux::run(&["has-session", "-t", session_name])
+        .map(|output| output.exit_code != 0)
+        .unwrap_or(false)
 }
 
-pub(crate) fn cleanup_panes(targets: &[PaneCleanupTarget]) -> anyhow::Result<()> {
-    let mut seen_sessions = HashSet::new();
-    let mut seen_panes = HashSet::new();
-    for target in targets {
-        if let Some(session_name) = target.session_name.as_deref() {
-            if seen_sessions.insert(session_name.to_string()) {
-                let _ = tmux::run(&["kill-session", "-t", session_name]);
+fn kill_tmux_pane(pane_id: &str) -> bool {
+    let _ = tmux::run(&["kill-pane", "-t", pane_id]);
+    tmux::run(&["display-message", "-p", "-t", pane_id, "#{pane_id}"])
+        .map(|output| output.exit_code != 0)
+        .unwrap_or(false)
+}
+
+pub(crate) fn cleanup_panes(targets: &[PaneCleanupTarget]) -> Vec<PaneCleanupVerdict> {
+    let mut session_verdicts = HashMap::new();
+    let mut pane_verdicts = HashMap::new();
+    targets
+        .iter()
+        .map(|target| {
+            let absent = if let Some(session_name) = target.session_name.as_deref() {
+                *session_verdicts
+                    .entry(session_name.to_string())
+                    .or_insert_with(|| kill_tmux_session(session_name))
+            } else {
+                *pane_verdicts
+                    .entry(target.pane_id.clone())
+                    .or_insert_with(|| kill_tmux_pane(&target.pane_id))
+            };
+            PaneCleanupVerdict {
+                target: target.clone(),
+                absent,
             }
-        } else if seen_panes.insert(target.pane_id.clone()) {
-            let _ = tmux::run(&["kill-pane", "-t", &target.pane_id]);
-        }
-    }
-    Ok(())
+        })
+        .collect()
 }
 
 fn run_agent_sequence(
@@ -1887,7 +1998,6 @@ struct DestructiveMatch {
 
 struct BuiltCommand {
     command: String,
-    env: Vec<(String, String)>,
     access_profile: Option<String>,
 }
 
@@ -2070,7 +2180,6 @@ fn spawn_pane(
         .map(|command| {
             Ok(BuiltCommand {
                 command,
-                env: Vec::new(),
                 access_profile: None,
             })
         })
@@ -2103,10 +2212,6 @@ fn spawn_pane(
     if !work_dir.trim().is_empty() {
         args.push("-c".to_owned());
         args.push(work_dir.to_owned());
-    }
-    for (key, value) in &built_command.env {
-        args.push("-e".to_owned());
-        args.push(format!("{key}={value}"));
     }
     args.push(command.clone());
 
@@ -2146,9 +2251,10 @@ fn build_agent_command(
     let extra_args = cfg.map(|cfg| cfg.extra_args.as_slice()).unwrap_or(&[]);
     let registry = driver::load_agent_registry()?;
 
-    let (argv, env, access_profile) = if let Some(agent_config) = agent_config {
-        let drv =
-            driver::get_driver(agent).ok_or_else(|| anyhow!("No driver for agent: {agent}"))?;
+    let drv = driver::get_driver(agent);
+    let (argv, access_profile) = if let Some(drv) = drv {
+        let default_config = AgentConfig::default();
+        let agent_config = agent_config.unwrap_or(&default_config);
         let session_args = drv.build_session_args(agent_config)?;
         let binary = registry
             .get(agent)
@@ -2160,26 +2266,17 @@ fn build_agent_command(
                 .chain(session_args.args)
                 .chain(extra_args.iter().cloned())
                 .collect::<Vec<_>>(),
-            session_args.env,
             Some(session_args.access_profile),
         )
+    } else if agent_config.is_some() {
+        return Err(anyhow!("No driver for agent: {agent}"));
     } else {
-        let explicit_access = cfg.and_then(|cfg| cfg.access.as_deref());
-        let argv = match registry.launch_argv(agent, explicit_access) {
-            Ok((binary, args)) => std::iter::once(binary)
-                .chain(args)
+        (
+            std::iter::once(agent.to_owned())
                 .chain(extra_args.iter().cloned())
                 .collect::<Vec<_>>(),
-            Err(error) => {
-                if registry.get(agent).is_some() {
-                    return Err(error);
-                }
-                std::iter::once(agent.to_owned())
-                    .chain(extra_args.iter().cloned())
-                    .collect::<Vec<_>>()
-            }
-        };
-        (argv, Vec::new(), explicit_access.map(str::to_owned))
+            None,
+        )
     };
 
     Ok(BuiltCommand {
@@ -2188,7 +2285,6 @@ fn build_agent_command(
             .map(|arg| shell_quote(arg))
             .collect::<Vec<_>>()
             .join(" "),
-        env,
         access_profile,
     })
 }
@@ -2297,6 +2393,9 @@ fn ready_signal_for_pane(pane: &str) -> anyhow::Result<ReadySignal> {
 }
 
 fn send_text(pane: &str, text: &str, enter: bool) -> anyhow::Result<()> {
+    // Accepted risk: prompt text is exposed in a short-lived tmux client's argv for milliseconds.
+    // SilverBond is a loopback-only, single-user desktop app, and the pinned tmux-tools API has
+    // no stdin path; persistent prompt storage has separate owner-only database permissions.
     tmux::run_checked(&["send-keys", "-t", pane, "-l", "--", text])?;
     if enter {
         tmux::run_checked(&["send-keys", "-t", pane, "Enter"])?;
@@ -2828,6 +2927,7 @@ exit 0
                     },
                     "",
                     "",
+                    None,
                     Some(&spawn_registration),
                 )?;
                 let reused = resolve_reused_pane(Some(&reuse_registration), Some("spawn"))?;
@@ -2948,7 +3048,6 @@ exit 0
                 "sandbox".to_string(),
             ]),
             user: None,
-            socket: None,
         };
         let inv = build_tmux_invocation(&cfg, "run_command");
         assert_eq!(
@@ -2965,7 +3064,6 @@ exit 0
         let cfg = RunAsConfig {
             user: Some("agent".to_string()),
             command: None,
-            socket: None,
         };
         let inv = build_tmux_invocation(&cfg, "run_user");
         assert_eq!(
@@ -2976,16 +3074,29 @@ exit 0
         assert_eq!(inv.socket.as_deref(), Some("silverbond-run_user"));
     }
 
-    /// build_tmux_invocation: explicit socket overrides the default.
+    /// Legacy workflow documents may contain `runAs.socket`, but the value is discarded and
+    /// execution remains isolated on the run-scoped socket.
     #[test]
-    fn build_invocation_explicit_socket_is_preserved() {
-        let cfg = RunAsConfig {
-            user: None,
-            command: None,
-            socket: Some("my-socket".to_string()),
-        };
-        let inv = build_tmux_invocation(&cfg, "run_explicit");
-        assert_eq!(inv.socket.as_deref(), Some("my-socket"));
+    fn legacy_workflow_socket_is_discarded_and_invocation_remains_run_scoped() {
+        let normalized = crate::model::normalize_workflow_value(serde_json::json!({
+            "version": 4,
+            "name": "legacy-socket",
+            "runAs": { "socket": "shared-server" },
+            "entryNodeId": "task"
+        }))
+        .expect("legacy runAs.socket documents must continue to load");
+
+        let serialized = serde_json::to_value(&normalized.workflow).unwrap();
+        assert!(
+            serialized["runAs"].get("socket").is_none(),
+            "deprecated socket must not survive normalization"
+        );
+
+        let inv = build_tmux_invocation_without_resolving(
+            normalized.workflow.run_as.as_ref().unwrap(),
+            "run_legacy",
+        );
+        assert_eq!(inv.socket.as_deref(), Some("silverbond-run_legacy"));
     }
 
     /// build_tmux_invocation: `command` takes precedence over `user` when both are set.
@@ -2994,7 +3105,6 @@ exit 0
         let cfg = RunAsConfig {
             command: Some(vec!["custom".to_string()]),
             user: Some("agent".to_string()),
-            socket: None,
         };
         let inv = build_tmux_invocation(&cfg, "run_precedence");
         assert_eq!(
@@ -3333,7 +3443,6 @@ exit 0
             built.command.find("'--model'").unwrap() < built.command.find("'--tail-flag'").unwrap(),
             "driver-rendered session args should precede caller extra args"
         );
-        assert!(built.env.is_empty());
     }
 
     #[test]
@@ -3422,6 +3531,173 @@ exit 0
             },
             log,
         )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_node_cannot_widen_read_only_agent_defaults() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (invocation, _) = access_metadata_invocation(&temp);
+        let node: WorkflowNode = serde_json::from_value(json!({
+            "id": "spawn",
+            "name": "Spawn",
+            "kind": {
+                "type": "spawn",
+                "spawnConfig": {
+                    "agent": "codex",
+                    "access": "full-access"
+                }
+            }
+        }))
+        .unwrap();
+        let defaults = std::collections::BTreeMap::from([(
+            "codex".to_string(),
+            crate::model::AgentDefaults {
+                access_mode: Some(AccessMode::ReadOnly),
+                ..crate::model::AgentDefaults::default()
+            },
+        )]);
+        let config = crate::model::resolve_agent_config(
+            &defaults,
+            "/workspace",
+            "codex",
+            &node,
+            None,
+            false,
+            None,
+        );
+
+        let error = tmux_tools_core::with_invocation(invocation, || {
+            run_tmux_node(
+                node,
+                "codex".to_string(),
+                String::new(),
+                "/workspace".to_string(),
+                None,
+                Some(&config),
+                String::new(),
+                None,
+                None,
+            )
+        })
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("would widen ReadOnly access mode"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawn_node_without_access_inherits_agent_defaults() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (invocation, log) = access_metadata_invocation(&temp);
+        let node: WorkflowNode = serde_json::from_value(json!({
+            "id": "spawn",
+            "name": "Spawn",
+            "kind": {
+                "type": "spawn",
+                "spawnConfig": { "agent": "codex" }
+            }
+        }))
+        .unwrap();
+        let defaults = std::collections::BTreeMap::from([(
+            "codex".to_string(),
+            crate::model::AgentDefaults {
+                access_mode: Some(AccessMode::ReadOnly),
+                ..crate::model::AgentDefaults::default()
+            },
+        )]);
+        let config = crate::model::resolve_agent_config(
+            &defaults,
+            "/workspace",
+            "codex",
+            &node,
+            None,
+            false,
+            None,
+        );
+
+        let result = tmux_tools_core::with_invocation(invocation, || {
+            run_tmux_node(
+                node,
+                "codex".to_string(),
+                String::new(),
+                "/workspace".to_string(),
+                None,
+                Some(&config),
+                String::new(),
+                None,
+                None,
+            )
+        })
+        .unwrap();
+
+        let command = result
+            .parsed_output
+            .as_ref()
+            .and_then(|value| value.get("command"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(command.contains("--sandbox") && command.contains("read-only"));
+        let recorded = std::fs::read_to_string(log).unwrap();
+        let args = recorded.lines().collect::<Vec<_>>();
+        assert!(
+            args.windows(2)
+                .any(|window| window == [names::KEY_ACCESS, "read-only"]),
+            "spawn metadata should inherit read-only; args={args:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unregistered_spawn_ignores_unverifiable_access_metadata() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (invocation, log) = access_metadata_invocation(&temp);
+        let node: WorkflowNode = serde_json::from_value(json!({
+            "id": "spawn",
+            "name": "Spawn",
+            "kind": {
+                "type": "spawn",
+                "spawnConfig": {
+                    "agent": "custom-agent",
+                    "access": "custom-access"
+                }
+            }
+        }))
+        .unwrap();
+        let config = crate::model::resolve_agent_config(
+            &Default::default(),
+            "/workspace",
+            "custom-agent",
+            &node,
+            None,
+            false,
+            None,
+        );
+
+        let result = tmux_tools_core::with_invocation(invocation, || {
+            run_tmux_node(
+                node,
+                "custom-agent".to_string(),
+                String::new(),
+                "/workspace".to_string(),
+                None,
+                Some(&config),
+                String::new(),
+                None,
+                None,
+            )
+        })
+        .unwrap();
+
+        assert!(result.output.contains("custom-agent"));
+        let recorded = std::fs::read_to_string(log).unwrap();
+        assert!(
+            !recorded.lines().any(|arg| arg == names::KEY_ACCESS),
+            "an unregistered agent must not stamp unrendered access metadata; args={recorded}"
+        );
     }
 
     #[cfg(unix)]
@@ -3757,6 +4033,266 @@ exit 0
     }
 
     #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pane_guard_reuse_rejects_mismatched_effective_agent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db);
+        let run_id = "reuse-agent-mismatch";
+        ctx.registry.register_test_run(run_id).await;
+        ctx.registry
+            .set_active_pane(
+                run_id,
+                &active_pane_key("cursor", "source"),
+                "%source-pane",
+            )
+            .await;
+        let registration = ActivePaneRegistration::new(
+            &ctx,
+            run_id.to_string(),
+            "cursor".to_string(),
+            "continuation".to_string(),
+        );
+
+        let script = temp.path().join("tmux-reuse-metadata.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \" $* \" in *\" display-message \"*) printf '\\037claude\\037workspace-write\\037\\037/workspace\\n' ;; esac\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![script.to_string_lossy().into_owned()],
+            socket: Some("reuse-agent-mismatch-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+
+        let error = tokio::task::spawn_blocking(move || {
+            tmux_tools_core::with_invocation(invocation, || {
+                let result = PaneGuard::acquire(
+                    &SpawnConfig {
+                        agent: Some("codex".to_string()),
+                        ..Default::default()
+                    },
+                    "codex",
+                    "/workspace",
+                    Some(&AgentConfig::default()),
+                    None,
+                    Some(&registration),
+                    Some("source"),
+                );
+                match result {
+                    Ok(_) => "pane reuse unexpectedly succeeded".to_string(),
+                    Err(error) => error.to_string(),
+                }
+            })
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            error.contains("agent claude, expected codex"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_guard_reuse_rejects_broader_recorded_access() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-reuse-broad-access.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \" $* \" in *\" display-message \"*) printf '\\037codex\\037full-access\\037\\037/workspace\\n' ;; esac\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![script.to_string_lossy().into_owned()],
+            socket: Some("reuse-broad-access-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+
+        let error = tmux_tools_core::with_invocation(invocation, || {
+            ensure_reused_pane_compatible(
+                "%source-pane",
+                "codex",
+                "/workspace",
+                &SpawnConfig {
+                    agent: Some("codex".to_string()),
+                    ..Default::default()
+                },
+                Some(&AgentConfig {
+                    access_mode: AccessMode::ReadOnly,
+                    ..AgentConfig::default()
+                }),
+            )
+            .unwrap_err()
+            .to_string()
+        });
+
+        assert!(
+            error.contains("broader access profile full-access")
+                && error.contains("no broader than read-only"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_guard_reuse_rejects_command_override_without_access_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-reuse-missing-access.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \" $* \" in *\" display-message \"*) printf '\\037codex\\037\\037\\037/workspace\\n' ;; esac\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![script.to_string_lossy().into_owned()],
+            socket: Some("reuse-missing-access-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+
+        let error = tmux_tools_core::with_invocation(invocation, || {
+            ensure_reused_pane_compatible(
+                "%source-pane",
+                "codex",
+                "/workspace",
+                &SpawnConfig {
+                    agent: Some("codex".to_string()),
+                    ..Default::default()
+                },
+                Some(&AgentConfig::default()),
+            )
+            .unwrap_err()
+            .to_string()
+        });
+
+        assert!(
+            error.contains("no recorded access profile")
+                && error.contains("command-override panes cannot be continued"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pane_guard_reuse_rejects_mismatched_effective_cwd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-reuse-cwd-mismatch.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \" $* \" in *\" display-message \"*) printf '\\037codex\\037read-only\\037\\037/source\\n' ;; esac\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![script.to_string_lossy().into_owned()],
+            socket: Some("reuse-cwd-mismatch-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+
+        let error = tmux_tools_core::with_invocation(invocation, || {
+            ensure_reused_pane_compatible(
+                "%source-pane",
+                "codex",
+                "/target",
+                &SpawnConfig {
+                    agent: Some("codex".to_string()),
+                    ..Default::default()
+                },
+                Some(&AgentConfig {
+                    access_mode: AccessMode::ReadOnly,
+                    ..AgentConfig::default()
+                }),
+            )
+            .unwrap_err()
+            .to_string()
+        });
+
+        assert!(
+            error.contains("working directory /source, expected /target"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_silverbond_tmux_sessions_propagates_listing_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-failed-list-prefix.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![script.to_string_lossy().into_owned()],
+            socket: None,
+            tmux_bin: "tmux".to_string(),
+        };
+        let listed =
+            tmux_tools_core::with_invocation(invocation, || list_silverbond_tmux_sessions());
+
+        assert!(
+            listed.is_err(),
+            "a failed listing must be distinguishable from a successful empty listing"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kill_tmux_session_retains_live_session_after_rejected_kill() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-rejected-kill-prefix.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nshift\nif [ \"$1\" = \"tmux\" ]; then shift; fi\nif [ \"$1\" = \"kill-session\" ]; then exit 1; fi\nif [ \"$1\" = \"has-session\" ]; then exit 0; fi\nexit 2\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![script.to_string_lossy().into_owned()],
+            socket: None,
+            tmux_bin: "tmux".to_string(),
+        };
+        let absent = tmux_tools_core::with_invocation(invocation, || {
+            kill_tmux_session("silverbond-still-live")
+        });
+
+        assert!(
+            !absent,
+            "a rejected kill must remain registered while has-session confirms it is live"
+        );
+    }
+
+    #[cfg(unix)]
     #[test]
     fn cleanup_panes_kills_registered_sessions_and_pane_fallbacks() {
         use std::os::unix::fs::PermissionsExt;
@@ -3766,7 +4302,7 @@ exit 0
         let log = temp.path().join("tmux-cleanup-args.log");
         std::fs::write(
             &script,
-            "#!/bin/sh\nlog=\"$1\"\nshift\nprintf '%s\\n' \"$@\" >> \"$log\"\nexit 0\n",
+            "#!/bin/sh\nlog=\"$1\"\nshift\nprintf '%s\\n' \"$@\" >> \"$log\"\ncase \"$*\" in *has-session*|*display-message*) exit 1;; esac\nexit 0\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
@@ -3781,7 +4317,7 @@ exit 0
             socket: Some("cleanup-test-socket".to_string()),
             tmux_bin: "tmux".to_string(),
         };
-        tmux_tools_core::with_invocation(invocation, || {
+        let verdicts = tmux_tools_core::with_invocation(invocation, || {
             cleanup_panes(&[
                 PaneCleanupTarget::new(
                     "%ephemeral-pane".to_string(),
@@ -3789,8 +4325,9 @@ exit 0
                 ),
                 PaneCleanupTarget::new("%external-pane".to_string(), None),
             ])
-        })
-        .unwrap();
+        });
+
+        assert!(verdicts.iter().all(|verdict| verdict.absent));
 
         let recorded =
             std::fs::read_to_string(log).expect("fake tmux prefix should record cleanup args");

@@ -27,6 +27,8 @@
     WorkflowNode,
   } from "@/lib/types/workflow";
   import PromptTextarea from "@/lib/components/PromptTextarea.svelte";
+  import PasswordDialog from "@/lib/components/PasswordDialog.svelte";
+  import { createPasswordPrompt } from "@/lib/components/passwordPrompt.svelte";
   import { buildSuggestions } from "@/lib/utils/templateSuggestions";
   import { sectionHasValues, SECTION_IDS } from "@/lib/utils/sectionUtils";
   import { activeValidationScope, issueMatchesScope } from "@/features/editor/flowNodes";
@@ -59,12 +61,10 @@
   let attachHintCopied = $state(false);
 
   function hasRunAsValues(config: RunAsConfig): boolean {
-    return Boolean(
-      config.user || config.socket || (config.command && config.command.length > 0),
-    );
+    return Boolean(config.user || (config.command && config.command.length > 0));
   }
 
-  function updateRunAs(key: "user" | "socket", value: string) {
+  function updateRunAs(key: "user", value: string) {
     store.updateWorkflow((wf) => {
       const next = mergeConfig({} as RunAsConfig, wf.runAs, key, value.trim() || undefined);
       wf.runAs = hasRunAsValues(next) ? next : undefined;
@@ -87,11 +87,10 @@
   let runAsAttachHint = $derived.by(() => {
     const runAs = activeWorkflow.runAs;
     const user = runAs?.user?.trim() || "<user>";
-    const socket = runAs?.socket?.trim() || "<socket>";
     const prefix = runAs?.command && runAs.command.length > 0
       ? runAs.command.join(" ")
       : `sudo -u ${user}`;
-    return `${prefix} tmux -L ${socket} attach -t <session>`;
+    return `${prefix} tmux -L silverbond-<run-id> attach -t <session>`;
   });
 
   async function copyAttachHint() {
@@ -183,6 +182,8 @@
     return activeWorkflow.nodes.find((node) => node.id === selection.id) ?? null;
   });
 
+  const unlockPrompt = createPasswordPrompt();
+
   async function runSelectedNodePreview() {
     if (!selectedNode) return null;
     const mockContext = { previousOutput };
@@ -192,7 +193,10 @@
       if (!(error instanceof ApiError) || error.code !== "privileged_unlock_required") {
         throw error;
       }
-      const unlockSecret = window.prompt("Unlock password");
+      const unlockSecret = await unlockPrompt.request({
+        title: "Unlock password",
+        message: "This node launches a process. Enter the unlock password to preview it.",
+      });
       if (unlockSecret === null) {
         throw new Error("Preview cancelled");
       }
@@ -294,6 +298,9 @@
     if (!selectedNode) return "claude";
     if (selectedNode.kind.type === "run_agent") {
       return runAgentConfig(selectedNode).agent ?? selectedNode.agent ?? "claude";
+    }
+    if (selectedNode.kind.type === "spawn") {
+      return spawnConfig(selectedNode).agent ?? selectedNode.agent ?? "claude";
     }
     return selectedNode.agent ?? "claude";
   });
@@ -781,11 +788,15 @@
             </label>
             <label class="field">
               <span>Access</span>
-              <input
+              <select
                 value={rc.access ?? ""}
-                placeholder="inherit (e.g. read_only / execute)"
-                onblur={(e) => updateRunAgent("access", (e.target as HTMLInputElement).value || undefined)}
-              />
+                onchange={(e) => updateRunAgent("access", (e.target as HTMLSelectElement).value || undefined)}
+              >
+                <option value="">registry default</option>
+                {#each selectedAgentAccessProfiles ?? [] as profile (profile)}
+                  <option value={profile}>{profile}</option>
+                {/each}
+              </select>
             </label>
             <label class="field">
               <span>Working directory</span>
@@ -990,6 +1001,8 @@
               <span>Retry count</span>
               <input
                 type="number"
+                min="0"
+                max="10"
                 value={selectedNode.retryCount ?? ""}
                 oninput={(e) => store.updateWorkflow((wf) => {
                   const n = wf.nodes.find((n) => n.id === selectedNode!.id);
@@ -1300,11 +1313,15 @@
           </label>
           <label class="field">
             <span>Access</span>
-            <input
+            <select
               value={sc.access ?? ""}
-              placeholder="inherit"
-              onblur={(e) => updateSpawn("access", (e.target as HTMLInputElement).value || undefined)}
-            />
+              onchange={(e) => updateSpawn("access", (e.target as HTMLSelectElement).value || undefined)}
+            >
+              <option value="">registry default</option>
+              {#each selectedAgentAccessProfiles ?? [] as profile (profile)}
+                <option value={profile}>{profile}</option>
+              {/each}
+            </select>
           </label>
           <label class="field">
             <span>Working directory</span>
@@ -1762,8 +1779,8 @@
       <section class="inspectorSection">
         <div class="inspectorSection__title">Run As / Sandbox</div>
         <small class="helperText">
-          Launch spawned panes under a different user, via a custom command prefix,
-          and on a dedicated tmux socket.
+          Launch spawned panes under a different user or via a custom command prefix.
+          Every run uses its own dedicated tmux socket.
         </small>
         <label class="field">
           <span>User</span>
@@ -1782,14 +1799,6 @@
             class="field--shortTextarea"
           ></textarea>
           <small class="helperText">One argv element per line. Takes precedence over "User" when set.</small>
-        </label>
-        <label class="field">
-          <span>Socket</span>
-          <input
-            value={activeWorkflow.runAs?.socket ?? ""}
-            placeholder="e.g. silverbond"
-            oninput={(e) => updateRunAs("socket", (e.target as HTMLInputElement).value)}
-          />
         </label>
         <div class="field">
           <span>Attach hint</span>
@@ -1884,6 +1893,14 @@
     </section>
   </div>
 {/if}
+
+<PasswordDialog
+  open={unlockPrompt.open}
+  title={unlockPrompt.title}
+  message={unlockPrompt.message}
+  onsubmit={(value) => unlockPrompt.submit(value)}
+  oncancel={() => unlockPrompt.cancel()}
+/>
 
 <style>
   .contractBox {

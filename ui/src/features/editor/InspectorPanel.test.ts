@@ -131,7 +131,6 @@ describe("InspectorPanel", () => {
         { code: "privileged_unlock_required" },
       ))
       .mockResolvedValueOnce({ success: true } as never);
-    const prompt = vi.spyOn(window, "prompt").mockReturnValue("preview-unlock");
 
     renderInspector(workflow({
       entryNodeId: taskNode.id,
@@ -141,8 +140,13 @@ describe("InspectorPanel", () => {
     await fireEvent.click(screen.getByRole("button", { name: /Test/ }));
     await fireEvent.click(screen.getByRole("button", { name: "Run preview" }));
 
+    // The masked dialog replaces window.prompt: type the secret and submit.
+    const input = await screen.findByLabelText("Password");
+    expect(input).toHaveProperty("type", "password");
+    await fireEvent.input(input, { target: { value: "preview-unlock" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Unlock" }));
+
     await waitFor(() => expect(testNode).toHaveBeenCalledTimes(2));
-    expect(prompt).toHaveBeenCalledWith("Unlock password");
     expect(testNode).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({ id: "preview-task" }),
@@ -192,6 +196,72 @@ describe("InspectorPanel", () => {
     if (node.kind.type !== "run_agent") throw new Error("node was not run_agent");
     expect(node.kind.runAgentConfig?.agent).toBe("codex");
     expect(node.kind.runAgentConfig?.prompt).toBe("Edited nested prompt");
+  });
+
+  it("edits run_agent access through capability-backed registry profiles", async () => {
+    const runAgentNode: WorkflowNode = {
+      id: "reviewer-a",
+      name: "Reviewer A",
+      kind: {
+        type: "run_agent",
+        runAgentConfig: {
+          agent: "codex",
+          access: "read-only",
+          killAfter: true,
+        },
+      },
+      agent: "",
+      prompt: "",
+      contextSources: [],
+      responseFormat: null,
+    };
+
+    renderInspector(workflow({
+      entryNodeId: runAgentNode.id,
+      nodes: [runAgentNode],
+    }), runAgentNode.id);
+
+    const access = screen.getByRole("combobox", { name: /^Access$/ }) as HTMLSelectElement;
+    expect(access).toHaveValue("read-only");
+    expect(screen.getByRole("option", { name: "registry default" })).toHaveValue("");
+
+    await fireEvent.change(access, { target: { value: "full-access" } });
+
+    const node = store.workflow!.nodes[0];
+    if (node.kind.type !== "run_agent") throw new Error("node was not run_agent");
+    expect(node.kind.runAgentConfig?.access).toBe("full-access");
+  });
+
+  it("edits spawn access through capability-backed registry profiles", async () => {
+    const spawnNode: WorkflowNode = {
+      id: "worker",
+      name: "Worker",
+      kind: {
+        type: "spawn",
+        spawnConfig: {
+          agent: "claude",
+          access: "workspace-write",
+        },
+      },
+      agent: null,
+      prompt: "",
+      contextSources: [],
+      responseFormat: null,
+    };
+
+    renderInspector(workflow({
+      entryNodeId: spawnNode.id,
+      nodes: [spawnNode],
+    }), spawnNode.id);
+
+    const access = screen.getByRole("combobox", { name: /^Access$/ }) as HTMLSelectElement;
+    expect(access).toHaveValue("workspace-write");
+
+    await fireEvent.change(access, { target: { value: "" } });
+
+    const node = store.workflow!.nodes[0];
+    if (node.kind.type !== "spawn") throw new Error("node was not spawn");
+    expect(node.kind.spawnConfig?.access).toBeUndefined();
   });
 
   it("persists and displays read-only for a read-only-only agent", async () => {
@@ -278,7 +348,7 @@ describe("InspectorPanel", () => {
     expect(storedNode.kind.agentConfig?.accessMode).toBeUndefined();
   });
 
-  it("persists run-as user and socket and clears empty runAs", async () => {
+  it("persists run-as user and clears empty runAs", async () => {
     const { container } = renderInspector(workflow());
 
     const userField = Array.from(container.querySelectorAll("label.field")).find(
@@ -288,17 +358,7 @@ describe("InspectorPanel", () => {
     await fireEvent.input(userInput, { target: { value: "sandbox" } });
     expect(store.workflow!.runAs?.user).toBe("sandbox");
 
-    const socketField = Array.from(container.querySelectorAll("label.field")).find(
-      (label) => label.textContent?.includes("Socket"),
-    );
-    const socketInput = socketField?.querySelector("input") as HTMLInputElement;
-    await fireEvent.input(socketInput, { target: { value: "silver" } });
-    expect(store.workflow!.runAs).toEqual({ user: "sandbox", socket: "silver" });
-
     await fireEvent.input(userInput, { target: { value: "  " } });
-    expect(store.workflow!.runAs).toEqual({ socket: "silver" });
-
-    await fireEvent.input(socketInput, { target: { value: "" } });
     expect(store.workflow!.runAs).toBeUndefined();
   });
 
@@ -307,7 +367,6 @@ describe("InspectorPanel", () => {
       runAs: {
         user: "sandbox",
         command: ["sudo", "-u", "Agent User"],
-        socket: "silver",
       },
     }));
 
@@ -316,12 +375,12 @@ describe("InspectorPanel", () => {
     );
     const commandTextarea = commandField?.querySelector("textarea") as HTMLTextAreaElement;
     expect(commandTextarea).toHaveValue("sudo\n-u\nAgent User");
-    expect(screen.getByText("sudo -u Agent User tmux -L silver attach -t <session>")).toBeInTheDocument();
+    expect(screen.getByText("sudo -u Agent User tmux -L silverbond-<run-id> attach -t <session>")).toBeInTheDocument();
 
     await fireEvent.input(commandTextarea, { target: { value: "doas\n-u\nAgent User" } });
 
     expect(store.workflow!.runAs?.command).toEqual(["doas", "-u", "Agent User"]);
-    expect(screen.getByText("doas -u Agent User tmux -L silver attach -t <session>")).toBeInTheDocument();
+    expect(screen.getByText("doas -u Agent User tmux -L silverbond-<run-id> attach -t <session>")).toBeInTheDocument();
   });
 
   it("hides Run As and Limits when drilled into a subflow", async () => {
@@ -339,7 +398,7 @@ describe("InspectorPanel", () => {
       }],
     });
     renderInspector(workflow({
-      runAs: { user: "root-user", socket: "root-socket" },
+      runAs: { user: "root-user" },
       limits: { maxTotalSteps: 100, maxVisitsPerNode: 20 },
       entryNodeId: "call_a",
       nodes: [{
@@ -377,7 +436,7 @@ describe("InspectorPanel", () => {
       wf.limits = { maxTotalSteps: 999, maxVisitsPerNode: 999 };
     });
 
-    expect(store.workflow!.runAs).toEqual({ user: "root-user", socket: "root-socket" });
+    expect(store.workflow!.runAs).toEqual({ user: "root-user" });
     expect(store.workflow!.limits).toEqual({ maxTotalSteps: 100, maxVisitsPerNode: 20 });
     expect(store.activeWorkflow!.runAs).toEqual({ user: "subflow-user" });
     expect(store.activeWorkflow!.limits).toEqual({ maxTotalSteps: 999, maxVisitsPerNode: 999 });

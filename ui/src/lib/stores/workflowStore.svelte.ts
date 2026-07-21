@@ -172,7 +172,7 @@ function compoundNodePromptTexts(node: WorkflowNode): CompoundPromptText[] {
     });
   }
   if (node.kind.type === "send") {
-    texts.push({ field: "sendText", text: node.kind.sendConfig.text });
+    texts.push({ field: "sendText", text: node.kind.sendConfig?.text ?? "" });
   }
   return texts;
 }
@@ -194,7 +194,12 @@ function applyCompoundPromptField(node: WorkflowNode, field: CompoundPromptField
       }
       break;
     case "sendText":
-      if (node.kind.type === "send") node.kind.sendConfig.text = text;
+      if (node.kind.type === "send") {
+        node.kind.sendConfig = {
+          ...(node.kind.sendConfig ?? { text: "", enter: true }),
+          text,
+        };
+      }
       break;
   }
 }
@@ -894,7 +899,14 @@ class WorkflowStore {
       name,
       goal: "",
       cwd: active.cwd,
-      useOrchestrator: false,
+      useOrchestrator: active.useOrchestrator,
+      ...(active.agentDefaults
+        ? {
+            agentDefaults: structuredClone(
+              $state.snapshot(active.agentDefaults),
+            ) as WorkflowDocument["agentDefaults"],
+          }
+        : {}),
       entryNodeId: entry.id,
       variables: plan.subflowVariables,
       limits: { maxTotalSteps: 50, maxVisitsPerNode: 10 },
@@ -991,8 +1003,14 @@ class WorkflowStore {
     this.#runStreamAbort = null;
   }
 
+  private clearRunScopedPaneSelection() {
+    this.selectedPane = "active";
+    this.runObservability = null;
+  }
+
   beginRunStream(): { epoch: number; signal: AbortSignal } {
     this.cancelRunStream();
+    this.clearRunScopedPaneSelection();
     this.runEpoch += 1;
     const epoch = this.runEpoch;
     const controller = new AbortController();
@@ -1013,8 +1031,7 @@ class WorkflowStore {
     this.approval = null;
     this.interactions = [];
     this.nodeStates = {};
-    this.selectedPane = "active";
-    this.runObservability = null;
+    this.clearRunScopedPaneSelection();
   }
 
   setRunState(patch: {
