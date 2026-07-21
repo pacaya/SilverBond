@@ -1,3 +1,46 @@
+> ## ⏳ fix-code-review cursor — auto-managed; deleted on success
+> **Status:** IN-PROGRESS, 2026-07-21T10:39:32Z
+> **Run prefix:** SilverBond-feature-tmux-panes
+> **Base branch:** feature/tmux-panes
+> **Base SHA at start:** 61ae2f82ade0cb0d78ee7b9c4621b7dc82ac12e2
+> **Staging branch:** fix-cr/SilverBond-feature-tmux-panes-staging
+> **Staging worktree:** /Users/Shared/Data/work/Programming/SilverBond/.claude/worktrees/SilverBond-feature-tmux-panes-fix-cr-staging
+> **Batch dir:** /Users/Shared/Data/work/Programming/SilverBond/docs/issues/code-reviews/feature-tmux-panes-code-review-20260720-032528-batches/
+> **Started:** 2026-07-21T06:42:54Z   **Last updated:** 2026-07-21T10:39:32Z
+> **Waves:**
+> - Wave 1: B1, B2, B4
+> - Wave 2: B5, B7
+> - Wave 3: B3, B8, B9
+> - Wave 4: B10, B11, B12
+> - Wave 5: B13, B14, B15
+> - Wave 6: B16, B17, B18
+> - Wave 7: B6
+> **Batches:**
+> - [x] B1 (codex)   issues=H2,M4       depends_on=—   → DONE
+> - [x] B2 (codex)   issues=H1,M16      depends_on=—   → DONE
+> - [x] B3 (codex)   issues=M6,M11      depends_on=B2  → DONE
+> - [x] B4 (codex)   issues=H5,M9       depends_on=—   → DONE
+> - [x] B5 (codex)   issues=H6,M12      depends_on=—   → DONE
+> - [ ] B6 (codex)   issues=H3,L3       depends_on=—   → PENDING
+> - [x] B7 (codex)   issues=H4,M2       depends_on=—   → DONE
+> - [x] B8 (cursor)  issues=M7,M8,L9    depends_on=—   → DONE
+> - [x] B9 (cursor)  issues=M1,M5       depends_on=—   → DONE
+> - [x] B10 (cursor) issues=L11,M14     depends_on=—   → DONE
+> - [x] B11 (cursor) issues=M10,L4,L12  depends_on=—   → DONE
+> - [x] B12 (cursor) issues=M15,L10,L14 depends_on=—   → DONE
+> - [ ] B13 (cursor) issues=M17,L1      depends_on=—   → PENDING
+> - [ ] B14 (codex)  issues=M18,L5      depends_on=—   → PENDING
+> - [ ] B15 (cursor) issues=L2,L6       depends_on=—   → PENDING
+> - [ ] B16 (cursor) issues=M13,L13     depends_on=—   → PENDING
+> - [ ] B17 (claude) issues=L7          depends_on=—   → PENDING
+> - [ ] B18 (cursor) issues=L8,L15      depends_on=—   → PENDING
+> **Pending merges:** none
+> **Next:** Wave 5 (B13, B14, B15)
+> **Resume:** invoke `/fix-code-review <file>` — reattaches to staging, skips DONE batches.
+> **Session note:** paused after Wave 4 for session reset; staging branch `fix-cr/SilverBond-feature-tmux-panes-staging` and its worktree are intentionally retained (base branch `feature/tmux-panes` still at 61ae2f8, un-consolidated). Waves 5-7 (B13-B18, then B6 last) remain. Steps 4.5-4.6 (consolidation + adversarial fix review) not yet run.
+
+---
+
 # Code Review: feature/tmux-panes
 
 **Branch:** `feature/tmux-panes` vs `development`
@@ -11,7 +54,8 @@
 
 ## HIGH
 
-### H1. Session continuation can reuse an incompatible privileged pane (FINALIZED)
+### H1. Session continuation can reuse an incompatible privileged pane (FIXED)
+> **Fix:** Pane adoption and editor validation now enforce effective agent, privilege-ranked access, and cwd compatibility while missing access metadata fails closed.
 **Severity:** HIGH — fails silently while validation gives active false assurance; a read-only node executes in an unrestricted process and inherits the wrong driver's destructive-command blocklist.
 **Files:** `src/tmux_exec.rs:406-426` (reuse arm), `:926`, `:1235-1240`, `:2056-2194` (`spawn_pane`/`build_agent_command`), `:2119-2130` (pane stamps), `src/model.rs:1806-1819` (continuation validation), `src/driver.rs:282-334`, `:295-299`, `src/runtime.rs:2078-2086` (`agent_name_for_node`)
 **Description:** For a `RunAgent` node the effective agent resolves from `runAgentConfig.agent` (`src/tmux_exec.rs:926`, `:1235`; `src/runtime.rs:2078-2086`), but continuation validation compares raw `node.agent` on both sides (`src/model.rs:1807-1808`), so a Codex-effective node passes the "same agents" check against a Claude source pane; `cwd` and `timeout` are shadowed the same way at `:1237-1240`. `PaneGuard::acquire` returns `(pane_id, None, true)` in the reuse arm (`src/tmux_exec.rs:406-426`) and never calls `spawn_pane` — which, with `build_agent_command` (`:2056-2194`), is the only place `access_mode`/`access_profile_override` become argv. Control then goes straight to `wait_for_mode`/`send_text` with no access or agent assertion anywhere. A downstream `read_only` node therefore executes inside the source pane's `Execute`/`Unrestricted` process, and `run_agent_interactive` selects its driver — including the destructive-command blocklist (`:994-1000`) — from the wrong agent.
@@ -24,7 +68,8 @@
 
 ---
 
-### H2. Session registration lifecycle ignores its own success/failure signals (FINALIZED)
+### H2. Session registration lifecycle ignores its own success/failure signals (FIXED)
+> **Fix:** Kill and cleanup outcomes now use post-action has-session probes; registrations are removed only after confirmed absence, with per-target terminal verdicts and contextual warnings.
 **Severity:** HIGH — an unkilled session plus its agent process leaks permanently and silently, unrecoverable by any later reaper pass; the same path carries `run_as` panes running as another user.
 **Files:** `src/tmux_exec.rs:1205-1207` (`kill_tmux_session`), `:1209-1222` (`cleanup_panes`), `:517` (dropped register result); `src/storage.rs:464-473` (`register_tmux_session`), `:479-506` (`remove_tmux_sessions`), `:525` (`list_reapable_tmux_sessions`); `src/runtime.rs:6352-6371`, `:6374-6381`, `:6479`, `:6507-6510`, `:6517-6538`
 **Description:** `kill_tmux_session` is `tmux::run(&["kill-session", "-t", name]).is_ok()`, and in the pinned `tmux-tools-core` rev `69173d1` `run_with` returns `Ok(TmuxOutput { … exit_code })` with no status check — only `run_checked` routes through `check()`. A kill *rejected* by tmux therefore reports success. The reaper treats that `Ok(true)` as confirmation and calls `remove_tmux_sessions` (`src/runtime.rs:6517-6537`), deleting the only record that makes the session reapable; because the reaper attempts kills only on sessions it just confirmed live (`:6479`, `:6507-6510`), a nonzero exit there is almost certainly a genuine failure, so the delete is wrong in exactly the reachable case. `cleanup_panes` discards every result with `let _ =` while its caller computes `killed_sessions` from the target list *before* the kills run (`:6352-6355`), and `register_tmux_session`'s `false` return (runs row absent) is dropped at both `src/runtime.rs:6374-6381` and `src/tmux_exec.rs:517`. Net: a live tmux session survives permanently, invisible to boot reaping and to the run-observability surface, with zero diagnostics.
@@ -55,7 +100,8 @@
 
 ---
 
-### H4. Opening/importing a legacy workflow crashes the graph editor (FINALIZED)
+### H4. Opening/importing a legacy workflow crashes the graph editor (FIXED)
+> **Fix:** Normalizer now backfills missing decide, parallel-batch, subflow, and call configs from editor defaults for both legacy and kind-shaped nodes, with regression coverage.
 **Severity:** MEDIUM — *lowered from HIGH*: reachable only via browser file import, since the backend always emits these configs; but within that ingress it is a total, unrecoverable loss of the editor. ID retained as `H4` for stability.
 **Files:** `ui/src/features/editor/flowNodes.ts:67,71`; `ui/src/lib/types/workflow.ts:226-229` (required decls), `:520` (`moveV2ConfigField`), `:543-611` (`normalizeWorkflowNode`), `:545-547` (early return), `:588-596` (capture/kill backfill pattern); `ui/src/lib/stores/workflowStore.svelte.ts:76,166`; `ui/src/lib/stores/nodeMetadata.ts:62-64` (`defaultNodeKind`); ingress `ui/src/features/editor/Sidebar.svelte:33`, `ui/src/app/AppShell.svelte:145`
 **Description:** `NodeKind` declares `subflowConfig`/`decideConfig`/`batchConfig` as required (`ui/src/lib/types/workflow.ts:226-229`), but `normalizeWorkflowNode` backfills only `captureConfig` (`:588-590`) and `killConfig` (`:594-596`) — `moveV2ConfigField`'s `if (value != null)` guard at `:520` silently drops the rest. A node whose config is absent or `null` therefore survives as `kind = {type:"subflow"}` with no config, and a node already in v4 `kind` shape bypasses normalization entirely through the early return at `:545-547`. `buildFlowNodes` then throws `TypeError: Cannot read properties of undefined (reading 'workflowName')` at `flowNodes.ts:67` inside `GraphEditor`'s `$effect`; because there is **no `<svelte:boundary>` anywhere in `ui/src`**, the whole canvas blanks with no recovery. Two further unguarded dereferences exist at `workflowStore.svelte.ts:76` and `:166`.
@@ -72,7 +118,8 @@
 
 ---
 
-### H5. Nested splits lose the outer family's failure policy — a failed branch finalizes the run as Completed (FINALIZED)
+### H5. Nested splits lose the outer family's failure policy — a failed branch finalizes the run as Completed (FIXED)
+> **Fix:** Split-family liveness now derives from active cursor references; stale member IDs are removed, missing-family warnings added, and nested fail-fast cancellation regression-tested with checkpoint compatibility.
 **Severity:** HIGH — silent success-on-failure with no backstop anywhere; an orchestration engine reporting a failed run as Completed is the worst defect class in this codebase.
 **Files:** `src/runtime.rs:228` (`SplitFamilyState`), `:1927-1935` (`evict_idle_split_families`), `:5412`, `:5421-5431`, `:5428`, `:5525-5534` (`handle_split_node`), `:5941-5943` (`handle_terminal_cursor_status`), `:5957-5962` (sibling cancel), `:6254-6263` (`finalize_run`), `:5696-5705` (collector release); related `:5711`, `:5834-5852` (M9)
 **Description:** `handle_split_node` removes the parent cursor from `active_cursors` (`src/runtime.rs:5412`) and inserts the new family with `member_cursor_ids: child_cursor_ids` only (`:5421-5431`), while children are pushed carrying `[…inherited, new]` family ids (`:5525-5534`) and are never added to the inherited families' member lists. Outer families thus reference only dead cursor ids, and `evict_idle_split_families` — whose retain predicate is "some `member_cursor_ids` entry is still in `active_cursors`", guarded only by `force_failed` (`:1927-1935`) — drops them while live descendants still hold their ids. On a later descendant failure, `handle_terminal_cursor_status` sets `fail_run = cursor.split_family_ids.is_empty()` → false (`:5941`), then the bare `if let Some(family) = …get_mut(family_id)` at `:5943` finds nothing and silently skips with no `else` and no warn; `finalize_run` (`:6254-6263`) sees no `force_failed` family and returns `RuntimeStatus::Completed`, and sibling cancellation (`:5957-5962`) never fires.
@@ -92,7 +139,8 @@
 
 ---
 
-### H6. Pane-stream process setup deadline is not cancellation-safe when descendants inherit pipes (FINALIZED)
+### H6. Pane-stream process setup deadline is not cancellation-safe when descendants inherit pipes (FIXED)
+> **Fix:** Enable and teardown now run under an absolute deadline in a dedicated process group with null stdio, closing the indefinite hang; upstream traversal-probe orphan leak remains unpatched (no upstream publish access).
 **Severity:** HIGH — carried by the unguarded enable path, which hangs a pane-stream task indefinitely; every timeout on any path also permanently leaks a blocking-pool thread and an orphan process. The prepare path alone would be MEDIUM.
 **Files:** upstream `tmux-tools` `core/src/tmux.rs:194`, `:226-229`, `:242-248`; `src/api.rs:61` (`PANE_STREAM_SETUP_TIMEOUT`), `:1391-1409` (guarded prepare), `:1424-1432` (**unguarded** enable), `:1481`, `:1529-1532`; `src/tmux_exec.rs:66-77` (`run_as.command`), `:123-126` (`resolve_tmux_bin_with_timeout`); `Cargo.toml:28` (rev pin)
 **Description:** `command_output_with_timeout` cannot honor its deadline when a descendant inherits stdout/stderr: on deadline it runs `child.kill(); child.wait(); join_reader(stdout); join_reader(stderr)` (`core/src/tmux.rs:226-229`), where `read_pipe` is `read_to_end` (`:242-246`) and `join_reader` is an unbounded `handle.join()` (`:248`). `Child::kill` is `libc::kill(pid, SIGKILL)` against a single pid, so any surviving descendant holding the inherited write end withholds EOF forever. SilverBond hits this on three paths: the traversal probe `ensure_run_as_can_traverse_root` (`src/api.rs:1532`), the `pipe-pane` enable (`:1481` via `:1424-1432`), and `resolve_tmux_bin_with_timeout` (`src/tmux_exec.rs:126`). Reachability is ordinary, not pathological: `run_as.command` is operator-arbitrary (`src/tmux_exec.rs:66-77`), `resolve_tmux_bin` runs `<prefix> zsh -lic …` where an interactive rc that backgrounds anything holds the pipe, and `sudo` forks-and-waits whenever PAM session/timestamp cleanup applies, leaving the exec'd `tmux` alive after the parent is killed.
@@ -111,7 +159,8 @@
 
 ## MEDIUM
 
-### M1. Compound extraction silently widens inherited agent access (FINALIZED)
+### M1. Compound extraction silently widens inherited agent access (FIXED)
+> **Fix:** Extracted subflows now inherit useOrchestrator and a cloned agentDefaults so an explicit read_only survives extraction; parent goal deliberately left empty per scope semantics.
 **Severity:** MEDIUM (top of band) — a pure editor gesture silently revokes a restriction the author explicitly set, with no prompt, diff, or warning; mechanically certain rather than conditional, and it fails toward *wider* access.
 **Files:** `ui/src/lib/stores/workflowStore.svelte.ts:891-911` (`saveSelectionAsCompound`); `ui/src/lib/types/workflow.ts:278`; `ui/src/features/editor/GraphEditor.svelte:232-234` (trigger); `ui/src/features/editor/InspectorPanel.svelte:509`; `src/runtime.rs:2763`, `:2774`, `:4831`; `src/model.rs:~264` (`merge!`); `src/driver.rs:405-412`, `:615-617`, `:840-842`
 **Description:** The `subflowDoc` object literal at `ui/src/lib/stores/workflowStore.svelte.ts:891-911` copies `cwd: active.cwd` but has no `agentDefaults` key and hardcodes `useOrchestrator: false`; `WorkflowDocument.agentDefaults` is optional (`ui/src/lib/types/workflow.ts:278`), so nothing type-flags the omission. Subflow scope is authoritative at dispatch — `agent_defaults: active_workflow.agent_defaults.clone()` (`src/runtime.rs:2774`, batch twin `:4831`) — so with no subflow defaults and no node override, `merge!(access_mode).unwrap_or_default()` (`src/model.rs:~264`) yields `AccessMode`'s `#[default] Execute` (`src/driver.rs:405-412`), producing skip-permissions for Claude (`src/driver.rs:615-617`) and `--full-auto` for Codex (`:840-842`). The loss is not limited to `accessMode`: `model`, `maxTurns`, `maxBudgetUsd`, `autoApprove`, `systemPrompt`, and `orchestrator` all merge through the same macro, and `useOrchestrator: false` is a second silent semantic change for orchestrator-enabled workflows. The trigger is a bare `prompt()` at `GraphEditor.svelte:234` with no preview or warning, and the store leaves selection on the compound node rather than drilling in, so the user never sees the new scope's config.
@@ -125,7 +174,8 @@
 
 ---
 
-### M2. Default Send nodes crash compound extraction and fail typechecking (FINALIZED)
+### M2. Default Send nodes crash compound extraction and fail typechecking (FIXED)
+> **Fix:** Compound extraction tolerates omitted Send config and initializes it before rewrites while preserving target and enter; typecheck gate now reports zero errors.
 **Severity:** MEDIUM (top of band) — sole cause of a red typecheck gate, so it blocks merge outright, and the runtime crash is reachable from ordinary backend data; offset by a trivial repair and the need for one save/reload cycle to hit it.
 **Files:** `ui/src/lib/stores/workflowStore.svelte.ts:175`, `:197` (compare correct sibling handling at `:171`, `:190-193`); `ui/src/lib/stores/workflowStore.test.ts:576-577`; `ui/src/lib/types/workflow.ts:231`, `:581`; `src/model.rs:430-443`, `:652`
 **Description:** `ui/src/lib/stores/workflowStore.svelte.ts:175` reads `node.kind.sendConfig.text` and `:197` writes `node.kind.sendConfig.text = text`, both unconditionally, while `NodeKind` declares `sendConfig?: SendConfig` (`ui/src/lib/types/workflow.ts:231`). Two lines above, the sibling `run_agent` branch handles this correctly — `node.kind.runAgentConfig?.prompt ?? ""` (`:171`) with a `?? { killAfter: true }` default before writing (`:190-193`). Verified by running the gate: `npm run typecheck` reports **exactly 4 errors and no others** — `workflowStore.svelte.ts:175:43`, `:197:38`, `workflowStore.test.ts:576:12`, `:577:12`, all `'…sendConfig' is possibly 'undefined'` — so this finding alone is why `just typecheck` / CI is red on this branch. At runtime, a Send node whose text is still empty round-trips from the backend without `sendConfig`, and "Save as compound" over it throws `TypeError` in `compoundNodePromptTexts`, blanking the canvas since `ui/src` contains no `<svelte:boundary>`.
@@ -147,7 +197,8 @@
 
 ---
 
-### M4. Stale session registrations accumulate and can target a newer run (FINALIZED)
+### M4. Stale session registrations accumulate and can target a newer run (FIXED)
+> **Fix:** The reaper reconciles absent registrations only after successful listings across each invocation group, preserves uncertain rows, and excludes names owned by nonterminal runs.
 **Severity:** MEDIUM (upper band) — under per-run sockets every orphaned row adds a `spawn_blocking` + `tmux list-sessions` subprocess to **every boot**, so growth is O(runs) process spawns at startup rather than a cosmetic row count; the cross-run kill destroys a live user session.
 **Files:** `src/tmux_exec.rs:450-463` (`PaneGuard::drop`), `:550-556` (`clear_key`/`block_on`), `:678-681` (spawn node), `:2083-2087`, `:2482-2506` (`stable_session_name`); `src/runtime.rs:1155-1159`, `:1592` (`dismiss_run`), `:6344-6355`, `:6371`, `:6383-6389`, `:6418`, `:6507-6510`, `:6517`, `:6523-6537`, `:6554-6569` (`kill_active_run_panes`); `src/storage.rs:547-561` (`list_reapable_tmux_sessions_for_run_id`)
 **Description:** `run_tmux_sessions` rows are deleted on only two paths — reaper-after-confirmed-kill (`src/runtime.rs:6523-6537`) and terminal cleanup of still-registered active panes (`:6371`). Guard teardown and the abort path `kill_active_run_panes` (`:6554-6569`) both kill without deregistering: `PaneGuard::drop` (`src/tmux_exec.rs:450-463`) calls only `active_pane.clear_key()`, which removes the entry from `active_panes` (`src/runtime.rs:1155-1159`) — and since terminal cleanup derives its `killed_sessions` *from* `active_panes` (`:6344-6355` → `:6371`), the guard has already erased the only record that would have triggered `remove_tmux_sessions`. The reaper cannot compensate, because `:6507-6510` iterates *live* sessions and `continue`s on any name not present, so a row whose session is gone is never visited. There is no TTL, no `created_at`, no prune, and no `LIMIT` on the reapable query. Separately, `list_reapable_tmux_sessions_for_run_id` (`src/storage.rs:547-561`) filters only on `runs.status IN ('completed','failed','aborted','restarted')` with no exclusion of names registered to nonterminal runs, and `:6418` skips rows by `run_id` only — so `dismiss_run` (`:1592`) on an old terminal run can reach `:6517` and kill a live run's identically-named session.
@@ -166,7 +217,8 @@
 
 ---
 
-### M5. A new run can wait for the pane selected in the previous run (FINALIZED)
+### M5. A new run can wait for the pane selected in the previous run (FIXED)
+> **Fix:** beginRunStream clears selectedPane to the "active" sentinel and drops runObservability through a shared helper that resetRun now delegates to, ending cross-run pane staleness.
 **Severity:** MEDIUM (lower band) — *lowered*: a dead terminal with a visible workaround, not data loss; the trigger needs a resume/restart or manual pane pick rather than every run, and it self-heals when the same node runs again.
 **Files:** `ui/src/lib/stores/workflowStore.svelte.ts:994-1001` (`beginRunStream`), `:1007-1018` (`resetRun`), `:1035-1044` (`setRunObservability`), `:1061` (`applyRunEvent`); `ui/src/app/AppShell.svelte:147`, `:156`, `:202`, `:211`, `:220`; `ui/src/features/runtime/PaneTerminal.svelte:149`, `:184-194`; `src/api.rs:60`, `:449-451`, `:1251-1265`, `:1281-1295`; `src/runtime.rs:1171-1194`, `:1385`
 **Description:** `AppShell.svelte:202` starts every run, resume, and restart via `store.beginRunStream()` (`workflowStore.svelte.ts:994-1001`), which only aborts the SSE controller, bumps `runEpoch`, and installs a new controller — it touches neither `selectedPane` nor `runObservability`. Only `resetRun()` (`:1007-1018`) clears them, and it is called solely from `openWorkflow` (`AppShell.svelte:147`) and `handleCreate` (`:156`). `setRunObservability` (`:1035-1044`) has exactly two branches — `panes?.length === 1` and `panes && panes.length > 1` — with no empty/absent case, and `src/api.rs:449-451` omits the `panes` field entirely when the list is empty while `src/runtime.rs:1385` spawns workflow execution *after* `start_run` returns, so a fresh run's kickoff response never carries panes. A stale exact pane key therefore survives into the new run and reaches `streamPane(activeRunId, pane, …)` at `PaneTerminal.svelte:149`, leaving the terminal blank while the backend holds the request pending.
@@ -183,7 +235,8 @@
 
 ---
 
-### M6. `extraArgs` are appended after access-mode flags, defeating the documented access ceiling (FINALIZED)
+### M6. `extraArgs` are appended after access-mode flags, defeating the documented access ceiling (FIXED)
+> **Fix:** Added normalized, abbreviation-aware extra-argument validation for Spawn and RunAgent including Codex config overrides; argv ordering unchanged, errors surfaced in the inspector issue list.
 **Severity:** MEDIUM (lower band) — *lowered*: author-only configuration footgun with no third-party injection path and no shipped template exercising it; still a silent, real downgrade of a declared access ceiling.
 **Files:** `src/tmux_exec.rs:2141-2183` (`build_agent_command`, `:2146`, `:2158-2162`, `:2161`, `:2171`, `:2178`), test `:3332-3335`; `src/driver.rs:687-688`, `:823-848`; `src/model.rs:419`, `:520`; `ui/src/features/editor/InspectorPanel.svelte:840`, `:1320`
 **Description:** `build_agent_command` assembles argv as `once(binary).chain(session_args.args).chain(extra_args.iter().cloned())` (`src/tmux_exec.rs:2158-2162`), appending `cfg.extra_args` verbatim after the driver's session args on all three branches (`:2161`, `:2171`, `:2178`) with no filtering anywhere. Access args are emitted inside the driver — claude at `src/driver.rs:688`, codex `--sandbox <mode> -a <policy>` / `--full-auto` at `:823-848`. An author who declares `accessMode: read_only` and also types a skip-permissions entry or `--sandbox danger-full-access` into the free-text `extraArgs` textarea (`InspectorPanel.svelte:840`, `:1320`) gets the later flag: claude-code's skip-permissions flag is a boolean that simply turns on, and codex is clap v4 `ArgAction::Set`, so a second `--sandbox`/`-a` overwrites rather than erroring. `extra_args` flows verbatim from workflow JSON (`src/model.rs:419`, `:520`) through `src/tmux_exec.rs:1006`, `:1246` to `:2146` with no validation at any point.
@@ -201,7 +254,8 @@
 
 ---
 
-### M7. `run_decide_node` discards the agent's failure/timeout/abort status (FINALIZED)
+### M7. `run_decide_node` discards the agent's failure/timeout/abort status (FIXED)
+> **Fix:** Decide now carries the agent NodeResult through the outcome overlay, normalizes the timeout sentinel to -2, and maps Timeout via exit code or error_type, preserving metadata.
 **Severity:** MEDIUM (upper band) — a timed-out Decide can silently route down a real branch on a truncated answer, the same silent-wrong-answer class as the already-fixed R1-2/F9 pair; metadata reset additionally destroys telemetry on every decide, including successful ones.
 **Files:** `src/runtime.rs:3843`, `:3860-3877`, `:4081-4112` (`select_decide_outcome`), `:4189-4195`, `:4221`, `:4237-4245`, `:4251` (`apply_join_result`), `:5886`; `src/tmux_exec.rs:1101-1116` (interactive timeout), `:1104` (`-1` sentinel), `:1138-1144`, `:2452-2469` (`aborted_result`), `:763`, `:1055`, `:2437` (`-2` sentinel sites)
 **Description:** `run_decide_node` discards the entire agent `NodeResult` except `output` (`src/runtime.rs:3843`) and reconstructs a fresh one at `:3860-3877` with `..Default::default()`. The interactive-poll timeout path builds `failed_result("Timeout waiting for agent response", -1, …)` and then sets `result.output = response.output` — the **partial capture** — plus `error_type = "timeout"` (`src/tmux_exec.rs:1101-1116`). That partial capture flows straight into `select_decide_outcome`, whose word-boundary regex matching (`:4081-4112`) can succeed on it, yielding `success = true` and `exit_code = 0` (`:3861-3864`). The user therefore sees one of two wrong outcomes: the run routes down a real branch as if the agent had answered — no error, no timeout event — or outcome selection fails and the node reports the misleading `"LLM response did not match any decide outcome: …"` classified as `Failure`, so `on_timeout` collector/split semantics (`:5886`) receive the wrong status. `aborted_result` (`src/tmux_exec.rs:2452-2469`) likewise carries a partial capture, so a matching abort capture can advance the run one node past the abort before the loop's next `is_aborted` check.
@@ -222,7 +276,8 @@
 
 ---
 
-### M8. Decide nodes ignore their configured timeout entirely (FINALIZED)
+### M8. Decide nodes ignore their configured timeout entirely (FIXED)
+> **Fix:** Threaded timeout_secs through run_tmux_oneshot; decide and preview sites pass timeout_for_node while the two orchestrator sites keep None.
 **Severity:** MEDIUM — loss of the configured deadline with silent fallback to a much longer generic cap, compounded by a UI that renders the setting as if it worked.
 **Files:** `src/runtime.rs:3810` (decide call site), `:1748` (preview call site), `:6971`, `:7004` (orchestrator call sites), `:2110-2128` (`timeout_for_node`, Decide arm at `:2120`), contrast `:3658`/`:3706` (`run_agent_node` pattern); `src/tmux_exec.rs:1167-1174` (signature), `:1180`, `:948-951` (300 s default); `ui/src/features/editor/InspectorPanel.svelte:972`, `:978-987`
 **Description:** `run_decide_node` never computes `timeout_for_node(&node)` before calling `run_tmux_oneshot` at `src/runtime.rs:3810`, and `run_tmux_oneshot` has no timeout parameter to receive one — its signature (`src/tmux_exec.rs:1167-1174`) omits it entirely and it forwards a literal `None` as `run_agent_interactive`'s 4th argument at `:1180`. `node.timeout` is therefore parsed and validated for `NodeKind::Decide` (`timeout_for_node`'s catch-all arm, `src/runtime.rs:2120`) but never consumed, so every Decide node silently falls back to the generic 300 s cap in `run_agent_interactive` (`src/tmux_exec.rs:948-951`) regardless of what the author configured.
@@ -242,7 +297,8 @@
 
 ---
 
-### M9. Collector release with no live waiter fabricates a phantom cursor (FINALIZED)
+### M9. Collector release with no live waiter fabricates a phantom cursor (FIXED)
+> **Fix:** Collector barriers snapshot the first terminal arrival, materialize it before release, and preserve policy, variables, call frames, scoped results, and all-failure continuation.
 **Severity:** MEDIUM (HIGH-leaning) — *raised*: in subflow scope it silently aborts the entire run and discards the subflow's results, and the trigger ("both branches of a 2-way split fail") is an ordinary flaky-agent outcome rather than an exotic authored shape.
 **Files:** `src/runtime.rs:425-432` (`CollectorBarrierState`), `:1907-1919` (`reset_released_collector_barrier`), `:1998-2008` (`collector_barrier_scope`), `:2966`, `:4355-4357` (`complete_subflow_if_at_exit`), `:5632-5634` (sole `waiting_cursor_ids` append), `:5655-5664` (readiness), `:5684-5698` (summary), `:5706-5711`, `:5742-5748`, `:5834-5851` (phantom construction), `:5859`, `:5863-5864` (normal path), `:5910`, `:5911-5939`, `:5941`, `:5963`
 **Description:** `waiting_cursor_ids` is appended in exactly one place — `src/runtime.rs:5632-5634`, inside `handle_collector_entry`'s *live*-arrival path. `handle_terminal_cursor_status` (`:5911-5939`) records the arrival via `insert_collector_arrival`, never touches `waiting_cursor_ids`, and then deletes the cursor at `:5963`. Since barrier readiness at `:5655-5664` checks only `required_inputs ⊆ arrivals`, a barrier whose arrivals all came through the terminal path releases with an empty waiting list: `representative_cursor_id` falls back to `new_cursor_id()` (`:5706-5711`), `representative_state` is `None` (`:5742-5748`), and `:5834-5851` fabricates a `CursorState` with `split_family_ids: Vec::new()`, `call_stack: Vec::new()`, and `var_map: checkpoint.var_map.clone()` — the run-global map rather than the cursor-scoped map the normal path carries at `:5863-5864`. In subflow scope the barrier is keyed to the call frame (`collector_barrier_scope`, `:1998-2008`), so the release targets a subflow-local node id on a cursor with no `call_stack`; resolution runs against the root workflow, misses, and `:2966` emits `Node "…" not found — aborting`, setting `RuntimeStatus::Aborted` for the whole run. `complete_subflow_if_at_exit` returns `false` immediately (`:4355-4357`, cursor absent from `active_cursors`), so the frame is never popped and the parent `call` node receives nothing — regressing the already-fixed R1-6. In root scope the empty `split_family_ids` makes `:5941` compute `fail_run = true` on any later downstream failure, failing the run against a `BestEffortContinue` policy the normal path (`:5859`) would have honoured.
@@ -264,7 +320,8 @@
 
 ---
 
-### M10. `O(call_nodes × subflow_size)` validation blowup blocks a tokio worker (FINALIZED)
+### M10. `O(call_nodes × subflow_size)` validation blowup blocks a tokio worker (FIXED)
+> **Fix:** Precomputed SubflowFacts threaded through validation to remove the per-call-node graph rebuild, plus post-hydration 50k node / 100k edge ingress caps.
 **Severity:** MEDIUM — mostly self-inflicted (a legitimate large workflow already hangs the UI for seconds on every validate) plus a local-process DoS; bounded by the loopback bind and the multi-worker runtime, but reachable with no unlock gate.
 **Files:** `src/model.rs:944-960` (`WorkflowV3::graph`), `:1326-1363` (`validate_workflow_input_bounds`), `:1365` (`validate_graph_body`), `:1484` (per-node dispatch), `:2000-2021` (`validate_subflow_catalog`), `:2061`, `:2078-2083`, `:2149-2153`; `src/api.rs:168` (`require_same_origin_mutation`), `:546-548`, `:723-732`; `src/main.rs:21`
 **Description:** `validate_graph_body` loops every node and dispatches each `Subflow`/`Call` to `validate_subflow_node_config` (`src/model.rs:1484`), which rebuilds the callee's entire graph via `subflow.graph()` (`:2061`) — three `HashMap`s over all its nodes and edges (`:944-960`) — then scans every callee node for terminals with `outgoing_for` (`:2078-2083`) and rebuilds a `BTreeSet` of its variables (`:2149-2153`). All of this is per call node, giving `Σ(call nodes) × |callee|`; `validate_subflow_catalog` (`:2000-2021`) re-runs `validate_graph_body` for each subflow, so calls nested inside subflows amplify further. Measured on a release build: 200 calls / 500-node subflow (97 KB JSON) = 132 ms; 400/1000 (196 KB) = 874 ms; 800/2000 (398 KB) = **5.09 s**. Both HTTP entry points run it inline on the async task with no `spawn_blocking` (`src/api.rs:548`, `:732` — the latter after a deep `clone()`), `hydrate_saved_subflows` runs *before* `enforce_workflow_input_bounds` (`:546`/`:547` and `:723`/`:731`), and the existing bounds count only subflows and call edges, never nodes (`src/model.rs:1326-1363`). No `DefaultBodyLimit` exists anywhere in `src/`; axum 0.8's `Json` default is 2 MB.
@@ -284,7 +341,8 @@
 
 ---
 
-### M11. `spawn` nodes select an arbitrary access profile with no ceiling check (FINALIZED)
+### M11. `spawn` nodes select an arbitrary access profile with no ceiling check (FIXED)
+> **Fix:** Threaded the resolved AgentConfig through registered Spawn launches, validated profile capabilities, and added capability-backed selects; command overrides still bypass ceilings.
 **Severity:** MEDIUM (lower band) — an inheritance/validation defect, not an authorization bypass: `access` is author-controlled JSON with no third-party injection channel and omission fails *safe* for three of four builtins; held at MEDIUM because a user-facing safety control ("inherit") does not do what it says and one path stamps a pane with an access profile that was never applied.
 **Files:** `src/tmux_exec.rs:656-694` (`execute_spawn`, `:678` dropped config), `:286`, `:317-319` (config in scope one frame up), `:2166-2182` (`build_agent_command` registry branch), `:2172-2179` (swallowed profile error), `:2182`→`:2122-2123` (`KEY_ACCESS` stamp), `:2069-2076` (command-override bypass); `src/driver.rs:281-322` (`resolve_registry_access_profile`), `:295-305` (widening guard), `:268-279` (`agent_access_profile_names`); `src/model.rs:411-425` (`SpawnConfig.access`), `:1486-1512` (validation that omits it); `ui/src/features/editor/InspectorPanel.svelte:1301-1307` (spawn Access field), `:782-788` (RunAgent twin); `src/agents/mod.rs:216-218`, `:222-240`
 **Description:** `execute_spawn` discards the run's resolved `AgentConfig` at `src/tmux_exec.rs:678` even though it is in scope one frame up (`:286`, dispatch `:317-319`), forcing `build_agent_command` down the registry branch at `:2166-2182`. That branch calls `registry.launch_argv(agent, explicit_access)` directly, so the widening guard in `resolve_registry_access_profile` (`src/driver.rs:295-305`) — reachable only from the `Some(agent_config)` branch — never runs for Spawn, and an omitted `access` inherits the *registry* default (`src/agents/mod.rs:222-240`) rather than `agentDefaults`. `SpawnConfig.access` is an unvalidated `Option<String>` (`src/model.rs:411-425`; `:1486-1512` checks only agent/command/cwd), and for an **unregistered** agent `:2172-2179` swallows the unknown-profile error and launches bare argv while `:2182`→`:2122-2123` still stamps `KEY_ACCESS` — a pane labelled with a profile that was never applied. User-visible: the free-text Access field at `InspectorPanel.svelte:1301-1307` reads `placeholder="inherit"` and inherits nothing, and its RunAgent twin at `:782-788` advertises `read_only`/`execute`, neither of which is a valid registry key (`read-only` is).
@@ -299,7 +357,8 @@
 
 ---
 
-### M12. A stale pane-stream task's teardown disables a freshly established `pipe-pane` (FINALIZED)
+### M12. A stale pane-stream task's teardown disables a freshly established `pipe-pane` (FIXED)
+> **Fix:** Pane-stream registry gained a single-owner active/draining/terminating lifecycle with explicit drain signaling, reconnect revival, and owner-scoped teardown, ending stale-generation pipe-pane clobber.
 **Severity:** MEDIUM — a visibly dead terminal that self-heals on the next reconnect, with no data loss and no security impact; held below HIGH because trigger 2 is narrow, but the window for trigger 1 is wide until H6 lands.
 **Files:** `src/api.rs:1550-1564` (`stop_pane_stream`, unscoped `pipe-pane`), `:1963` (teardown call), `:1448` (setup-error teardown call), `:1553` (`timeout` over `spawn_blocking`), `:1805-1832` (`subscribe_pane_stream`, `drop(streams)` at `:1832`), `:1834` (`spawn_pane_stream_task`), `:1868-1875` (`sender.closed()` arm), `:1952-1972` (task lifetime), `:1416` (lifecycle marker), `:1704-1716`, `:1756-1758`, `:1886`, `:1162`, `:1169-1173` (`stream_chunks_seen` gate), `:60` (`PANE_STREAM_PENDING_TIMEOUT`); `src/app.rs:223-240` (`unsubscribe`), `:232`, `:251`, `:258-271` (`same_channel` / `remove_terminal_sender`); tests `src/api.rs:3815`, `:4440`
 **Description:** `stop_pane_stream` runs `tmux::run(&["pipe-pane", "-t", &pane_target])` with no command and no owner check (`src/api.rs:1550-1564`); tmux has one pipe per pane and no way to query its command, so this closes whatever pipe is installed. Nothing serializes setup per `PaneStreamKey` — `subscribe_pane_stream` holds the registry mutex only across the lookup/insert and explicitly `drop(streams)` at `:1832` before spawning the pump at `:1834` — while the registry entry is removed at refcount 0 (`src/app.rs:235-236`) even though the task owning the tmux pipe lives on to `:1963`. A reconnect therefore creates a **second** owner for the same key: task #1's `sender.closed()` arm (`:1868-1875`) fires immediately, and its unconditional teardown at `:1963` (or the setup-error path at `:1448`) disables task #2's pipe. The writer then hits EOF, emits its `.` marker (`:1416`) → `terminated` (`:1704-1716`) → `Ok(0)` (`:1756-1758`) → `Terminal` (`:1886`) → `RecvError::Closed` (`:1162`); the user sees `"pane stream unavailable"` when no bytes had yet flowed, and a silent socket close when they had (the frame at `:1173` is gated on `!stream_chunks_seen` at `:1169`). A second, narrower trigger: `tokio::time::timeout` at `:1553` wraps `spawn_blocking`, and dropping the `JoinHandle` **detaches** rather than cancels, so the closure can still fire its unscoped `pipe-pane` after a reconnect installed a replacement. Teardown is the one place in the codebase that skips the `same_channel` ownership discriminator already used at `src/app.rs:232`, `:251`, `:266`. No test spawns two generations for one key (`:3815` covers a single generation; `:4440` is registry-level only).
@@ -335,7 +394,8 @@
 
 ---
 
-### M14. `get_run` is a read that can fail because of a write (FINALIZED)
+### M14. `get_run` is a read that can fail because of a write (FIXED)
+> **Fix:** The workflow_json CAS upgrade moved into Database::init and upsert now normalizes on INSERT, so get_run is a pure read with no write-back.
 **Severity:** MEDIUM — the filed failure mode alone is LOW (both cited triggers are near-unreachable under WAL + a write-requiring startup), but two comments on a data-integrity path assert a startup upgrade that does not exist, and this write-back is what converts L11 from a transient in-memory bug into permanent on-disk workflow corruption.
 **Files:** `src/storage.rs:294` (`get_run`), `:328-332` (false comment), `:333` (in-memory normalize), `:335-343` (read-path CAS), `:342` (`?`), `:180-190` (`upsert_run`), `:186` (INSERT), `:189-192` (duplicate false comment), `:985` (`ensure_dir`), `:992-994` (`configure_connection`: WAL, `synchronous=NORMAL`, 5 s `busy_timeout`), `:134`ff (`init`), tests `:1639-1692`, `:1745-1789`; callers `src/runtime.rs:1394-1397`, `:1437-1440`, `:1452-1455`, `src/api.rs:472`, `:1029`, `:1214-1216`, `:1259-1261`; normalization `src/model.rs:973`, `:325-352`
 **Description:** `get_run` performs a write on the read path — a genuine CAS at `src/storage.rs:335-343` guarded by `WHERE run_id = ?2 AND workflow_json = ?3` — whose `?` at `:342` propagates through the `with_connection` closure into the returned `anyhow::Result`, so a write-side failure turns a successful read into `Err`. That maps to `RunControlError::Internal` in `resume_run` (`src/runtime.rs:1394-1397`) and `restart_from` (`:1437-1455`), `PaneContextError::Internal` at `src/api.rs:1214-1216` and `:1259-1261`, and a 500 at `src/api.rs:472` and `:1029`. The persistence is pure optimization: the in-memory `workflow` is already normalized at `:333` *before* the UPDATE, so if the write never lands, normalization simply re-runs on each read — nothing reads persisted-canonical-ness.
@@ -356,7 +416,8 @@
 
 ---
 
-### M15. ~4 full-checkpoint DB writes per second for the whole duration of a human approval wait (FINALIZED)
+### M15. ~4 full-checkpoint DB writes per second for the whole duration of a human approval wait (FIXED)
+> **Fix:** persist_checkpoint hashes the serialized checkpoint with updated_at cleared and skips the DB write when unchanged, ending the ~4 writes/sec approval-wait churn.
 **Severity:** MEDIUM (low end) — pure write churn with no correctness or security impact and no executor blocking; held above LOW because the wait is unbounded by construction, every write is genuinely byte-different so nothing dedups, and this is the known-incomplete remainder of a chartered prior fix.
 **Files:** `src/runtime.rs:2795-2798` (ungated persist), `:2789-2790` (`changed`), `:2830`, `:2847-2850`, `:2852`, `:2862-2865` (`wait_changed` gating), `:3518-3535` (`wait_for_approval`), `:3526-3530` (decision arm), `:3531` (250 ms sleep), `:6577-6594` (`persist_checkpoint`), `:6582` (`updated_at` stamp), `:6299`, `:551-589` (checkpoint contents); `src/storage.rs:255-287` (`update_run_checkpoint`), `:284` (`state_json`), `:186-203` (frozen `workflow_json`), `:976-980` (pool), `:991-995` (WAL, `synchronous=NORMAL`, 5 s busy_timeout)
 **Description:** While a run is parked on a human approval and no agent tasks are in flight, the loop at `src/runtime.rs:2793-2799` spins a 250 ms poll and unconditionally re-serializes and re-writes the full `RuntimeCheckpoint` at `:2797` — `changed` is false at `:2789` while parked, so `:2790` is skipped and `:2797` is the sole write per iteration. That is ~4 writes/s, ~14,400/hour, ~115,000 overnight. The blob is `state_json` (`src/storage.rs:284`), carrying `all_results` (every node's full agent output), `batch_item_results`, `execution_log`, and `output_hashes` (`src/runtime.rs:551-589`) — realistically 50 KB–2 MB on a moderate workflow — and `persist_checkpoint` stamps `updated_at = now_iso()` (`:6582`) before writing, so every blob is byte-different and nothing dedups. Cost is full JSON serialization per tick plus roughly 800 KB/s of WAL traffic on a 200 KB blob, with the periodic auto-checkpoint fsync stealing the pool's writer slot from `append_event`. The wait is unbounded: approval resolves only via the oneshot `wait.receiver`, and there is no timeout arm in `wait_for_approval` or `restore_pending_approval`.
@@ -374,7 +435,8 @@
 
 ---
 
-### M16. `default` access-profile fallback can silently widen `Edit` (FINALIZED)
+### M16. `default` access-profile fallback can silently widen `Edit` (FIXED)
+> **Fix:** Default fallback now requires a non-widening declared rank, using exact local profile-shape validation because an upstream rev bump was not authorized.
 **Severity:** LOW — *lowered from MEDIUM*: latent-only. The branch is dead code against every shipped builtin and the operator's own `agents.toml`; reaching it requires a hand-authored registry entry that both omits `workspace-write` and gives `default` broad argv — an author configuring their own escalation, with no third-party channel. ID retained as `M16` for stability.
 **Files:** `src/driver.rs:282-324` (`resolve_registry_access_profile`), `:290` (`mapped`), `:291` (override arm), `:295-305` (widening guard), `:307-308` (else arm), `:310-311` (early return), `:314-315` (false comment), `:316-318` (`ReadOnly` fail-closed), `:319-321` (`default` fallback), `:323` (bail); `core/src/agents/mod.rs:28-30` (`AccessProfile`), `:180-186` (`Registry::load` merge), `:342-348` (unknown-name insert); `core/src/agents/builtin.rs:29-45`, `:76-93`, `:117-129`, `:149-156`, `:269`; `Cargo.toml:28` (upstream rev pin); neighbouring tests `src/driver.rs:1819`, `:1830`, `:1841-1887`
 **Description:** `resolve_registry_access_profile` resolves a profile name and, when that name is absent from `spec.access_profiles`, substitutes the literal `"default"` at `src/driver.rs:319-321` for every mode except `ReadOnly` (`:316-318`). The comment at `:314-315` asserts that a default "may safely reduce or preserve privileges" — a property the code never checks and *cannot* check, because `AccessProfile` carries only raw argv (`core/src/agents/mod.rs:28-30`) and exposes no privilege metadata. The widening guard at `:295-305` never runs on this path: it lives inside the `access_profile_override` arm (`:291`) and compares the override *name* against the mode, while the `default` fallback is a post-hoc substitution in the `else` arm (`:307-308`) reached only after the early return at `:310`. No test covers `:319-321`.
@@ -483,7 +545,8 @@
 
 ---
 
-### L4. `retry_count` is unclamped — debug-build panic, and an unbounded retry runaway in the reachable mid-range (FINALIZED)
+### L4. `retry_count` is unclamped — debug-build panic, and an unbounded retry runaway in the reachable mid-range (FIXED)
+> **Fix:** retry_count is clamped in the runtime, bounded at ingress validation, and the Inspector input now carries min 0 / max 10, closing the runaway at every layer.
 **Severity:** LOW — the claimed release-mode "zero attempts" failure does not exist and the debug panic degrades to a clean `Failed` run; what keeps it on the list is the reachable mid-range runaway (`retryCount: 1000`) through a UI input with no `min`/`max`.
 **Files:** `src/runtime.rs:3696` (the `+ 1`), `:3697-3716` (retry loop), `:2110` (`timeout_for_node`), `:2778`, `:2832`, `:2854` (`JoinSet`), `:3729` (`retry_delay` → `Duration::from_secs`), `:4137-4146` (`apply_join_result`), `:6096`; `src/model.rs:813` (`retry_count`), `:815` (`retry_delay`), `:821` (`loop_max_iterations`), `:1326-1363` (`validate_workflow_input_bounds`); `src/api.rs:547`, `:731` (`enforce_workflow_input_bounds`); `ui/src/features/editor/InspectorPanel.svelte:991-998`
 **Description:** `src/runtime.rs:3696` computes `node.retry_count.unwrap_or(0) + 1` on a `u32` with no clamp, and `validate_workflow_input_bounds` (`src/model.rs:1326-1363`) bounds only `MAX_WORKFLOW_SUBFLOWS` and `MAX_SUBFLOW_CALL_EDGES` — no per-node numeric limits, and `enforce_workflow_input_bounds` at `src/api.rs:547`, `:731` adds none. The practically important consequence is not the overflow but the mid-range: `retryCount: 1000` produces 1000 sequential agent invocations with no cap anywhere, since `timeout_for_node` (`:2110`) is per-attempt and there is no global run timeout. Ingress is the ordinary UI — `InspectorPanel.svelte:991-998` is a bare `type="number"` with no `min`/`max` and no clamp — so a typo or paste reaches the backend directly, not only a hand-edited file.
@@ -583,7 +646,8 @@
 
 ---
 
-### L9. Non-string decide outcome fails with an imprecise diagnostic (FINALIZED)
+### L9. Non-string decide outcome fails with an imprecise diagnostic (FIXED)
+> **Fix:** select_decide_outcome returns a typed selection distinguishing non-scalar and type failures, coerces numbers to label text, and keeps the no-prose-fallback contract intact.
 **Severity:** LOW — *lowered*: the "abandoned fallbacks" premise is refuted, no behavior differs from the already-correct non-matching-string path, and what remains is a diagnostics polish item. ID retained as `L9` for stability.
 **Files:** `src/runtime.rs:4056-4113` (`select_decide_outcome`), `:4061-4069` (structured branch), `:4063` (`as_str()?`), `:4064-4067` (exact match + `return`), `:4071-4079` (trimmed exact), `:4081-4112` (regex scan), `:4026-4041` (`decide_output_schema`), `:4007-4010` (prompt instruction), `:4043-4054` (`parse_decide_structured_response`), `:6741-6761` (`parse_structured_output`), `:3847-3858` (`run_decide_node` failure mapping), `:3860-3877` (block M7 rewrites), `:4237-4266` (`apply_join_result`), `:12166-12177` (pinning test)
 **Description:** When a structured `outcome` field is a non-string, `as_str()?` at `src/runtime.rs:4063` returns `None` from the whole function. This is **behaviorally identical** to the string path: a string `outcome` that matches no label also returns `None` at `:4064-4067` without reaching stages 2–3. The consequence is a clean, correctly classified failure — `run_decide_node` (`:3847-3858`) maps `None` to `success=false`, `exit_code=1`, `stderr = "LLM response did not match any decide outcome: {labels}"`, and `apply_join_result` (`:4237-4266`) routes it to `CursorTerminalStatus::Failure`. The only real defect is diagnostic: the operator cannot tell that the agent emitted the wrong *type* rather than an unrecognized label.
@@ -603,7 +667,8 @@
 
 ---
 
-### L10. Unbounded hot loop with no sleep in the scheduler (FINALIZED)
+### L10. Unbounded hot loop with no sleep in the scheduler (FIXED)
+> **Fix:** Orphan WaitingApproval cursors are reconciled at rehydration and the bare continue now fails the run like the sibling WaitingCollector arm, so the loop can no longer spin.
 **Severity:** LOW — real and unbounded (one core pegged, run never terminates), but reachable only from an already-inconsistent checkpoint, with no data loss and a working abort escape hatch.
 **Files:** `src/runtime.rs:2823` (the bare `continue`), `:2793` (`running_tasks.is_empty()`), `:2663` (`is_aborted`), `:2680` (abort break), `:2681` (`process_immediate_cursors`), `:2790` (`changed`-gated persist), `:2794-2798` (M15's arm), `:2801`, `:2805-2821` (`WaitingCollector` arm), `:2941-2946`, `:3441` (`activate_next_approval` early return), `:3413-3414` (`queue_approval`), `:2262-2292` (`rehydrate_checkpoint_for_execution` consistency check), `:2277` (`cancel_requested` retain), `:4599`, `:4605-4607` (`handle_approval_resolution`); `src/storage.rs:186-203` *(pre-existing)*
 **Description:** The bare `continue` at `src/runtime.rs:2823` is taken when `running_tasks` is empty, no approval is active, cursors exist, and not all are `WaitingCollector`. The iteration contains no pending await — `is_aborted` (`:2663`) hits an uncontended mutex fast path, `process_immediate_cursors` (`:2681`) reaches `activate_next_approval`'s early `Ok(false)` at `:3441` and then filters zero runnable cursors (`:2941-2946`) — and `persist_checkpoint` (`:2790`) is gated by `changed`, so the branch performs no emit, no persist, and no sleep. Result: **100% of one core with zero DB writes**, and on a current-thread runtime it would also starve the executor. The run stays Running indefinitely with a frozen `updated_at`. No guard exists: no iteration counter, no elapsed check (`start_instant` at `:2640` is used only for final duration), no watchdog, and `max_total_steps` is enforced in `prepare_cursor_visit`, which never runs here.
@@ -626,7 +691,8 @@
 
 ---
 
-### L11. `migrate_output_schema` misclassifies real JSON Schemas as legacy and corrupts them (FINALIZED)
+### L11. `migrate_output_schema` misclassifies real JSON Schemas as legacy and corrupts them (FIXED)
+> **Fix:** Legacy outputSchema migration is now gated to v2/v3 to v4 with a positive primitive-type predicate and the serde hook is passthrough, so real JSON Schemas round-trip intact.
 **Severity:** LOW — the trigger is narrow and the schema currently feeds nothing but a prompt hint, so there is no execution or validation breakage; it stays on the list because the loss is permanent user data and it must land before or with M14.
 **Files:** `src/model.rs:325-352` (`migrate_output_schema`), `:806-811` (`deserialize_output_schema` serde hook), `:973`, `:981` (`normalize_workflow_value`), `:3852-3946` (legacy-shorthand tests), `:3885-3910`; `src/api.rs:520-522` (save), `:544`, `:721`; `src/storage.rs:333`, `:335-343` (`get_run` CAS write-back), `:851`, `:871`, `:880-886`, `:943`, `:1053` (`backfill_legacy_tmux_sessions` precedent); `src/runtime.rs:3670` (`json_schema = None`), `:4026`; `src/driver.rs:895-925` (`schema_to_prompt_hint`); `docs/workflow-schema.md:392`
 **Description:** Legacy detection is `!obj.is_empty() && !obj.contains_key("type") && obj.values().all(|v| v.is_string())` (`src/model.rs:325-352`), which sniffs format structurally rather than by version. A genuine schema such as `{"$ref":"#/defs/X"}` or `{"$schema":"…","$id":"…"}` satisfies it and is rewritten to `{"type":"object","properties":{"$ref":{"type":"#/defs/X"}},"required":["$ref"]}`. Because the conversion lives in a serde `deserialize_with` on the `output_schema` field (`:806-811`), it fires on **every** deserialization via `normalize_workflow_value` (`:973`, `:981`) — it is not gated on `migrate_workflow_value_to_v4` at all. The corruption is then persisted twice over: `save_workflow` normalizes and writes the migrated document over the user's `.json` (`src/api.rs:520-522` → `src/storage.rs:880-886`), and `get_run` CAS-writes the normalized workflow into `runs.workflow_json` (`src/storage.rs:335-343`). The original schema is destroyed with no backup.
@@ -647,7 +713,8 @@
 
 ---
 
-### L12. Subflow cycle detection can collide the root workflow with a subflow of the same name (FINALIZED)
+### L12. Subflow cycle detection can collide the root workflow with a subflow of the same name (FIXED)
+> **Fix:** Cycle detection keys vertices by a SubflowCallVertex discriminant separating root from catalog, so a root named after a subflow no longer warns spuriously.
 **Severity:** LOW — warning-only and non-blocking; a spurious banner that mis-labels the root as a subflow, with no masking risk since merging only adds edges.
 **Files:** `src/model.rs:2205-2216` (`validate_subflow_call_cycles`), `:2240` (warning severity), `:2252-2280` (`collect_subflow_calls`), `:2288` (Tarjan), `:865` (`WorkflowV3.name`), `:886-889` (global subflow-name contract), `:2001` (`validate_subflow_catalog`); `src/api.rs:581` (`hydrate_saved_subflows`), `:736` (error-only filter); tests `src/model.rs:4178`, `:4544`
 **Description:** `validate_subflow_call_cycles` derives the root vertex key from `workflow.name`, falling back to the literal `"__root__"` (`src/model.rs:2206-2211`), then keys every subflow vertex by its catalog name (`:2214-2215`) in the same flat `BTreeMap`; `collect_subflow_calls` appends out-edges via `graph.entry(name).or_default()` (`:2257`, `:2280`), so equal names merge two vertices into one. Nothing forbids a root `name` equal to a catalog key — `WorkflowV3.name` is free-text `Option<String>` (`:865`) and `hydrate_saved_subflows` inserts under storage name into the same namespace (`src/api.rs:581`). The result is a "Subflow call cycle detected among subflows {…}" warning for an acyclic graph, mis-labeling the root as a subflow; the inverse holds too, where a blank root name collides with a catalog entry literally named `__root__`. Impact is bounded: the issue is `severity: "warning"` (`:2240`) and `src/api.rs:736` filters only `error`, so no workflow is rejected, and in the dominant hydration path (root named after a saved catalog entry whose body *is* the root) the merge is semantically correct and the reported recursion real.
@@ -677,7 +744,8 @@
 
 ---
 
-### L14. `abort_and_wait` awaits `drained_token` with no timeout (FINALIZED)
+### L14. `abort_and_wait` awaits `drained_token` with no timeout (FIXED)
+> **Fix:** The run task is spawned via a supervisor clearing the registry on JoinError or panic, and abort_and_wait bounds the drain await with a force-clear and warning on expiry.
 **Severity:** MEDIUM — *raised from LOW*: unrecoverable without a server restart (the run id is wedged for resume, restart, and abort alike) and the hung request leaks a task with no server-side timeout; held down only by requiring a top-level panic. ID retained as `L14` for stability.
 **Files:** `src/runtime.rs:951-957` (`abort_and_wait`), `:956` (unbounded await), `:952` (guard dropped), `:1071-1073` (`RunRegistry::clear`, sole `drained_token.cancel()`), `:1386`, `:1425`, `:1567` (bare `tokio::spawn` of the run task), `:1405` (`AlreadyActive`), `:1449` (`restart_from` await), `:2878-2896` (error path → `finalize_run`), `:6324-6325` (`cleanup_terminal_active_panes` before `clear`), `:4119-4145` (`apply_join_result`, child tasks only), `:5213` (per-item `catch_unwind`), `:6871-6905` (`PendingInteractionGuard` pattern); `src/api.rs:113-151` (router layers), `:2260` (`restart_run` handler); tests `src/runtime.rs:7665-7687`, `:9516`
 **Description:** `abort_and_wait` cancels `abort_token` then awaits `drained_token.cancelled()` with no bound (`src/runtime.rs:956`); that token is cancelled only in `RunRegistry::clear` (`:1071-1073`), whose sole production caller is the tail of `finalize_run` (`:6325`). The run task is spawned as a bare `tokio::spawn` at `:1386`, `:1425`, and `:1567` — the `JoinHandle` is dropped immediately, nothing observes it, no `catch_unwind` wraps it, no `Drop` impl cancels the token, and `Cargo.toml` sets no `panic = "abort"` — so a panic unwinding out of `execute_workflow_to_terminal` never reaches `finalize_run`. `restart_from` awaits this at `:1449` and the axum handler `restart_run` (`src/api.rs:2260`) has no timeout layer (the router at `src/api.rs:113-151` carries only origin middleware), so the request hangs until the client gives up while the stale registry entry makes `resume_run` return `AlreadyActive` forever (`:1405`). No lock is held across the await — the map guard drops in the `let-else` at `:952` — so damage is confined to that run id plus the leaked request task.
