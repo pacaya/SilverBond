@@ -57,3 +57,11 @@ One row per unique key (`file:line` + smell name). Columns:
 | `src/model.rs:2061` + Feature Envy | 1 | 2026-07-20 | open |
 | `src/driver.rs:291-305` + Primitive Obsession | 1 | 2026-07-20 | open |
 | `ui/src/features/editor/InspectorPanel.svelte:1` + Divergent Change | 1 | 2026-07-20 | open |
+| `ui/src/features/editor/InspectorPanel.svelte:789` + Duplicated Code | 1 | 2026-07-21 | open |
+| `src/model.rs:2247` + Shotgun Surgery | 1 | 2026-07-21 | open |
+| `src/driver.rs:291` + Primitive Obsession | 1 | 2026-07-21 | open |
+| `src/driver.rs:301` + Repeated Switches | 1 | 2026-07-21 | open |
+| `src/api.rs:1601` + Divergent Change | 1 | 2026-07-21 | open |
+| `src/api.rs:2205` + Mysterious Name | 1 | 2026-07-21 | open |
+| `ui/src/lib/types/workflow.ts:511` + Shotgun Surgery | 1 | 2026-07-21 | open |
+| `src/runtime.rs:1352` + Divergent Change | 1 | 2026-07-21 | open |
