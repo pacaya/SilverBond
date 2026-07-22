@@ -7,6 +7,7 @@ default:
 # Install frontend dependencies
 setup:
     npm install
+    just install-hooks
 
 # Start Vite frontend dev server (port 5173)
 dev:
@@ -50,6 +51,10 @@ test-rust:
 # Frontend vitest unit tests
 test-ui:
     npm test
+
+# Frontend freshness pre-commit hook regression
+test-pre-commit:
+    bash scripts/test-pre-commit-frontend-freshness.sh
 
 # Build + Playwright e2e tests
 test-e2e:

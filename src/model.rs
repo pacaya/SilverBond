@@ -57,25 +57,18 @@ pub struct OrchestratorConfig {
 /// Default agent used when a node has no explicit `agent` field.
 pub const DEFAULT_AGENT: &str = "claude";
 
-/// Returns the agent that will actually execute an agent-running node.
-pub fn agent_name_for_node(node: &WorkflowNode) -> String {
+fn explicit_agent_for_node(node: &WorkflowNode) -> Option<&str> {
     match &node.kind {
         NodeKind::RunAgent {
             run_agent_config, ..
         } => run_agent_config
             .agent
-            .clone()
-            .or_else(|| node.agent.clone())
-            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
+            .as_deref()
+            .or(node.agent.as_deref()),
         NodeKind::Spawn { spawn_config } => spawn_config
             .agent
-            .clone()
-            .or_else(|| node.agent.clone())
-            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
-        NodeKind::Send { .. }
-        | NodeKind::Wait { .. }
-        | NodeKind::Capture { .. }
-        | NodeKind::Kill { .. } => "tmux".to_string(),
+            .as_deref()
+            .or(node.agent.as_deref()),
         NodeKind::Task { .. }
         | NodeKind::Approval
         | NodeKind::Split
@@ -83,10 +76,21 @@ pub fn agent_name_for_node(node: &WorkflowNode) -> String {
         | NodeKind::Decide { .. }
         | NodeKind::ParallelBatch { .. }
         | NodeKind::Subflow { .. }
-        | NodeKind::Call { .. } => node
-            .agent
-            .clone()
-            .unwrap_or_else(|| DEFAULT_AGENT.to_string()),
+        | NodeKind::Call { .. } => node.agent.as_deref(),
+        _ => None,
+    }
+}
+
+/// Returns the agent that will actually execute an agent-running node.
+pub fn agent_name_for_node(node: &WorkflowNode) -> String {
+    match &node.kind {
+        NodeKind::Send { .. }
+        | NodeKind::Wait { .. }
+        | NodeKind::Capture { .. }
+        | NodeKind::Kill { .. } => "tmux".to_string(),
+        _ => explicit_agent_for_node(node)
+            .unwrap_or(DEFAULT_AGENT)
+            .to_string(),
     }
 }
 
@@ -104,6 +108,17 @@ fn working_directory_for_node(workflow_cwd: &str, node: &WorkflowNode) -> String
             .clone()
             .unwrap_or_else(|| workflow_cwd.to_string()),
     }
+}
+
+fn configured_access_profile_name(config: &AgentConfig) -> &str {
+    config
+        .access_profile_override
+        .as_deref()
+        .unwrap_or(match &config.access_mode {
+            AccessMode::ReadOnly => "read-only",
+            AccessMode::Edit | AccessMode::Execute => "workspace-write",
+            AccessMode::Unrestricted => "full-access",
+        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1698,16 +1713,10 @@ fn validate_graph_body(
                 );
             }
             NodeKind::Spawn { spawn_config } => {
-                let agent = spawn_config
-                    .agent
-                    .as_deref()
-                    .or(node.agent.as_deref())
-                    .unwrap_or(DEFAULT_AGENT);
-                let has_agent = spawn_config
-                    .agent
-                    .as_deref()
-                    .or(node.agent.as_deref())
-                    .is_some_and(|agent| !agent.trim().is_empty());
+                let explicit_agent = explicit_agent_for_node(node);
+                let agent = explicit_agent.unwrap_or(DEFAULT_AGENT);
+                let has_agent =
+                    explicit_agent.is_some_and(|agent| !agent.trim().is_empty());
                 let has_command = spawn_config
                     .command
                     .as_deref()
@@ -1771,16 +1780,10 @@ fn validate_graph_body(
             NodeKind::RunAgent {
                 run_agent_config, ..
             } => {
-                let agent = run_agent_config
-                    .agent
-                    .as_deref()
-                    .or(node.agent.as_deref())
-                    .unwrap_or(DEFAULT_AGENT);
-                let has_agent = run_agent_config
-                    .agent
-                    .as_deref()
-                    .or(node.agent.as_deref())
-                    .is_some_and(|agent| !agent.trim().is_empty());
+                let explicit_agent = explicit_agent_for_node(node);
+                let agent = explicit_agent.unwrap_or(DEFAULT_AGENT);
+                let has_agent =
+                    explicit_agent.is_some_and(|agent| !agent.trim().is_empty());
                 if !has_agent {
                     issues.push(ValidationIssue {
                         severity: "error".to_string(),
@@ -2077,23 +2080,48 @@ fn validate_graph_body(
                     false,
                     None,
                 );
-                if let (
-                    Ok((current_profile, current_privilege)),
-                    Ok((source_profile, source_privilege)),
-                ) = (
+                match (
                     driver::resolved_access_profile(&current_agent, &current_config),
                     driver::resolved_access_profile(&source_agent, &source_config),
-                ) && source_privilege > current_privilege
-                {
-                    issues.push(ValidationIssue {
-                        severity: "error".to_string(),
+                ) {
+                    (
+                        Ok((current_profile, current_privilege)),
+                        Ok((source_profile, source_privilege)),
+                    ) => {
+                        if source_privilege > current_privilege {
+                            issues.push(ValidationIssue {
+                                severity: "error".to_string(),
+                                node_id: Some(node.id.clone()),
+                                scope: None,
+                                message: format!(
+                                    "\"{}\" continues session from \"{}\" with a broader access profile ({} vs {}).",
+                                    node.name, source_node.name, current_profile, source_profile
+                                ),
+                            });
+                        }
+                    }
+                    (Err(_), _) => issues.push(ValidationIssue {
+                        severity: "warning".to_string(),
                         node_id: Some(node.id.clone()),
                         scope: None,
                         message: format!(
-                            "\"{}\" continues session from \"{}\" with a broader access profile ({} vs {}).",
-                            node.name, source_node.name, current_profile, source_profile
+                            "\"{}\" cannot verify session continuation because agent {} access profile {} has no declared privilege rank; pane adoption will be refused at run time.",
+                            node.name,
+                            current_agent,
+                            configured_access_profile_name(&current_config)
                         ),
-                    });
+                    }),
+                    (_, Err(_)) => issues.push(ValidationIssue {
+                        severity: "warning".to_string(),
+                        node_id: Some(node.id.clone()),
+                        scope: None,
+                        message: format!(
+                            "\"{}\" cannot verify session continuation because agent {} access profile {} has no declared privilege rank; pane adoption will be refused at run time.",
+                            node.name,
+                            source_agent,
+                            configured_access_profile_name(&source_config)
+                        ),
+                    }),
                 }
                 let current_cwd = working_directory_for_node(&workflow.cwd, node);
                 let source_cwd = working_directory_for_node(&workflow.cwd, source_node);
@@ -2244,19 +2272,6 @@ fn validate_agent_launch_config(
     node_name: &str,
     issues: &mut Vec<ValidationIssue>,
 ) {
-    const CLAUDE_ACCESS_FLAGS: &[&str] = &[
-        "--dangerously-skip-permissions",
-        "--permission-mode",
-        "--allowedTools",
-        "--disallowedTools",
-    ];
-    const CODEX_ACCESS_FLAGS: &[&str] = &[
-        "--sandbox",
-        "--ask-for-approval",
-        "--full-auto",
-        "--dangerously-bypass-approvals-and-sandbox",
-    ];
-
     if let Some(access) = access {
         let access_profiles = driver::agent_access_profile_names(agent);
         match driver::get_driver(agent) {
@@ -2282,47 +2297,165 @@ fn validate_agent_launch_config(
         }
     }
 
-    for (index, arg) in extra_args.iter().enumerate() {
-        let (flag, inline_value) = arg
-            .split_once('=')
-            .map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
-        let is_config_flag = flag == "-c" || matches_long_flag(flag, &["--config"]);
-        let access_config_override = (agent == "codex" && is_config_flag)
-            .then(|| {
-                inline_value
-                    .or_else(|| extra_args.get(index + 1).map(String::as_str))
-            })
-            .flatten()
-            .filter(|value| config_override_changes_access(value));
-        let changes_access_flag = match agent {
-            "claude" => matches_long_flag(flag, CLAUDE_ACCESS_FLAGS),
-            "codex" => {
-                matches!(flag, "-s" | "-a") || matches_long_flag(flag, CODEX_ACCESS_FLAGS)
+    let accepts_model = matches!(agent, "claude" | "codex");
+    let mut index = 0;
+    while let Some(arg) = extra_args.get(index).map(String::as_str) {
+        if accepts_model && arg == "--model" {
+            let value = extra_args.get(index + 1).map(String::as_str);
+            if value.is_none_or(is_option_syntax) {
+                reject_agent_extra_arg(
+                    arg,
+                    agent,
+                    "requires a following non-option value",
+                    node_id,
+                    node_name,
+                    issues,
+                );
+                index += 1;
+            } else {
+                index += 2;
             }
-            _ => false,
-        };
-        if changes_access_flag || access_config_override.is_some() {
-            let rejected = access_config_override.unwrap_or(arg);
-            issues.push(ValidationIssue {
-                severity: "error".to_string(),
-                node_id: Some(node_id.to_string()),
-                scope: None,
-                message: format!(
-                    "\"{node_name}\" extraArgs cannot override agent access with {rejected}."
-                ),
-            });
+            continue;
         }
+        if accepts_model
+            && arg
+                .strip_prefix("--model=")
+                .is_some_and(|value| !value.is_empty())
+        {
+            index += 1;
+            continue;
+        }
+        if agent == "codex" && arg == "--search" {
+            index += 1;
+            continue;
+        }
+        if agent == "codex" && matches!(arg, "-c" | "--config") {
+            let value = extra_args.get(index + 1).map(String::as_str);
+            match value {
+                Some(value) if !is_option_syntax(value) => {
+                    validate_agent_config_override(value, value, agent, node_id, node_name, issues);
+                    index += 2;
+                }
+                _ => {
+                    reject_agent_extra_arg(
+                        arg,
+                        agent,
+                        "requires a following non-option value",
+                        node_id,
+                        node_name,
+                        issues,
+                    );
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        if agent == "codex" {
+            if let Some(value) = arg
+                .strip_prefix("--config=")
+                .filter(|value| !value.is_empty())
+            {
+                validate_agent_config_override(value, arg, agent, node_id, node_name, issues);
+                index += 1;
+                continue;
+            }
+        }
+        if is_option_syntax(arg) {
+            reject_agent_extra_arg(
+                arg,
+                agent,
+                "is not an allowlisted option",
+                node_id,
+                node_name,
+                issues,
+            );
+        }
+        index += 1;
     }
 }
 
-fn matches_long_flag(candidate: &str, flags: &[&str]) -> bool {
-    candidate.starts_with("--")
-        && candidate != "--"
-        && flags
-            .iter()
-            .filter(|flag| flag.starts_with(candidate))
-            .count()
-            == 1
+fn is_option_syntax(arg: &str) -> bool {
+    arg.starts_with('-') && arg != "-"
+}
+
+fn validate_agent_config_override(
+    value: &str,
+    offending_arg: &str,
+    agent: &str,
+    node_id: &str,
+    node_name: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    let Some((key, _)) = value.split_once('=') else {
+        reject_agent_extra_arg(
+            offending_arg,
+            agent,
+            "must use KEY=VALUE syntax",
+            node_id,
+            node_name,
+            issues,
+        );
+        return;
+    };
+    if key.trim().is_empty() {
+        reject_agent_extra_arg(
+            offending_arg,
+            agent,
+            "must include a non-empty key in KEY=VALUE syntax",
+            node_id,
+            node_name,
+            issues,
+        );
+        return;
+    }
+    if !config_key_has_supported_syntax(key) {
+        reject_agent_extra_arg(
+            offending_arg,
+            agent,
+            "uses unsupported config key syntax",
+            node_id,
+            node_name,
+            issues,
+        );
+        return;
+    }
+    if config_override_changes_access(value) {
+        reject_agent_extra_arg(
+            offending_arg,
+            agent,
+            "cannot override sandbox or approval settings",
+            node_id,
+            node_name,
+            issues,
+        );
+    }
+}
+
+fn config_key_has_supported_syntax(key: &str) -> bool {
+    key.split('.').all(|segment| {
+        !segment.is_empty()
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    })
+}
+
+fn reject_agent_extra_arg(
+    arg: &str,
+    agent: &str,
+    reason: &str,
+    node_id: &str,
+    node_name: &str,
+    issues: &mut Vec<ValidationIssue>,
+) {
+    issues.push(ValidationIssue {
+        severity: "error".to_string(),
+        node_id: Some(node_id.to_string()),
+        scope: None,
+        message: format!(
+            "\"{node_name}\" extraArgs argument \"{arg}\" {reason} for agent {agent}."
+        ),
+    });
 }
 
 fn config_override_changes_access(value: &str) -> bool {
@@ -3301,6 +3434,32 @@ mod tests {
     }
 
     #[test]
+    fn validates_spawn_requires_agent_or_command() {
+        let spawn = node("spawn", "Spawn", WorkflowNodeType::Spawn);
+
+        let result = validate_workflow(workflow(vec![spawn], vec![], "spawn"));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.node_id.as_deref() == Some("spawn")
+                && issue.message.contains("spawn node requires an agent or command")
+        }));
+    }
+
+    #[test]
+    fn validates_run_agent_requires_agent() {
+        let run_agent = node("run", "Run", WorkflowNodeType::RunAgent);
+
+        let result = validate_workflow(workflow(vec![run_agent], vec![], "run"));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.node_id.as_deref() == Some("run")
+                && issue.message.contains("run_agent node requires an agent")
+        }));
+    }
+
+    #[test]
     fn validates_spawn_extra_args_rejects_claude_access_flag() {
         let mut spawn = node("spawn", "Spawn", WorkflowNodeType::Spawn);
         spawn.kind = NodeKind::Spawn {
@@ -3370,6 +3529,27 @@ mod tests {
     }
 
     #[test]
+    fn validates_run_agent_extra_args_rejects_glued_sandbox_short_flag() {
+        let mut run_agent = node("run", "Run", WorkflowNodeType::RunAgent);
+        run_agent.kind = NodeKind::RunAgent {
+            run_agent_config: RunAgentConfig {
+                agent: Some("codex".to_string()),
+                extra_args: vec!["-sdanger-full-access".to_string()],
+                ..RunAgentConfig::default()
+            },
+            agent_config: None,
+        };
+
+        let result = validate_workflow(workflow(vec![run_agent], vec![], "run"));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.node_id.as_deref() == Some("run")
+                && issue.message.contains("-sdanger-full-access")
+        }));
+    }
+
+    #[test]
     fn validates_run_agent_extra_args_rejects_access_config_override() {
         let mut run_agent = node("run", "Run", WorkflowNodeType::RunAgent);
         run_agent.kind = NodeKind::RunAgent {
@@ -3401,6 +3581,7 @@ mod tests {
             ("claude", vec!["--disallowedTools", "Bash"], "--disallowedTools"),
             ("codex", vec!["-s", "danger-full-access"], "-s"),
             ("codex", vec!["-a", "never"], "-a"),
+            ("codex", vec!["-anever"], "-anever"),
             ("codex", vec!["--ask-for-approval", "never"], "--ask-for-approval"),
             ("codex", vec!["--full-auto"], "--full-auto"),
             (
@@ -3412,6 +3593,11 @@ mod tests {
                 "codex",
                 vec!["--config=approval_policy=never"],
                 "approval_policy=never",
+            ),
+            (
+                "codex",
+                vec!["-csandbox_mode=danger-full-access"],
+                "-csandbox_mode=danger-full-access",
             ),
         ];
 
@@ -3439,27 +3625,141 @@ mod tests {
     }
 
     #[test]
-    fn validates_extra_args_allows_benign_model_flags() {
-        let mut spawn = node("spawn", "Spawn", WorkflowNodeType::Spawn);
-        spawn.kind = NodeKind::Spawn {
-            spawn_config: SpawnConfig {
-                agent: Some("codex".to_string()),
-                extra_args: vec![
-                    "--model".to_string(),
-                    "o3".to_string(),
-                    "-c".to_string(),
-                    "model_reasoning_effort=high".to_string(),
+    fn validates_extra_args_allows_curated_benign_arguments() {
+        let cases = [
+            (
+                "claude",
+                vec!["--model", "claude-sonnet-4", "plain positional", "-"],
+            ),
+            ("claude", vec!["--model=claude-sonnet-4"]),
+            (
+                "codex",
+                vec![
+                    "--model",
+                    "o3",
+                    "--search",
+                    "-c",
+                    "model_reasoning_effort=high",
+                    "--config",
+                    "model_verbosity=low",
+                    "plain positional",
+                    "-",
                 ],
-                ..SpawnConfig::default()
+            ),
+            (
+                "codex",
+                vec!["--model=o3", "--config=model_reasoning_effort=high"],
+            ),
+            ("custom-agent", vec!["plain positional", "-"]),
+        ];
+
+        for (agent, args) in cases {
+            let mut spawn = node("spawn", "Spawn", WorkflowNodeType::Spawn);
+            spawn.kind = NodeKind::Spawn {
+                spawn_config: SpawnConfig {
+                    agent: Some(agent.to_string()),
+                    extra_args: args.into_iter().map(str::to_string).collect(),
+                    ..SpawnConfig::default()
+                },
+            };
+
+            let result = validate_workflow(workflow(vec![spawn], vec![], "spawn"));
+
+            assert!(
+                !result.issues.iter().any(|issue| {
+                    issue.severity == "error"
+                        && issue.node_id.as_deref() == Some("spawn")
+                        && issue.message.contains("extraArgs")
+                }),
+                "{agent} benign extraArgs should be allowed; issues={:?}",
+                result.issues
+            );
+        }
+    }
+
+    #[test]
+    fn validates_extra_args_rejects_unknown_option_syntax() {
+        let cases = [
+            ("claude", "--search"),
+            ("codex", "--ephemeral"),
+            ("codex", "--mod=o3"),
+            ("codex", "-sc"),
+            ("codex", "--"),
+            ("custom-agent", "--model"),
+        ];
+
+        for (agent, arg) in cases {
+            let mut run_agent = node("run", "Run", WorkflowNodeType::RunAgent);
+            run_agent.kind = NodeKind::RunAgent {
+                run_agent_config: RunAgentConfig {
+                    agent: Some(agent.to_string()),
+                    extra_args: vec![arg.to_string()],
+                    ..RunAgentConfig::default()
+                },
+                agent_config: None,
+            };
+
+            let result = validate_workflow(workflow(vec![run_agent], vec![], "run"));
+
+            assert!(
+                result.issues.iter().any(|issue| {
+                    issue.severity == "error"
+                        && issue.node_id.as_deref() == Some("run")
+                        && issue.message.contains(arg)
+                        && (issue.message.contains("not an allowlisted option")
+                            || issue
+                                .message
+                                .contains("requires a following non-option value"))
+                }),
+                "{agent} extraArgs should reject {arg}; issues={:?}",
+                result.issues
+            );
+        }
+    }
+
+    #[test]
+    fn validates_extra_args_rejects_config_without_key_value_syntax() {
+        let mut run_agent = node("run", "Run", WorkflowNodeType::RunAgent);
+        run_agent.kind = NodeKind::RunAgent {
+            run_agent_config: RunAgentConfig {
+                agent: Some("codex".to_string()),
+                extra_args: vec!["-c".to_string(), "model_reasoning_effort".to_string()],
+                ..RunAgentConfig::default()
             },
+            agent_config: None,
         };
 
-        let result = validate_workflow(workflow(vec![spawn], vec![], "spawn"));
+        let result = validate_workflow(workflow(vec![run_agent], vec![], "run"));
 
-        assert!(!result.issues.iter().any(|issue| {
+        assert!(result.issues.iter().any(|issue| {
             issue.severity == "error"
-                && issue.node_id.as_deref() == Some("spawn")
-                && issue.message.contains("extraArgs")
+                && issue.node_id.as_deref() == Some("run")
+                && issue.message.contains("model_reasoning_effort")
+                && issue.message.contains("KEY=VALUE")
+        }));
+    }
+
+    #[test]
+    fn validates_extra_args_rejects_escaped_config_key_syntax() {
+        let mut run_agent = node("run", "Run", WorkflowNodeType::RunAgent);
+        run_agent.kind = NodeKind::RunAgent {
+            run_agent_config: RunAgentConfig {
+                agent: Some("codex".to_string()),
+                extra_args: vec![
+                    "--config=\"sand\\u0062ox_mode\"=\"danger-full-access\"".to_string(),
+                ],
+                ..RunAgentConfig::default()
+            },
+            agent_config: None,
+        };
+
+        let result = validate_workflow(workflow(vec![run_agent], vec![], "run"));
+
+        assert!(result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.node_id.as_deref() == Some("run")
+                && issue.message.contains("sand\\u0062ox_mode")
+                && issue.message.contains("unsupported config key syntax")
         }));
     }
 
@@ -4792,6 +5092,119 @@ mod tests {
                 && issue.message.contains("broader access profile")
                 && issue.message.contains("workspace-write vs full-access")
         }));
+    }
+
+    #[test]
+    fn warns_when_continuation_agent_is_not_registered() {
+        let mut source = node("source", "Source", WorkflowNodeType::Task);
+        source.agent = Some("unregistered-m22".to_string());
+        source.prompt = "start".to_string();
+        let mut continuation = node("continuation", "Continuation", WorkflowNodeType::Task);
+        continuation.agent = Some("unregistered-m22".to_string());
+        continuation.prompt = "continue".to_string();
+        continuation.continue_session_from = Some("source".to_string());
+
+        let result = validate_workflow(workflow(
+            vec![source, continuation],
+            vec![
+                success_edge("forward", "source", "continuation", None),
+                success_edge("back", "continuation", "source", None),
+            ],
+            "source",
+        ));
+
+        let warnings: Vec<_> = result
+            .issues
+            .iter()
+            .filter(|issue| issue.severity == "warning")
+            .collect();
+        assert_eq!(warnings.len(), 1, "unexpected warnings: {warnings:?}");
+        assert_eq!(
+            warnings[0].message,
+            "\"Continuation\" cannot verify session continuation because agent unregistered-m22 access profile workspace-write has no declared privilege rank; pane adoption will be refused at run time."
+        );
+        assert!(
+            result.issues.iter().all(|issue| issue.severity != "error"),
+            "unexpected errors: {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn warns_when_source_uses_registered_unranked_access_profile() {
+        const CHILD_MARKER: &str = "SILVERBOND_M22_UNRANKED_PROFILE_CHILD";
+        const TEST_NAME: &str =
+            "model::tests::warns_when_source_uses_registered_unranked_access_profile";
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let agents_dir = temp.path().join("tmux-tools");
+            std::fs::create_dir_all(&agents_dir).unwrap();
+            std::fs::write(
+                agents_dir.join("agents.toml"),
+                r#"
+[claude.access.m22-unranked]
+args = ["--m22-unranked"]
+"#,
+            )
+            .unwrap();
+
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env("XDG_CONFIG_HOME", temp.path())
+                .env(CHILD_MARKER, "1")
+                .arg(TEST_NAME)
+                .arg("--exact")
+                .arg("--nocapture")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let mut source = node("source", "Source", WorkflowNodeType::RunAgent);
+        source.agent = Some("claude".to_string());
+        source.prompt = "start".to_string();
+        let NodeKind::RunAgent {
+            run_agent_config, ..
+        } = &mut source.kind
+        else {
+            unreachable!();
+        };
+        run_agent_config.access = Some("m22-unranked".to_string());
+        let mut continuation = node("continuation", "Continuation", WorkflowNodeType::Task);
+        continuation.agent = Some("claude".to_string());
+        continuation.prompt = "continue".to_string();
+        continuation.continue_session_from = Some("source".to_string());
+
+        let result = validate_workflow(workflow(
+            vec![source, continuation],
+            vec![
+                success_edge("forward", "source", "continuation", None),
+                success_edge("back", "continuation", "source", None),
+            ],
+            "source",
+        ));
+
+        let warnings: Vec<_> = result
+            .issues
+            .iter()
+            .filter(|issue| issue.severity == "warning")
+            .collect();
+        assert_eq!(warnings.len(), 1, "unexpected warnings: {warnings:?}");
+        assert_eq!(
+            warnings[0].message,
+            "\"Continuation\" cannot verify session continuation because agent claude access profile m22-unranked has no declared privilege rank; pane adoption will be refused at run time."
+        );
+        assert!(
+            result.issues.iter().all(|issue| issue.severity != "error"),
+            "unexpected errors: {:?}",
+            result.issues
+        );
     }
 
     #[test]

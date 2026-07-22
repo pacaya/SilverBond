@@ -272,11 +272,15 @@
   }
 
   function captureConfig(node: WorkflowNode): CaptureConfig {
-    return node.kind.type === "capture" ? node.kind.captureConfig : DEFAULT_CAPTURE_CONFIG;
+    return node.kind.type === "capture"
+      ? node.kind.captureConfig ?? DEFAULT_CAPTURE_CONFIG
+      : DEFAULT_CAPTURE_CONFIG;
   }
 
   function killConfig(node: WorkflowNode): KillConfig {
-    return node.kind.type === "kill" ? node.kind.killConfig : DEFAULT_KILL_CONFIG;
+    return node.kind.type === "kill"
+      ? node.kind.killConfig ?? DEFAULT_KILL_CONFIG
+      : DEFAULT_KILL_CONFIG;
   }
 
   function subflowConfig(node: WorkflowNode): SubflowConfig {

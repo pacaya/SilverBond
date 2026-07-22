@@ -64,6 +64,20 @@ describe("normalizeWorkflowNode", () => {
     });
   });
 
+  it("preserves a configless kind-shaped capture node", () => {
+    const node = v3Node("c2", { type: "capture" });
+
+    expect(normalizeWorkflowNode(node)).toBe(node);
+    expect(node.kind).toEqual({ type: "capture" });
+  });
+
+  it("preserves a configless kind-shaped kill node", () => {
+    const node = v3Node("k2", { type: "kill" });
+
+    expect(normalizeWorkflowNode(node)).toBe(node);
+    expect(node.kind).toEqual({ type: "kill" });
+  });
+
   it("defaults subflow config for legacy and kind-shaped nodes", () => {
     const expected = { workflowName: "", inputs: [], maxDepth: 10 };
 

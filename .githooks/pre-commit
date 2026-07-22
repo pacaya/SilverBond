@@ -27,11 +27,13 @@ cleanup() {
 trap cleanup EXIT
 
 git checkout-index --all --prefix="$STAGED_SNAPSHOT/"
+ln -s "$ROOT/node_modules" "$STAGED_SNAPSHOT/node_modules"
 
-npm run build
+cd "$STAGED_SNAPSHOT"
+npm run build -- --outDir "$STAGED_SNAPSHOT/out" --emptyOutDir
 
-if ! diff -qr "$STAGED_SNAPSHOT/public" "$ROOT/public" >/dev/null; then
-  echo "Staged public/ assets do not match the bundle built from the working tree." >&2
+if ! diff -qr "$STAGED_SNAPSHOT/public" "$STAGED_SNAPSHOT/out" >/dev/null; then
+  echo "Staged public/ assets do not match the bundle built from staged ui/src." >&2
   echo "Stage the intended ui/src and public/ changes, then retry the commit." >&2
   exit 1
 fi

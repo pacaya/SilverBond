@@ -5,7 +5,7 @@ Rust backend (`src/`) + Svelte 5 frontend (`ui/`). The backend embeds built fron
 ## Commands
 
 ```bash
-just setup          # npm install
+just setup          # npm install + configure repository Git hooks
 just dev            # Vite dev server on :5173 (proxies /api to :3333)
 just server         # Rust backend on :3333
 just build          # Build frontend to public/
@@ -16,6 +16,13 @@ just test-e2e       # Build + Playwright e2e tests
 just typecheck      # svelte-check
 just check          # cargo check
 ```
+
+## Frontend bundle freshness
+
+`just setup` sets this clone's `core.hooksPath` to `.githooks/`. The pre-commit
+hook verifies that staged `public/` assets were built from the staged `ui/src/`
+tree without modifying the working tree. Run `git config --unset core.hooksPath`
+to disable the repository hooks for this clone.
 
 ## Test details
 

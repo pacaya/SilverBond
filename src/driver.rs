@@ -329,6 +329,15 @@ fn declared_profile_privilege(
     matched
 }
 
+fn require_privilege(spec: &agents::AgentSpec, profile: &str) -> anyhow::Result<AccessPrivilege> {
+    declared_profile_privilege(spec, profile).ok_or_else(|| {
+        anyhow::anyhow!(
+            "agent {} access profile {profile} has no declared privilege rank",
+            spec.name
+        )
+    })
+}
+
 pub(crate) fn access_profile_privilege(
     agent: &str,
     profile_name: &str,
@@ -337,11 +346,7 @@ pub(crate) fn access_profile_privilege(
     let spec = registry
         .get(agent)
         .ok_or_else(|| anyhow::anyhow!("unknown agent {agent}"))?;
-    declared_profile_privilege(spec, profile_name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "agent {agent} access profile {profile_name} has no declared privilege rank"
-        )
-    })
+    require_privilege(spec, profile_name)
 }
 
 pub(crate) fn resolved_access_profile(
@@ -353,11 +358,7 @@ pub(crate) fn resolved_access_profile(
     let spec = registry
         .get(agent)
         .ok_or_else(|| anyhow::anyhow!("unknown agent {agent}"))?;
-    let privilege = declared_profile_privilege(spec, &profile_name).ok_or_else(|| {
-        anyhow::anyhow!(
-            "agent {agent} access profile {profile_name} has no declared privilege rank"
-        )
-    })?;
+    let privilege = require_privilege(spec, &profile_name)?;
     Ok((profile_name, privilege))
 }
 
@@ -387,22 +388,18 @@ fn resolve_registry_access_profile(
         if !spec.access_profiles.contains_key(profile) {
             anyhow::bail!("agent {agent} has no access profile {profile}");
         }
-        let profile_privilege = declared_profile_privilege(spec, profile).ok_or_else(|| {
-            anyhow::anyhow!(
-                "agent {agent} access profile {profile} has no declared privilege rank"
-            )
-        })?;
-        if profile_privilege > config.access_mode.privilege() {
-            anyhow::bail!(
-                "access profile {profile} would widen {:?} access mode for agent {agent}",
-                config.access_mode
-            );
-        }
         profile
     } else {
         mapped
     };
     if spec.access_profiles.contains_key(selected) {
+        let profile_privilege = require_privilege(spec, selected)?;
+        if profile_privilege > config.access_mode.privilege() {
+            anyhow::bail!(
+                "access profile {selected} would widen {:?} access mode for agent {agent}",
+                config.access_mode
+            );
+        }
         return Ok(selected.to_string());
     }
 
@@ -411,11 +408,7 @@ fn resolve_registry_access_profile(
         anyhow::bail!("agent {agent} has no read-only access profile");
     }
     if spec.access_profiles.contains_key("default") {
-        let default_privilege = declared_profile_privilege(spec, "default").ok_or_else(|| {
-            anyhow::anyhow!(
-                "agent {agent} default access profile has no declared privilege rank"
-            )
-        })?;
+        let default_privilege = require_privilege(spec, "default")?;
         if default_privilege <= config.access_mode.privilege() {
             return Ok("default".to_string());
         }
@@ -1965,7 +1958,115 @@ args = ["--dangerously-write-anywhere"]
         assert!(
             error
                 .to_string()
-                .contains("default access profile has no declared privilege rank"),
+                .contains("access profile default has no declared privilege rank"),
+            "unexpected error: {error}"
+        );
+    }
+
+    static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn install_temp_agent_registry(toml: &str) -> (tempfile::TempDir, Option<std::ffi::OsString>) {
+        let temp = tempfile::tempdir().unwrap();
+        let agents_dir = temp.path().join("tmux-tools");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(agents_dir.join("agents.toml"), toml).unwrap();
+        let previous = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: `REGISTRY_ENV_LOCK` serializes all tests that mutate `XDG_CONFIG_HOME`.
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path());
+        }
+        (temp, previous)
+    }
+
+    fn restore_xdg_config_home(previous: Option<std::ffi::OsString>) {
+        // SAFETY: callers hold `REGISTRY_ENV_LOCK` while restoring the prior value.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    const UNRANKED_PROFILE_TOML: &str = r#"
+[custom]
+binary = "custom-agent"
+
+[custom.access.unranked]
+args = ["--dangerously-write-anywhere"]
+"#;
+
+    #[test]
+    fn access_profile_privilege_rejects_unranked_profile() {
+        let _lock = REGISTRY_ENV_LOCK.lock().unwrap();
+        let (_temp, previous) = install_temp_agent_registry(UNRANKED_PROFILE_TOML);
+        let error = access_profile_privilege("custom", "unranked").unwrap_err();
+        restore_xdg_config_home(previous);
+        assert!(
+            error
+                .to_string()
+                .contains("has no declared privilege rank"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn resolved_access_profile_rejects_unranked_default_fallback() {
+        let _lock = REGISTRY_ENV_LOCK.lock().unwrap();
+        let toml = r#"
+[custom]
+binary = "custom-agent"
+
+[custom.access.default]
+args = ["--dangerously-write-anywhere"]
+"#;
+        let (_temp, previous) = install_temp_agent_registry(toml);
+        let config = AgentConfig {
+            access_mode: AccessMode::Edit,
+            ..default_config()
+        };
+        let error = resolved_access_profile("custom", &config).unwrap_err();
+        restore_xdg_config_home(previous);
+        assert!(
+            error
+                .to_string()
+                .contains("has no declared privilege rank"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn registry_edit_rejects_unranked_access_profile_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agents.toml");
+        std::fs::write(
+            &path,
+            r#"
+[custom]
+binary = "custom-agent"
+
+[custom.access.unranked]
+args = ["--dangerously-write-anywhere"]
+
+[custom.access.workspace-write]
+args = ["--write"]
+"#,
+        )
+        .unwrap();
+        let (registry, warnings) = agents::Registry::load_with_user_path(Some(&path)).unwrap();
+        assert!(warnings.is_empty());
+        let config = AgentConfig {
+            access_mode: AccessMode::Edit,
+            access_profile_override: Some("unranked".into()),
+            ..default_config()
+        };
+
+        let error = resolve_registry_access_profile(&registry, "custom", &config).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("has no declared privilege rank"),
             "unexpected error: {error}"
         );
     }

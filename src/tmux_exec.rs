@@ -25,6 +25,7 @@ use crate::{
         CaptureConfig, KillConfig, NodeKind, RunAgentConfig, RunAsConfig, SendConfig, SpawnConfig,
         WaitConfig, WaitMode, WorkflowNode,
     },
+    proc,
     pty_output::strip_ansi,
     runtime::{
         AgentExecutionMetadata, NodeResult, NodeRunner, PANE_ALIAS_KEYS, RuntimeContext,
@@ -66,6 +67,14 @@ impl PaneCleanupTarget {
 pub(crate) struct PaneCleanupVerdict {
     pub(crate) target: PaneCleanupTarget,
     pub(crate) absent: bool,
+}
+
+pub(crate) fn run_scoped_tmux_invocation(run_id: &str) -> TmuxInvocation {
+    TmuxInvocation {
+        prefix: Vec::new(),
+        socket: Some(format!("silverbond-{run_id}")),
+        tmux_bin: "tmux".to_string(),
+    }
 }
 
 pub fn build_tmux_invocation(run_as: &RunAsConfig, run_id: &str) -> TmuxInvocation {
@@ -124,7 +133,9 @@ fn resolve_tmux_bin_with_timeout(prefix: &[String], timeout: Duration) -> String
         command.args(["zsh", "-lic", TMUX_LOOKUP_COMMAND]);
     }
 
-    let Ok(output) = tmux::command_output_with_timeout(command, timeout) else {
+    let Ok(output) =
+        proc::command_output_with_timeout(command, timeout, "resolving the tmux executable")
+    else {
         return "tmux".to_string();
     };
     if !output.status.success() {
@@ -1304,7 +1315,7 @@ pub(crate) fn kill_tmux_session(session_name: &str) -> bool {
 
 fn kill_tmux_pane(pane_id: &str) -> bool {
     let _ = tmux::run(&["kill-pane", "-t", pane_id]);
-    tmux::run(&["display-message", "-p", "-t", pane_id, "#{pane_id}"])
+    tmux::run(&["list-panes", "-t", pane_id])
         .map(|output| output.exit_code != 0)
         .unwrap_or(false)
 }
@@ -4302,7 +4313,7 @@ exit 0
         let log = temp.path().join("tmux-cleanup-args.log");
         std::fs::write(
             &script,
-            "#!/bin/sh\nlog=\"$1\"\nshift\nprintf '%s\\n' \"$@\" >> \"$log\"\ncase \"$*\" in *has-session*|*display-message*) exit 1;; esac\nexit 0\n",
+            "#!/bin/sh\nlog=\"$1\"\nshift\nprintf '%s\\n' \"$@\" >> \"$log\"\ncase \"$*\" in *has-session*|*list-panes*) exit 1;; esac\nexit 0\n",
         )
         .unwrap();
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
@@ -4341,6 +4352,54 @@ exit 0
             args.windows(3)
                 .any(|window| window == ["kill-pane", "-t", "%external-pane"]),
             "external/reused panes should fall back to kill-pane; args={args:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_panes_confirms_absence_when_display_message_would_succeed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let script = temp.path().join("tmux-pane-probe-prefix.sh");
+        let log = temp.path().join("tmux-pane-probe-args.log");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nlog=\"$1\"\nshift\nprintf '%s\\n' \"$@\" >> \"$log\"\ncase \"$*\" in\n  *list-panes*) exit 1;;\n  *display-message*) exit 0;;\n  *kill-pane*) exit 0;;\nesac\nexit 2\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let invocation = tmux_tools_core::TmuxInvocation {
+            prefix: vec![
+                script.to_string_lossy().into_owned(),
+                log.to_string_lossy().into_owned(),
+            ],
+            socket: Some("pane-probe-test-socket".to_string()),
+            tmux_bin: "tmux".to_string(),
+        };
+        let verdicts = tmux_tools_core::with_invocation(invocation, || {
+            cleanup_panes(&[PaneCleanupTarget::new("%missing-pane".to_string(), None)])
+        });
+
+        assert!(
+            verdicts[0].absent,
+            "display-message exits zero for an absent pane, so it cannot confirm absence"
+        );
+
+        let recorded =
+            std::fs::read_to_string(log).expect("fake tmux prefix should record pane probe args");
+        let args = recorded.lines().collect::<Vec<_>>();
+        assert!(
+            args.windows(3)
+                .any(|window| window == ["list-panes", "-t", "%missing-pane"]),
+            "pane absence should be probed with list-panes; args={args:?}"
+        );
+        assert!(
+            !args.contains(&"display-message"),
+            "CANFAIL display-message must not be used as an absence probe; args={args:?}"
         );
     }
 

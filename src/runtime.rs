@@ -901,6 +901,7 @@ pub(crate) struct ActivePaneEntry {
 #[derive(Debug, Clone, Default)]
 pub struct RunRegistry {
     inner: Arc<Mutex<HashMap<String, ActiveRun>>>,
+    checkpoint_persist_hashes: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 pub(crate) fn active_pane_key(cursor_id: &str, node_id: &str) -> String {
@@ -1099,10 +1100,26 @@ impl RunRegistry {
         Ok(())
     }
 
+    async fn last_persist_hash(&self, run_id: &str) -> Option<u32> {
+        self.checkpoint_persist_hashes
+            .lock()
+            .await
+            .get(run_id)
+            .copied()
+    }
+
+    async fn record_persist_hash(&self, run_id: &str, hash: u32) {
+        self.checkpoint_persist_hashes
+            .lock()
+            .await
+            .insert(run_id.to_string(), hash);
+    }
+
     async fn clear(&self, run_id: &str) {
         if let Some(active) = self.inner.lock().await.remove(run_id) {
             active.drained_token.cancel();
         }
+        self.checkpoint_persist_hashes.lock().await.remove(run_id);
     }
 
     pub async fn active_run_ids(&self) -> HashSet<String> {
@@ -1355,7 +1372,6 @@ pub struct RuntimeContext {
     pub registry: RunRegistry,
     runner: Arc<dyn NodeRunner>,
     pub run_invocation: Option<TmuxInvocation>,
-    checkpoint_persist_hashes: Arc<Mutex<HashMap<String, u32>>>,
 }
 
 impl RuntimeContext {
@@ -1366,7 +1382,6 @@ impl RuntimeContext {
             registry: RunRegistry::default(),
             runner,
             run_invocation: None,
-            checkpoint_persist_hashes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -1377,7 +1392,6 @@ impl RuntimeContext {
             registry: RunRegistry::default(),
             runner,
             run_invocation: None,
-            checkpoint_persist_hashes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -3406,7 +3420,7 @@ where
         return Ok(existing);
     }
     let Some(run_as) = run_as else {
-        return Ok(None);
+        return Ok(Some(crate::tmux_exec::run_scoped_tmux_invocation(&run_id)));
     };
 
     tokio::task::spawn_blocking(move || build(&run_as, &run_id))
@@ -6650,6 +6664,21 @@ async fn finalize_run(
     persistence_result
 }
 
+async fn run_pane_cleanup(
+    run_invocation: Option<TmuxInvocation>,
+    targets: Vec<crate::tmux_exec::PaneCleanupTarget>,
+) -> Result<Vec<crate::tmux_exec::PaneCleanupVerdict>, tokio::task::JoinError> {
+    let inv = run_invocation;
+    tokio::task::spawn_blocking(move || {
+        if let Some(inv) = inv {
+            tmux_tools_core::with_invocation(inv, || crate::tmux_exec::cleanup_panes(&targets))
+        } else {
+            crate::tmux_exec::cleanup_panes(&targets)
+        }
+    })
+    .await
+}
+
 async fn cleanup_terminal_active_panes(
     ctx: &RuntimeContext,
     run_id: &str,
@@ -6673,15 +6702,7 @@ async fn cleanup_terminal_active_panes(
         return;
     }
 
-    let inv = ctx.run_invocation.clone();
-    let cleanup_verdicts = tokio::task::spawn_blocking(move || {
-        if let Some(inv) = inv {
-            tmux_tools_core::with_invocation(inv, || crate::tmux_exec::cleanup_panes(&targets))
-        } else {
-            crate::tmux_exec::cleanup_panes(&targets)
-        }
-    })
-    .await;
+    let cleanup_verdicts = run_pane_cleanup(ctx.run_invocation.clone(), targets).await;
     let cleanup_verdicts = match cleanup_verdicts {
         Ok(verdicts) => verdicts,
         Err(error) => {
@@ -6812,10 +6833,8 @@ async fn reap_tmux_sessions(ctx: &RuntimeContext, run_id: Option<&str>) {
                                 &reapable.run_id,
                             )
                         })
-                        .unwrap_or_else(|| TmuxInvocation {
-                            prefix: Vec::new(),
-                            socket: None,
-                            tmux_bin: "tmux".to_string(),
+                        .unwrap_or_else(|| {
+                            crate::tmux_exec::run_scoped_tmux_invocation(&reapable.run_id)
                         });
                     reconstructed_invocations.insert(reapable.run_id.clone(), invocation.clone());
                     invocation
@@ -6937,15 +6956,7 @@ async fn kill_active_run_panes(ctx: &RuntimeContext, run_id: &str) {
         return;
     }
 
-    let inv = ctx.run_invocation.clone();
-    let cleanup_verdicts = tokio::task::spawn_blocking(move || {
-        if let Some(inv) = inv {
-            tmux_tools_core::with_invocation(inv, || crate::tmux_exec::cleanup_panes(&targets))
-        } else {
-            crate::tmux_exec::cleanup_panes(&targets)
-        }
-    })
-    .await;
+    let cleanup_verdicts = run_pane_cleanup(ctx.run_invocation.clone(), targets).await;
     match cleanup_verdicts {
         Ok(verdicts) => {
             for verdict in verdicts.into_iter().filter(|verdict| !verdict.absent) {
@@ -6986,18 +6997,19 @@ async fn persist_checkpoint(
     checkpoint: &mut RuntimeCheckpoint,
 ) -> anyhow::Result<()> {
     let content_hash = checkpoint_content_hash(checkpoint);
+    if ctx
+        .registry
+        .last_persist_hash(&checkpoint.run_id)
+        .await
+        == Some(content_hash)
     {
-        let hashes = ctx.checkpoint_persist_hashes.lock().await;
-        if hashes.get(&checkpoint.run_id) == Some(&content_hash) {
-            return Ok(());
-        }
+        return Ok(());
     }
     checkpoint.updated_at = now_iso();
     if ctx.db.update_run_checkpoint(checkpoint).await? {
-        ctx.checkpoint_persist_hashes
-            .lock()
-            .await
-            .insert(checkpoint.run_id.clone(), content_hash);
+        ctx.registry
+            .record_persist_hash(&checkpoint.run_id, content_hash)
+            .await;
         return Ok(());
     }
     ctx.db
@@ -7008,10 +7020,9 @@ async fn persist_checkpoint(
             workflow: workflow.clone(),
         })
         .await?;
-    ctx.checkpoint_persist_hashes
-        .lock()
-        .await
-        .insert(checkpoint.run_id.clone(), content_hash);
+    ctx.registry
+        .record_persist_hash(&checkpoint.run_id, content_hash)
+        .await;
     Ok(())
 }
 
@@ -8234,6 +8245,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_persist_hash_retired_when_run_registry_cleared() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db.clone());
+        let workflow = workflow_from_parts("work", vec![task_node("work", "Work", "go")], vec![]);
+        let run_id = "run_persist_hash_retire";
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: None,
+            checkpoint: checkpoint.clone(),
+            workflow: workflow.clone(),
+        })
+        .await
+        .unwrap();
+        ctx.registry.register(run_id).await;
+
+        persist_checkpoint(&ctx, &workflow, &mut checkpoint)
+            .await
+            .unwrap();
+        assert!(
+            ctx.registry.last_persist_hash(run_id).await.is_some(),
+            "persist should record dedupe hash"
+        );
+
+        let mut checkpoint = checkpoint.clone();
+        checkpoint.status = RuntimeStatus::Completed;
+        finalize_run(&ctx, &workflow, checkpoint, Duration::from_millis(1))
+            .await
+            .unwrap();
+
+        assert!(
+            ctx.registry.last_persist_hash(run_id).await.is_none(),
+            "finalize_run should clear checkpoint dedupe hash via registry.clear"
+        );
+    }
+
+    #[tokio::test]
     async fn orphan_waiting_approval_cursor_is_reconciled_on_resume() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
@@ -8545,6 +8595,168 @@ mod tests {
         assert_eq!(resolved.prefix, vec!["sandbox-prefix"]);
         assert_eq!(resolved.socket.as_deref(), Some("silverbond-run_blocking"));
         assert_eq!(resolved.tmux_bin, "tmux-from-builder");
+    }
+
+    #[tokio::test]
+    async fn no_run_as_invocation_resolution_returns_run_scoped_socket() {
+        let run_id = "run_no_run_as_socket";
+        let resolved = resolve_workflow_invocation(None, None, run_id.to_string())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            resolved,
+            crate::tmux_exec::run_scoped_tmux_invocation(run_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn start_run_without_run_as_persists_run_scoped_socket() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::new(db.clone());
+        let workflow = workflow_from_parts(
+            "approve",
+            vec![approval_node("approve", "Approve", "continue?")],
+            vec![],
+        );
+
+        let run_id = runtime
+            .start_run(workflow, BTreeMap::new(), None)
+            .await
+            .unwrap();
+
+        let persisted = db.get_run(&run_id).await.unwrap().unwrap();
+        assert_eq!(
+            persisted.tmux_invocation,
+            Some(crate::tmux_exec::run_scoped_tmux_invocation(&run_id))
+        );
+
+        runtime.abort_run(&run_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resume_run_without_run_as_persists_run_scoped_socket() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let runtime = RuntimeContext::new(db.clone());
+        let run_id = "run_resume_no_run_as";
+        let workflow = workflow_from_parts(
+            "approve",
+            vec![approval_node("approve", "Approve", "continue?")],
+            vec![],
+        );
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: None,
+            checkpoint: build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None),
+            workflow,
+        })
+        .await
+        .unwrap();
+
+        runtime.resume_run(run_id).await.unwrap();
+
+        let persisted = db.get_run(run_id).await.unwrap().unwrap();
+        assert_eq!(
+            persisted.tmux_invocation,
+            Some(crate::tmux_exec::run_scoped_tmux_invocation(run_id))
+        );
+
+        runtime.abort_run(run_id).await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stale_tmux_reaper_reconstructs_no_run_as_invocation_without_resolving() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::new(db.clone());
+
+        let run_id = "run_no_run_as_stale_reaper";
+        let run_socket = format!("silverbond-{run_id}");
+        let session = "silverbond-No-RunAs-Stale";
+        let log = temp.path().join("no-run-as-reaper-args.log");
+        let fake_tmux = temp.path().join("tmux");
+        fs::write(
+            &fake_tmux,
+            format!(
+                "#!/bin/sh\nlog=\"{}\"\nprintf '%s\\n' \"$@\" >> \"$log\"\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"list-sessions\" ]; then printf '%s\\n' \"{session}\"; fi\nif [ \"$1\" = \"has-session\" ]; then exit 1; fi\nexit 0\n",
+                log.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_tmux, permissions).unwrap();
+
+        let old_path = std::env::var("PATH").ok();
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    temp.path().to_string_lossy(),
+                    old_path.as_deref().unwrap_or("")
+                ),
+            );
+        }
+
+        let workflow = workflow_from_parts("work", vec![task_node("work", "Work", "")], vec![]);
+        let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
+        checkpoint.status = RuntimeStatus::Failed;
+        db.upsert_run(&PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: None,
+            checkpoint,
+            workflow,
+        })
+        .await
+        .unwrap();
+        register_tmux_session(&db, run_id, session).await.unwrap();
+
+        reap_stale_tmux_sessions(&ctx).await;
+
+        if let Some(path) = old_path {
+            unsafe {
+                std::env::set_var("PATH", path);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("PATH");
+            }
+        }
+
+        let recorded = fs::read_to_string(&log).expect("fake tmux should record reaper args");
+        let args = recorded.lines().collect::<Vec<_>>();
+        assert!(
+            args.windows(5).any(|window| window
+                == [
+                    "-L",
+                    run_socket.as_str(),
+                    "list-sessions",
+                    "-F",
+                    "#{session_name}"
+                ]),
+            "reaper should list sessions under the reconstructed no-runAs invocation; args={args:?}"
+        );
+        assert!(
+            args.windows(5).any(|window| window
+                == [
+                    "-L",
+                    run_socket.as_str(),
+                    "kill-session",
+                    "-t",
+                    session
+                ]),
+            "reaper should kill the stale session under the reconstructed no-runAs invocation; args={args:?}"
+        );
+        assert!(db.list_reapable_tmux_sessions().await.unwrap().is_empty());
     }
 
     #[cfg(unix)]

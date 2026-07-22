@@ -264,6 +264,47 @@ describe("InspectorPanel", () => {
     expect(node.kind.spawnConfig?.access).toBeUndefined();
   });
 
+  it("renders defaults for a configless capture node", () => {
+    const captureNode: WorkflowNode = {
+      id: "capture-output",
+      name: "Capture output",
+      kind: { type: "capture" },
+      agent: null,
+      prompt: "",
+      contextSources: [],
+      responseFormat: null,
+    };
+
+    renderInspector(workflow({
+      entryNodeId: captureNode.id,
+      nodes: [captureNode],
+    }), captureNode.id);
+
+    expect(screen.getByRole("textbox", { name: "Target pane" })).toHaveValue("");
+    expect(screen.getByRole("checkbox", { name: "Capture all scrollback" })).not.toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Include ANSI" })).not.toBeChecked();
+  });
+
+  it("renders defaults for a configless kill node", () => {
+    const killNode: WorkflowNode = {
+      id: "kill-pane",
+      name: "Kill pane",
+      kind: { type: "kill" },
+      agent: null,
+      prompt: "",
+      contextSources: [],
+      responseFormat: null,
+    };
+
+    renderInspector(workflow({
+      entryNodeId: killNode.id,
+      nodes: [killNode],
+    }), killNode.id);
+
+    expect(screen.getByRole("textbox", { name: "Target pane" })).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: "Session name" })).toHaveValue("");
+  });
+
   it("persists and displays read-only for a read-only-only agent", async () => {
     const readOnlyCapabilities: RuntimeCapabilities = {
       ...capabilities,

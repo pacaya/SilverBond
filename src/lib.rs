@@ -4,6 +4,7 @@ pub mod driver;
 pub mod frontend;
 pub mod host;
 pub mod model;
+pub(crate) mod proc;
 pub mod pty_output;
 pub mod runtime;
 pub mod storage;

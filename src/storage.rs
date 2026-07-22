@@ -1,7 +1,10 @@
 use std::{
     collections::BTreeSet,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -884,6 +887,35 @@ impl Database {
     }
 }
 
+static WORKFLOW_SAVE_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowTempDisposition {
+    /// Legacy `<safe>.json.tmp` from before per-attempt temp paths.
+    Legacy,
+    /// `<safe>.json.<pid>-<nonce>.tmp`
+    WithPid(u32),
+}
+
+fn workflow_temp_disposition(filename: &str) -> Option<WorkflowTempDisposition> {
+    if !filename.ends_with(".tmp") {
+        return None;
+    }
+    if filename.ends_with(".json.tmp") {
+        return Some(WorkflowTempDisposition::Legacy);
+    }
+    const MARKER: &str = ".json.";
+    let stem = filename.strip_suffix(".tmp")?;
+    let marker_start = stem.rfind(MARKER)?;
+    let tail = &stem[marker_start + MARKER.len()..];
+    let (pid_str, nonce) = tail.split_once('-')?;
+    if pid_str.is_empty() || nonce.is_empty() {
+        return None;
+    }
+    let pid = pid_str.parse::<u32>().ok()?;
+    Some(WorkflowTempDisposition::WithPid(pid))
+}
+
 impl WorkflowStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -900,12 +932,18 @@ impl WorkflowStore {
         let mut workflows = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             let filename = entry.file_name().to_string_lossy().to_string();
-            if filename.ends_with(".json.tmp") {
-                if let Err(error) = tokio::fs::remove_file(entry.path()).await {
-                    tracing::warn!(
-                        workflow_file = %filename,
-                        "Could not remove stale workflow temp file: {error}"
-                    );
+            if let Some(disposition) = workflow_temp_disposition(&filename) {
+                let should_remove = match disposition {
+                    WorkflowTempDisposition::Legacy => true,
+                    WorkflowTempDisposition::WithPid(pid) => pid != std::process::id(),
+                };
+                if should_remove {
+                    if let Err(error) = tokio::fs::remove_file(entry.path()).await {
+                        tracing::warn!(
+                            workflow_file = %filename,
+                            "Could not remove stale workflow temp file: {error}"
+                        );
+                    }
                 }
                 continue;
             }
@@ -974,7 +1012,13 @@ impl WorkflowStore {
         let safe = safe_name(name)?;
         ensure_dir(self.dir())?;
         let path = self.dir().join(format!("{}.json", safe));
-        let tmp_path = self.dir().join(format!("{}.json.tmp", safe));
+        let nonce = WORKFLOW_SAVE_NONCE.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = self.dir().join(format!(
+            "{}.json.{}-{}.tmp",
+            safe,
+            std::process::id(),
+            nonce
+        ));
         let data = serde_json::to_vec_pretty(&normalized.workflow)?;
         let mut file = tokio::fs::File::create(&tmp_path).await?;
         file.write_all(&data).await?;
@@ -1243,10 +1287,15 @@ fn backfill_legacy_tmux_sessions(conn: &Connection) -> anyhow::Result<()> {
 }
 
 /// One-time startup upgrade: normalize each stored workflow_json and CAS-update rows that differ.
-/// Runs in Database::init (a write context) so failures are loud rather than poisoning get_run.
+/// Runs in Database::init (a write context). Unparseable or unmigratable rows are skipped with a
+/// warn so one bad row cannot abort boot; those runs still fail at `get_run` on read.
 fn upgrade_run_workflow_json(conn: &Connection) -> anyhow::Result<()> {
     let rows = {
-        let mut stmt = conn.prepare("SELECT run_id, workflow_json FROM runs")?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, workflow_json FROM runs \
+             WHERE NOT json_valid(workflow_json) \
+                OR json_extract(workflow_json, '$.version') IS NOT 4",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -1254,8 +1303,26 @@ fn upgrade_run_workflow_json(conn: &Connection) -> anyhow::Result<()> {
     };
 
     for (run_id, workflow_json) in rows {
-        let workflow_value: Value = serde_json::from_str(&workflow_json)?;
-        let normalized = normalize_workflow_value(workflow_value)?.workflow;
+        let workflow_value: Value = match serde_json::from_str(&workflow_json) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    "Skipping run workflow with invalid JSON during startup upgrade: {error}"
+                );
+                continue;
+            }
+        };
+        let normalized = match normalize_workflow_value(workflow_value) {
+            Ok(normalized) => normalized.workflow,
+            Err(error) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    "Skipping run workflow with invalid workflow schema during startup upgrade: {error}"
+                );
+                continue;
+            }
+        };
         let normalized_json = serde_json::to_string(&normalized)?;
         if normalized_json == workflow_json {
             continue;
@@ -1445,6 +1512,16 @@ mod tests {
         tokio::fs::write(temp.path().join("stale.json.tmp"), b"partial")
             .await
             .unwrap();
+        let own_pid = std::process::id();
+        let own_temp = format!("inflight.json.{own_pid}-99.tmp");
+        tokio::fs::write(temp.path().join(&own_temp), b"partial")
+            .await
+            .unwrap();
+        let foreign_pid = own_pid.wrapping_add(1);
+        let foreign_temp = format!("foreign.json.{foreign_pid}-1.tmp");
+        tokio::fs::write(temp.path().join(&foreign_temp), b"partial")
+            .await
+            .unwrap();
 
         let workflows = store.list().await.unwrap();
 
@@ -1453,6 +1530,46 @@ mod tests {
         assert_eq!(workflows[0].name, "valid");
         assert_eq!(workflows[0].workflow, valid);
         assert!(!temp.path().join("stale.json.tmp").exists());
+        assert!(temp.path().join(&own_temp).exists());
+        assert!(!temp.path().join(&foreign_temp).exists());
+    }
+
+    #[tokio::test]
+    async fn concurrent_saves_of_same_workflow_produce_valid_json() {
+        use std::sync::Arc;
+
+        let temp = TempDir::new().unwrap();
+        let store = Arc::new(WorkflowStore::new(temp.path()));
+        let mut workflow_a = sample_workflow();
+        workflow_a.goal = "goal-a".to_string();
+        let mut workflow_b = sample_workflow();
+        workflow_b.goal = "goal-b".to_string();
+
+        let store_a = Arc::clone(&store);
+        let normalized_a = NormalizedWorkflow {
+            workflow: workflow_a.clone(),
+            notices: Vec::new(),
+        };
+        let store_b = Arc::clone(&store);
+        let normalized_b = NormalizedWorkflow {
+            workflow: workflow_b.clone(),
+            notices: Vec::new(),
+        };
+
+        let (result_a, result_b) = tokio::join!(
+            async move { store_a.save("flow", normalized_a).await },
+            async move { store_b.save("flow", normalized_b).await },
+        );
+        result_a.unwrap();
+        result_b.unwrap();
+
+        let on_disk = tokio::fs::read_to_string(temp.path().join("flow.json"))
+            .await
+            .unwrap();
+        let parsed: WorkflowV3 = serde_json::from_str(&on_disk).unwrap();
+        assert!(parsed.goal == workflow_a.goal || parsed.goal == workflow_b.goal);
+        let loaded = store.get("flow").await.unwrap().unwrap();
+        assert_eq!(loaded.workflow, parsed);
     }
 
     #[tokio::test]
@@ -1957,6 +2074,74 @@ mod tests {
         assert_eq!(stored_workflow["version"], 4);
         assert_eq!(stored_workflow["nodes"][0]["kind"]["type"], "decide");
         assert!(stored_workflow["nodes"][0].get("type").is_none());
+    }
+
+    #[tokio::test]
+    async fn init_skips_damaged_run_workflow_without_rewriting() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("silverbond.db");
+        let db = Database::new(path.clone());
+        db.init().await.unwrap();
+        db.upsert_run(&sample_persisted_run("damaged-run"))
+            .await
+            .unwrap();
+
+        let garbage_workflow = "not valid workflow json {{{";
+        with_connection(&db.connection, |conn| {
+            conn.execute(
+                "UPDATE runs SET workflow_json = ?2 WHERE run_id = ?1",
+                params!["damaged-run", garbage_workflow],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let unsupported_workflow = serde_json::json!({
+            "version": 99,
+            "goal": "future schema",
+            "cwd": "/tmp",
+            "useOrchestrator": false,
+            "entryNodeId": "decide",
+            "variables": [],
+            "limits": { "maxTotalSteps": 10, "maxVisitsPerNode": 5 },
+            "nodes": [],
+            "edges": []
+        });
+        let unsupported_json = serde_json::to_string(&unsupported_workflow).unwrap();
+        db.upsert_run(&sample_persisted_run("unsupported-version-run"))
+            .await
+            .unwrap();
+        with_connection(&db.connection, |conn| {
+            conn.execute(
+                "UPDATE runs SET workflow_json = ?2 WHERE run_id = ?1",
+                params!["unsupported-version-run", unsupported_json.clone()],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let upgraded = Database::new(path);
+        upgraded.init().await.unwrap();
+
+        let stored_garbage = with_connection(&upgraded.connection, |conn| {
+            Ok(conn.query_row(
+                "SELECT workflow_json FROM runs WHERE run_id = ?1",
+                params!["damaged-run"],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .unwrap();
+        assert_eq!(stored_garbage, garbage_workflow);
+
+        let stored_unsupported = with_connection(&upgraded.connection, |conn| {
+            Ok(conn.query_row(
+                "SELECT workflow_json FROM runs WHERE run_id = ?1",
+                params!["unsupported-version-run"],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .unwrap();
+        assert_eq!(stored_unsupported, unsupported_json);
     }
 
     fn canonical_v4_decide_workflow() -> WorkflowV3 {

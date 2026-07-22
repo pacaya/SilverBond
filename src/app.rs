@@ -316,6 +316,23 @@ impl PaneStreamRegistry {
             inner.remove(key);
         }
     }
+
+    /// Removes a stuck terminating entry and signals waiters (bounded-wait timeout path).
+    pub(crate) async fn force_clear_stuck_terminating_owner(&self, key: &PaneStreamKey) {
+        let owner_done = {
+            let mut inner = self.inner.lock().await;
+            let Some(entry) = inner.get(key) else {
+                return;
+            };
+            if !entry.is_terminating() {
+                return;
+            }
+            let owner_done = entry.owner_done();
+            inner.remove(key);
+            owner_done
+        };
+        owner_done.cancel();
+    }
 }
 
 pub struct Application {

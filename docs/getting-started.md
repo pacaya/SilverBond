@@ -23,6 +23,20 @@ cd SilverBond
 just setup
 ```
 
+`just setup` also configures this clone's `core.hooksPath` to use the repository's
+`.githooks/` directory. The pre-commit hook checks that staged `public/` assets are
+the bundle produced from the staged `ui/src/` tree. It builds only in a temporary
+index snapshot and does not rewrite the working tree. To disable the repository
+hooks for this clone, run `git config --unset core.hooksPath`.
+
+Existing clones remain unguarded until `just setup` or `just install-hooks` is run
+again, and `git commit --no-verify` can bypass the local hook. The required CI
+status check below must cover both gaps.
+
+> **OPEN ITEM (opened 2026-07-21; target 2026-07-28):** Alexander Yazvetsky
+> (`@pacaya`) owns making `.github/workflows/frontend-freshness.yml` a required
+> status check on `main`.
+
 ## Running the Application
 
 ### Development Mode (recommended)
@@ -96,7 +110,8 @@ All commands are defined in the `justfile`:
 
 | Command | Description |
 |---------|-------------|
-| `just setup` | Install npm dependencies |
+| `just setup` | Install npm dependencies and repository-managed Git hooks |
+| `just install-hooks` | Configure this clone to use `.githooks/` |
 | `just dev` | Start Vite dev server on :5173 (proxies /api to :3333) |
 | `just server` | Start Rust backend on :3333 |
 | `just build` | Build frontend to `public/` |

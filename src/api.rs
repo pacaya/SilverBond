@@ -2,13 +2,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Read},
-    os::unix::{
-        fs::{OpenOptionsExt, PermissionsExt},
-        process::CommandExt,
-    },
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path as FsPath, PathBuf},
     pin::Pin,
-    process::{Command, Stdio},
+    process::Command,
     task::{Context as TaskContext, Poll, ready},
     time::Duration,
 };
@@ -51,6 +48,7 @@ use crate::{
         NodeKind, RunAsConfig, WORKFLOW_SCHEMA_VERSION, WorkflowLimits, WorkflowNode, WorkflowV3,
         normalize_workflow_value, validate_workflow, validate_workflow_input_bounds,
     },
+    proc,
     runtime::{
         InterruptedRunSummary, NodeTestContext, PaneCandidate, PersistedRun, RunControlError,
         RuntimeCheckpoint, RuntimeEvent, RuntimeStatus, available_agents, check_cli,
@@ -65,6 +63,15 @@ const PANE_STREAM_PENDING_TIMEOUT: Duration = Duration::from_secs(120);
 const PANE_STREAM_SETUP_TIMEOUT: Duration = Duration::from_secs(6);
 const PANE_STREAM_READ_MAX_RETRIES: usize = 5;
 const PANE_STREAM_READ_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Bound for `subscribe_pane_stream` when the owner never signals `owner_done` (panic or wedged teardown).
+fn pane_stream_owner_wait_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(250)
+    } else {
+        Duration::from_secs(600)
+    }
+}
 const PANE_SESSION_LOOKUP_CONCURRENCY: usize = 4;
 const STREAM_TOKEN_HEADER: &str = "x-stream-token";
 
@@ -886,13 +893,10 @@ async fn stream_run(
     let run_id_for_stream = run_id.clone();
     let stream = stream! {
         let mut done_seen = false;
-        let mut max_seq = 0u64;
+        let mut seq_filter = SeqFilter::new();
 
         for event in replay {
-            let seq = runtime_event_seq(&event);
-            if seq > max_seq {
-                max_seq = seq;
-            }
+            seq_filter.observe(&event);
             if event.kind == "done" {
                 done_seen = true;
             }
@@ -904,11 +908,11 @@ async fn stream_run(
         }
 
         if let Some(mut receiver) = receiver {
-            for item in drain_buffered_run_events(&mut receiver, &mut max_seq) {
+            for item in drain_buffered_run_events(&mut receiver, &mut seq_filter) {
                 match item {
                     RunStreamBufferedItem::Resync => {
                         yield Ok(run_stream_resync_sse_event());
-                        match resync_run_stream_from_journal(&db, &run_id_for_stream, &mut max_seq).await {
+                        match resync_run_stream_from_journal(&db, &run_id_for_stream, &mut seq_filter).await {
                             Ok(events) => {
                                 for item in events {
                                     if item.is_done {
@@ -921,12 +925,12 @@ async fn stream_run(
                             Err(_) => break,
                         }
                     }
-                    RunStreamBufferedItem::Event { sse, is_done } => {
-                        if is_done {
-                            yield Ok(sse);
+                    RunStreamBufferedItem::Item(stream_item) => {
+                        if stream_item.is_done {
+                            yield Ok(stream_item.sse);
                             return;
                         }
-                        yield Ok(sse);
+                        yield Ok(stream_item.sse);
                     }
                 }
             }
@@ -934,20 +938,17 @@ async fn stream_run(
             loop {
                 match receiver.recv().await {
                     Ok(event) => {
-                        let seq = runtime_event_seq(&event);
-                        if seq <= max_seq {
-                            continue;
-                        }
-                        max_seq = seq;
-                        let is_done = event.kind == "done";
-                        yield Ok(run_stream_sse_event(&event));
-                        if is_done {
-                            break;
+                        if let Some(item) = seq_filter.accept(event) {
+                            if item.is_done {
+                                yield Ok(item.sse);
+                                break;
+                            }
+                            yield Ok(item.sse);
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                         yield Ok(run_stream_resync_sse_event());
-                        match resync_run_stream_from_journal(&db, &run_id_for_stream, &mut max_seq).await {
+                        match resync_run_stream_from_journal(&db, &run_id_for_stream, &mut seq_filter).await {
                             Ok(events) => {
                                 for item in events {
                                     if item.is_done {
@@ -991,35 +992,58 @@ fn run_stream_resync_sse_event() -> Event {
     )
 }
 
-struct RunStreamJournalItem {
+struct RunStreamItem {
     sse: Event,
     is_done: bool,
 }
 
+struct SeqFilter {
+    max_seq: u64,
+}
+
+impl SeqFilter {
+    fn new() -> Self {
+        Self { max_seq: 0 }
+    }
+
+    fn observe(&mut self, event: &RuntimeEvent) {
+        let seq = runtime_event_seq(event);
+        if seq > self.max_seq {
+            self.max_seq = seq;
+        }
+    }
+
+    fn accept(&mut self, event: RuntimeEvent) -> Option<RunStreamItem> {
+        let seq = runtime_event_seq(&event);
+        if seq <= self.max_seq {
+            return None;
+        }
+        self.max_seq = seq;
+        let is_done = event.kind == "done";
+        Some(RunStreamItem {
+            sse: run_stream_sse_event(&event),
+            is_done,
+        })
+    }
+}
+
 enum RunStreamBufferedItem {
-    Event { sse: Event, is_done: bool },
+    Item(RunStreamItem),
     Resync,
 }
 
 fn drain_buffered_run_events(
     receiver: &mut tokio::sync::broadcast::Receiver<RuntimeEvent>,
-    max_seq: &mut u64,
+    seq_filter: &mut SeqFilter,
 ) -> Vec<RunStreamBufferedItem> {
     use tokio::sync::broadcast::error::TryRecvError;
     let mut out = Vec::new();
     loop {
         match receiver.try_recv() {
             Ok(event) => {
-                let seq = runtime_event_seq(&event);
-                if seq <= *max_seq {
-                    continue;
+                if let Some(item) = seq_filter.accept(event) {
+                    out.push(RunStreamBufferedItem::Item(item));
                 }
-                *max_seq = seq;
-                let is_done = event.kind == "done";
-                out.push(RunStreamBufferedItem::Event {
-                    sse: run_stream_sse_event(&event),
-                    is_done,
-                });
             }
             Err(TryRecvError::Lagged(_)) => {
                 out.push(RunStreamBufferedItem::Resync);
@@ -1034,21 +1058,14 @@ fn drain_buffered_run_events(
 async fn resync_run_stream_from_journal(
     db: &crate::storage::Database,
     run_id: &str,
-    max_seq: &mut u64,
-) -> anyhow::Result<Vec<RunStreamJournalItem>> {
+    seq_filter: &mut SeqFilter,
+) -> anyhow::Result<Vec<RunStreamItem>> {
     let replay = db.list_events(run_id).await?;
     let mut out = Vec::new();
     for event in replay {
-        let seq = runtime_event_seq(&event);
-        if seq <= *max_seq {
-            continue;
+        if let Some(item) = seq_filter.accept(event) {
+            out.push(item);
         }
-        *max_seq = seq;
-        let is_done = event.kind == "done";
-        out.push(RunStreamJournalItem {
-            sse: run_stream_sse_event(&event),
-            is_done,
-        });
     }
     Ok(out)
 }
@@ -1652,49 +1669,30 @@ fn run_tmux_status_with_timeout(
     timeout: Duration,
     operation: &str,
 ) -> anyhow::Result<()> {
-    let mut command = tmux_command(invocation, args);
-    command
-        .process_group(0)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to spawn tmux while {operation}"))?;
-    let process_group = i32::try_from(child.id()).context("tmux pid exceeded i32")?;
-    let deadline = std::time::Instant::now() + timeout;
-
-    loop {
-        match child
-            .try_wait()
-            .with_context(|| format!("failed to wait for tmux while {operation}"))?
-        {
-            Some(status) if status.success() => return Ok(()),
-            Some(status) => {
+    let output = match proc::command_output_with_timeout(
+        tmux_command(invocation, args),
+        timeout,
+        operation,
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            if let Some(captured) = proc::timeout_captured_output(&error) {
                 anyhow::bail!(
-                    "tmux command failed with exit code {} while {operation}",
-                    status.code().unwrap_or(-1)
+                    "timed out while {operation} after {timeout:?} (args: {args:?}): {}",
+                    String::from_utf8_lossy(&captured.stderr).trim()
                 );
             }
-            None if std::time::Instant::now() >= deadline => {
-                // The child is its own process-group leader, so a negative pid
-                // cannot signal SilverBond's process group.
-                unsafe {
-                    libc::kill(-process_group, libc::SIGKILL);
-                }
-                let _ = child.kill();
-                let _ = child.wait();
-                anyhow::bail!("timed out while {operation} after {timeout:?}");
-            }
-            None => {
-                std::thread::sleep(
-                    deadline
-                        .saturating_duration_since(std::time::Instant::now())
-                        .min(Duration::from_millis(10)),
-                );
-            }
+            return Err(error);
         }
+    };
+    if !output.status.success() {
+        anyhow::bail!(
+            "tmux command failed (args: {args:?}, exit code {}): {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
+    Ok(())
 }
 
 /// The blocking half of pane-stream setup. It owns the FIFO guard for the paths
@@ -1731,23 +1729,25 @@ fn ensure_run_as_can_traverse_root(
     command
         .args(prefix_args)
         .args(["/bin/test", "-x"])
-        .arg(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let output = tmux::command_output_with_timeout(command, tmux::DEFAULT_TMUX_COMMAND_TIMEOUT)
-        .with_context(|| {
-            format!(
-                "failed to check whether the configured run-as identity can traverse SILVERBOND_ROOT {}",
-                root.display()
-            )
-        })?;
+        .arg(root);
+    let output = proc::command_output_with_timeout(
+        command,
+        tmux::DEFAULT_TMUX_COMMAND_TIMEOUT,
+        "checking run-as access to SILVERBOND_ROOT",
+    )
+    .with_context(|| {
+        format!(
+            "failed to check whether the configured run-as identity can traverse SILVERBOND_ROOT {}",
+            root.display()
+        )
+    })?;
     if !output.status.success() {
         let chmod_command = format!("chmod o+x {}", shell_quote(&root.to_string_lossy()));
         anyhow::bail!(
-            "configured run-as identity cannot traverse SILVERBOND_ROOT {}; run `{}` and repeat it for each inaccessible ancestor",
+            "configured run-as identity cannot traverse SILVERBOND_ROOT {}; run `{}` and repeat it for each inaccessible ancestor: {}",
             root.display(),
-            chmod_command
+            chmod_command,
+            String::from_utf8_lossy(&output.stderr).trim()
         );
     }
     Ok(())
@@ -2009,7 +2009,20 @@ async fn subscribe_pane_stream(
             if entry.is_terminating() {
                 let owner_done = entry.owner_done();
                 drop(streams);
-                owner_done.cancelled().await;
+                if tokio::time::timeout(pane_stream_owner_wait_timeout(), owner_done.cancelled())
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(
+                        pane_stream_key = ?key,
+                        timeout_secs = pane_stream_owner_wait_timeout().as_secs(),
+                        "pane stream owner wait timed out; force-clearing registry entry"
+                    );
+                    state
+                        .pane_streams
+                        .force_clear_stuck_terminating_owner(&key)
+                        .await;
+                }
                 continue;
             }
             if entry.refcount >= subscriber_limit {
@@ -2163,65 +2176,86 @@ fn spawn_pane_stream_task(
     mut drain_signal: watch::Receiver<bool>,
     owner_done: CancellationToken,
 ) {
+    let pane_streams = state.pane_streams.clone();
+    let key_supervisor = key.clone();
+    let sender_supervisor = sender.clone();
+    let owner_done_supervisor = owner_done.clone();
     tokio::spawn(async move {
-        let owns_entry = match start_pane_stream(&state.paths.root, &pane_target, &invocation).await
-        {
-            Ok(mut pane_reader) => loop {
-                let exit = pump_pane_stream(
-                    &mut pane_reader,
-                    &sender,
-                    &mut drain_signal,
-                    &run_id,
-                    &pane,
-                    &pane_target,
-                    PANE_STREAM_READ_RETRY_DELAY,
-                )
-                .await;
-                match claim_pane_stream_task_exit(&state.pane_streams, &key, &sender, exit).await {
-                    PaneStreamOwnerAction::Continue => continue,
-                    PaneStreamOwnerAction::Stale => break false,
-                    PaneStreamOwnerAction::Teardown => {
-                        if let Err(error) = stop_pane_stream(&pane_target, &invocation).await {
-                            tracing::debug!(
-                                run_id = %run_id,
-                                pane = %pane,
-                                pane_target = %pane_target,
-                                error = %error,
-                                "failed to stop pane stream pipe"
-                            );
-                        }
-                        break true;
-                    }
-                }
-            },
-            Err(error) => {
-                tracing::warn!(
-                    run_id = %run_id,
-                    pane = %pane,
-                    pane_target = %pane_target,
-                    error = %error,
-                    "failed to start pane stream"
-                );
-                matches!(
-                    claim_pane_stream_task_exit(
-                        &state.pane_streams,
-                        &key,
+        let handle = tokio::spawn(async move {
+            let owns_entry = match start_pane_stream(&state.paths.root, &pane_target, &invocation)
+                .await
+            {
+                Ok(mut pane_reader) => loop {
+                    let exit = pump_pane_stream(
+                        &mut pane_reader,
                         &sender,
-                        PaneStreamTaskExit::Terminal,
+                        &mut drain_signal,
+                        &run_id,
+                        &pane,
+                        &pane_target,
+                        PANE_STREAM_READ_RETRY_DELAY,
                     )
-                    .await,
-                    PaneStreamOwnerAction::Teardown
-                )
-            }
-        };
+                    .await;
+                    match claim_pane_stream_task_exit(&state.pane_streams, &key, &sender, exit)
+                        .await
+                    {
+                        PaneStreamOwnerAction::Continue => continue,
+                        PaneStreamOwnerAction::Stale => break false,
+                        PaneStreamOwnerAction::Teardown => {
+                            if let Err(error) = stop_pane_stream(&pane_target, &invocation).await {
+                                tracing::debug!(
+                                    run_id = %run_id,
+                                    pane = %pane,
+                                    pane_target = %pane_target,
+                                    error = %error,
+                                    "failed to stop pane stream pipe"
+                                );
+                            }
+                            break true;
+                        }
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        pane = %pane,
+                        pane_target = %pane_target,
+                        error = %error,
+                        "failed to start pane stream"
+                    );
+                    matches!(
+                        claim_pane_stream_task_exit(
+                            &state.pane_streams,
+                            &key,
+                            &sender,
+                            PaneStreamTaskExit::Terminal,
+                        )
+                        .await,
+                        PaneStreamOwnerAction::Teardown
+                    )
+                }
+            };
 
-        if owns_entry {
-            state
-                .pane_streams
-                .remove_terminal_sender(&key, &sender)
+            if owns_entry {
+                state
+                    .pane_streams
+                    .remove_terminal_sender(&key, &sender)
+                    .await;
+            }
+            owner_done.cancel();
+        });
+        if let Err(join_error) = handle.await {
+            tracing::warn!(
+                pane_stream_key = ?key_supervisor,
+                panic = join_error.is_panic(),
+                cancelled = join_error.is_cancelled(),
+                "pane stream owner task exited before cleanup; force-clearing registry entry"
+            );
+            pane_streams
+                .remove_terminal_sender(&key_supervisor, &sender_supervisor)
                 .await;
+            owner_done_supervisor.cancel();
         }
-        owner_done.cancel();
     });
 }
 
@@ -3396,6 +3430,48 @@ mod tests {
         assert_eq!(missing_run_response.status(), StatusCode::FORBIDDEN);
     }
 
+    #[test]
+    fn seq_filter_discards_duplicate_seq() {
+        let mut filter = SeqFilter::new();
+        filter.observe(&RuntimeEvent::new("node_start").with_seq(5));
+        let event = RuntimeEvent::new("node_start").with_seq(5);
+        assert!(filter.accept(event).is_none());
+    }
+
+    #[test]
+    fn seq_filter_discards_lower_seq() {
+        let mut filter = SeqFilter::new();
+        filter.observe(&RuntimeEvent::new("node_start").with_seq(5));
+        let event = RuntimeEvent::new("node_start").with_seq(3);
+        assert!(filter.accept(event).is_none());
+    }
+
+    #[test]
+    fn seq_filter_accepts_advancing_seq() {
+        let mut filter = SeqFilter::new();
+        filter.observe(&RuntimeEvent::new("node_start").with_seq(5));
+        let event = RuntimeEvent::new("node_start").with_seq(6);
+        let item = filter.accept(event).expect("advancing seq should be accepted");
+        assert!(!item.is_done);
+    }
+
+    #[test]
+    fn seq_filter_propagates_is_done() {
+        let mut filter = SeqFilter::new();
+        let event = RuntimeEvent::new("done").with_seq(1);
+        let item = filter.accept(event).expect("first event accepted");
+        assert!(item.is_done);
+    }
+
+    #[test]
+    fn seq_filter_observe_updates_max_without_emitting() {
+        let mut filter = SeqFilter::new();
+        let replayed = RuntimeEvent::new("node_start").with_seq(10);
+        filter.observe(&replayed);
+        let duplicate = RuntimeEvent::new("node_start").with_seq(10);
+        assert!(filter.accept(duplicate).is_none());
+    }
+
     #[tokio::test]
     async fn run_stream_dedupes_buffered_live_event_after_replay() {
         let (_temp, state) = create_test_state(SecurityConfig::default()).await;
@@ -3422,8 +3498,9 @@ mod tests {
             .await;
 
         let replay = state.runtime.db.list_events(run_id).await.unwrap();
-        let mut max_seq = runtime_event_seq(&replay[0]);
-        let drained = drain_buffered_run_events(&mut receiver, &mut max_seq);
+        let mut seq_filter = SeqFilter::new();
+        seq_filter.observe(&replay[0]);
+        let drained = drain_buffered_run_events(&mut receiver, &mut seq_filter);
         assert!(
             drained.is_empty(),
             "live broadcast duplicate must be dropped after replay"
@@ -3436,8 +3513,8 @@ mod tests {
         let _ = tx.send(RuntimeEvent::new("first").with_seq(1));
         let _ = tx.send(RuntimeEvent::new("second").with_seq(2));
 
-        let mut max_seq = 0u64;
-        let items = drain_buffered_run_events(&mut rx, &mut max_seq);
+        let mut seq_filter = SeqFilter::new();
+        let items = drain_buffered_run_events(&mut rx, &mut seq_filter);
         assert!(
             items
                 .iter()
@@ -3447,11 +3524,11 @@ mod tests {
     }
 
     #[test]
-    fn build_attach_command_omits_socket_flag_for_default_invocation() {
-        let invocation = TmuxInvocation::default();
+    fn build_attach_command_includes_socket_flag_for_run_scoped_invocation() {
+        let invocation = crate::tmux_exec::run_scoped_tmux_invocation("run_abc");
         let command = build_attach_command(&invocation, "my-run");
-        assert!(!command.contains("-L"));
-        assert_eq!(command, "tmux attach -t my-run");
+        assert!(command.contains("-L silverbond-run_abc"));
+        assert_eq!(command, "tmux -L silverbond-run_abc attach -t my-run");
     }
 
     #[test]
@@ -4476,6 +4553,39 @@ printf 'fallback-session\n'
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tmux_command_failure_surfaces_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let fake_tmux = temp.path().join("tmux");
+        std::fs::write(
+            &fake_tmux,
+            "#!/bin/sh\nprintf 'pipe-pane target missing\\n' >&2\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = TmuxInvocation {
+            prefix: vec![],
+            socket: None,
+            tmux_bin: fake_tmux.to_string_lossy().into_owned(),
+        };
+
+        let error = run_tmux_status_with_timeout(
+            &invocation,
+            &["pipe-pane", "-t", "%1"],
+            Duration::from_secs(5),
+            "starting pane stream",
+        )
+        .expect_err("a failing tmux command must surface stderr");
+
+        assert!(
+            format!("{error:#}").contains("pipe-pane target missing"),
+            "tmux stderr must be included in the failure: {error:#}"
+        );
+    }
+
     /// A `pipe-pane` enable that never returns must fail setup inside the setup
     /// budget, must be waited out (not abandoned) before teardown, and must not
     /// leave FIFOs behind.
@@ -5190,6 +5300,127 @@ printf 'fallback-session\n'
                 .expect("replacement pane-stream subscription must succeed");
 
         assert!(!old_sender.same_channel(&new_sender));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pane_stream_subscribe_force_clears_when_owner_never_completes() {
+        let registry = PaneStreamRegistry::default();
+        let state = test_app_state(registry.clone());
+        let invocation = TmuxInvocation {
+            prefix: Vec::new(),
+            socket: None,
+            tmux_bin: "/usr/bin/false".to_string(),
+        };
+        let key = PaneStreamKey::new(&invocation, "%1");
+        let (old_sender, _old_receiver) = broadcast::channel::<Vec<u8>>(16);
+        {
+            let mut entry = PaneStreamEntry::new(old_sender.clone(), 1);
+            entry.begin_termination();
+            registry.inner.lock().await.insert(key.clone(), entry);
+        }
+        registry.unsubscribe(&key, &old_sender).await;
+
+        let subscribe_state = state.clone();
+        let subscribe_invocation = invocation.clone();
+        let started = Instant::now();
+        let subscribe = tokio::spawn(async move {
+            subscribe_pane_stream(
+                &subscribe_state,
+                "run-test",
+                "pane-test",
+                "%1",
+                &subscribe_invocation,
+            )
+            .await
+        });
+
+        let (_receiver, new_sender, _new_key) = tokio::time::timeout(Duration::from_secs(2), subscribe)
+            .await
+            .expect("subscribe must not hang when the terminating owner never signals done")
+            .expect("subscribe task must not panic")
+            .expect("replacement pane-stream subscription must succeed after force-clear");
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "subscribe should return within the owner-wait timeout, took {:?}",
+            elapsed
+        );
+        assert!(!old_sender.same_channel(&new_sender));
+        assert!(
+            registry.inner.lock().await.get(&key).is_some_and(|entry| {
+                entry.sender.same_channel(&new_sender) && !entry.is_terminating()
+            }),
+            "subscribe should replace the stuck terminating entry with a fresh owner"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pane_stream_owner_supervisor_clears_terminating_entry_on_panic() {
+        let registry = PaneStreamRegistry::default();
+        let state = test_app_state(registry.clone());
+        let invocation = TmuxInvocation {
+            prefix: Vec::new(),
+            socket: None,
+            tmux_bin: "/usr/bin/false".to_string(),
+        };
+        let key = PaneStreamKey::new(&invocation, "%1");
+        let (sender, _receiver) = broadcast::channel::<Vec<u8>>(16);
+        let owner_done = {
+            let mut entry = PaneStreamEntry::new(sender.clone(), 1);
+            entry.begin_termination();
+            let owner_done = entry.owner_done();
+            registry.inner.lock().await.insert(key.clone(), entry);
+            owner_done
+        };
+
+        let registry_supervisor = registry.clone();
+        let key_supervisor = key.clone();
+        let sender_supervisor = sender.clone();
+        let owner_done_supervisor = owner_done.clone();
+        let supervisor = tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
+                panic!("simulated pane stream owner panic after begin_termination");
+            });
+            let Err(join_error) = handle.await else {
+                return;
+            };
+            tracing::warn!(
+                pane_stream_key = ?key_supervisor,
+                panic = join_error.is_panic(),
+                cancelled = join_error.is_cancelled(),
+                "pane stream owner task exited before cleanup; force-clearing registry entry"
+            );
+            registry_supervisor
+                .remove_terminal_sender(&key_supervisor, &sender_supervisor)
+                .await;
+            owner_done_supervisor.cancel();
+        });
+        supervisor.await.expect("supervisor task must not panic");
+
+        assert!(
+            !registry.inner.lock().await.contains_key(&key),
+            "panic should remove the terminating registry entry"
+        );
+
+        let subscribe_state = state.clone();
+        let subscribe_invocation = invocation.clone();
+        let subscribe = tokio::time::timeout(
+            Duration::from_secs(2),
+            subscribe_pane_stream(
+                &subscribe_state,
+                "run-test",
+                "pane-test",
+                "%1",
+                &subscribe_invocation,
+            ),
+        )
+        .await
+        .expect("subscribe must not hang after supervisor cleanup")
+        .expect("subscribe must succeed");
+
+        assert!(!sender.same_channel(&subscribe.1));
+        owner_done.cancel();
     }
 
     fn test_checkpoint() -> RuntimeCheckpoint {

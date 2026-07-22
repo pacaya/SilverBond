@@ -231,8 +231,8 @@ export type NodeKind =
   | { type: "spawn"; spawnConfig?: SpawnConfig }
   | { type: "send"; sendConfig?: SendConfig }
   | { type: "wait"; waitConfig?: WaitConfig }
-  | { type: "capture"; captureConfig: CaptureConfig }
-  | { type: "kill"; killConfig: KillConfig }
+  | { type: "capture"; captureConfig?: CaptureConfig }
+  | { type: "kill"; killConfig?: KillConfig }
   | { type: "run_agent"; runAgentConfig?: RunAgentConfig; agentConfig?: AgentNodeConfig | null };
 
 export interface WorkflowNode {
