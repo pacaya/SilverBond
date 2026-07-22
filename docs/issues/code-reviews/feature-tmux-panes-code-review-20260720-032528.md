@@ -802,7 +802,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ## Fix-Review Follow-ups (2026-07-21)
 
-### H7. M6's extraArgs validator is bypassed by glued clap short-option syntax, leaving the access-ceiling escalation channel open (FINALIZED)
+### H7. M6's extraArgs validator is bypassed by glued clap short-option syntax, leaving the access-ceiling escalation channel open (FIXED)
+> **Fix:** Replaced the bypassable extra_args denylist with an exact per-agent allowlist that rejects glued/clustered/abbreviated/unknown/access-changing args; added regressions for -sdanger-full-access, -anever, -csandbox_mode=danger-full-access plus positive coverage.
 **Severity:** MEDIUM — mechanically certain silent access widening, but `extra_args` is author-only with no interpolation or third-party injection path; consistent with M6's own adjudicated lowering to MEDIUM. ID retained as `H7` for stability.
 **Files:** `src/model.rs:2285-2315` (validator), `:2318-2326` (`matches_long_flag`), `:3303-3464` (existing tests); `src/api.rs:743-758` (error gate); `src/tmux_exec.rs:2264-2270` (`build_agent_command` arg chaining); `src/driver.rs:929-936` (codex ReadOnly session args)
 **Description:** The `extra_args` access-ceiling validator at `src/model.rs:2285-2315` splits each arg on the first `=` and then compares the flag as a whole token, so clap's attached-value short syntax escapes it entirely — `-sdanger-full-access`, `-anever`, and `-csandbox_mode=danger-full-access` match neither the exact short tests nor `matches_long_flag` (`:2318-2326`), which short-circuits on a `--` prefix. Validation is a hard gate (`src/api.rs:743-758` rejects a run start on any `severity == "error"` issue), so a clean pass means the run launches. `build_agent_command` chains `extra_args` after the driver's session args (`src/tmux_exec.rs:2264-2270`) and codex's flags are `ArgAction::Set`, so the glued flag overwrites the `--sandbox read-only -a never` emitted for `AccessMode::ReadOnly` (`src/driver.rs:929-936`). A workflow declaring `accessMode: read_only` with `extraArgs: ["-sdanger-full-access"]` therefore validates clean and launches codex fully unsandboxed — the exact silent downgrade M6 was filed to close. Existing tests (`:3303-3464`) cover spaced, `=`-joined, and abbreviated long forms but no glued short.
@@ -816,7 +817,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### H8. H6 leaves run startup and traversal probe on the cancellation-unsafe timeout primitive (FINALIZED)
+### H8. H6 leaves run startup and traversal probe on the cancellation-unsafe timeout primitive (FIXED)
+> **Fix:** Extracted H6's cancellation-safe timeout runner into a new shared src/proc.rs (status + tempfile-backed output variants, no reader threads), routed the two remaining unpatched call sites (resolve_tmux_bin_with_timeout, ensure_run_as_can_traverse_root) through it, and added an fd-inheriting-descendant regression; left the zsh -lic flag and the Cargo rev pin untouched.
 **Severity:** HIGH — narrower trigger than H6 (requires `run_as` configured), but a hang on the resume path leaves the run permanently `AlreadyActive` and unstartable, and every occurrence irreversibly leaks a tokio blocking-pool thread plus an orphan process group.
 **Files:** `src/tmux_exec.rs:127` (`resolve_tmux_bin_with_timeout`), `:119`/`:124` (`zsh -lic`); `src/api.rs:1738` (`ensure_run_as_can_traverse_root`), `:1736-1737` (probe's own `Stdio::null()`), `:1649-1698` (H6's inline status-only runner), `:1683` (group kill), `:1710`, `:224`; `src/runtime.rs:3412` (unbounded await), `:3408`, `:1393`, `:1438`, `:1441`, `:1557`, `:2764`; `Cargo.toml:28` (rev pin `69173d1`); upstream `core/src/tmux.rs:192`, `:196`, `:225-231`, `:249`
 **Description:** Two call sites still route through the unpatched primitive: `resolve_tmux_bin_with_timeout` (`src/tmux_exec.rs:127`) and `ensure_run_as_can_traverse_root` (`src/api.rs:1738`). `command_output_with_timeout` sets `stdout(Stdio::piped()).stderr(Stdio::piped())` as the **first** statement of its body (upstream `core/src/tmux.rs:192`, `:196`), unconditionally overriding the probe's own `Stdio::null()` at `src/api.rs:1736-1737`, and its timeout arm is verbatim `child.kill(); child.wait(); join_reader(stdout); join_reader(stderr)` with `join_reader` an unbounded `handle.join()` over `read_to_end` (`:225-231`, `:242-249`). Any descendant inheriting the write end — an interactive `.zshrc` that backgrounds anything under the intentional `zsh -lic` (`src/tmux_exec.rs:119`), or `sudo` fork-and-wait leaving the exec'd child alive — therefore withholds EOF and blocks the join forever after the direct child is SIGKILLed. `src/runtime.rs:3412` awaits that `spawn_blocking` with no outer `tokio::time::timeout`, so `start_run` (`:1393`), resume (`:1441`), restart (`:1557`), `execute_workflow` (`:2764`) and the HTTP helper `src/api.rs:224` hang indefinitely; because `registry.register` runs before resolution on the resume path (`:1438`), the run is left permanently unresumable. Precondition: `run_as` must be configured (`:3408` short-circuits to `Ok(None)` otherwise).
@@ -830,7 +832,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### H9. H4's new kind-shaped backfill omits `capture` and `kill` — the two node kinds the backend actually does omit — so an ordinary save/reload still blanks the editor (FINALIZED)
+### H9. H4's new kind-shaped backfill omits `capture` and `kill` — the two node kinds the backend actually does omit — so an ordinary save/reload still blanks the editor (FIXED)
+> **Fix:** Made captureConfig/killConfig optional in the NodeKind union and rewired the InspectorPanel accessors to `?? DEFAULT_*` fallbacks matching their spawn/send/wait siblings, so configless capture/kill nodes render defaults after save/reload; added normalize/inspector regressions; backfill left untouched.
 **Severity:** MEDIUM (top of band) — reachable from ordinary backend data with a single save/reload, unlike H4's import-only ingress, but the failure is scoped to selecting the node rather than loading the canvas; matches M2's calibration for the identical `sendConfig` defect. ID retained as `H9` for stability.
 **Files:** `ui/src/lib/types/workflow.ts:232-233` (required decls), `:514-527` (`backfillRequiredKindConfig`), `:620-631` (legacy arm, still correct); `ui/src/features/editor/InspectorPanel.svelte:274-280` (unguarded accessor), `:262-272` (correct sibling pattern), `:1455`, `:1497`; `ui/src/lib/stores/nodeMetadata.ts:45,47`; `src/model.rs:732,736` (`skip_serializing_if`), `:720`, `:724`, `:728`, `:740` (same-family twins); `src/api.rs:527-534`; `src/storage.rs:978`; `ui/src/lib/types/workflow.normalize.test.ts:57-64`
 **Description:** `captureConfig`/`killConfig` are declared required at `ui/src/lib/types/workflow.ts:232-233`, but the backend omits them whenever they equal the default (`src/model.rs:732,736`) — exactly the state of a freshly added Capture/Kill node, since `nodeMetadata.ts:45,47` produce `{all:false,ansi:false}` and `{}`, both `is_default`. Saves round-trip through the typed `WorkflowV3` (`src/api.rs:527-534` → `src/storage.rs:978`), so the field genuinely leaves the wire. On reload the node arrives as `{"type":"capture"}`, `backfillRequiredKindConfig` falls through to `default: return node` (`workflow.ts:525-526`), and `InspectorPanel.svelte:275` returns `undefined` with no `?? DEFAULT_*` fallback — unlike its spawn/send/wait siblings at `:262-272`. Selecting the node throws `TypeError: Cannot read properties of undefined (reading 'target')` at `InspectorPanel.svelte:1455` (kill: `:1497`); with no `<svelte:boundary>` anywhere in `ui/src`, the editor blanks with no recovery.
@@ -846,7 +849,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M19. M14's startup migration bricks boot on a single bad run row (FINALIZED)
+### M19. M14's startup migration bricks boot on a single bad run row (FIXED)
+> **Fix:** upgrade_run_workflow_json now warns-and-skips rows with invalid JSON or an unmigratable schema instead of bare ?-propagating out of init/boot, and narrows the SELECT to skip already-v4 rows (with a NOT json_valid guard added for SQLite safety); added a damaged-row regression asserting boot succeeds without rewriting.
 **Severity:** MEDIUM (lower band) — unreachable with today's writers, but a genuine upgrade-path landmine: the next `WORKFLOW_SCHEMA_VERSION` bump without a matching migrate arm bricks boot for every user at once, with no in-app recovery.
 **Files:** `src/storage.rs:1247-1268` (`upgrade_run_workflow_json`), `:1257-1258` (bare `?`), `:1249-1252` (unbounded scan), `:1260-1262` (write-back suppression), `:223` (init call), `:239-240`, `:247-249` (`upsert_run` normalize + freeze), `:390` (`get_run`), `:914-943` (`WorkflowStore::list` warn-and-skip), `:1210-1212` (`backfill_legacy_tmux_sessions` skip), `:1907`, `:2010` (existing tests); `src/app.rs:344`; `src/main.rs:19-23`; `src/model.rs:1135-1142` (`migrate_workflow_value_to_v4`)
 **Description:** `upgrade_run_workflow_json` SELECTs every `runs` row and applies `serde_json::from_str` (`src/storage.rs:1257`) and `normalize_workflow_value` (`:1258`) with bare `?`. The caller chain `init()` (`:223`) → `Application::boot` (`src/app.rs:344`) → `main` (`src/main.rs:19-23`) propagates that Err all the way out, so one failing row aborts process startup with no recovery short of hand-editing SQLite — where before M14 the same row failed only its own `get_run`. The realistic trigger is schema evolution rather than corruption: `migrate_workflow_value_to_v4` (`src/model.rs:1135-1142`) accepts only 2, 3, and the current `WORKFLOW_SCHEMA_VERSION` and hard-bails otherwise, so a bump to 5 without adding a `4` arm makes every stored row bail and every user's server refuse to boot. The scan is also unbounded — no version guard, no `LIMIT`, a full parse+normalize+reserialize per row on every boot (`:1249-1252`), though write-back is correctly suppressed when unchanged (`:1260-1262`).
@@ -862,7 +866,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M20. H3 freshness hook destroys working-tree `public/` and validates the wrong tree (FINALIZED)
+### M20. H3 freshness hook destroys working-tree `public/` and validates the wrong tree (FIXED)
+> **Fix:** Freshness pre-commit hook now builds and diffs only the staged snapshot (--outDir into a temp dir, symlinked node_modules) so it never touches working-tree public/; added a real-Vite partial-stage regression test.
 **Severity:** MEDIUM — a real false-pass in the freshness guarantee plus a destructive, false-rejecting side effect on every run; bounded by being git-recoverable and reachable only for developers who opted into the hook.
 **Files:** `.githooks/pre-commit:29` (snapshot), `:31` (live-tree build), `:33` (diff), `:24-27` (EXIT trap), `:36` (reject exit), `:8-10`, `:12-16`, `:18-21`; `ui/vite.config.ts:25-27`; `package.json:8`; `justfile:23-26`
 **Description:** `.githooks/pre-commit:29` materializes an index snapshot via `git checkout-index --all --prefix=…`, but `:31` runs `npm run build` against the **live working tree** and `:33` diffs the snapshot against it — the snapshot is never built, serving only as a comparison baseline. The check therefore compares staged assets against a bundle built from staged *plus unstaged* sources, admitting commits whose `public/` does not correspond to their own `ui/src` (stage subset A of `ui/src`, leave B unstaged, stage assets built from A+B → hook rebuilds A+B → match → pass) and falsely rejecting ordinary partially-staged commits with a message that misdescribes the cause. Because `package.json:8` runs `vite build --config ui/vite.config.ts` and `ui/vite.config.ts:25-27` sets `outDir: ../public` with `emptyOutDir: true`, the check also wipes and rewrites the developer's `public/` on every non-early-exit run, including the reject path at `:36`; if vite fails mid-build, `set -e` aborts with `public/` emptied. The `trap cleanup EXIT` at `:24-27` removes only the temp dir.
@@ -878,7 +883,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M21. H3's authoring-time guard is entirely opt-in and unwired, repeating the recurrence pattern H3 exists to break (FINALIZED)
+### M21. H3's authoring-time guard is entirely opt-in and unwired, repeating the recurrence pattern H3 exists to break (FIXED)
+> **Fix:** just setup now chains install-hooks; documented the hook, git-config opt-out, and residual bypasses in CLAUDE.md and getting-started, and recorded the required-status-check follow-up with owner and date.
 **Severity:** MEDIUM — process/enforcement defect on a four-time recurrence with a demonstrated failure history; no runtime impact, and the load-bearing control is out-of-repo.
 **Files:** `justfile:8-9` (`setup`), `:19-21` (`build`), `:23-26` (`install-hooks`); `.githooks/pre-commit`; `docs/getting-started.md:17-26`; `CLAUDE.md`; `.github/workflows/frontend-freshness.yml:3-5`
 **Description:** `.githooks/pre-commit` is dormant by default: git consults it only when `core.hooksPath` is set, which happens solely if a human runs `just install-hooks` (`justfile:23-26`). `just setup` is exactly `npm install` (`:8-9`) and does not chain it; `docs/getting-started.md:17-26` documents the fresh-clone flow as `git clone` → `cd` → `just setup`, the precise sequence that leaves the hook uninstalled; and a grep over `docs/`, `README.md`, `CLAUDE.md`, `ARCHITECTURE.md`, and `.github/` for `install-hooks|hooksPath|githooks|pre-commit` returns zero hits outside this review file. `core.hooksPath` is unset even in the clone where the hook was authored. `.github/workflows/frontend-freshness.yml:3-5` triggers on bare `push:`/`pull_request:`, so it does run and does go red on a stale bundle — but it is not a required status check, and history proves red-alone is insufficient: the workflow landed in `482ba08` (2026-06-21) and `public/` still went stale twice afterward (rebuilt `3790df1`, `da27009`, again `c1659c8`). H3 therefore landed as one more manual rebuild plus two controls both requiring unprompted manual opt-in.
@@ -894,7 +900,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M22. H1's editor-time continuation check fails open rather than closed when privilege cannot be resolved (FINALIZED)
+### M22. H1's editor-time continuation check fails open rather than closed when privilege cannot be resolved (FIXED)
+> **Fix:** Restructured the editor-time continuation check to a match on both resolved_access_profile results, emitting a severity="warning" (not error) issue that pre-announces the runtime pane-adoption refusal when either profile is unrankable; added regressions for the unregistered-agent and unrankable-custom-profile branches.
 **Severity:** LOW — *lowered from MEDIUM*: no path reaches an unsafe pane adoption because the runtime site `?`-propagates the same failure; the trigger requires an operator-authored registry with a non-canonical, non-alias profile name, and the sole impact is a late cryptic error instead of an early editor diagnostic. ID retained as `M22` for stability.
 **Files:** `src/model.rs:2080-2086` (editor-time check), `:2273-2281` (M11 warning precedent), `:4708-4870`, `:4770` (existing continuation tests); `src/tmux_exec.rs:481-533` (`ensure_reused_pane_compatible`), `:503-507`, `:509-510`, `:414-422`; `src/driver.rs:287-329` (`declared_profile_privilege`), `:355`, `:382-384`, `:155-164`; `src/api.rs:743-758`; `ui/src/app/AppShell.svelte:114-115`; `ui/src/features/editor/flowNodes.ts:40-41`; `ui/src/features/editor/InspectorPanel.svelte:698`
 **Description:** The editor-time continuation check is written as `if let (Ok((current_profile, current_privilege)), Ok((source_profile, source_privilege))) = (…) && source_privilege > current_privilege` (`src/model.rs:2080-2086`) with no `else`, so either `Err` silently skips the ceiling comparison and validation reports green. `resolved_access_profile` returns `Err` for an unknown agent (`src/driver.rs:355`, `:382-384`) or a profile with no declared rank — `declared_profile_privilege` (`:287-329`) ranks only `read-only`/`workspace-write`/`full-access`, the `cursor`/`plan` special case, and argv-identical aliases. The author then starts the run and receives a mid-run node failure ("agent X access profile Y has no declared privilege rank") from `src/tmux_exec.rs:509-510`. Existing tests (`src/model.rs:4708-4870`, incl. `validates_continue_session_from_broader_access_profile` at `:4770`) never exercise the `Err` branch.
@@ -910,7 +917,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M23. M12's new Terminating wait state becomes a permanent silent hang if the owner task panics (FINALIZED)
+### M23. M12's new Terminating wait state becomes a permanent silent hang if the owner task panics (FIXED)
+> **Fix:** Wrapped the pane-stream owner task in a supervisor that retains the JoinHandle and force-cleans + cancels owner_done on panic/cancellation, and bounded the subscribe wait with tokio::time::timeout (force_clear on expiry with a warn) instead of an unbounded loop; added owner-panic and owner-never-completes regressions.
 **Severity:** LOW — *lowered from MEDIUM*: the mechanism is live (unwind is enabled), but the window between termination and cleanup is currently panic-free code, so this is latent structural fragility rather than a reachable defect. ID retained as `M23` for stability.
 **Files:** `src/api.rs:2166-2225` (`spawn_pane_stream_task`), `:2184`, `:2218-2224`, `:2250` (`begin_termination`), `:2009-2013` (unbounded wait), `:2020-2023` (revive path), `:84-121` (`PaneStreamGuard`), `:1601-1630`, `:1633-1641`, `:5145-5192` (existing test); `src/app.rs:221`, `:270`, `:305-318`; `src/runtime.rs:3072-3093` (`spawn_supervised_run`), `:979-988` (`abort_and_wait`), `:5504-5511` (`catch_unwind` precedent), `:8124`, `:8148`; `Cargo.toml` (no `[profile]`)
 **Description:** `spawn_pane_stream_task` (`src/api.rs:2166-2225`) discards its `JoinHandle`, so nothing observes the owner task's exit, and the waiting side parks unconditionally: `:2009-2013` reads `entry.is_terminating()`, clones the `CancellationToken` (`src/app.rs:221`, `:270`), drops the lock, and awaits `owner_done.cancelled()` inside a loop with no timeout, no log, and no abort path. If the owner unwinds anywhere after `begin_termination()` (`:2250`), the entry stays `Terminating` for the process lifetime and every later `subscribe_pane_stream` for that `PaneStreamKey` hangs silently — a permanently dead terminal pane with zero diagnostics. `Cargo.toml` declares no `[profile]` section and there is no `.cargo/config.toml`, so `panic = "unwind"` is in effect and a panic kills only that task rather than aborting the process. Coverage is happy-path only (`pane_stream_subscribe_waits_for_terminal_owner_exit`, `:5145-5192`); no owner-panic test exists.
@@ -925,7 +933,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M24. M18 still puts privileged no-runAs runs on the default tmux server (FINALIZED)
+### M24. M18 still puts privileged no-runAs runs on the default tmux server (FIXED)
+> **Fix:** Added a resolve-free run_scoped_tmux_invocation(run_id) helper and made the no-run_as arm (plus the boot reaper fallback) return a per-run silverbond-<run_id> socket instead of the default server, so every run now persists a run-scoped socket; reworked the attach-command test and added start/resume/reaper regressions.
 **Severity:** LOW — *lowered from MEDIUM*: no privilege boundary is crossed and the run-scoped ownership check blunts the only cross-run targeting path; the concrete residue is documentation inaccuracy plus tmux-server hygiene. ID retained as `M24` for stability.
 **Files:** `src/runtime.rs:3408-3410` (`resolve_workflow_invocation_with`), `:1393-1400` (`start_run`), `:2764-2769` (`execute_workflow`), `:3384-3390` (`load_or_resolve_run_tmux_invocation`), `:6805-6819` (reaper fallback); `src/api.rs:797-804`, `:844`, `:233-250` (`build_attach_command`), `:3450` (affected test); `src/tmux_exec.rs:95-99`, `:2581` (`stable_session_name`), `:2585-2588` (`unique_session_name`), `:624` (`owns_session`), `:925` (`execute_kill`); `docs/architecture-overview.md:50`
 **Description:** `resolve_workflow_invocation_with` returns `None` when `workflow.run_as` is absent (`src/runtime.rs:3408-3410`), and `start_run` (`:1400`), `execute_workflow` (`:2764-2769`), and `load_or_resolve_run_tmux_invocation` (`:3390`) all collapse that to `TmuxInvocation::default()`, whose `socket: None` emits no `-L` and therefore uses the invoking user's ordinary tmux server; the boot reaper repeats the fallback literally at `:6805-6819`. The path is reachable in a supported mode: `src/api.rs:797-804` injects `run_as` only when `security.agent_user` is configured, and with none configured `resolved_run_as_is_privileged(None, None)` is `true` (`:844`), so the run proceeds password-unlocked with `run_as == None`. `docs/architecture-overview.md:50` states flatly and without hedging that "Each run has its own tmux server on a `silverbond-<run-id>` socket", which is false for this path; M18's applied-fix note ("runtime and reaper **always** derive the per-run socket") and `20260716-003531` M7 ("Every run gets a per-run socket") overstate the same way.
@@ -954,7 +963,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M28. Cleanup-verdict warning logic is duplicated across two pane-cleanup paths — re-scoped to the `spawn_blocking` wrapper clone (FINALIZED)
+### M28. Cleanup-verdict warning logic is duplicated across two pane-cleanup paths — re-scoped to the `spawn_blocking` wrapper clone (FIXED)
+> **Fix:** Extracted the duplicated spawn_blocking(cleanup_panes) block into a shared run_pane_cleanup async helper called from both pane-cleanup sites; left the two H2-mandated contextual warn! blocks verbatim as required.
 **Severity:** LOW — *lowered from MEDIUM*: the filed claim has zero duplicated lines; the re-scoped item is a genuine 9-line byte-identical clone, but it is a behavior-free maintainability cleanup with no correctness impact. ID retained as `M28` for stability.
 **Files:** `src/runtime.rs:6676-6684` and `:6940-6948` (the real clone); `:6697-6711` (`cleanup_terminal_active_panes` warns), `:6713-6730` (verdict-driven deletions), `:6951-6958` (`kill_active_run_panes` warn), `:6679/6681`, `:6943/6945` (the only two `cleanup_panes` callers), `:9426` (existing test); `src/tmux_exec.rs:68` (`PaneCleanupVerdict`)
 **Description:** As filed, the finding does not reproduce: a literal `diff` of `src/runtime.rs:6697-6711` against `:6951-6958` returns `1,15c1,8` — **zero byte-identical lines**, even after normalizing indentation. The loop headers differ (`.iter()` vs `.into_iter()`), the field sets differ, the message texts differ, and the control flow differs (an if/else on `verdict.target.session_name` vs a single unconditional warn). The two warns encode different post-conditions by design: `cleanup_terminal_active_panes` distinguishes session from pane targets because it then *acts* on the verdicts, deleting registrations for absent sessions at `:6713-6730` ("retaining registration"), while `kill_active_run_panes` deliberately performs no DB work and defers to the reaper ("registration will be reconciled by the reaper"). H2 mandated exactly this per-path contextual split (`:62`, `:70`). No third site exists — `cleanup_panes` has exactly two callers crate-wide and `!verdict.absent` appears only at these two places.
@@ -970,7 +980,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M29. L6's sequence dedupe-and-wrap logic is written three times (FINALIZED)
+### M29. L6's sequence dedupe-and-wrap logic is written three times (FIXED)
+> **Fix:** Introduced a SeqFilter { max_seq } type with accept()/observe(), merged the twinned RunStreamJournalItem/RunStreamBufferedItem::Event into one RunStreamItem, and routed all four sequence touchpoints through it (removing the threaded &mut u64 params); added five direct SeqFilter unit tests covering the previously-untested resync and live-arm dedupe paths.
 **Severity:** LOW — *lowered from MEDIUM*: genuine rule-of-three duplication with real type-twinning, but only 6 shared lines, zero drift between the copies today, and no correctness exposure; the live hazard is the untested paths, not the duplication itself. ID retained as `M29` for stability.
 **Files:** `src/api.rs:937-946` (live `recv()` arm), `:1013-1022` (`drain_buffered_run_events`), `:1042-1051` (`resync_run_stream_from_journal`), `:891-895` (fourth seq touchpoint, replay-loop max-tracking), `:994-997` (`RunStreamJournalItem`), `:1000` (`RunStreamBufferedItem::Event`), `:1006`, `:1037` (`&mut max_seq` params), `:974` (`unwrap_or(0)`), `:3399`, `:3433` (existing tests); `src/runtime.rs:6969-6970` (`emit_event`, the only non-test sender)
 **Description:** The dedupe-and-wrap sequence appears three times: `src/api.rs:937-946` inside the `stream!` live `recv()` arm, `:1013-1022` in `drain_buffered_run_events`, and `:1042-1051` in `resync_run_stream_from_journal`. Sites 2 and 3 are 9-of-10 lines identical, differing only in which of two field-identical wrapper types they construct — `RunStreamBufferedItem::Event` (`:1000`) versus `RunStreamJournalItem` (`:994-997`), both `{ sse: Event, is_done: bool }` — and that twinning is precisely why the wrap step cannot already be shared. Site 1 shares the same 6-line core but yields directly instead of pushing. Test coverage is asymmetric and is the real hazard: `run_stream_dedupes_buffered_live_event_after_replay` (`:3399`) and `run_stream_buffered_drain_signals_resync_on_lagged` (`:3433`) exercise only `drain_buffered_run_events`, while the resync path and the live arm carry **zero** dedupe assertions, so drift in two of the three copies would go undetected.
@@ -986,7 +997,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M30. The agent-resolution chain `agent_name_for_node` owns is re-implemented inline twice (FINALIZED)
+### M30. The agent-resolution chain `agent_name_for_node` owns is re-implemented inline twice (FIXED)
+> **Fix:** Added explicit_agent_for_node(node) -> Option<&str> (nested-config-first) and reimplemented agent_name_for_node on it with an unchanged String contract; rewrote the Spawn and RunAgent validation arms to derive both the agent name and has_agent from it, removing the duplicated inline chains; added the two missing validation regressions.
 **Severity:** LOW — *lowered from MEDIUM*: 10 duplicated lines across two sites (three copies crate-wide), all behaviorally equivalent, with no user-visible impact; pure maintainability. ID retained as `M30` for stability.
 **Files:** `src/model.rs:61-91` (`agent_name_for_node`), `:65-74` (chain), `:86-89` (Task arm), `:1701-1710` (Spawn arm), `:1774-1783` (RunAgent arm), `:2049-2050`, `:2084-2086`, `:2098-2099` (H1's landed consolidation), `:4738`, `:4765` (only agent-resolution tests); `src/runtime.rs:1766-1769` (third copy), `:3871`, `:4500`, `:5556`, `:5616` (other callers); `src/api.rs:660`
 **Description:** `src/model.rs:1701-1705` and `:1774-1778` each re-derive the `config.agent → node.agent → DEFAULT_AGENT` chain that `agent_name_for_node` (`:61-91`) exists to own, and are immediately followed by 5 more duplicated lines computing `has_agent` (`:1706-1710`, `:1779-1783`); the two 10-line blocks are byte-identical except the config binding (`spawn_config` vs `run_agent_config`). A third, narrower copy sits at `src/runtime.rs:1766-1769` in `run_node_preview`, which the finding does not name. Neither validation message ("spawn node requires an agent or command", "run_agent node requires an agent") has any test — the only agent-resolution coverage is the continuation check around `:4738`/`:4765`.
@@ -1002,7 +1014,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M31. The privilege-rank `ok_or_else` block is repeated four times (FINALIZED)
+### M31. The privilege-rank `ok_or_else` block is repeated four times (FIXED)
+> **Fix:** Added a require_privilege(spec, profile) helper wrapping declared_profile_privilege(...).ok_or_else(...) with unified wording, collapsed all four driver.rs call sites to it, updated the fallback assertion, and added three previously-missing error-path tests.
 **Severity:** LOW — *lowered from MEDIUM*: four sites clears the rule of three, but it is 20 lines with zero behavioral drift and ~8 net lines saved; the access-control location is what keeps it above cosmetic. ID retained as `M31` for stability.
 **Files:** `src/driver.rs:340-344`, `:356-360`, `:390-394`, `:414-418` (the four sites), `:337`, `:353`, `:382` (`spec` bindings), `:291-305`, `:301`, `:311-314` (privilege inference and its TODO), `:1941-1971`, `:1968` (only error-path test); `docs/issues/SMELLS-LEDGER.md:45`, `:58`, `:62-63`
 **Description:** The `Option → Result` lift around `declared_profile_privilege` is written four times — `src/driver.rs:340-344`, `:356-360`, `:390-394`, `:414-418` — at 5 lines apiece. All four have `spec: &agents::AgentSpec` (`:337`, `:353`, `:382`) and `agent: &str` in scope, and `spec.name` equals the registry lookup key (`Registry::get` is a plain `BTreeMap` lookup with no aliases), so the error message is fully reconstructible from `(spec, profile)`. Test coverage is lopsided: only `:414` has an error-path test (`registry_edit_rejects_unranked_default_fallback`, `:1941-1971`, asserting the exact string at `:1968`), while `:340`, `:356`, and `:390` have no assertion on this error at all. The residual risk is the "fix three, miss one" class landing in privilege-relevant code.
@@ -1019,7 +1032,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M32. `kill_tmux_pane`'s absence probe uses a CANFAIL tmux command and never confirms absence (FINALIZED)
+### M32. `kill_tmux_pane`'s absence probe uses a CANFAIL tmux command and never confirms absence (FIXED)
+> **Fix:** Replaced kill_tmux_pane's CANFAIL display-message absence probe with list-panes (whose nonzero exit genuinely means absent), fixed the mis-modelled tmux test fake (list-panes exits 1, not display-message), and added a negative regression pinning that the old display-message form cannot confirm absence.
 **Severity:** MEDIUM — reframed from a duplication smell to a correctness defect: H2's verification mechanism is inert on the pane path and emits false "could not confirm" warnings on every cleanup, but no DB row is wrongly deleted and no pane is leaked. ID retained as `M32` for stability; title rewritten because the filed duplication is incidental.
 **Files:** `src/tmux_exec.rs:1305-1310` (`kill_tmux_pane`, broken probe), `:1298-1303` (`kill_tmux_session`, correct), `:4297-4345`, `:4331` (mis-modelled tmux fake), `:4266` (session-path fake); `src/runtime.rs:6697-6710`, `:6706`, `:6712-6716`, `:6949-6956`, `:6950`
 **Description:** `kill_tmux_pane` probes absence with `display-message -p -t <pane_id> '#{pane_id}'`, but that command declares its target `CMD_FIND_CANFAIL` — an unresolvable pane target is **not** an error and exits **0**. Verified empirically against tmux 3.7b: `tmux -L probe3 display-message -p -t '%9999' '#{pane_id}'` exits 0 with empty stdout on a live server, while `tmux -L probe3 list-panes -t '%9999'` exits 1 with `can't find pane: %9999`. The `absent = exit_code != 0` test at `src/tmux_exec.rs:1305-1310` is therefore inverted in the dominant case: it returns `true` essentially only when the whole tmux server is down, reporting "pane still present" for every pane it successfully killed. `kill_tmux_session` (`:1298-1303`) uses `has-session`, which genuinely exits nonzero when absent, and is correct. The regression fake at `:4297-4345` hardcodes `case "$*" in *has-session*|*display-message*) exit 1;;` — it encodes the wrong assumption, so `cleanup_panes_kills_registered_sessions_and_pane_fallbacks` passes green while real tmux behaves inversely. H2's mandated nonzero-exit fakes landed for the session path (`:4266`); the pane path is covered only by that mis-modelled fake.
@@ -1035,7 +1049,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### L16. M17's stale-temp cleanup races a concurrent save and fails the write it was meant to protect (FINALIZED)
+### L16. M17's stale-temp cleanup races a concurrent save and fails the write it was meant to protect (FIXED)
+> **Fix:** Made workflow save temp files per-writer (<safe>.json.<pid>-<nonce>.tmp) so concurrent same-name saves no longer share a temp, and taught list to reap only foreign-pid/legacy temps via workflow_temp_disposition(); added own-pid-preserved and concurrent-save valid-JSON regressions.
 **Severity:** LOW — the cited race is a data-safe, retryable 500 in a sub-10ms window; the adjacent same-name concurrent-save path found during verification can publish corrupt JSON (MEDIUM in isolation) and is covered by the same fix.
 **Files:** `src/storage.rs:903-911` (`list` temp unlink), `:977-983` (`save` temp write + rename), `:1424-1455` (test that locks in the unguarded unlink); `src/api.rs:136` (shared route), `:505-507`, `:527-535`
 **Description:** `WorkflowStore::list` unlinks every `*.json.tmp` it walks past (`src/storage.rs:903-911`) with no age or ownership test, while `save` writes `<safe>.json.tmp` and renames it **by path** (`:977-983`) — so the open `File` handle does not save the rename. `GET /api/workflows` and `POST /api/workflows` are independent handlers on the multi-threaded runtime with no lock over the store (`src/api.rs:136`; `WorkflowStore` is just `{ dir: Arc<PathBuf> }`), and TanStack Query keeps `refetchOnWindowFocus: true`, so a window focus or second tab during a save fires the racing GET; `rename` then fails ENOENT and the user's save 500s with the prior `.json` intact. Because the temp path is per-workflow rather than per-attempt (`:977`), two overlapping saves of the same workflow additionally truncate and interleave `write_all` into one file and can publish corrupt JSON. The cleanup was introduced by M17 in this same review, which explicitly accepted the read-path-mutates layering smell but never considered concurrency.
@@ -1047,7 +1062,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### L17. M15 checkpoint dedupe cache never retires completed runs, leaking memory unbounded (FINALIZED)
+### L17. M15 checkpoint dedupe cache never retires completed runs, leaking memory unbounded (FIXED)
+> **Fix:** Relocated checkpoint_persist_hashes into RunRegistry with last_persist_hash/record_persist_hash accessors and drop-on-clear so entries retire on every exit path; added a lifecycle retirement test.
 **Severity:** LOW — pure unbounded growth at ~80–100 bytes per completed run (~1 MB per 10k runs); no correctness impact and no user-visible symptom short of six-figure run counts in one uptime.
 **Files:** `src/runtime.rs:1358` (declaration), `:6990-6992` (read), `:6997-7000`, `:7011-7014` (writes), `:917` (`RunRegistry` impl), `:1102-1106` (`RunRegistry::clear`), `:6648` (`finalize_run` clear call), `:3084-3091` (panic/abnormal-exit path), `:8195` (existing dedupe test); `src/app.rs:345` (single `RuntimeContext::new`)
 **Description:** `checkpoint_persist_hashes` is an `Arc<Mutex<HashMap<String, u32>>>` (`src/runtime.rs:1358`) with two writers and one reader and — verified by grep across `src/` — zero `.remove(`/`.retain(`/`.clear()` call sites. `finalize_run` ends by calling `ctx.registry.clear(&run_id)` (`:6648`) but leaves the hash entry behind, and `dismiss_run` (`:1618`) never touches it; since `RuntimeContext::new` runs once (`src/app.rs:345`) and every per-run clone shares the same `Arc`, the map is process-lifetime. Each completed run permanently retains a 40-byte UUID key plus `String` header, `u32` value, and hashbrown slot overhead. Two claims in the original write-up do not survive verification: `RunRegistry::clear` is a method on a *sibling* field of `RuntimeContext` with no access to the map, so the proposed fix location is not directly implementable; and the 32-bit djb2 collision risk is ~2⁻³² per transition rather than a birthday bound, because only one hash is retained per run. The restart/run-id-reuse correctness angle is refuted — `restart_from` mints a new run id (`:1560`), and `resume_run` reloads from the DB so a stale match is correct.
@@ -1060,7 +1076,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### L18. H6's local process-group fix discards tmux's stderr on non-zero exit, narrowing `pipe-pane` failure diagnostics (FINALIZED)
+### L18. H6's local process-group fix discards tmux's stderr on non-zero exit, narrowing `pipe-pane` failure diagnostics (FIXED)
+> **Fix:** Extended H8's src/proc.rs seam with file-backed stderr capture (WaitResult enum; timeout returns captured partial output) and wired the args list plus trimmed stderr into both the non-zero-exit and timeout bails of run_tmux_status_with_timeout and ensure_run_as_can_traverse_root; added a stderr-surfacing regression.
 **Severity:** LOW — a diagnostics-only gap scoped to tmux `pipe-pane` non-zero exits; no correctness or safety impact, and the operator still gets an exit code and the operation name.
 **Files:** `src/api.rs:1649-1698` (`run_tmux_status_with_timeout`), `:1657-1660` (null stdio + `process_group(0)`), `:1674-1677` (non-zero-exit bail), `:1687` (timeout bail), `:1723-1754` (`ensure_run_as_can_traverse_root`, `:1746-1752` pre-existing stderr discard); superseded call site `c1659c8^:src/api.rs:1484-1489`
 **Description:** `run_tmux_status_with_timeout` sets `Stdio::null()` on all three streams (`src/api.rs:1657-1660`), so its non-zero-exit bail reports only `"tmux command failed with exit code {} while {operation}"` (`:1674-1677`) — the superseded call site surfaced `String::from_utf8_lossy(&output.stderr).trim()` plus the `args` list (`c1659c8^:src/api.rs:1484-1489`), and both are now gone. An operator hitting a `pipe-pane` failure (bad target, unwritable FIFO, socket permission) sees "exit code 1 while starting pane stream" at the websocket client instead of tmux's own explanatory line, and nothing in the code records the suppression as deliberate.
@@ -1075,7 +1092,7 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### L19. M16 infers privilege from canonical profile names (FINALIZED)
+### L19. M16 infers privilege from canonical profile names (escalated: ISSUE-260722-0818-1)
 **Severity:** LOW — reachable only by the operator mislabeling profiles in their own `agents.toml`, crossing no trust boundary; workflow authors cannot add or edit profiles, and the name-only path at `src/driver.rs:405-407` already grants the same escalation with less effort.
 **Files:** `src/driver.rs:291-296` (`declared_profile_privilege` name table), `:311-314` (comment), `:315-329` (shape-matching fallback), `:340`, `:356`, `:390-400`, `:405-407` (unguarded name-mapped return), `:414`, `:419` (gate), `:1971-1999` (existing fallback test); upstream `core/src/agents/mod.rs:29-31` (`AccessProfile`), `:264-268` (`AccessProfileConfig`), `:175-186`, `:335-350` (operator registry merge); `Cargo.toml:28` (rev pin)
 **Description:** `declared_profile_privilege` (`src/driver.rs:291-296`) ranks `read-only`/`workspace-write`/`full-access` purely by string, and for non-canonical names the fallback at `:315-329` accepts a profile only if its argv is byte-identical to a canonically-named sibling. An operator registry containing `[custom.access.read-only] args=["--broad"]` plus an identical `default` therefore makes `declared_profile_privilege(spec, "default")` return `ReadOnly`, pass `default_privilege <= config.access_mode.privilege()` at `:419`, and launch broad argv under `Edit` — the widening M16 was filed to stop. The larger hole is on the primary path: `:405-407` returns the name-mapped profile with **no rank check at all**, so broad argv placed under `[custom.access.workspace-write]` launches under `Edit` without ever reaching `declared_profile_privilege`. Upstream `AccessProfile` carries `{ args: Vec<String> }` only (`core/src/agents/mod.rs:29-31`), so SilverBond currently has no channel through which a profile could declare its own privilege.
@@ -1092,5 +1109,101 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 ---
 
 ### L20. L7's rewritten unlock test runs close to the default Vitest timeout (dismissed: not reproducible, and the stated mechanism is impossible. Measured in the main checkout under heavy load (load avg 10.8, concurrent agents): the test ran 508 / 588 / 675 / 534 ms across four consecutive full `npm test` runs — all green, 105/105, suite 3.9–4.2 s wall — and 313 ms in file isolation. Peak is 13% of the 5000 ms budget, not "close to the timeout". The premise "dominated by real-time async resolution" is factually wrong: `ui/src/lib/components/PasswordDialog.svelte` contains no `transition:`/`fade`/`fly` directive and no `setTimeout`, its `$effect` (`:24-33`) only calls `showModal()`/`close()` — both shimmed synchronously at `ui/src/test/setup.ts:5-28` — and `ui/src/lib/components/passwordPrompt.svelte.ts:8-48` is a pure deferred-promise resolver with no timers. Decisively, every await in the test is already bounded at 1000 ms by testing-library defaults (`findByLabelText` at `:144`, `waitFor` at `:149`), so a resolution failure fails at ~1 s with a testing-library error and can never reach Vitest's 5000 ms; the cited timeout would require ~5 s of raw CPU starvation, which is what the original audit most likely observed. The real cost is first-mount of the 1958-line `InspectorPanel.svelte` plus Svelte CSS injection (`css: true`, `ui/vite.config.ts:32`) — 313 ms for test 1 vs 6–51 ms for tests 2–10 mounting the same component. Suite headroom is not thin: next-slowest tests are 246 ms, 182 ms, 135 ms. The reviewer's fake-timers branch is inapplicable — there is no timer to fake and `vi.useFakeTimers()` would break `waitFor`, which needs real intervals. A per-test `{ timeout: 15000 }` cannot prevent the described symptom either, since the testing-library sub-bounds fire first. Note the test's standalone `render(InspectorPanel, …)` shape at `:101`/`:117-155` is load-bearing for M25's dismissal and was deliberately left untouched. Follow-up if CI contention ever produces a genuine flake: raise `testTimeout` globally in `ui/vite.config.ts:29-34` rather than singling out one test; the durable fix for mount cost is decomposing `InspectorPanel.svelte`.)
+
+---
+
+### M33. Legacy no-runAs runs are moved to a socket they never used
+
+**File:** `src/runtime.rs:3422`
+**Source:** fix-review audit (was X-1)
+**Severity:** MEDIUM
+
+M24 applies the new per-run socket whenever a persisted invocation is missing, but production rows with a missing invocation are legacy rows from the period when no-runAs runs used the default tmux server. Resuming such a run now persists a new socket and makes its surviving panes unreachable, while the matching reaper fallback at src/runtime.rs:6836 looks on that new socket and leaves old terminal sessions running.
+
+**Fix:** Use the run-scoped helper only when creating a new run ID; when loading or reaping a no-runAs legacy row with no invocation, reconstruct and persist TmuxInvocation::default(), and add upgrade tests that place the legacy session on the default invocation.
+
+---
+
+### M34. Output capture is unbounded after the deadline
+
+**File:** `src/proc.rs:132`
+**Source:** fix-review audit (was X-2)
+**Severity:** MEDIUM
+
+H8 and L18 require the shared runner to remain deadline-safe and explicitly call for reading a captured tail, but read_capture measures and copies the entire tempfile into memory. A noisy zsh startup, run-as wrapper, or failing tmux command can therefore make a timed-out call spend unbounded additional time reading output and can exhaust memory, replacing the inherited-fd hang with an output-volume hang or OOM.
+
+**Fix:** Cap each capture and read only a bounded tail, include a truncation marker, and add a regression in which a timed-out child emits substantially more data than the cap while the call still returns within its time budget.
+
+---
+
+### L21. Traversal-probe timeouts still discard stderr
+
+**File:** `src/api.rs:1733`
+**Source:** fix-review audit (was X-3)
+**Severity:** LOW
+
+L18's fix was supposed to surface captured stderr on both failure and timeout paths for ensure_run_as_can_traverse_root, but this call applies context and propagates the timeout error directly. TimedOutOutput's Display text is only "command timed out with captured output", so partial sudo or wrapper diagnostics are never included even though proc.rs captured them.
+
+**Fix:** Match the error as run_tmux_status_with_timeout does, extract timeout_captured_output, and include the trimmed bounded stderr plus the attempted probe arguments in the returned traversal error; add a timeout-stderr regression.
+
+---
+
+### L22. Timed-out waiter can clear a replacement pane-stream owner
+
+**File:** `src/app.rs:321`
+**Source:** fix-review audit (was X-4)
+**Severity:** LOW
+
+M23's force_clear_stuck_terminating_owner identifies an entry only by PaneStreamKey, although the waiter timed out on one specific owner_done token. If that owner finishes and a replacement entry reaches Terminating before the timed-out waiter acquires this lock, the stale waiter removes and cancels the replacement, allowing overlapping teardown and restart of the same pipe.
+
+**Fix:** Clone the original sender before waiting and require same_channel plus Terminating in the force-clear operation, matching remove_terminal_sender's identity check; add an ABA replacement regression.
+
+---
+
+### L23. Panic regression does not exercise the production supervisor
+
+**File:** `src/api.rs:5381`
+**Source:** fix-review audit (was X-5)
+**Severity:** LOW
+
+M23 required a regression in which the pane-stream owner panics after begin_termination, but this test manually copies the supervisor body into a new task instead of invoking spawn_pane_stream_task or a helper used by it. It will remain green if the real supervisor is removed, detached, or wired to the wrong sender, so the principal panic-path integration remains untested.
+
+**Fix:** Extract the production supervision body behind a testable helper or inject an owner future into spawn_pane_stream_task, then make the regression panic through that production seam.
+
+---
+
+### L24. Continuation warning fabricates the failure cause
+
+**File:** `src/model.rs:2103`
+**Source:** fix-review audit (was X-6)
+**Severity:** LOW
+
+M22 discards each resolved_access_profile error and always says that a named profile has no declared privilege rank. The same branch also handles an unknown agent, a missing profile, registry-load failure, and a profile that would widen access; configured_access_profile_name can additionally report workspace-write when the resolver actually failed on the default fallback. This no longer pre-announces the runtime refusal with aligned wording as the fix plan requires.
+
+**Fix:** Bind and report the actual resolver error in the warning, retaining the agent and pane-adoption consequence, and add cases for unknown-agent, missing-profile, and unranked-default failures.
+
+---
+
+### L25. Failed saves leave same-process temp files permanently unreapable
+
+**File:** `src/storage.rs:938`
+**Source:** fix-review audit (was X-7)
+**Severity:** LOW
+
+L16 treats every temp bearing the current PID as in flight, but save has no cleanup guard. Cancellation or any write, sync, or rename error after file creation leaves a same-PID temp that every later list call deliberately preserves, so repeated failed saves accumulate files for the rest of the process lifetime.
+
+**Fix:** Track active temp paths explicitly and reap unmatched same-PID paths, or use a cancellation-safe guard that removes its per-attempt temp on every non-success exit; add a failed or aborted save regression.
+
+---
+
+### L26. Process-wide environment mutation in parallel in-process tests
+
+**File:** `src/driver.rs:1976, src/runtime.rs:8700`
+**Source:** fix-review audit (was X-8, X-9)
+**Severity:** LOW
+
+The new REGISTRY_ENV_LOCK serializes only tests that voluntarily take it, and the stale-reaper regression changes process-wide PATH with no suite-wide serialization. Mutating XDG_CONFIG_HOME or PATH process-wide with std::env::set_var can make unrelated parallel tests observe the temporary custom registry or fake tmux executable, making the suite order-dependent. A panic before restore leaves the mutation permanently behind.
+
+**Fix:** Execute these environment-mutating regressions in isolated child processes (as the model tests do) or inject dependencies explicitly (like a Registry or a custom binary path). Restore environment through RAII guards if any in-process mutation remains.
 
 ---

@@ -65,3 +65,7 @@ One row per unique key (`file:line` + smell name). Columns:
 | `src/api.rs:2205` + Mysterious Name | 1 | 2026-07-21 | open |
 | `ui/src/lib/types/workflow.ts:511` + Shotgun Surgery | 1 | 2026-07-21 | open |
 | `src/runtime.rs:1352` + Divergent Change | 1 | 2026-07-21 | open |
+| `src/proc.rs:37` + Speculative Generality | 1 | 2026-07-22 | open |
+| `src/proc.rs:14` + Speculative Generality | 1 | 2026-07-22 | open |
+| `src/model.rs:110` + Duplicated Code | 1 | 2026-07-22 | open |
+| `src/api.rs:5381` + Duplicated Code | 1 | 2026-07-22 | open |
