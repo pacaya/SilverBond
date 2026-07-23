@@ -3407,10 +3407,12 @@ pub(crate) async fn load_or_resolve_run_tmux_invocation(
         )
         .await?
         .unwrap_or_default()
-    } else if let Some(invocation) = existing {
-        invocation
     } else {
-        // Legacy rows with NULL invocation ran on the default tmux server (no -L).
+        // Legacy rows with NULL invocation and no `run_as` ran on the default
+        // tmux server (no -L). Reconstruct the default unconditionally, ignoring
+        // any `existing` override the caller carried: persisting a non-default
+        // prefix/socket here would make the run's default-server panes
+        // unreachable (M33).
         TmuxInvocation::default()
     };
     db.store_tmux_invocation_if_missing(&persisted.checkpoint.run_id, &invocation)
@@ -8695,6 +8697,41 @@ mod tests {
         assert_eq!(persisted.tmux_invocation, Some(TmuxInvocation::default()));
 
         runtime.abort_run(run_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_no_run_as_ignores_non_default_existing_invocation() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+
+        let run_id = "run_legacy_no_run_as_override";
+        let workflow = workflow_from_parts("work", vec![task_node("work", "Work", "")], vec![]);
+        let persisted = PersistedRun {
+            stream_token: new_stream_token(),
+            tmux_invocation: None,
+            checkpoint: build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None),
+            workflow,
+        };
+        db.upsert_run(&persisted).await.unwrap();
+
+        // A caller carrying a non-default override (e.g. resume_run passing
+        // self.run_invocation) must NOT taint a legacy no-run_as row: the run's
+        // panes live on the default tmux server, so a non-default prefix/socket
+        // would make them unreachable (M33).
+        let existing = TmuxInvocation {
+            prefix: vec!["sandbox-prefix".to_string()],
+            socket: Some("silverbond-override".to_string()),
+            tmux_bin: "tmux-override".to_string(),
+        };
+
+        let resolved = load_or_resolve_run_tmux_invocation(&db, &persisted, Some(existing))
+            .await
+            .unwrap();
+
+        assert_eq!(resolved, TmuxInvocation::default());
+        let reloaded = db.get_run(run_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.tmux_invocation, Some(TmuxInvocation::default()));
     }
 
     #[cfg(unix)]

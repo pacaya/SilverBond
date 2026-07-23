@@ -918,20 +918,27 @@ fn workflow_temp_disposition(filename: &str) -> Option<WorkflowTempDisposition> 
 
 struct WorkflowSaveTempGuard {
     path: PathBuf,
+    armed: bool,
 }
 
 impl WorkflowSaveTempGuard {
     fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, armed: true }
     }
 
-    fn disarm(self) {
-        std::mem::forget(self);
+    /// Marks the temp file as successfully consumed (renamed into place) so the
+    /// guard drops normally without unlinking. Avoids `mem::forget`, which would
+    /// leak the guard's owned `PathBuf` on every successful save.
+    fn disarm(mut self) {
+        self.armed = false;
     }
 }
 
 impl Drop for WorkflowSaveTempGuard {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         if let Err(error) = std::fs::remove_file(&self.path) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(
@@ -1631,6 +1638,59 @@ mod tests {
             remaining_temps.is_empty(),
             "failed save should not leave temp files behind: {remaining_temps:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn successful_workflow_save_leaves_no_temp_file() {
+        let temp = TempDir::new().unwrap();
+        let store = WorkflowStore::new(temp.path());
+        let workflow = sample_workflow();
+
+        store
+            .save(
+                "flow",
+                NormalizedWorkflow {
+                    workflow: workflow.clone(),
+                    notices: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut remaining_temps = Vec::new();
+        let mut entries = tokio::fs::read_dir(store.dir()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".tmp") {
+                remaining_temps.push(name);
+            }
+        }
+        assert!(
+            remaining_temps.is_empty(),
+            "successful save should not leave temp files behind: {remaining_temps:?}"
+        );
+        assert_eq!(
+            store.get("flow").await.unwrap().unwrap().workflow,
+            workflow
+        );
+    }
+
+    #[test]
+    fn disarmed_temp_guard_does_not_unlink() {
+        let temp = TempDir::new().unwrap();
+        let tmp_path = temp.path().join("guarded.json.tmp");
+        std::fs::write(&tmp_path, b"partial").unwrap();
+
+        // Disarmed guard (success path) drops without unlinking and without leaking.
+        let guard = WorkflowSaveTempGuard::new(tmp_path.clone());
+        guard.disarm();
+        assert!(tmp_path.exists(), "disarmed guard must not remove the file");
+
+        // Armed guard (failure/cancellation path) unlinks on drop.
+        {
+            let _armed = WorkflowSaveTempGuard::new(tmp_path.clone());
+        }
+        assert!(!tmp_path.exists(), "armed guard must remove the file on drop");
     }
 
     #[tokio::test]
