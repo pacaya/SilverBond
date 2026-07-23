@@ -1962,32 +1962,6 @@ args = ["--dangerously-write-anywhere"]
             "unexpected error: {error}"
         );
     }
-
-    static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn install_temp_agent_registry(toml: &str) -> (tempfile::TempDir, Option<std::ffi::OsString>) {
-        let temp = tempfile::tempdir().unwrap();
-        let agents_dir = temp.path().join("tmux-tools");
-        std::fs::create_dir_all(&agents_dir).unwrap();
-        std::fs::write(agents_dir.join("agents.toml"), toml).unwrap();
-        let previous = std::env::var_os("XDG_CONFIG_HOME");
-        // SAFETY: `REGISTRY_ENV_LOCK` serializes all tests that mutate `XDG_CONFIG_HOME`.
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.path());
-        }
-        (temp, previous)
-    }
-
-    fn restore_xdg_config_home(previous: Option<std::ffi::OsString>) {
-        // SAFETY: callers hold `REGISTRY_ENV_LOCK` while restoring the prior value.
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
-            }
-        }
-    }
-
     const UNRANKED_PROFILE_TOML: &str = r#"
 [custom]
 binary = "custom-agent"
@@ -1998,10 +1972,18 @@ args = ["--dangerously-write-anywhere"]
 
     #[test]
     fn access_profile_privilege_rejects_unranked_profile() {
-        let _lock = REGISTRY_ENV_LOCK.lock().unwrap();
-        let (_temp, previous) = install_temp_agent_registry(UNRANKED_PROFILE_TOML);
-        let error = access_profile_privilege("custom", "unranked").unwrap_err();
-        restore_xdg_config_home(previous);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agents.toml");
+        std::fs::write(&path, UNRANKED_PROFILE_TOML).unwrap();
+        let (registry, warnings) = agents::Registry::load_with_user_path(Some(&path)).unwrap();
+        assert!(warnings.is_empty());
+        let config = AgentConfig {
+            access_profile_override: Some("unranked".into()),
+            ..default_config()
+        };
+
+        let error = resolve_registry_access_profile(&registry, "custom", &config).unwrap_err();
+
         assert!(
             error
                 .to_string()
@@ -2012,21 +1994,26 @@ args = ["--dangerously-write-anywhere"]
 
     #[test]
     fn resolved_access_profile_rejects_unranked_default_fallback() {
-        let _lock = REGISTRY_ENV_LOCK.lock().unwrap();
-        let toml = r#"
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agents.toml");
+        std::fs::write(
+            &path,
+            r#"
 [custom]
 binary = "custom-agent"
 
 [custom.access.default]
 args = ["--dangerously-write-anywhere"]
-"#;
-        let (_temp, previous) = install_temp_agent_registry(toml);
+"#,
+        )
+        .unwrap();
+        let (registry, warnings) = agents::Registry::load_with_user_path(Some(&path)).unwrap();
+        assert!(warnings.is_empty());
         let config = AgentConfig {
             access_mode: AccessMode::Edit,
             ..default_config()
         };
-        let error = resolved_access_profile("custom", &config).unwrap_err();
-        restore_xdg_config_home(previous);
+        let error = resolve_registry_access_profile(&registry, "custom", &config).unwrap_err();
         assert!(
             error
                 .to_string()

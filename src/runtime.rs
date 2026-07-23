@@ -1372,6 +1372,8 @@ pub struct RuntimeContext {
     pub registry: RunRegistry,
     runner: Arc<dyn NodeRunner>,
     pub run_invocation: Option<TmuxInvocation>,
+    /// Test-only override for the tmux binary used when reconstructing legacy invocations without `run_as`.
+    pub(crate) legacy_reaper_tmux_bin: Option<String>,
 }
 
 impl RuntimeContext {
@@ -1382,6 +1384,7 @@ impl RuntimeContext {
             registry: RunRegistry::default(),
             runner,
             run_invocation: None,
+            legacy_reaper_tmux_bin: None,
         }
     }
 
@@ -1392,6 +1395,7 @@ impl RuntimeContext {
             registry: RunRegistry::default(),
             runner,
             run_invocation: None,
+            legacy_reaper_tmux_bin: None,
         }
     }
 
@@ -3395,13 +3399,20 @@ pub(crate) async fn load_or_resolve_run_tmux_invocation(
         return Ok(invocation);
     }
 
-    let invocation = resolve_workflow_invocation(
-        existing,
-        persisted.workflow.run_as.clone(),
-        persisted.checkpoint.run_id.clone(),
-    )
-    .await?
-    .unwrap_or_default();
+    let invocation = if persisted.workflow.run_as.is_some() {
+        resolve_workflow_invocation(
+            existing,
+            persisted.workflow.run_as.clone(),
+            persisted.checkpoint.run_id.clone(),
+        )
+        .await?
+        .unwrap_or_default()
+    } else if let Some(invocation) = existing {
+        invocation
+    } else {
+        // Legacy rows with NULL invocation ran on the default tmux server (no -L).
+        TmuxInvocation::default()
+    };
     db.store_tmux_invocation_if_missing(&persisted.checkpoint.run_id, &invocation)
         .await?;
     Ok(invocation)
@@ -6767,6 +6778,16 @@ fn tmux_invocation_key(invocation: &TmuxInvocation) -> (Vec<String>, Option<Stri
     )
 }
 
+fn legacy_reaper_default_invocation(ctx: &RuntimeContext) -> TmuxInvocation {
+    match ctx.legacy_reaper_tmux_bin.as_deref() {
+        Some(tmux_bin) => TmuxInvocation {
+            tmux_bin: tmux_bin.to_string(),
+            ..TmuxInvocation::default()
+        },
+        None => TmuxInvocation::default(),
+    }
+}
+
 pub async fn reap_stale_tmux_sessions(ctx: &RuntimeContext) {
     reap_tmux_sessions(ctx, None).await;
 }
@@ -6833,9 +6854,20 @@ async fn reap_tmux_sessions(ctx: &RuntimeContext, run_id: Option<&str>) {
                                 &reapable.run_id,
                             )
                         })
-                        .unwrap_or_else(|| {
-                            crate::tmux_exec::run_scoped_tmux_invocation(&reapable.run_id)
-                        });
+                        .unwrap_or_else(|| legacy_reaper_default_invocation(ctx));
+                    if persisted.tmux_invocation.is_none() {
+                        if let Err(error) = ctx
+                            .db
+                            .store_tmux_invocation_if_missing(&reapable.run_id, &invocation)
+                            .await
+                        {
+                            tracing::warn!(
+                                run_id = %reapable.run_id,
+                                error = %error,
+                                "Could not persist reconstructed legacy tmux invocation"
+                            );
+                        }
+                    }
                     reconstructed_invocations.insert(reapable.run_id.clone(), invocation.clone());
                     invocation
                 }
@@ -8637,7 +8669,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resume_run_without_run_as_persists_run_scoped_socket() {
+    async fn resume_run_without_run_as_persists_default_invocation_for_legacy_rows() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
         db.init().await.unwrap();
@@ -8660,10 +8692,7 @@ mod tests {
         runtime.resume_run(run_id).await.unwrap();
 
         let persisted = db.get_run(run_id).await.unwrap().unwrap();
-        assert_eq!(
-            persisted.tmux_invocation,
-            Some(crate::tmux_exec::run_scoped_tmux_invocation(run_id))
-        );
+        assert_eq!(persisted.tmux_invocation, Some(TmuxInvocation::default()));
 
         runtime.abort_run(run_id).await.unwrap();
     }
@@ -8676,10 +8705,8 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
         db.init().await.unwrap();
-        let ctx = RuntimeContext::new(db.clone());
 
         let run_id = "run_no_run_as_stale_reaper";
-        let run_socket = format!("silverbond-{run_id}");
         let session = "silverbond-No-RunAs-Stale";
         let log = temp.path().join("no-run-as-reaper-args.log");
         let fake_tmux = temp.path().join("tmux");
@@ -8695,17 +8722,10 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&fake_tmux, permissions).unwrap();
 
-        let old_path = std::env::var("PATH").ok();
-        unsafe {
-            std::env::set_var(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    temp.path().to_string_lossy(),
-                    old_path.as_deref().unwrap_or("")
-                ),
-            );
-        }
+        let ctx = RuntimeContext {
+            legacy_reaper_tmux_bin: Some(fake_tmux.to_string_lossy().into_owned()),
+            ..RuntimeContext::new(db.clone())
+        };
 
         let workflow = workflow_from_parts("work", vec![task_node("work", "Work", "")], vec![]);
         let mut checkpoint = build_initial_checkpoint(&workflow, run_id, BTreeMap::new(), None);
@@ -8722,39 +8742,19 @@ mod tests {
 
         reap_stale_tmux_sessions(&ctx).await;
 
-        if let Some(path) = old_path {
-            unsafe {
-                std::env::set_var("PATH", path);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("PATH");
-            }
-        }
-
         let recorded = fs::read_to_string(&log).expect("fake tmux should record reaper args");
         let args = recorded.lines().collect::<Vec<_>>();
         assert!(
-            args.windows(5).any(|window| window
-                == [
-                    "-L",
-                    run_socket.as_str(),
-                    "list-sessions",
-                    "-F",
-                    "#{session_name}"
-                ]),
-            "reaper should list sessions under the reconstructed no-runAs invocation; args={args:?}"
+            args.windows(3).any(|window| window == ["list-sessions", "-F", "#{session_name}"]),
+            "legacy no-runAs reaper should list sessions on the default tmux server; args={args:?}"
         );
         assert!(
-            args.windows(5).any(|window| window
-                == [
-                    "-L",
-                    run_socket.as_str(),
-                    "kill-session",
-                    "-t",
-                    session
-                ]),
-            "reaper should kill the stale session under the reconstructed no-runAs invocation; args={args:?}"
+            !args.iter().any(|arg| arg == &"-L"),
+            "legacy no-runAs reaper must not target a run-scoped socket; args={args:?}"
+        );
+        assert!(
+            args.windows(3).any(|window| window == ["kill-session", "-t", session]),
+            "reaper should kill the stale session on the default tmux server; args={args:?}"
         );
         assert!(db.list_reapable_tmux_sessions().await.unwrap().is_empty());
     }

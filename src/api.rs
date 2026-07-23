@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     fs::{self, File, OpenOptions},
     io::{self, Read},
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
@@ -1676,13 +1677,7 @@ fn run_tmux_status_with_timeout(
     ) {
         Ok(output) => output,
         Err(error) => {
-            if let Some(captured) = proc::timeout_captured_output(&error) {
-                anyhow::bail!(
-                    "timed out while {operation} after {timeout:?} (args: {args:?}): {}",
-                    String::from_utf8_lossy(&captured.stderr).trim()
-                );
-            }
-            return Err(error);
+            return Err(proc::bail_timeout_stderr(error, timeout, operation, args));
         }
     };
     if !output.status.success() {
@@ -1730,17 +1725,34 @@ fn ensure_run_as_can_traverse_root(
         .args(prefix_args)
         .args(["/bin/test", "-x"])
         .arg(root);
-    let output = proc::command_output_with_timeout(
+    let root_display = root.to_string_lossy();
+    let mut probe_args_owned: Vec<String> = vec![program.to_string()];
+    probe_args_owned.extend(prefix_args.iter().cloned());
+    probe_args_owned.push("/bin/test".to_string());
+    probe_args_owned.push("-x".to_string());
+    probe_args_owned.push(root_display.into_owned());
+    let probe_args: Vec<&str> = probe_args_owned.iter().map(String::as_str).collect();
+    let output = match proc::command_output_with_timeout(
         command,
         tmux::DEFAULT_TMUX_COMMAND_TIMEOUT,
         "checking run-as access to SILVERBOND_ROOT",
-    )
-    .with_context(|| {
-        format!(
-            "failed to check whether the configured run-as identity can traverse SILVERBOND_ROOT {}",
-            root.display()
-        )
-    })?;
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            return Err(proc::bail_timeout_stderr(
+                error,
+                tmux::DEFAULT_TMUX_COMMAND_TIMEOUT,
+                "checking run-as access to SILVERBOND_ROOT",
+                &probe_args,
+            ))
+            .with_context(|| {
+                format!(
+                    "failed to check whether the configured run-as identity can traverse SILVERBOND_ROOT {}",
+                    root.display()
+                )
+            });
+        }
+    };
     if !output.status.success() {
         let chmod_command = format!("chmod o+x {}", shell_quote(&root.to_string_lossy()));
         anyhow::bail!(
@@ -2008,6 +2020,7 @@ async fn subscribe_pane_stream(
         if let Some(entry) = streams.get_mut(&key) {
             if entry.is_terminating() {
                 let owner_done = entry.owner_done();
+                let waited_sender = entry.sender.clone();
                 drop(streams);
                 if tokio::time::timeout(pane_stream_owner_wait_timeout(), owner_done.cancelled())
                     .await
@@ -2020,7 +2033,7 @@ async fn subscribe_pane_stream(
                     );
                     state
                         .pane_streams
-                        .force_clear_stuck_terminating_owner(&key)
+                        .force_clear_stuck_terminating_owner(&key, &waited_sender)
                         .await;
                 }
                 continue;
@@ -2165,6 +2178,36 @@ where
     }
 }
 
+fn supervise_pane_stream_owner<F>(
+    owner_future: F,
+    key: PaneStreamKey,
+    sender: broadcast::Sender<Vec<u8>>,
+    owner_done: CancellationToken,
+    pane_streams: crate::app::PaneStreamRegistry,
+) -> tokio::task::JoinHandle<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let key_supervisor = key.clone();
+    let sender_supervisor = sender.clone();
+    let owner_done_supervisor = owner_done.clone();
+    tokio::spawn(async move {
+        let handle = tokio::spawn(owner_future);
+        if let Err(join_error) = handle.await {
+            tracing::warn!(
+                pane_stream_key = ?key_supervisor,
+                panic = join_error.is_panic(),
+                cancelled = join_error.is_cancelled(),
+                "pane stream owner task exited before cleanup; force-clearing registry entry"
+            );
+            pane_streams
+                .remove_terminal_sender(&key_supervisor, &sender_supervisor)
+                .await;
+            owner_done_supervisor.cancel();
+        }
+    })
+}
+
 fn spawn_pane_stream_task(
     state: AppState,
     run_id: String,
@@ -2180,8 +2223,8 @@ fn spawn_pane_stream_task(
     let key_supervisor = key.clone();
     let sender_supervisor = sender.clone();
     let owner_done_supervisor = owner_done.clone();
-    tokio::spawn(async move {
-        let handle = tokio::spawn(async move {
+    let _supervisor = supervise_pane_stream_owner(
+        async move {
             let owns_entry = match start_pane_stream(&state.paths.root, &pane_target, &invocation)
                 .await
             {
@@ -2243,20 +2286,12 @@ fn spawn_pane_stream_task(
                     .await;
             }
             owner_done.cancel();
-        });
-        if let Err(join_error) = handle.await {
-            tracing::warn!(
-                pane_stream_key = ?key_supervisor,
-                panic = join_error.is_panic(),
-                cancelled = join_error.is_cancelled(),
-                "pane stream owner task exited before cleanup; force-clearing registry entry"
-            );
-            pane_streams
-                .remove_terminal_sender(&key_supervisor, &sender_supervisor)
-                .await;
-            owner_done_supervisor.cancel();
-        }
-    });
+        },
+        key_supervisor,
+        sender_supervisor,
+        owner_done_supervisor,
+        pane_streams,
+    );
 }
 
 async fn claim_pane_stream_task_exit(
@@ -4555,6 +4590,43 @@ printf 'fallback-session\n'
 
     #[cfg(unix)]
     #[test]
+    fn traverse_root_probe_timeout_surfaces_stderr_and_args() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let wrapper = temp.path().join("run-as-wrapper");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nif [ \"$1\" = /bin/test ]; then printf 'pam auth failed\\n' >&2; sleep 60; fi\nexec \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let invocation = TmuxInvocation {
+            prefix: vec![wrapper.to_string_lossy().into_owned()],
+            socket: None,
+            tmux_bin: "/usr/bin/true".to_string(),
+        };
+
+        let error = ensure_run_as_can_traverse_root(temp.path(), &invocation)
+            .expect_err("a hanging traversal probe must fail");
+        let message = format!("{error:#}");
+
+        assert!(
+            message.contains("pam auth failed"),
+            "timeout must surface captured stderr: {message}"
+        );
+        assert!(
+            message.contains("/bin/test"),
+            "timeout must include the attempted probe arguments: {message}"
+        );
+        assert!(
+            message.contains("timed out"),
+            "timeout must still be reported: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn tmux_command_failure_surfaces_stderr() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -5033,6 +5105,34 @@ printf 'fallback-session\n'
     }
 
     #[tokio::test]
+    async fn pane_stream_registry_stale_force_clear_keeps_replacement_terminating_owner() {
+        let registry = PaneStreamRegistry::default();
+        let key = test_pane_stream_key("%1");
+        let (stale_sender, _stale_receiver) = broadcast::channel::<Vec<u8>>(16);
+        let (replacement_sender, _replacement_receiver) = broadcast::channel::<Vec<u8>>(16);
+        let replacement_owner_done = {
+            let mut streams = registry.inner.lock().await;
+            let mut entry = PaneStreamEntry::new(replacement_sender.clone(), 1);
+            entry.begin_termination();
+            let replacement_owner_done = entry.owner_done();
+            streams.insert(key.clone(), entry);
+            replacement_owner_done
+        };
+
+        registry
+            .force_clear_stuck_terminating_owner(&key, &stale_sender)
+            .await;
+
+        let streams = registry.inner.lock().await;
+        let entry = streams
+            .get(&key)
+            .expect("replacement terminating owner must survive stale force-clear");
+        assert!(entry.sender.same_channel(&replacement_sender));
+        assert!(entry.is_terminating());
+        replacement_owner_done.cancel();
+    }
+
+    #[tokio::test]
     async fn pane_stream_registry_stale_unsubscribe_keeps_replacement_channel() {
         let registry = PaneStreamRegistry::default();
         let key = test_pane_stream_key("%1");
@@ -5374,28 +5474,15 @@ printf 'fallback-session\n'
             owner_done
         };
 
-        let registry_supervisor = registry.clone();
-        let key_supervisor = key.clone();
-        let sender_supervisor = sender.clone();
-        let owner_done_supervisor = owner_done.clone();
-        let supervisor = tokio::spawn(async move {
-            let handle = tokio::spawn(async move {
+        let supervisor = supervise_pane_stream_owner(
+            async move {
                 panic!("simulated pane stream owner panic after begin_termination");
-            });
-            let Err(join_error) = handle.await else {
-                return;
-            };
-            tracing::warn!(
-                pane_stream_key = ?key_supervisor,
-                panic = join_error.is_panic(),
-                cancelled = join_error.is_cancelled(),
-                "pane stream owner task exited before cleanup; force-clearing registry entry"
-            );
-            registry_supervisor
-                .remove_terminal_sender(&key_supervisor, &sender_supervisor)
-                .await;
-            owner_done_supervisor.cancel();
-        });
+            },
+            key.clone(),
+            sender.clone(),
+            owner_done.clone(),
+            registry.clone(),
+        );
         supervisor.await.expect("supervisor task must not panic");
 
         assert!(

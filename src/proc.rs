@@ -8,6 +8,9 @@ use std::{
 use anyhow::Context;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const COMMAND_CAPTURE_TAIL_BYTES: usize = 64 * 1024;
+const COMMAND_CAPTURE_TRUNCATION_MARKER: &[u8] =
+    b"[... earlier command output elided ...]\n";
 
 #[derive(Debug)]
 pub(crate) struct TimedOutOutput {
@@ -27,6 +30,21 @@ pub(crate) fn timeout_captured_output(error: &anyhow::Error) -> Option<&TimedOut
     error
         .chain()
         .find_map(|cause| cause.downcast_ref::<TimedOutOutput>())
+}
+
+pub(crate) fn bail_timeout_stderr(
+    error: anyhow::Error,
+    timeout: Duration,
+    operation: &str,
+    args: &[&str],
+) -> anyhow::Error {
+    if let Some(captured) = timeout_captured_output(&error) {
+        return anyhow::anyhow!(
+            "timed out while {operation} after {timeout:?} (args: {args:?}): {}",
+            String::from_utf8_lossy(&captured.stderr).trim()
+        );
+    }
+    error
 }
 
 enum WaitResult {
@@ -130,8 +148,12 @@ fn wait_for_child(
 
 fn read_capture(file: &File) -> std::io::Result<Vec<u8>> {
     let length = file.metadata()?.len();
+    let tail_start = length.saturating_sub(COMMAND_CAPTURE_TAIL_BYTES as u64);
     let mut bytes = Vec::new();
-    let mut offset = 0_u64;
+    if tail_start > 0 {
+        bytes.extend_from_slice(COMMAND_CAPTURE_TRUNCATION_MARKER);
+    }
+    let mut offset = tail_start;
     let mut buffer = [0_u8; 8192];
     while offset < length {
         let remaining = usize::try_from((length - offset).min(buffer.len() as u64))
@@ -182,6 +204,44 @@ mod tests {
         assert!(
             !descendant_marker.exists(),
             "the timed-out command's process group must be terminated"
+        );
+    }
+
+    #[test]
+    fn command_timeout_capture_is_bounded_to_output_tail() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(
+            "dd if=/dev/zero bs=1024 count=256 2>/dev/null; printf END_TAIL; sleep 60",
+        );
+
+        let started = Instant::now();
+        let error = command_output_with_timeout(
+            command,
+            Duration::from_millis(100),
+            "running bounded capture regression child",
+        )
+        .expect_err("the command should time out");
+        let elapsed = started.elapsed();
+
+        let captured = timeout_captured_output(&error).expect("timeout must carry output");
+        let stdout = String::from_utf8_lossy(&captured.stdout);
+        assert!(
+            stdout.contains("earlier command output elided"),
+            "truncated capture must include the elision marker: {stdout}"
+        );
+        assert!(
+            stdout.contains("END_TAIL"),
+            "tail read must preserve the terminal output: {stdout}"
+        );
+        let max_len = COMMAND_CAPTURE_TAIL_BYTES + COMMAND_CAPTURE_TRUNCATION_MARKER.len();
+        assert!(
+            captured.stdout.len() <= max_len,
+            "stdout capture must stay within the tail cap (len={}, max={max_len})",
+            captured.stdout.len()
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "reading a large capture must not block past the timeout budget; took {elapsed:?}"
         );
     }
 }

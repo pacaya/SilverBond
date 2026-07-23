@@ -916,6 +916,33 @@ fn workflow_temp_disposition(filename: &str) -> Option<WorkflowTempDisposition> 
     Some(WorkflowTempDisposition::WithPid(pid))
 }
 
+struct WorkflowSaveTempGuard {
+    path: PathBuf,
+}
+
+impl WorkflowSaveTempGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    fn disarm(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for WorkflowSaveTempGuard {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_file(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    workflow_file = %self.path.display(),
+                    "Could not remove failed workflow save temp file: {error}"
+                );
+            }
+        }
+    }
+}
+
 impl WorkflowStore {
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -1021,10 +1048,12 @@ impl WorkflowStore {
         ));
         let data = serde_json::to_vec_pretty(&normalized.workflow)?;
         let mut file = tokio::fs::File::create(&tmp_path).await?;
+        let guard = WorkflowSaveTempGuard::new(tmp_path.clone());
         file.write_all(&data).await?;
         file.sync_all().await?;
         drop(file);
         tokio::fs::rename(&tmp_path, &path).await?;
+        guard.disarm();
         Ok(safe)
     }
 
@@ -1570,6 +1599,38 @@ mod tests {
         assert!(parsed.goal == workflow_a.goal || parsed.goal == workflow_b.goal);
         let loaded = store.get("flow").await.unwrap().unwrap();
         assert_eq!(loaded.workflow, parsed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_workflow_save_removes_temp_file() {
+        let temp = TempDir::new().unwrap();
+        let store = WorkflowStore::new(temp.path());
+        let workflow = sample_workflow();
+        let normalized = NormalizedWorkflow {
+            workflow,
+            notices: Vec::new(),
+        };
+
+        tokio::fs::create_dir(temp.path().join("flow.json"))
+            .await
+            .unwrap();
+
+        let result = store.save("flow", normalized).await;
+        assert!(result.is_err());
+
+        let mut remaining_temps = Vec::new();
+        let mut entries = tokio::fs::read_dir(store.dir()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.ends_with(".tmp") {
+                remaining_temps.push(name);
+            }
+        }
+        assert!(
+            remaining_temps.is_empty(),
+            "failed save should not leave temp files behind: {remaining_temps:?}"
+        );
     }
 
     #[tokio::test]

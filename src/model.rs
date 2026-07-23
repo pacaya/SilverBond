@@ -110,17 +110,6 @@ fn working_directory_for_node(workflow_cwd: &str, node: &WorkflowNode) -> String
     }
 }
 
-fn configured_access_profile_name(config: &AgentConfig) -> &str {
-    config
-        .access_profile_override
-        .as_deref()
-        .unwrap_or(match &config.access_mode {
-            AccessMode::ReadOnly => "read-only",
-            AccessMode::Edit | AccessMode::Execute => "workspace-write",
-            AccessMode::Unrestricted => "full-access",
-        })
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowVariable {
@@ -2100,26 +2089,22 @@ fn validate_graph_body(
                             });
                         }
                     }
-                    (Err(_), _) => issues.push(ValidationIssue {
+                    (Err(e), _) => issues.push(ValidationIssue {
                         severity: "warning".to_string(),
                         node_id: Some(node.id.clone()),
                         scope: None,
                         message: format!(
-                            "\"{}\" cannot verify session continuation because agent {} access profile {} has no declared privilege rank; pane adoption will be refused at run time.",
+                            "\"{}\" cannot verify session continuation: agent {current_agent} {e}; pane adoption will be refused at run time.",
                             node.name,
-                            current_agent,
-                            configured_access_profile_name(&current_config)
                         ),
                     }),
-                    (_, Err(_)) => issues.push(ValidationIssue {
+                    (_, Err(e)) => issues.push(ValidationIssue {
                         severity: "warning".to_string(),
                         node_id: Some(node.id.clone()),
                         scope: None,
                         message: format!(
-                            "\"{}\" cannot verify session continuation because agent {} access profile {} has no declared privilege rank; pane adoption will be refused at run time.",
+                            "\"{}\" cannot verify session continuation: agent {source_agent} {e}; pane adoption will be refused at run time.",
                             node.name,
-                            source_agent,
-                            configured_access_profile_name(&source_config)
                         ),
                     }),
                 }
@@ -5116,17 +5101,156 @@ mod tests {
         let warnings: Vec<_> = result
             .issues
             .iter()
-            .filter(|issue| issue.severity == "warning")
+            .filter(|issue| {
+                issue.severity == "warning"
+                    && issue.message.contains("cannot verify session continuation")
+            })
             .collect();
         assert_eq!(warnings.len(), 1, "unexpected warnings: {warnings:?}");
+        let resolver_error = crate::driver::resolved_access_profile("unregistered-m22", &crate::driver::AgentConfig::default())
+            .unwrap_err()
+            .to_string();
         assert_eq!(
             warnings[0].message,
-            "\"Continuation\" cannot verify session continuation because agent unregistered-m22 access profile workspace-write has no declared privilege rank; pane adoption will be refused at run time."
+            format!(
+                "\"Continuation\" cannot verify session continuation: agent unregistered-m22 {resolver_error}; pane adoption will be refused at run time."
+            )
         );
         assert!(
             result.issues.iter().all(|issue| issue.severity != "error"),
             "unexpected errors: {:?}",
             result.issues
+        );
+    }
+
+    #[test]
+    fn warns_when_continuation_uses_missing_access_profile_override() {
+        let mut source = node("source", "Source", WorkflowNodeType::Task);
+        source.agent = Some("codex".to_string());
+        source.prompt = "start".to_string();
+        let mut continuation = node("continuation", "Continuation", WorkflowNodeType::RunAgent);
+        continuation.agent = Some("codex".to_string());
+        continuation.prompt = "continue".to_string();
+        continuation.continue_session_from = Some("source".to_string());
+        let NodeKind::RunAgent {
+            run_agent_config, ..
+        } = &mut continuation.kind
+        else {
+            unreachable!();
+        };
+        run_agent_config.access = Some("no-such-profile".into());
+
+        let result = validate_workflow(workflow(
+            vec![source, continuation],
+            vec![
+                success_edge("forward", "source", "continuation", None),
+                success_edge("back", "continuation", "source", None),
+            ],
+            "source",
+        ));
+
+        let warnings: Vec<_> = result
+            .issues
+            .iter()
+            .filter(|issue| {
+                issue.severity == "warning"
+                    && issue.message.contains("cannot verify session continuation")
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1, "unexpected warnings: {warnings:?}");
+        let continuation_config = crate::driver::AgentConfig {
+            access_profile_override: Some("no-such-profile".into()),
+            ..crate::driver::AgentConfig::default()
+        };
+        let resolver_error =
+            crate::driver::resolved_access_profile("codex", &continuation_config)
+                .unwrap_err()
+                .to_string();
+        assert_eq!(
+            warnings[0].message,
+            format!(
+                "\"Continuation\" cannot verify session continuation: agent codex {resolver_error}; pane adoption will be refused at run time."
+            )
+        );
+    }
+
+    #[test]
+    fn warns_when_continuation_agent_has_unranked_default_profile() {
+        const CHILD_MARKER: &str = "SILVERBOND_L24_UNRANKED_DEFAULT_CHILD";
+        const TEST_NAME: &str =
+            "model::tests::warns_when_continuation_agent_has_unranked_default_profile";
+
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            let temp = tempfile::tempdir().unwrap();
+            let agents_dir = temp.path().join("tmux-tools");
+            std::fs::create_dir_all(&agents_dir).unwrap();
+            std::fs::write(
+                agents_dir.join("agents.toml"),
+                r#"
+[m22-custom]
+binary = "custom-agent"
+
+[m22-custom.access.default]
+args = ["--dangerously-write-anywhere"]
+"#,
+            )
+            .unwrap();
+
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .env("XDG_CONFIG_HOME", temp.path())
+                .env(CHILD_MARKER, "1")
+                .arg(TEST_NAME)
+                .arg("--exact")
+                .arg("--nocapture")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child test failed:\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let mut source = node("source", "Source", WorkflowNodeType::Task);
+        source.agent = Some("m22-custom".to_string());
+        source.prompt = "start".to_string();
+        let mut continuation = node("continuation", "Continuation", WorkflowNodeType::Task);
+        continuation.agent = Some("m22-custom".to_string());
+        continuation.prompt = "continue".to_string();
+        continuation.continue_session_from = Some("source".to_string());
+
+        let result = validate_workflow(workflow(
+            vec![source, continuation],
+            vec![
+                success_edge("forward", "source", "continuation", None),
+                success_edge("back", "continuation", "source", None),
+            ],
+            "source",
+        ));
+
+        let warnings: Vec<_> = result
+            .issues
+            .iter()
+            .filter(|issue| {
+                issue.severity == "warning"
+                    && issue.message.contains("cannot verify session continuation")
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1, "unexpected warnings: {warnings:?}");
+        let continuation_config = crate::driver::AgentConfig {
+            access_mode: crate::driver::AccessMode::Edit,
+            ..crate::driver::AgentConfig::default()
+        };
+        let resolver_error = crate::driver::resolved_access_profile("m22-custom", &continuation_config)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            warnings[0].message,
+            format!(
+                "\"Continuation\" cannot verify session continuation: agent m22-custom {resolver_error}; pane adoption will be refused at run time."
+            )
         );
     }
 
@@ -5193,12 +5317,24 @@ args = ["--m22-unranked"]
         let warnings: Vec<_> = result
             .issues
             .iter()
-            .filter(|issue| issue.severity == "warning")
+            .filter(|issue| {
+                issue.severity == "warning"
+                    && issue.message.contains("cannot verify session continuation")
+            })
             .collect();
         assert_eq!(warnings.len(), 1, "unexpected warnings: {warnings:?}");
+        let source_config = crate::driver::AgentConfig {
+            access_profile_override: Some("m22-unranked".into()),
+            ..crate::driver::AgentConfig::default()
+        };
+        let resolver_error = crate::driver::resolved_access_profile("claude", &source_config)
+            .unwrap_err()
+            .to_string();
         assert_eq!(
             warnings[0].message,
-            "\"Continuation\" cannot verify session continuation because agent claude access profile m22-unranked has no declared privilege rank; pane adoption will be refused at run time."
+            format!(
+                "\"Continuation\" cannot verify session continuation: agent claude {resolver_error}; pane adoption will be refused at run time."
+            )
         );
         assert!(
             result.issues.iter().all(|issue| issue.severity != "error"),
