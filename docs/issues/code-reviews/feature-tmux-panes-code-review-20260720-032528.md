@@ -1112,98 +1112,117 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M33. Legacy no-runAs runs are moved to a socket they never used
-
-**File:** `src/runtime.rs:3422`
-**Source:** fix-review audit (was X-1)
-**Severity:** MEDIUM
-
-M24 applies the new per-run socket whenever a persisted invocation is missing, but production rows with a missing invocation are legacy rows from the period when no-runAs runs used the default tmux server. Resuming such a run now persists a new socket and makes its surviving panes unreachable, while the matching reaper fallback at src/runtime.rs:6836 looks on that new socket and leaves old terminal sessions running.
-
-**Fix:** Use the run-scoped helper only when creating a new run ID; when loading or reaping a no-runAs legacy row with no invocation, reconstruct and persist TmuxInvocation::default(), and add upgrade tests that place the legacy session on the default invocation.
+### M33. Legacy no-runAs runs are moved to a socket they never used (FINALIZED)
+**Severity:** MEDIUM — silent pane unreachability plus a reaper leak of surviving default-server sessions; same UID/trust domain (no privilege boundary) and reachable only for a pre-migration run resumed in a non-terminal state, so it trends toward LOW.
+**Files:** `src/runtime.rs:3423` (no-runAs reconstruction arm), `:3389-3408` (`load_or_resolve_run_tmux_invocation`), `:6836-6838` (reaper fallback), `:1422` (new-run persist); `src/storage.rs:1208-1229` (`ensure_runs_tmux_invocation_columns`), `:1231-1243` (`decode_tmux_invocation`)
+**Description:** Legacy rows predating the `tmux_bin/tmux_socket/tmux_prefix_json` columns migrate to NULL and decode to `tmux_invocation = None` (`src/storage.rs:1231-1243`); a no-`run_as` run of that era ran on the default tmux server (`socket: None`). On resume, `load_or_resolve_run_tmux_invocation` (`src/runtime.rs:3389-3408`) unconditionally mints a run-scoped socket at `:3423` (`silverbond-<run_id>`) and persists it at `:3405`, making the surviving default-server panes unreachable. The reaper fallback (`:6836-6838`) enumerates the same wrong socket, finds nothing, and drops the registrations without killing (`:6886-6902`) — leaking the old sessions. New runs are unaffected because `start_run` always persists `Some(invocation)` at `:1422`, so a NULL invocation reliably signals "legacy."
+**Fix:** Split new-run creation from legacy-row resume/reap. Retain `run_scoped_tmux_invocation` only at new-run creation (`start_run`). In `load_or_resolve_run_tmux_invocation` and the reaper fallback, when a no-`run_as` row has a NULL persisted invocation, reconstruct and persist `TmuxInvocation::default()` (`{tmux_bin:"tmux", prefix:[], socket:None}`) — it round-trips cleanly through `decode_tmux_invocation` (non-empty `tmux_bin`, `"[]"` prefix) so the persisted value sticks with no re-reconstruction loop. Apply the same correction consistently across all funnel sites (resume, the `api.rs:231` attach path, and the reaper). Add upgrade tests that place a legacy no-runAs session on the default invocation and assert resume/reap target the default server rather than a run-scoped socket.
 
 ---
 
-### M34. Output capture is unbounded after the deadline
-
-**File:** `src/proc.rs:132`
-**Source:** fix-review audit (was X-2)
-**Severity:** MEDIUM
-
-H8 and L18 require the shared runner to remain deadline-safe and explicitly call for reading a captured tail, but read_capture measures and copies the entire tempfile into memory. A noisy zsh startup, run-as wrapper, or failing tmux command can therefore make a timed-out call spend unbounded additional time reading output and can exhaust memory, replacing the inherited-fd hang with an output-volume hang or OOM.
-
-**Fix:** Cap each capture and read only a bounded tail, include a truncation marker, and add a regression in which a timed-out child emits substantially more data than the cap while the call still returns within its time budget.
+### M34. Output capture is unbounded after the deadline (FINALIZED)
+**Severity:** MEDIUM (lower band) — `run_as.command` is operator-arbitrary and the read materializes a process-wide `Vec<u8>`, so a large capture can OOM the whole server; but the read is finite (child is killed and reaped before the read runs), realistic output is KB, and it sits on an already-failed path. The original "output-volume hang" framing is overstated — there is no hang, only a memory spike.
+**Files:** `src/proc.rs:131-147` (`read_capture`), `:132` (full-length read), `:81` (`wait_for_child` kills/reaps before read), `:82-83` (read calls); callers `src/tmux_exec.rs:137` (`resolve_tmux_bin_with_timeout`), `src/api.rs:1672` (`run_tmux_status_with_timeout`), `:1733` (`ensure_run_as_can_traverse_root`)
+**Description:** `read_capture` (`src/proc.rs:131`) reads the entire capture tempfile into a `Vec<u8>` with no cap — `:132` takes `metadata()?.len()` and the loop at `:136-145` accumulates all bytes. On the timeout path the child had up to `DEFAULT_TMUX_COMMAND_TIMEOUT = 5s` to write to the disk-backed tempfile before being SIGKILLed and reaped by `wait_for_child` (`:81`, `:113-118`), so the file can already be hundreds of MB by the time `read_capture` runs at `:82-83` and pulls it all into memory. This contradicts L18's finalized fix text, which called for reading the file's tail (`:1107`); the shipped code reads the whole file. No caller truncates downstream (`parse_tmux_lookup_output` at `src/tmux_exec.rs:148` iterates `.lines()` over the fully-materialized buffer).
+**Fix:** Bound `read_capture` to a tail read. Seek to `len.saturating_sub(CAP)` and read only the last `CAP` bytes into the buffer, prepending an explicit truncation marker when the file exceeded the cap so callers/diagnostics see that output was elided. Tail (not head) is deliberate — it preserves the terminal error line that matters most for stderr diagnostics and matches L18's "tail" requirement. Keep the pipe-free file topology H6/H8 mandate (no reader threads). Add a regression in which a timed-out child emits substantially more data than the cap while the call still returns within its time budget and the returned buffer is bounded with the truncation marker present.
 
 ---
 
-### L21. Traversal-probe timeouts still discard stderr
-
-**File:** `src/api.rs:1733`
-**Source:** fix-review audit (was X-3)
-**Severity:** LOW
-
-L18's fix was supposed to surface captured stderr on both failure and timeout paths for ensure_run_as_can_traverse_root, but this call applies context and propagates the timeout error directly. TimedOutOutput's Display text is only "command timed out with captured output", so partial sudo or wrapper diagnostics are never included even though proc.rs captured them.
-
-**Fix:** Match the error as run_tmux_status_with_timeout does, extract timeout_captured_output, and include the trimmed bounded stderr plus the attempted probe arguments in the returned traversal error; add a timeout-stderr regression.
+### L21. Traversal-probe timeouts still discard stderr (FINALIZED)
+**Severity:** LOW — the common failure (permission-denied exit) already surfaces stderr at `src/api.rs:1750`; only the rarer timeout branch is affected, and it still reports that it timed out. The dropped data (partial sudo/PAM/wrapper diagnostics) is provably available but hidden.
+**Files:** `src/api.rs:1733-1743` (`ensure_run_as_can_traverse_root` timeout propagation), `:1750` (exit-code path, already correct), `:1678-1685` (`run_tmux_status_with_timeout` reference extraction); `src/proc.rs:13-16` (`TimedOutOutput`), `:20` (fixed `Display` string), `:82-83`/`:91` (captured bytes populated on timeout), `timeout_captured_output`; `src/tmux_exec.rs:137` (`resolve_tmux_bin_with_timeout`, third candidate caller)
+**Description:** `ensure_run_as_can_traverse_root` (`src/api.rs:1733-1743`) calls `proc::command_output_with_timeout(...).with_context(...)?` and propagates the timeout error directly — it never calls `proc::timeout_captured_output`. On timeout the `TimedOutOutput` struct holds `stdout`/`stderr` (populated at `src/proc.rs:82-83`, `:91`) but its `Display` is the fixed string "command timed out with captured output" (`:20`), so the captured stderr is discarded. The non-zero-exit path already prints trimmed stderr (`:1750`); only the timeout bail is missing, contradicting L18's FIXED summary (`:1099`) which claimed the timeout bail was wired. Impact: on a hanging/slow sudo prompt or wrapper the diagnostic explaining why is silently dropped.
+**Fix:** Hoist the timeout-stderr extract-trim-format logic into a shared helper in `proc.rs` (e.g. `bail_timeout_stderr(error, operation, args)`) — `proc.rs` already owns `timeout_captured_output`, making it the correct seam — and have both `ensure_run_as_can_traverse_root` and the reference `run_tmux_status_with_timeout` (`src/api.rs:1678-1685`) call it, so the two sites cannot drift; the third caller `resolve_tmux_bin_with_timeout` can adopt it later. The returned traversal error must include the trimmed stderr plus the attempted probe arguments. Do **not** add byte-bounding here — bounding is owned by M34's tail-read change to `read_capture` (`src/proc.rs:131`) with its truncation marker, so this fix must land after or with M34 and simply consume the already-bounded capture. Add a timeout-stderr regression asserting the traversal error carries the captured stderr and probe args.
 
 ---
 
-### L22. Timed-out waiter can clear a replacement pane-stream owner
-
-**File:** `src/app.rs:321`
-**Source:** fix-review audit (was X-4)
-**Severity:** LOW
-
-M23's force_clear_stuck_terminating_owner identifies an entry only by PaneStreamKey, although the waiter timed out on one specific owner_done token. If that owner finishes and a replacement entry reaches Terminating before the timed-out waiter acquires this lock, the stale waiter removes and cancels the replacement, allowing overlapping teardown and restart of the same pipe.
-
-**Fix:** Clone the original sender before waiting and require same_channel plus Terminating in the force-clear operation, matching remove_terminal_sender's identity check; add an ABA replacement regression.
+### L22. Timed-out waiter can clear a replacement pane-stream owner (FINALIZED)
+**Severity:** LOW — cheap hardening/consistency rather than a live defect. The false-clear only fires after a genuine 600s-stuck owner, and a replacement entry is born `Active` (never `Terminating`) and can only reach `Terminating` via a full pump cycle that cannot complete inside the sub-millisecond lock window, so the ABA is effectively unreachable in practice.
+**Files:** `src/app.rs:321-335` (`force_clear_stuck_terminating_owner`, the only asymmetric mutator), `:294` (`unsubscribe` identity check), `:313` (`remove_terminal_sender` identity check), `:224-238` (`PaneStreamEntry::new`); `src/api.rs:2008-2026` (waiter), `:2010` (clones only `owner_done`), `:2023` (force-clear call), `:2049` (entry insert), `:2272`/`:2284` (`claim_pane_stream_task_exit`/`begin_termination`), `:68-73` (`pane_stream_owner_wait_timeout`, 600s)
+**Description:** The waiter in `subscribe_pane_stream` (`src/api.rs:2008-2026`) clones only `owner_done` (`:2010`), drops the lock, and awaits `owner_done.cancelled()` under the 600s `pane_stream_owner_wait_timeout`. On timeout it calls `force_clear_stuck_terminating_owner(&key)` (`:2023`), which re-locks and removes+cancels whatever entry now sits at `key` if it is `Terminating` — without confirming it is the same owner it waited on (`src/app.rs:324-332`). This is the single registry mutator lacking the `same_channel` identity guard present at `:294`, `:313`, and `src/api.rs:2272`. In the (near-impossible) window where the original owner finishes and a replacement reaches `Terminating` before force-clear re-acquires the lock, the stale waiter cancels the replacement, permitting overlapping teardown/restart of the same pipe.
+**Fix:** Add the missing owner-identity guard to force-clear, matching the established idiom. Capture `entry.sender.clone()` (a `broadcast::Sender<Vec<u8>>`, which supports `same_channel`) at the waiter's lock hold in `src/api.rs:2010`, thread it into `force_clear_stuck_terminating_owner(key, sender)`, and gate the remove+cancel on `entry.sender.same_channel(&sender) && entry.is_terminating()` so a replacement owner at the same key is left untouched. Add an ABA regression that plants a replacement `Terminating` entry at the key before the stale waiter force-clears and asserts the replacement survives.
 
 ---
 
-### L23. Panic regression does not exercise the production supervisor
-
-**File:** `src/api.rs:5381`
-**Source:** fix-review audit (was X-5)
-**Severity:** LOW
-
-M23 required a regression in which the pane-stream owner panics after begin_termination, but this test manually copies the supervisor body into a new task instead of invoking spawn_pane_stream_task or a helper used by it. It will remain green if the real supervisor is removed, detached, or wired to the wrong sender, so the principal panic-path integration remains untested.
-
-**Fix:** Extract the production supervision body behind a testable helper or inject an owner future into spawn_pane_stream_task, then make the regression panic through that production seam.
+### L23. Panic regression does not exercise the production supervisor (FINALIZED)
+**Severity:** LOW — a test-quality gap, not a live defect. The termination→cleanup window is currently panic-free (M23 itself was LOW), so the untested supervisor guards only latent fragility; but the coverage gap is total-zero, so the exact M23 regression could silently ship if the supervisor is deleted, detached, or mis-wired.
+**Files:** `src/api.rs:5359` (test `pane_stream_owner_supervisor_clears_terminating_entry_on_panic`), `:5381-5398` (inline supervisor copy), `:5401`/`:5422` (assertions), `:2183-2259` (production supervisor `spawn_pane_stream_task`), `:2247-2257` (the copied force-clear body), `:2052` (sole production call site), `:2168` (definition)
+**Description:** The regression at `src/api.rs:5359` plants a `Terminating` entry, then at `:5381-5398` `tokio::spawn`s a fresh task that hand-copies the production supervisor line-for-line — inner panic, `JoinError` guard, identical `tracing::warn!`, `remove_terminal_sender`, `owner_done.cancel()` — mirroring `:2247-2257`. Its assertions (`:5401`, `:5422`) observe only registry state produced by that copy; the production supervisor at `:2183-2259` is never invoked (the only references to `spawn_pane_stream_task` are the production call site `:2052` and the definition `:2168` — zero test callers). If the real supervisor were removed, detached (handle dropped, restoring the original M23 hang), or wired to the wrong sender/key, the test stays green.
+**Fix:** Extract the outer supervision body (`:2183-2258`) into a `supervise_pane_stream_owner(owner_future, key, sender, owner_done, pane_streams)` helper that spawns the inner owner handle, awaits it, and force-clears the Terminating entry on `JoinError`, matching the existing small-helper idiom (e.g. `claim_pane_stream_task_exit`). `spawn_pane_stream_task` calls it with the real owner body; the regression calls it with a future that panics after `begin_termination`, so the same production supervision code runs under test. The owner future takes a `Send + 'static` bound / generic param. Rewrite the test to drive the helper and assert the Terminating entry is force-cleared and no waiter hangs. This also provides the production regression harness for L22's new `same_channel` identity guard.
 
 ---
 
-### L24. Continuation warning fabricates the failure cause
-
-**File:** `src/model.rs:2103`
-**Source:** fix-review audit (was X-6)
-**Severity:** LOW
-
-M22 discards each resolved_access_profile error and always says that a named profile has no declared privilege rank. The same branch also handles an unknown agent, a missing profile, registry-load failure, and a profile that would widen access; configured_access_profile_name can additionally report workspace-write when the resolver actually failed on the default fallback. This no longer pre-announces the runtime refusal with aligned wording as the fix plan requires.
-
-**Fix:** Bind and report the actual resolver error in the warning, retaining the agent and pane-adoption consequence, and add cases for unknown-agent, missing-profile, and unranked-default failures.
+### L24. Continuation warning fabricates the failure cause (FINALIZED)
+**Severity:** LOW — a misleading pre-run advisory only; runtime enforcement is unaffected and fail-closed. It does not rise (no unsafe pane adoption becomes reachable) and does not fall to trivial (it violates M22's explicit alignment mandate and can name the wrong access level, actively misdirecting diagnosis).
+**Files:** `src/model.rs:2103-2113` (target-side `Err(_)` arm), `:2114-2124` (source-side twin), `:113-122` (`configured_access_profile_name` mapping); `src/driver.rs:352-421` (`resolved_access_profile` error variants), `:332-338` (`require_privilege`, the sole source of the hardcoded text); runtime refusal `?`-propagates the same resolver error verbatim (`src/tmux_exec.rs`)
+**Description:** The editor-time continuation check at `src/model.rs:2103`/`:2114` matches `Err(_)` — discarding the resolver's actual error — and hardcodes a "has no declared privilege rank" message, though `resolved_access_profile` (`src/driver.rs:352-421`) also fails for registry-load failure, unknown agent, missing override profile, profile-would-widen, missing read-only profile, and default-would-widen; only `require_privilege` (`:332-338`) emits the hardcoded text. Compounding it, `configured_access_profile_name` (`:113-122`) maps `Edit|Execute → "workspace-write"`, so when resolution failed on the "default" fallback the warning names the wrong access level. The run is still correctly refused at runtime (fail-closed via `?`-propagation of the same error), so the defect is purely the pre-run diagnostic wording, which M22 required to align with the runtime refusal.
+**Fix:** Bind the resolver error and surface its `Display` verbatim in both arms. Change the `Err(_)` matches to `Err(e)` and format the warning as e.g. `"\"{node.name}\" cannot verify session continuation: agent {current_agent} {e}; pane adoption will be refused at run time."`, dropping `configured_access_profile_name` from this message. This structurally guarantees alignment with the runtime refusal (the same string the runtime `?`-propagates), removes the misleading-profile-name bug at its source, and keeps a single source of truth so a newly added resolver error cannot silently drift out of the warning. Apply identically to the source-side twin at `:2114-2124`. Add regressions covering unknown-agent, missing-profile, and unranked-default failures asserting the warning text matches the resolver error.
 
 ---
 
-### L25. Failed saves leave same-process temp files permanently unreapable
-
-**File:** `src/storage.rs:938`
-**Source:** fix-review audit (was X-7)
-**Severity:** LOW
-
-L16 treats every temp bearing the current PID as in flight, but save has no cleanup guard. Cancellation or any write, sync, or rename error after file creation leaves a same-PID temp that every later list call deliberately preserves, so repeated failed saves accumulate files for the rest of the process lifetime.
-
-**Fix:** Track active temp paths explicitly and reap unmatched same-PID paths, or use a cancellation-safe guard that removes its per-attempt temp on every non-success exit; add a failed or aborted save regression.
+### L25. Failed saves leave same-process temp files permanently unreapable (FINALIZED)
+**Severity:** LOW — a real unbounded-over-uptime temp leak on a client-reachable cancellation path (`src/api.rs:540`), but no correctness, data-loss, or security impact and saves rarely fail. Does not rise (small files, error path) and does not fall to trivial (genuinely unbounded, not theoretical).
+**Files:** `src/storage.rs:1011-1029` (`WorkflowStore::save`), `:1016-1021` (per-attempt temp name), `:890`/`:1015` (`WORKFLOW_SAVE_NONCE`), `:1023-1027` (create/write/sync/rename, all `?`-propagating), `:935-948` (L16 reaper), `:938` (same-PID preservation), `:950` (`list` filters `.json`); sole caller `src/api.rs:540` (`save_workflow` axum handler)
+**Description:** Each `save` attempt writes a uniquely-named temp `{safe}.json.{pid}-{nonce}.tmp` (`src/storage.rs:1016-1021`) using the process-global `WORKFLOW_SAVE_NONCE` counter (`:890`, `:1015`), and every step — `File::create` (`:1023`), `write_all` (`:1024`), `sync_all` (`:1025`), `rename` (`:1027`) — `?`-propagates with no `remove_file` and no RAII guard. On any I/O error (disk full, `EXDEV`), or when the async future is dropped mid-flight on client disconnect (`save` is async, sole caller `src/api.rs:540`), the temp is left behind. L16's reaper (`:935-948`) then preserves it forever because it carries this process's PID (`:938`, `pid != std::process::id()`). Result: one orphaned `.tmp` per failed/cancelled save, unbounded over process lifetime, invisible to `list()` (which filters `.json`, `:950`) but consuming disk.
+**Fix:** Add a cancellation-safe RAII guard local to `save`. Immediately after `File::create`, construct a `TempGuard { path }` whose `Drop` calls blocking `std::fs::remove_file(&self.path)` (ignoring `NotFound`); `disarm()` it exactly once (e.g. a flag or `mem::forget`) after `rename` succeeds. Because `Drop` runs on both error return and future-drop cancellation and a blocking unlink needs no await, this cleans up at the moment the failure happens rather than deferring to the next `list`. The guard touches only its own per-attempt temp, so L16's per-attempt isolation (and its concurrent-save race fix) is preserved. Add a regression that forces a post-create failure (e.g. save into a directory made read-only after create, or inject a write error) and asserts no `.tmp` remains, plus a companion assertion that a genuinely concurrent same-PID save is still preserved so L16 is not regressed.
 
 ---
 
-### L26. Process-wide environment mutation in parallel in-process tests
+### L26. Process-wide environment mutation in parallel in-process tests (FINALIZED)
+**Severity:** LOW — real test-suite order-dependence and a panic-leak window, but no production path is affected and most sibling reaper tests already inject absolute-path scripts and are shielded.
+**Files:** `src/driver.rs:1976` (`install_temp_agent_registry` sets `XDG_CONFIG_HOME`, restored `:1981-1989`), `:1966` (module-private `REGISTRY_ENV_LOCK`), `:156` (`agent_config_home` reads `XDG_CONFIG_HOME`); `src/runtime.rs:8700` (stale-reaper prepends fake `tmux` to `PATH`, restored `:8725-8733`), `:1675` (`check_cli` reads `PATH`)
+**Description:** Two in-process `#[test]`-family tests mutate process-global environment without shared serialization. `install_temp_agent_registry` sets `XDG_CONFIG_HOME` (`src/driver.rs:1976`) under the driver-module-private `REGISTRY_ENV_LOCK` (`:1966`), which cannot be referenced from `runtime.rs`; the stale-reaper regression prepends a fake-`tmux` temp dir to `PATH` (`src/runtime.rs:8700`) under no lock at all. Cargo's default harness runs both on parallel threads in one binary, so a concurrent reader — `check_cli` reading `PATH` (`src/runtime.rs:1675`) or `agent_config_home` reading `XDG_CONFIG_HOME` (`src/driver.rs:156`) — can observe the temporary registry or fake binary, making the suite order-dependent; a panic between mutation and restore leaks the change permanently.
+**Fix:** Remove the process-global mutation at its source via explicit dependency injection rather than serializing access to it. Switch the two `XDG_CONFIG_HOME` tests to `agents::Registry::load_with_user_path(Some(path))` — the seam already exists and is used by neighboring driver tests (`src/driver.rs:1949, 2056, 2092`) — so no env var is touched. For the `PATH` test, expose a small explicit tmux binary/search-path override seam on the reaper and inject the fake-`tmux` path through it instead of prepending to `PATH`. With both mutations gone, `REGISTRY_ENV_LOCK` and the manual restores become unnecessary for these tests and the cross-test-interference and panic-leak windows disappear.
 
-**File:** `src/driver.rs:1976, src/runtime.rs:8700`
-**Source:** fix-review audit (was X-8, X-9)
-**Severity:** LOW
+---
 
-The new REGISTRY_ENV_LOCK serializes only tests that voluntarily take it, and the stale-reaper regression changes process-wide PATH with no suite-wide serialization. Mutating XDG_CONFIG_HOME or PATH process-wide with std::env::set_var can make unrelated parallel tests observe the temporary custom registry or fake tmux executable, making the suite order-dependent. A panic before restore leaves the mutation permanently behind.
+## Smells — walked (2026-07-23)
 
-**Fix:** Execute these environment-mutating regressions in isolated child processes (as the model tests do) or inject dependencies explicitly (like a Registry or a custom binary path). Restore environment through RAII guards if any in-process mutation remains.
+User-pulled Divergent Change + Duplicated Code smells from the batch list, consolidated per module. Advisory; severity capped at MEDIUM on promote.
+
+### S1. Divergent Change — `src/api.rs` (pane-stream transport crammed into the API module) (FINALIZED)
+**Severity:** MEDIUM — advisory; navigation/blast-radius maintainability cost, not correctness. Capped at MEDIUM per in-diff smell-promotion precedent. Ledger keys `src/api.rs:1375` (count 2), `:1441-1610`, `:1601` all marked `fixed: S1`.
+**Files:** `src/api.rs:1073-2459` (contiguous pane-stream transport block), `:1265-1363` (`pane_stream_socket` select loop), `:1371` (`resolve_run_pane_context`), `:1435`-`:1541` (`resolve_or_wait_for_pane_context` → `start_pane_stream`), `:1618`-`:1756` (`run_tmux_status_until`/`tmux_command`/`stop_pane_stream`), `:1766`-`:1989` (`PaneStreamFifoGuard`/`prepare_pane_stream`/`make_cross_user_fifo`/`PaneStream` `AsyncRead`), `:2317`-`:2427` (`PaneWsFrame`/`send_*`), `:1990` (`subscribe_pane_stream`), `:2168` (`spawn_pane_stream_task`); related seams `src/app.rs:184-330` (`PaneStreamRegistry`), `src/proc.rs` (H8 timeout-runner extraction)
+**Description:** `src/api.rs` is 5,473 lines (~2,715 non-test) and co-locates Axum HTTP routing with three transport mechanisms that change for unrelated reasons: tmux protocol control, POSIX FIFO ownership (`:1796-1821`), and the pane-stream wire format (`:2317-2427`). The transport is a ~1,250-line contiguous block (`:1073-2459`) wedged between route handlers — `create_run`/`stream_run` end at `:974`, `run_events`/`approve_run` resume at `:2461` — so a change to any single mechanism forces a reader through the whole API surface. The pure-transport functions take only primitives (`root`, `pane_target`, `&TmuxInvocation`, `sender`, `bytes`) and never touch `AppState`; the AppState coupling lives only in the orchestration layer (`subscribe_pane_stream`, `resolve_run_pane_context`, `spawn_pane_stream_task`), which already leans on the extracted `PaneStreamRegistry` (`src/app.rs:184-330`). Impact is maintainability (navigation, blast-radius), not correctness — hence advisory.
+**Fix:** Extract the AppState-free pane-stream transport into a dedicated `pane_stream` module behind a small start/stop/read(+frame) interface, tracked and executed as a deliberate refactor rather than folded into this branch.
+- Move ~900 lines of mechanism — `start_pane_stream`, `stop_pane_stream`, `PaneStream`/`poll_read`, the FIFO helpers (`prepare_pane_stream`, `make_cross_user_fifo`, `PaneStreamFifoGuard`), the `send_*` wire framing (`PaneWsFrame`), and `run_tmux_status_*`/`tmux_command` — into a new `src/pane_stream` module that sits *above* `src/proc.rs`.
+- Leave `subscribe_pane_stream`, `resolve_run_pane_context`, and `spawn_pane_stream_task` in `api.rs` as the module's only internal callers; expose the frame helpers as `pub(crate)` because `pane_stream_socket`'s `tokio::select!` loop (`:1265-1363`) interleaves `send_*` with registry receivers.
+- Extends the seam H8 already established (`src/proc.rs`) and the registry already extracted to `src/app.rs:184`, rather than inventing a new pattern.
+
+### S2. Divergent Change — `src/runtime.rs` (run engine) (FINALIZED)
+**Severity:** MEDIUM — advisory; the maintainability cost is real coupling (not just length), concentrated in the split/collector state machine. Capped at MEDIUM per smell-promotion precedent. Ledger keys `src/runtime.rs:1-12785` (stale line count — file is 14,570 lines) and `:1352` both marked `fixed: S2`.
+**Files:** `src/runtime.rs` (14,570 lines; ~7,443 non-test, tests `:7444-14570`); state machine `:5714` (`handle_split_node`), `:5960` (`release_collectors_if_ready`), `:6215` (`handle_terminal_cursor_status`), `:1969` (`evict_idle_split_families`), `:6585` (`finalize_run`); scheduler core `:2771` (`execute_workflow`), `:3110` (`process_immediate_cursors`); leaf concerns `:7236` (`build_log_id`), `:7029-7170` (template resolution), `:1652-1745` (agent/CLI discovery), `:6667-6979` (tmux reaping)
+**Description:** One module owns ~15 concerns and is 14,570 lines (~7,443 non-test). The maintainability cost is not mere length but coupling: the split/collector state-machine functions each mutate the scheduler's shared run state *and* perform IO inline — `release_collectors_if_ready` (`:5960`) and `handle_terminal_cursor_status` (`:6215`) both take `&mut RuntimeCheckpoint` (mutating `active_cursors`/`split_families`/`collector_barriers`) *and* `ctx` (DB + `emit_event`), and are `async` because they interleave state edits with persistence. Any change to split/collector semantics forces reasoning across five sites — `handle_split_node:5714`, `handle_terminal_cursor_status:6215`, `release_collectors_if_ready:5960`, `evict_idle_split_families:1969`, `finalize_run:6585` — with no interface boundary. Advisory: maintainability, not correctness.
+**Fix:** Extract a `SplitCollectorMachine` type that owns only `split_families` + `collector_barriers` and returns decisions the scheduler applies — a tracked refactor **gated behind H5/M9 landing** (those changed how split-family liveness is derived).
+- The machine takes `&[CursorState]` read-only for liveness (required because H5, review `:109-125`, made family liveness a read-derivative of `active_cursors.iter().flat_map(|c| &c.split_family_ids)`), and returns a `SchedulerDecision` enum (`SpawnCursors` / `CancelSiblings` / `ReleaseBarrier{cursor}` / `ForceFail`).
+- The scheduler retains all `active_cursors` mutation and every DB/event IO call, applying the returned decisions — so the machine becomes synchronously unit-testable without a DB.
+- Sequence *after* H5/M9 land, not concurrently, to avoid churn on the same code; do **not** take the verbatim lines-relocation route (moving `:5714-6215` as-is leaves the `&mut RuntimeCheckpoint`+`ctx` coupling intact and fails the deletion test).
+- Optional low-risk down payment now: extract the IO-free leaf concerns (`build_log_id:7236`, template resolution `:7029-7170`, agent/CLI discovery `:1652-1745`, tmux reaping `:6667-6979`) into submodules; these have narrow inputs and no shared `checkpoint` mutation.
+
+### S3. Divergent Change — `ui/src/features/editor/InspectorPanel.svelte` (escalated: ISSUE-260723-0823-1)
+**Ledger key:** `ui/src/features/editor/InspectorPanel.svelte:1`
+One component (1,176 lines changed) hosts node config for every node kind plus agent capability probing, access-mode reconciliation, and unlock prompting. Proposed fix: extract a per-node-kind config panel and lift capability/unlock concerns to the shell.
+
+### S4. Duplicated Code — `src/api.rs:5381` (owner-panic cleanup re-implemented in test) (FINALIZED)
+**Severity:** MEDIUM — advisory; below rule-of-three (2 sites, one a test double), so promoted for the test-fidelity value of the seam rather than churn reduction. Ledger key marked `fixed: S4`.
+**Files:** `src/api.rs:5358-5424` (test `pane_stream_owner_supervisor_clears_terminating_entry_on_panic`), `:5382-5384` (stubbed panicking handle), `:5385-5397` (copied cleanup trio); `:2185` (`spawn_pane_stream_task` hardcodes `start_pane_stream`), `:2247-2258` (production panic-recovery branch — the duplicated original)
+**Description:** The panic-recovery regression at `src/api.rs:5381-5398` copies the production supervisor's owner-panic cleanup branch (`:2247-2258`) verbatim inline — the identical tracing message `"pane stream owner task exited before cleanup; force-clearing registry entry"`, the `is_panic()`/`is_cancelled()` fields, `remove_terminal_sender`, and `owner_done.cancel()` — because `spawn_pane_stream_task` hardcodes `start_pane_stream` (`:2185`) and exposes no seam to inject a panicking owner. This is test-fidelity coupling, not repeated production logic: if the production cleanup changes (different log, extra step, ordering), the test keeps passing against its stale copy and no longer verifies the real path. Only 2 sites, one a test double, so churn risk is low; the value is confidence, not line reduction.
+**Fix:** Add a seam so the test drives the real supervisor instead of re-implementing it. Make the owner future injectable into `spawn_pane_stream_task` — or extract the supervisor loop into a testable `run_supervised_owner(owner_future, …)` that `spawn_pane_stream_task` calls with the real `start_pane_stream` future. The regression then injects a panicking future and asserts on the *production* cleanup path, deleting the copied branch at `:5385-5397`. This eliminates the duplication at its root (the test exercises production code, so no stale copy can drift) and passes the deletion test with ~1 parameter of real cost; keep the change scoped to the spawn seam and preserve the existing panic-path assertions.
+
+### S5. Duplicated Code — `src/model.rs:110` (deferred)
+**Ledger key:** `src/model.rs:110`
+Duplicated Code smell logged 2026-07-22.
+
+### S6. Duplicated Code — `ui/src/features/editor/InspectorPanel.svelte:789` (escalated: ISSUE-260723-0823-1)
+**Ledger key:** `ui/src/features/editor/InspectorPanel.svelte:789`
+_Folded into ISSUE-260723-0823-1 as a sub-task (shared `PaneConfigFields` for run_agent + spawn); ledger row stays open until that refactor lands._
+Duplicated Code smell logged 2026-07-21.
+
+### S7. Duplicated Code — `ui/src/lib/stores/workflowStore.svelte.ts:104-108` (deferred)
+**Ledger key:** `ui/src/lib/stores/workflowStore.svelte.ts:104-108`
+_Kept advisory: token-grammar duplication (3 `refsIn` loops at `:217-225`) is contained within `compoundBoundary`; `[regex, form][]` table saves ~6 lines and marginally fails the deletion test. Previously deferred as S10 (`20260716-003531.md:666`)._
+Duplicated Code smell logged 2026-07-19.
+
+### S8. Duplicated Code — `ui/src/lib/stores/workflowStore.svelte.ts:147` (dismissed: retired — duplicate key of `workflowStore.svelte.ts:104-108` (S7); it is the retarget/print-side of the same compound token grammar (`retargetNodeRefsInText` `:147-158`), which S7 already owns on the parse side. No independent duplication axis; a single `TokenGrammar` fix would collapse both, so S7 is the single tracked owner. Mirrors ledger precedent for co-located dup-keys (row 50 `:401`→`:110`, row 46 `api.rs:1544-1547`→`:1498`).)
 
 ---

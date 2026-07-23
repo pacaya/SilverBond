@@ -39,7 +39,7 @@ One row per unique key (`file:line` + smell name). Columns:
 | `ui/src/lib/stores/workflowStore.svelte.ts:754` + Positional coupling | 0 | 2026-07-19 | fixed: S5 (promoted LOW -> match-by-id with fail-safe no-op; branch unreachable from current emitter) |
 | `ui/src/lib/stores/workflowStore.svelte.ts:455-457` + entry-guard OR-vs-AND | 0 | 2026-07-19 | fixed: S6 (promoted LOW -> REFUTED: shipped OR is correct; added entry-selection tests + comment, corrected M4/R3-4 record) |
 | `playwright.config.ts:3-5` + committed test unlock hash / reuseExistingServer | 0 | 2026-07-19 | fixed: S7 (promoted LOW -> reuseExistingServer:false + per-run random secret via globalSetup; harness hygiene, not security) |
-| src/api.rs:1441-1610 Divergent Change | 1 | 2026-07-19 | open |
+| src/api.rs:1441-1610 Divergent Change | 1 | 2026-07-19 | fixed: S1 |
 | src/model.rs:1205-1235 Speculative Generality | 1 | 2026-07-19 | open |
 | ui/src/lib/stores/workflowStore.svelte.ts:104-108 Duplicated Code | 1 | 2026-07-19 | open |
 | src/driver.rs:648-674 Duplicated Code | 1 | 2026-07-19 | retired: not independently actionable - duplicate branch collapses as a byproduct of the read-only-enforcement fix in the same if/else chain |
@@ -51,9 +51,9 @@ One row per unique key (`file:line` + smell name). Columns:
 | `ui/src/lib/stores/workflowStore.svelte.ts:909` + Speculative Generality | 1 | 2026-07-19 | open |
 | `src/api.rs:1498` + Mysterious Name | 2 | 2026-07-20 | open |
 | `ui/src/lib/stores/workflowStore.svelte.ts:325` + Speculative Generality | 1 | 2026-07-19 | open |
-| `ui/src/lib/stores/workflowStore.svelte.ts:147` + Duplicated Code | 1 | 2026-07-19 | open |
-| `src/api.rs:1375` + Divergent Change | 2 | 2026-07-20 | open |
-| `src/runtime.rs:1-12785` + Divergent Change | 1 | 2026-07-20 | open |
+| `ui/src/lib/stores/workflowStore.svelte.ts:147` + Duplicated Code | 1 | 2026-07-19 | retired: duplicate key of `ui/src/lib/stores/workflowStore.svelte.ts:104-108` (S7) — retarget-side of the same compound token grammar; S7 is the single owner |
+| `src/api.rs:1375` + Divergent Change | 2 | 2026-07-20 | fixed: S1 |
+| `src/runtime.rs:1-12785` + Divergent Change | 1 | 2026-07-20 | fixed: S2 |
 | `src/model.rs:2061` + Feature Envy | 1 | 2026-07-20 | open |
 | `src/driver.rs:291-305` + Primitive Obsession | 1 | 2026-07-20 | open |
 | `ui/src/features/editor/InspectorPanel.svelte:1` + Divergent Change | 1 | 2026-07-20 | open |
@@ -61,11 +61,11 @@ One row per unique key (`file:line` + smell name). Columns:
 | `src/model.rs:2247` + Shotgun Surgery | 1 | 2026-07-21 | open |
 | `src/driver.rs:291` + Primitive Obsession | 1 | 2026-07-21 | open |
 | `src/driver.rs:301` + Repeated Switches | 1 | 2026-07-21 | open |
-| `src/api.rs:1601` + Divergent Change | 1 | 2026-07-21 | open |
+| `src/api.rs:1601` + Divergent Change | 1 | 2026-07-21 | fixed: S1 |
 | `src/api.rs:2205` + Mysterious Name | 1 | 2026-07-21 | open |
 | `ui/src/lib/types/workflow.ts:511` + Shotgun Surgery | 1 | 2026-07-21 | open |
-| `src/runtime.rs:1352` + Divergent Change | 1 | 2026-07-21 | open |
+| `src/runtime.rs:1352` + Divergent Change | 1 | 2026-07-21 | fixed: S2 |
 | `src/proc.rs:37` + Speculative Generality | 1 | 2026-07-22 | open |
 | `src/proc.rs:14` + Speculative Generality | 1 | 2026-07-22 | open |
 | `src/model.rs:110` + Duplicated Code | 1 | 2026-07-22 | open |
-| `src/api.rs:5381` + Duplicated Code | 1 | 2026-07-22 | open |
+| `src/api.rs:5381` + Duplicated Code | 1 | 2026-07-22 | fixed: S4 |
