@@ -69,3 +69,4 @@ One row per unique key (`file:line` + smell name). Columns:
 | `src/proc.rs:14` + Speculative Generality | 1 | 2026-07-22 | open |
 | `src/model.rs:110` + Duplicated Code | 1 | 2026-07-22 | open |
 | `src/api.rs:5381` + Duplicated Code | 1 | 2026-07-22 | fixed: S4 |
+| `src/runtime.rs:1376` + Speculative Generality | 1 | 2026-07-23 | open |

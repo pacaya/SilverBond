@@ -1112,7 +1112,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M33. Legacy no-runAs runs are moved to a socket they never used (FINALIZED)
+### M33. Legacy no-runAs runs are moved to a socket they never used (FIXED)
+> **Fix:** Split new-run vs legacy-resume/reap tmux invocation; load_or_resolve_run_tmux_invocation and reaper fallback now reconstruct/persist TmuxInvocation::default() for NULL legacy no-runAs rows; updated resume/reaper tests.
 **Severity:** MEDIUM — silent pane unreachability plus a reaper leak of surviving default-server sessions; same UID/trust domain (no privilege boundary) and reachable only for a pre-migration run resumed in a non-terminal state, so it trends toward LOW.
 **Files:** `src/runtime.rs:3423` (no-runAs reconstruction arm), `:3389-3408` (`load_or_resolve_run_tmux_invocation`), `:6836-6838` (reaper fallback), `:1422` (new-run persist); `src/storage.rs:1208-1229` (`ensure_runs_tmux_invocation_columns`), `:1231-1243` (`decode_tmux_invocation`)
 **Description:** Legacy rows predating the `tmux_bin/tmux_socket/tmux_prefix_json` columns migrate to NULL and decode to `tmux_invocation = None` (`src/storage.rs:1231-1243`); a no-`run_as` run of that era ran on the default tmux server (`socket: None`). On resume, `load_or_resolve_run_tmux_invocation` (`src/runtime.rs:3389-3408`) unconditionally mints a run-scoped socket at `:3423` (`silverbond-<run_id>`) and persists it at `:3405`, making the surviving default-server panes unreachable. The reaper fallback (`:6836-6838`) enumerates the same wrong socket, finds nothing, and drops the registrations without killing (`:6886-6902`) — leaking the old sessions. New runs are unaffected because `start_run` always persists `Some(invocation)` at `:1422`, so a NULL invocation reliably signals "legacy."
@@ -1120,7 +1121,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### M34. Output capture is unbounded after the deadline (FINALIZED)
+### M34. Output capture is unbounded after the deadline (FIXED)
+> **Fix:** Bounded read_capture to a 64 KiB tail read with an elision marker (COMMAND_CAPTURE_TAIL_BYTES / COMMAND_CAPTURE_TRUNCATION_MARKER) in src/proc.rs; added command_timeout_capture_is_bounded_to_output_tail regression.
 **Severity:** MEDIUM (lower band) — `run_as.command` is operator-arbitrary and the read materializes a process-wide `Vec<u8>`, so a large capture can OOM the whole server; but the read is finite (child is killed and reaped before the read runs), realistic output is KB, and it sits on an already-failed path. The original "output-volume hang" framing is overstated — there is no hang, only a memory spike.
 **Files:** `src/proc.rs:131-147` (`read_capture`), `:132` (full-length read), `:81` (`wait_for_child` kills/reaps before read), `:82-83` (read calls); callers `src/tmux_exec.rs:137` (`resolve_tmux_bin_with_timeout`), `src/api.rs:1672` (`run_tmux_status_with_timeout`), `:1733` (`ensure_run_as_can_traverse_root`)
 **Description:** `read_capture` (`src/proc.rs:131`) reads the entire capture tempfile into a `Vec<u8>` with no cap — `:132` takes `metadata()?.len()` and the loop at `:136-145` accumulates all bytes. On the timeout path the child had up to `DEFAULT_TMUX_COMMAND_TIMEOUT = 5s` to write to the disk-backed tempfile before being SIGKILLed and reaped by `wait_for_child` (`:81`, `:113-118`), so the file can already be hundreds of MB by the time `read_capture` runs at `:82-83` and pulls it all into memory. This contradicts L18's finalized fix text, which called for reading the file's tail (`:1107`); the shipped code reads the whole file. No caller truncates downstream (`parse_tmux_lookup_output` at `src/tmux_exec.rs:148` iterates `.lines()` over the fully-materialized buffer).
@@ -1128,7 +1130,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### L21. Traversal-probe timeouts still discard stderr (FINALIZED)
+### L21. Traversal-probe timeouts still discard stderr (FIXED)
+> **Fix:** Added shared proc::bail_timeout_stderr and wired ensure_run_as_can_traverse_root and run_tmux_status_with_timeout through it so timeout errors carry trimmed stderr plus probe args; added traverse_root_probe_timeout regression.
 **Severity:** LOW — the common failure (permission-denied exit) already surfaces stderr at `src/api.rs:1750`; only the rarer timeout branch is affected, and it still reports that it timed out. The dropped data (partial sudo/PAM/wrapper diagnostics) is provably available but hidden.
 **Files:** `src/api.rs:1733-1743` (`ensure_run_as_can_traverse_root` timeout propagation), `:1750` (exit-code path, already correct), `:1678-1685` (`run_tmux_status_with_timeout` reference extraction); `src/proc.rs:13-16` (`TimedOutOutput`), `:20` (fixed `Display` string), `:82-83`/`:91` (captured bytes populated on timeout), `timeout_captured_output`; `src/tmux_exec.rs:137` (`resolve_tmux_bin_with_timeout`, third candidate caller)
 **Description:** `ensure_run_as_can_traverse_root` (`src/api.rs:1733-1743`) calls `proc::command_output_with_timeout(...).with_context(...)?` and propagates the timeout error directly — it never calls `proc::timeout_captured_output`. On timeout the `TimedOutOutput` struct holds `stdout`/`stderr` (populated at `src/proc.rs:82-83`, `:91`) but its `Display` is the fixed string "command timed out with captured output" (`:20`), so the captured stderr is discarded. The non-zero-exit path already prints trimmed stderr (`:1750`); only the timeout bail is missing, contradicting L18's FIXED summary (`:1099`) which claimed the timeout bail was wired. Impact: on a hanging/slow sudo prompt or wrapper the diagnostic explaining why is silently dropped.
@@ -1136,7 +1139,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### L22. Timed-out waiter can clear a replacement pane-stream owner (FINALIZED)
+### L22. Timed-out waiter can clear a replacement pane-stream owner (FIXED)
+> **Fix:** Gated force_clear_stuck_terminating_owner on same_channel(sender) && is_terminating(); waiter captures entry.sender under the lock; added ABA regression asserting a replacement Terminating owner survives a stale waiter force-clear.
 **Severity:** LOW — cheap hardening/consistency rather than a live defect. The false-clear only fires after a genuine 600s-stuck owner, and a replacement entry is born `Active` (never `Terminating`) and can only reach `Terminating` via a full pump cycle that cannot complete inside the sub-millisecond lock window, so the ABA is effectively unreachable in practice.
 **Files:** `src/app.rs:321-335` (`force_clear_stuck_terminating_owner`, the only asymmetric mutator), `:294` (`unsubscribe` identity check), `:313` (`remove_terminal_sender` identity check), `:224-238` (`PaneStreamEntry::new`); `src/api.rs:2008-2026` (waiter), `:2010` (clones only `owner_done`), `:2023` (force-clear call), `:2049` (entry insert), `:2272`/`:2284` (`claim_pane_stream_task_exit`/`begin_termination`), `:68-73` (`pane_stream_owner_wait_timeout`, 600s)
 **Description:** The waiter in `subscribe_pane_stream` (`src/api.rs:2008-2026`) clones only `owner_done` (`:2010`), drops the lock, and awaits `owner_done.cancelled()` under the 600s `pane_stream_owner_wait_timeout`. On timeout it calls `force_clear_stuck_terminating_owner(&key)` (`:2023`), which re-locks and removes+cancels whatever entry now sits at `key` if it is `Terminating` — without confirming it is the same owner it waited on (`src/app.rs:324-332`). This is the single registry mutator lacking the `same_channel` identity guard present at `:294`, `:313`, and `src/api.rs:2272`. In the (near-impossible) window where the original owner finishes and a replacement reaches `Terminating` before force-clear re-acquires the lock, the stale waiter cancels the replacement, permitting overlapping teardown/restart of the same pipe.
@@ -1144,7 +1148,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### L23. Panic regression does not exercise the production supervisor (FINALIZED)
+### L23. Panic regression does not exercise the production supervisor (FIXED)
+> **Fix:** Extracted the outer supervision body into supervise_pane_stream_owner helper called by both the production call site and the panic regression, so the real production supervision path is exercised under test.
 **Severity:** LOW — a test-quality gap, not a live defect. The termination→cleanup window is currently panic-free (M23 itself was LOW), so the untested supervisor guards only latent fragility; but the coverage gap is total-zero, so the exact M23 regression could silently ship if the supervisor is deleted, detached, or mis-wired.
 **Files:** `src/api.rs:5359` (test `pane_stream_owner_supervisor_clears_terminating_entry_on_panic`), `:5381-5398` (inline supervisor copy), `:5401`/`:5422` (assertions), `:2183-2259` (production supervisor `spawn_pane_stream_task`), `:2247-2257` (the copied force-clear body), `:2052` (sole production call site), `:2168` (definition)
 **Description:** The regression at `src/api.rs:5359` plants a `Terminating` entry, then at `:5381-5398` `tokio::spawn`s a fresh task that hand-copies the production supervisor line-for-line — inner panic, `JoinError` guard, identical `tracing::warn!`, `remove_terminal_sender`, `owner_done.cancel()` — mirroring `:2247-2257`. Its assertions (`:5401`, `:5422`) observe only registry state produced by that copy; the production supervisor at `:2183-2259` is never invoked (the only references to `spawn_pane_stream_task` are the production call site `:2052` and the definition `:2168` — zero test callers). If the real supervisor were removed, detached (handle dropped, restoring the original M23 hang), or wired to the wrong sender/key, the test stays green.
@@ -1152,7 +1157,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### L24. Continuation warning fabricates the failure cause (FINALIZED)
+### L24. Continuation warning fabricates the failure cause (FIXED)
+> **Fix:** Continuation Err arms in validate_workflow (src/model.rs, both target and source side) now bind the resolver error and surface its Display verbatim instead of the hardcoded privilege-rank string; removed unused configured_access_profile_name; added unknown-agent/missing-profile/unranked-default regressions asserting warning matches resolver Display.
 **Severity:** LOW — a misleading pre-run advisory only; runtime enforcement is unaffected and fail-closed. It does not rise (no unsafe pane adoption becomes reachable) and does not fall to trivial (it violates M22's explicit alignment mandate and can name the wrong access level, actively misdirecting diagnosis).
 **Files:** `src/model.rs:2103-2113` (target-side `Err(_)` arm), `:2114-2124` (source-side twin), `:113-122` (`configured_access_profile_name` mapping); `src/driver.rs:352-421` (`resolved_access_profile` error variants), `:332-338` (`require_privilege`, the sole source of the hardcoded text); runtime refusal `?`-propagates the same resolver error verbatim (`src/tmux_exec.rs`)
 **Description:** The editor-time continuation check at `src/model.rs:2103`/`:2114` matches `Err(_)` — discarding the resolver's actual error — and hardcodes a "has no declared privilege rank" message, though `resolved_access_profile` (`src/driver.rs:352-421`) also fails for registry-load failure, unknown agent, missing override profile, profile-would-widen, missing read-only profile, and default-would-widen; only `require_privilege` (`:332-338`) emits the hardcoded text. Compounding it, `configured_access_profile_name` (`:113-122`) maps `Edit|Execute → "workspace-write"`, so when resolution failed on the "default" fallback the warning names the wrong access level. The run is still correctly refused at runtime (fail-closed via `?`-propagation of the same error), so the defect is purely the pre-run diagnostic wording, which M22 required to align with the runtime refusal.
@@ -1160,7 +1166,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### L25. Failed saves leave same-process temp files permanently unreapable (FINALIZED)
+### L25. Failed saves leave same-process temp files permanently unreapable (FIXED)
+> **Fix:** Added WorkflowSaveTempGuard RAII guard in WorkflowStore::save whose Drop removes the per-attempt temp on error/cancellation, disarmed after rename succeeds; added failed-save regression, L16 same-PID preservation intact.
 **Severity:** LOW — a real unbounded-over-uptime temp leak on a client-reachable cancellation path (`src/api.rs:540`), but no correctness, data-loss, or security impact and saves rarely fail. Does not rise (small files, error path) and does not fall to trivial (genuinely unbounded, not theoretical).
 **Files:** `src/storage.rs:1011-1029` (`WorkflowStore::save`), `:1016-1021` (per-attempt temp name), `:890`/`:1015` (`WORKFLOW_SAVE_NONCE`), `:1023-1027` (create/write/sync/rename, all `?`-propagating), `:935-948` (L16 reaper), `:938` (same-PID preservation), `:950` (`list` filters `.json`); sole caller `src/api.rs:540` (`save_workflow` axum handler)
 **Description:** Each `save` attempt writes a uniquely-named temp `{safe}.json.{pid}-{nonce}.tmp` (`src/storage.rs:1016-1021`) using the process-global `WORKFLOW_SAVE_NONCE` counter (`:890`, `:1015`), and every step — `File::create` (`:1023`), `write_all` (`:1024`), `sync_all` (`:1025`), `rename` (`:1027`) — `?`-propagates with no `remove_file` and no RAII guard. On any I/O error (disk full, `EXDEV`), or when the async future is dropped mid-flight on client disconnect (`save` is async, sole caller `src/api.rs:540`), the temp is left behind. L16's reaper (`:935-948`) then preserves it forever because it carries this process's PID (`:938`, `pid != std::process::id()`). Result: one orphaned `.tmp` per failed/cancelled save, unbounded over process lifetime, invisible to `list()` (which filters `.json`, `:950`) but consuming disk.
@@ -1168,7 +1175,8 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### L26. Process-wide environment mutation in parallel in-process tests (FINALIZED)
+### L26. Process-wide environment mutation in parallel in-process tests (FIXED)
+> **Fix:** Driver XDG_CONFIG_HOME tests switched to Registry::load_with_user_path (dropping REGISTRY_ENV_LOCK and the env restore dance); added RuntimeContext tmux-bin/default-invocation override seam so the stale-reaper regression injects a fake tmux via DI instead of mutating process-global PATH.
 **Severity:** LOW — real test-suite order-dependence and a panic-leak window, but no production path is affected and most sibling reaper tests already inject absolute-path scripts and are shielded.
 **Files:** `src/driver.rs:1976` (`install_temp_agent_registry` sets `XDG_CONFIG_HOME`, restored `:1981-1989`), `:1966` (module-private `REGISTRY_ENV_LOCK`), `:156` (`agent_config_home` reads `XDG_CONFIG_HOME`); `src/runtime.rs:8700` (stale-reaper prepends fake `tmux` to `PATH`, restored `:8725-8733`), `:1675` (`check_cli` reads `PATH`)
 **Description:** Two in-process `#[test]`-family tests mutate process-global environment without shared serialization. `install_temp_agent_registry` sets `XDG_CONFIG_HOME` (`src/driver.rs:1976`) under the driver-module-private `REGISTRY_ENV_LOCK` (`:1966`), which cannot be referenced from `runtime.rs`; the stale-reaper regression prepends a fake-`tmux` temp dir to `PATH` (`src/runtime.rs:8700`) under no lock at all. Cargo's default harness runs both on parallel threads in one binary, so a concurrent reader — `check_cli` reading `PATH` (`src/runtime.rs:1675`) or `agent_config_home` reading `XDG_CONFIG_HOME` (`src/driver.rs:156`) — can observe the temporary registry or fake binary, making the suite order-dependent; a panic between mutation and restore leaks the change permanently.
