@@ -2,7 +2,7 @@
 id: ISSUE-260722-0818-1
 kind: issue
 category: bug
-status: needs-triage
+status: wontfix
 summary: M16 infers privilege from canonical profile names
 ---
 
@@ -13,6 +13,61 @@ Escalated from code review.
 **Source:** `feature-tmux-panes-code-review-20260720-032528.md` — finding `L19`
 
 **Blocker (why it could not be fixed in the run):** The root-cause fix requires a first-class privilege declaration in the upstream `tmux-tools-core` crate (`AccessProfile` / `AccessProfileConfig`), plus a `Cargo.toml` rev-pin bump. `cargo metadata` confirms `tmux-tools-core` resolves only to a read-only git-checkout cache (`~/.cargo/git/checkouts/…`) with no vendored copy, path dependency, `.cargo/config.toml` override, or `[patch]` entry in this repo — matching the H8/M31 precedent that the crate is not editable/re-pinnable here. A partial in-repo hardening did land in the fix run (commit `a22abc1`): `resolve_registry_access_profile` now runs `require_privilege` + the access-mode ceiling check on the mode-mapped profile arm, closing the code-level asymmetry with the override arm. But `declared_profile_privilege` still derives privilege purely from the canonical profile name, so a deceptively-named broad-argv profile cannot be caught without the upstream metadata. Completing this needs upstream access.
+
+---
+
+**Triage resolution (2026-08-08) — `wontfix`, rejected: the behaviour is intended.**
+
+*Claim verified.* The escalation reproduces, and by a simpler route than the finding describes.
+The finding routes the attack through a custom-named profile plus the byte-identical shape match;
+that detour is unnecessary. Upstream `merge_agent_config` (`core/src/agents/mod.rs:377`) inserts
+operator profiles over builtins **by key**, so an operator can overwrite the canonical profile's
+args directly. With `[codex.access.read-only] args = ["--sandbox", "danger-full-access"]` in
+`agents.toml`, an `AccessMode::ReadOnly` run resolves profile `read-only` and launches
+`["--sandbox", "danger-full-access"]`. Confirmed with a throwaway test against
+`resolve_registry_access_profile`; not retained (see below).
+
+*Rejected as a defect.* `~/.config/tmux-tools/agents.toml` is operator-owned, and the finding's own
+severity note concedes the path crosses no trust boundary. Exploiting it requires the operator to
+attack themselves — someone who can edit that file can already launch any agent with any flags
+directly. An operator redefining their own profiles is configuration, not a vulnerability.
+
+The governing semantics, now documented in `docs/agent-drivers.md` (Registry Profile Driver):
+**the profile name is the operator's privilege declaration**, not a heuristic SilverBond infers
+from. The finding's core complaint — that names cannot prove what free-form argv permits — assumes
+SilverBond was trying to prove something. It is honouring a declaration. Two guarantees, both from
+the `a22abc1` hardening, remain and are the actual contract: unranked names fail closed
+(`require_privilege`, `src/driver.rs:334-340`), and a profile's declared rank can never exceed the
+run's requested `access_mode` (`:396-402`). The operator may redefine what a rank *means*; they
+cannot escape the rank they declared.
+
+*The stated blocker was wrong, and is moot.* The record claimed `tmux-tools-core` is not
+editable/re-pinnable because `cargo metadata` resolves it only to `~/.cargo/git/checkouts/`. That
+is how cargo resolves every git dependency and is not evidence about editability — a writable,
+user-owned clone exists at `/Users/Shared/Data/work/Programming/tools/tmux-tools` (remote
+`pacaya/tmux-tools`, containing the pinned rev `69173d1`), running its own `docs/issues/` pipeline.
+The H8/M31 precedent cited here does not hold. It no longer matters: the recommended upstream
+`privilege: Option<Privilege>` field exists to let a profile declare a rank independently of its
+name, and under the name-is-the-declaration doctrine there is nothing left for it to express. No
+two-repo change, no rev pin bump.
+
+*Rejected alternative.* An in-repo-only fix was available — `Registry::load_with_user_path(None)`
+(`core/src/agents/mod.rs:172-194`) returns the builtin-only registry, so SilverBond could refuse to
+rank any canonical profile whose args differ from builtin. Rejected because it breaks exactly the
+operator customisation this resolution affirms: an operator adding a flag to `workspace-write`
+would silently lose the ability to launch under `Edit`/`Execute`.
+
+*No code change.* No regression test was added — there is no defect to pin, and a test asserting
+the mislabeled profile is refused would encode the opposite of the decided semantics. The existing
+`registry_edit_accepts_narrow_ranked_default_fallback` (`src/driver.rs:1971-1999`) and
+`registry_edit_rejects_unranked_access_profile_override` stand unchanged; the latter is the
+fail-closed guarantee above.
+
+*Known exception, left in place.* The shape-matching fallback (`src/driver.rs:315-329`) grants a
+rank to a non-canonically-named profile whose argv is byte-identical to a canonical sibling. It is
+the one place SilverBond still infers rather than honours a declaration, making it the exception to
+the documented doctrine. Left as-is per maintainer decision — harmless and convenient. Revisit only
+if the doctrine needs to be exceptionless.
 
 ---
 

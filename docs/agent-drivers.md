@@ -275,6 +275,18 @@ are injected (those capabilities are off by default for registry profiles).
 - `edit` / `execute` → `workspace-write` profile
 - `unrestricted` → `full-access` profile
 
+**Profile names are declarations.** The registry profile name is how an operator declares a
+profile's privilege rank — SilverBond ranks by name and does not inspect argv to second-guess it.
+An operator who rebinds `[codex.access.read-only]` to broader arguments in `agents.toml` has
+declared those arguments to be read-only for their setup, and runs requesting `read_only` will
+launch them. This is deliberate: `agents.toml` is operator-owned, and an operator can already
+launch any agent with any flags directly.
+
+Two rules constrain it. A profile whose name is outside the `read-only` / `workspace-write` /
+`full-access` vocabulary carries no rank and is refused for `edit`/`execute` runs rather than
+guessed at. And a profile's rank can never exceed the run's requested `access_mode` — redefining a
+rank's meaning does not let a profile escape the rank it declared.
+
 ### Cursor (`cursor-agent`)
 
 - `read-only` → `--mode ask` (also the `default`; `plan` tier → `--mode plan`)
