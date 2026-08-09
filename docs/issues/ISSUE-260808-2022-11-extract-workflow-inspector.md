@@ -2,7 +2,7 @@
 id: ISSUE-260808-2022-11
 kind: issue
 category: enhancement
-status: needs-triage
+status: ready-for-agent
 summary: Extract the workflow-level inspector, promote the shared agent-config fields, and move the workflow-level access-mode effect
 ---
 
@@ -232,3 +232,23 @@ The round-5 `PASS` above is withdrawn, and this stamp is what makes the withdraw
 This is the same failure `ISSUE-260723-0823-1` hit at its own round 3, and the same remedy. Recording the earned `PASS` and withdrawing it explicitly is preferred over not writing it, so the round's findings stay in the record and the supersession is auditable.
 
 Due a round-6 gate against this text.
+
+**Readiness gate (cold-reader): PASS** (round 6, 2026-08-09)
+
+Every gap `fine` or an explicit delegation; class 6 does not fire on either prong; an 88-row class-7 ledger with no blocking rows and no kind (a) figures surviving; class 8 does not fire; class 9 does not fire on either arm.
+
+**Stamp resolution, since this record's chain is unusual.** This stamp ties at round 6 with the `REOPENED` above, which named itself "round 6 pending" and so consumed the number. The matcher breaks a tie by document order, so this stamp — being later — is authoritative, and the reader confirmed that resolution independently before relying on it. The round-5 `PASS` is history, not authority. Future rounds start at 7.
+
+**The round-5 remedy holds where two previous remedies did not.** The reader executed the membership construction against every identifier the moved code reaches and found no member for which it returns the wrong answer — including both shapes that defeated the earlier rules: helpers consumed only by each other now resolve correctly through the "every remaining consumer is moving" clause, and the expanded-agent state is defused by being pre-named, so the clause that would still have stranded it never runs. It also verified the compiler genuinely closes the set there, since the parent's reset line stops compiling once the state leaves. The style derivation was executed to a clean partition, and the transition derivation was falsified for completeness against every selection assignment in the store rather than only the ones the command returns.
+
+**Class 8 was live this round, and four earlier rounds were wrong to call it inert.** The class fires only on records stamped `PASS`/`WAIVED` at some round — and this record *has* been, at round 5. Withdrawing that stamp by `REOPENED` moves authority but does not un-stamp the fact, so the class became applicable from this round on. The reader judged it on the merits rather than declaring it inert, walked every note in `## Triage Notes` through the materiality test, and found each binding one already hoisted into the brief. It does not fire — but it was judged, not waived.
+
+**Non-blocking, carried forward and now immutable under this stamp:**
+
+- **No accepted-risk statement for the uncovered sections.** Rendered-output preservation for the Workflow fields and the Variables section rests on review rather than any mechanical guard. `ISSUE-260723-0823-1` records the equivalent exposure as an explicit accepted-risk paragraph; this record leaves it implicit. The most consequential of these notes.
+- **The component-render criterion is the weaker of the two of its kind** — its grep is satisfiable by an unused import, where the shared-component criterion carries a read-don't-merely-import clause. Not a class-9 fire, since the observable is red at baseline.
+- The branch's own header markup sits inside the extent the brief says to move but is not one of the five enumerated sections, so the rendered-output-unchanged sentence does not literally reach it, and no test asserts it.
+- The transitions reachable only from a selected state are described as requiring a *node* selected; edge removal requires an *edge*. Same side of the mounted/unmounted split, and the instruction is unconditional.
+- The merge-helper module's location is bounded only by its criterion's directory scope, where the access-modes bullet states the bound in prose. Asymmetric but unambiguous.
+- The snippet also reaches two access-mode label constants the brief does not name; both are snippet-exclusive, so they travel and the compiler forces it.
+- The cross-record claim about the sibling's criteria is true against that record's current ungated text, which may legitimately change before its own gate. Not fixable from this side.
