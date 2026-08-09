@@ -1092,7 +1092,7 @@ Advisory only — no C/H/M/L rank, never displaces the findings above. Merged in
 
 ---
 
-### L19. M16 infers privilege from canonical profile names (escalated: ISSUE-260722-0818-1)
+### L19. M16 infers privilege from canonical profile names (escalated: ISSUE-260722-0818-01)
 **Severity:** LOW — reachable only by the operator mislabeling profiles in their own `agents.toml`, crossing no trust boundary; workflow authors cannot add or edit profiles, and the name-only path at `src/driver.rs:405-407` already grants the same escalation with less effort.
 **Files:** `src/driver.rs:291-296` (`declared_profile_privilege` name table), `:311-314` (comment), `:315-329` (shape-matching fallback), `:340`, `:356`, `:390-400`, `:405-407` (unguarded name-mapped return), `:414`, `:419` (gate), `:1971-1999` (existing fallback test); upstream `core/src/agents/mod.rs:29-31` (`AccessProfile`), `:264-268` (`AccessProfileConfig`), `:175-186`, `:335-350` (operator registry merge); `Cargo.toml:28` (rev pin)
 **Description:** `declared_profile_privilege` (`src/driver.rs:291-296`) ranks `read-only`/`workspace-write`/`full-access` purely by string, and for non-canonical names the fallback at `:315-329` accepts a profile only if its argv is byte-identical to a canonically-named sibling. An operator registry containing `[custom.access.read-only] args=["--broad"]` plus an identical `default` therefore makes `declared_profile_privilege(spec, "default")` return `ReadOnly`, pass `default_privilege <= config.access_mode.privilege()` at `:419`, and launch broad argv under `Edit` — the widening M16 was filed to stop. The larger hole is on the primary path: `:405-407` returns the name-mapped profile with **no rank check at all**, so broad argv placed under `[custom.access.workspace-write]` launches under `Edit` without ever reaching `declared_profile_privilege`. Upstream `AccessProfile` carries `{ args: Vec<String> }` only (`core/src/agents/mod.rs:29-31`), so SilverBond currently has no channel through which a profile could declare its own privilege.
@@ -1207,7 +1207,7 @@ User-pulled Divergent Change + Duplicated Code smells from the batch list, conso
 - Sequence *after* H5/M9 land, not concurrently, to avoid churn on the same code; do **not** take the verbatim lines-relocation route (moving `:5714-6215` as-is leaves the `&mut RuntimeCheckpoint`+`ctx` coupling intact and fails the deletion test).
 - Optional low-risk down payment now: extract the IO-free leaf concerns (`build_log_id:7236`, template resolution `:7029-7170`, agent/CLI discovery `:1652-1745`, tmux reaping `:6667-6979`) into submodules; these have narrow inputs and no shared `checkpoint` mutation.
 
-### S3. Divergent Change — `ui/src/features/editor/InspectorPanel.svelte` (escalated: ISSUE-260723-0823-1)
+### S3. Divergent Change — `ui/src/features/editor/InspectorPanel.svelte` (escalated: ISSUE-260723-0823-01)
 **Ledger key:** `ui/src/features/editor/InspectorPanel.svelte:1`
 One component (1,176 lines changed) hosts node config for every node kind plus agent capability probing, access-mode reconciliation, and unlock prompting. Proposed fix: extract a per-node-kind config panel and lift capability/unlock concerns to the shell.
 
@@ -1221,9 +1221,9 @@ One component (1,176 lines changed) hosts node config for every node kind plus a
 **Ledger key:** `src/model.rs:110`
 Duplicated Code smell logged 2026-07-22.
 
-### S6. Duplicated Code — `ui/src/features/editor/InspectorPanel.svelte:789` (escalated: ISSUE-260723-0823-1)
+### S6. Duplicated Code — `ui/src/features/editor/InspectorPanel.svelte:789` (escalated: ISSUE-260723-0823-01)
 **Ledger key:** `ui/src/features/editor/InspectorPanel.svelte:789`
-_Folded into ISSUE-260723-0823-1 as a sub-task (shared `PaneConfigFields` for run_agent + spawn); ledger row stays open until that refactor lands._
+_Folded into ISSUE-260723-0823-01 as a sub-task (shared `PaneConfigFields` for run_agent + spawn); ledger row stays open until that refactor lands._
 Duplicated Code smell logged 2026-07-21.
 
 ### S7. Duplicated Code — `ui/src/lib/stores/workflowStore.svelte.ts:104-108` (deferred)

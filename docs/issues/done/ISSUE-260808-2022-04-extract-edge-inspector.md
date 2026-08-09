@@ -51,21 +51,21 @@ One branch moves into one component. The criteria are views of that single move 
 
 **Out of scope:**
 
-- The node-kind panels (`ISSUE-260723-0823-1`), the shared per-control form components (`ISSUE-260808-2000-07`), and the workflow-level inspector with its shared agent-config fields (`ISSUE-260808-2022-11`) — each is a separate sibling issue.
+- The node-kind panels (`ISSUE-260723-0823-01`), the shared per-control form components (`ISSUE-260808-2000-07`), and the workflow-level inspector with its shared agent-config fields (`ISSUE-260808-2022-11`) — each is a separate sibling issue.
 - Any change to edge semantics, edge validation, condition-builder behavior, or the outcome vocabulary — including the hardcoded fallback, which is preserved as-is rather than corrected.
 - Broadening the test harness beyond what the edge-render criterion needs.
-- Closing any smells-ledger row. The `InspectorPanel.svelte:1` Divergent Change row is a whole-component judgment and closes on `ISSUE-260723-0823-1` once every axis has been separated; this issue closes no row on its own.
+- Closing any smells-ledger row. The `InspectorPanel.svelte:1` Divergent Change row is a whole-component judgment and closes on `ISSUE-260723-0823-01` once every axis has been separated; this issue closes no row on its own.
 - Any visual, styling, copy, or layout change.
 
 ## Context Pack — generated at claim (2026-08-09T12:43:25Z)
 
 **PRD decisions relevant to this slice**: no PRD linked — the record carries no `prd:` frontmatter and the repo has no `docs/prd/` or `docs/decisions/prd/` tree; slice-governing decisions live in the Agent Brief and Triage Notes only.
 
-- Coverage exclusion reversed (maintainer, 2026-08-09): `ISSUE-260723-0823-1` excluded the edge inspector by name from targeted coverage; that exclusion does not hold for this standalone record, so an edge-render test is a required criterion.
+- Coverage exclusion reversed (maintainer, 2026-08-09): `ISSUE-260723-0823-01` excluded the edge inspector by name from targeted coverage; that exclusion does not hold for this standalone record, so an edge-render test is a required criterion.
 - The extraction is behavior-preserving: no edge semantics, validation, condition-builder, or outcome-vocabulary change — including the hardcoded outcome fallback, preserved as-is rather than corrected.
 - The delete control keeps its label verbatim; copy, styling, and layout changes are out of scope.
 - Store access is via the module singleton import, not Svelte context, so the standalone-mount test pattern keeps working.
-- This record closes no smells-ledger row; the `InspectorPanel.svelte:1` Divergent Change row is owned by `ISSUE-260723-0823-1`.
+- This record closes no smells-ledger row; the `InspectorPanel.svelte:1` Divergent Change row is owned by `ISSUE-260723-0823-01`.
 - Scoped styles and parent-side dead code are derived by the brief's commands, never assumed in advance.
 
 **Test seam & Testing Decisions:** observable at `ui/src/features/editor/InspectorPanel.test.ts` via the existing standalone-mount harness, which drives the workflow store singleton directly (`selectEdge`) and accepts an edges patch on the fixture; the new case must build a workflow with an edge, select it, assert Outcome/Label/Branch id/Condition all render, and assert an outcome edit persists. Testing decisions that touch it: the test must land in that exact file because the preservation runner (`npx vitest run --config ui/vite.config.ts ui/src/features/editor/InspectorPanel.test.ts`) is file-scoped; every baseline case must still pass with assertions unmodified — new cases may be added, existing ones may not be relaxed; harness broadening beyond what the edge-render criterion needs is out of scope; the guard is a characterization net (it passes against the un-extracted branch), so the four-labels completeness criterion is what proves the extraction. Second preservation gate: `just typecheck` reports no new errors — note unused locals are not an error here, so it will not flag stranded parent code.
@@ -84,7 +84,7 @@ One branch moves into one component. The criteria are views of that single move 
 
 **TDD:** n/a (linear) — behavior-preserving markup and handler relocation, and the mandated edge-render criterion is a characterization guard that is green at baseline by construction, so red-green does not apply to the extraction itself. The one test that *is* falsifiable arrived during fix round 1: the H1 regression guard was proven red against reconstructed broken semantics rather than merely asserted.
 
-**Review telemetry:** 9 findings — 1 HIGH, 4 MEDIUM, 4 LOW. 7 FIXED, 2 dismissed (L2, L3) on the brief's own contract. Fix rounds used: 2 of 4; round 2 closed with no new findings from either reviewer. Every acceptance criterion independently confirmed satisfied by both reviewers. 3 smells reported: 2 promoted into the findings track as M3/M4 under the in-diff duplication rule, 1 advisory (`EdgeInspector.svelte:14` Middle Man, borderline) appended to the ledger. No ledger row closed by this issue, per Out of scope — the `InspectorPanel.svelte:1` Divergent Change row is owned by `ISSUE-260723-0823-1`.
+**Review telemetry:** 9 findings — 1 HIGH, 4 MEDIUM, 4 LOW. 7 FIXED, 2 dismissed (L2, L3) on the brief's own contract. Fix rounds used: 2 of 4; round 2 closed with no new findings from either reviewer. Every acceptance criterion independently confirmed satisfied by both reviewers. 3 smells reported: 2 promoted into the findings track as M3/M4 under the in-diff duplication rule, 1 advisory (`EdgeInspector.svelte:14` Middle Man, borderline) appended to the ledger. No ledger row closed by this issue, per Out of scope — the `InspectorPanel.svelte:1` Divergent Change row is owned by `ISSUE-260723-0823-01`.
 
 **The HIGH finding was a real regression, and its guard is real.** H1: the extraction weakened the parent's branch predicate from an edge-existence check to a selection-kind check, so undoing an edge-add rendered a blank inspector instead of falling back to the workflow inspector. Caught empirically by baseline-vs-worktree render comparison, fixed by restoring `{:else if selectedEdge}`, and pinned by a new case in `InspectorPanel.test.ts`. Re-verified at close by reintroducing the broken predicate in a throwaway worktree: the suite went to 1 failed / 15 passed, with the failure landing on `renders workflow inspector when edge selection is stale after undo`. This test is the main durable addition beyond the extraction.
 
@@ -102,7 +102,7 @@ One branch moves into one component. The criteria are views of that single move 
 
 ## Triage Notes
 
-Minted 2026-08-08 as one of four records the `ISSUE-260723-0823-1` decomposition was split into, after that record's readiness gate fired class 6 prong (b) twice. This is the carve-out both gate rounds identified as cleanly separable: the edge branch couples to nothing else in the component. The parent record had conceded its separability while keeping it in scope; the maintainer accepted the split rather than the concession.
+Minted 2026-08-08 as one of four records the `ISSUE-260723-0823-01` decomposition was split into, after that record's readiness gate fired class 6 prong (b) twice. This is the carve-out both gate rounds identified as cleanly separable: the edge branch couples to nothing else in the component. The parent record had conceded its separability while keeping it in scope; the maintainer accepted the split rather than the concession.
 
 Deliberately closes no ledger row — see Out of scope. The `:1` Divergent Change row is a whole-component judgment and is owned by the kind-panels record, which lands last.
 
@@ -122,7 +122,7 @@ Classes 1, 2, 6, 8, and 9 clear — the record is correctly issue-scale on both 
 
 ### Gate round 1 resolved (2026-08-08)
 
-**Coverage now required — the earlier exclusion is reversed, not reinterpreted.** `ISSUE-260723-0823-1` excluded the edge inspector *by name* when it recorded its targeted-coverage decision, under `### Gate round 1 resolved`. **Maintainer decision (2026-08-09): that exclusion is reversed for this record.** So a minimal edge-render test is now a required criterion: build a workflow with an edge, select it, assert all four controls render and that editing the outcome persists.
+**Coverage now required — the earlier exclusion is reversed, not reinterpreted.** `ISSUE-260723-0823-01` excluded the edge inspector *by name* when it recorded its targeted-coverage decision, under `### Gate round 1 resolved`. **Maintainer decision (2026-08-09): that exclusion is reversed for this record.** So a minimal edge-render test is now a required criterion: build a workflow with an edge, select it, assert all four controls render and that editing the outcome persists.
 
 The reason the exclusion no longer holds is that it was taken while the edge work sat inside a larger record carrying other guards. Transplanted into a standalone record it left this record with no working guard at all — the Agent Brief's edge-render criterion carries the command over the test file that establishes this.
 
@@ -168,7 +168,7 @@ One blocking surface. Every other class clears, and the reader re-derived them f
 
 **The style bullet now derives its set instead of presupposing it.** The hardcoded rule-family pattern is gone. The bullet is split onto its own line and hands over a command that dumps the component's entire scoped style block, followed by the rule for deciding which side of the extraction each selector falls on: usages lying entirely inside the branch travel with it, a rule with no usage inside stays, and a class the block does not define is global. Nothing about the outcome is asserted up front, so the exhaustiveness qualifier, the zero-occurrence inventory, and the global-classes claim are gone rather than refreshed — the remedy the class prescribes.
 
-**The same construction was corrected in `ISSUE-260808-2022-11` in the same pass**, verbatim as it stood there, so that record's own round 3 does not burn on a row already adjudicated here. `ISSUE-260723-0823-1` was deliberately left alone: its command is narrower and is authoritative for the set it names, so it is not this defect. Both edited records were ungated at the time — authoritative verdict FAIL — so no `REOPENED` stamp was owed on either.
+**The same construction was corrected in `ISSUE-260808-2022-11` in the same pass**, verbatim as it stood there, so that record's own round 3 does not burn on a row already adjudicated here. `ISSUE-260723-0823-01` was deliberately left alone: its command is narrower and is authoritative for the set it names, so it is not this defect. Both edited records were ungated at the time — authoritative verdict FAIL — so no `REOPENED` stamp was owed on either.
 
 **The three non-blocking items are recorded above, not edited away.** In particular the false single-slice sentence is left standing: what was wrong is this record's account of its own history, and correcting the sentence would bury that rather than show it. Flagged to the maintainer as an open, non-blocking inaccuracy in the brief.
 

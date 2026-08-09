@@ -137,7 +137,7 @@ Smells: 2 advisory (Mysterious Name, Speculative Generality), both appended to `
 
 ## Triage Notes
 
-Split out of `ISSUE-260723-0823-1` on 2026-08-08 after that record's readiness gate fired class 6 prong (b). The parent record's decomposition was subsequently split further; this record owns the `InspectorPanel.svelte:789` Duplicated Code ledger row.
+Split out of `ISSUE-260723-0823-01` on 2026-08-08 after that record's readiness gate fired class 6 prong (b). The parent record's decomposition was subsequently split further; this record owns the `InspectorPanel.svelte:789` Duplicated Code ledger row.
 
 The gate's class-4 finding G1 is resolved here: the original S6 specification called for a single contiguous four-field group, which is unbuildable without reordering, because the controls are non-contiguous in both consumers. Maintainer decision (2026-08-08): emit one component per control so each consumer composes them in its existing order. This preserves rendered output while still delivering one edit point per control, which is what S6 actually required.
 

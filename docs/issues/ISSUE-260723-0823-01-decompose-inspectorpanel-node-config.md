@@ -1,5 +1,5 @@
 ---
-id: ISSUE-260723-0823-1
+id: ISSUE-260723-0823-01
 kind: issue
 category: enhancement
 status: ready-for-agent

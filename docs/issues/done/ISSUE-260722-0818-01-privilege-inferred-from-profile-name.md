@@ -1,5 +1,5 @@
 ---
-id: ISSUE-260722-0818-1
+id: ISSUE-260722-0818-01
 kind: issue
 category: bug
 status: wontfix

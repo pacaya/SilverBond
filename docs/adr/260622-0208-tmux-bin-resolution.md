@@ -1,3 +1,9 @@
+---
+id: ADR-260622-0208-01
+status: accepted
+origin: docs/decisions/tmux-bin-resolution.md
+---
+
 # Tmux Binary Resolution Uses Interactive Zsh
 
 Status: Accepted
