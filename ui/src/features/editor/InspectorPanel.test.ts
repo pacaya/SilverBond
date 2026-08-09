@@ -360,6 +360,33 @@ describe("InspectorPanel", () => {
     expect(store.workflow!.agentDefaults?.deployer?.accessMode).toBe("unrestricted");
   });
 
+  it("collapses expanded agent defaults when selection clears while workflow inspector is shown", async () => {
+    const fullAccessCapabilities: RuntimeCapabilities = {
+      ...capabilities,
+      agents: {
+        deployer: {
+          available: true,
+          capabilities: agentCaps,
+          accessProfiles: ["full-access"],
+        },
+      },
+    };
+
+    renderInspector(workflow(), undefined, fullAccessCapabilities);
+    await fireEvent.click(screen.getByRole("button", { name: /deployer/ }));
+
+    expect(await screen.findByDisplayValue("unrestricted")).toBeInTheDocument();
+
+    // Drive the store directly with nothing selected — the only shape guaranteed
+    // to keep the workflow inspector mounted on every selection-clearing path.
+    // Some UI routes (e.g. drill-in) require a node selected first, unmounting
+    // and remounting this branch, so they would not guard this reset.
+    store.selectWorkflow();
+    await tick();
+
+    expect(screen.queryByDisplayValue("unrestricted")).not.toBeInTheDocument();
+  });
+
   it("surfaces an agent with no supported access modes without persisting a fallback", async () => {
     const noAccessCapabilities: RuntimeCapabilities = {
       ...capabilities,

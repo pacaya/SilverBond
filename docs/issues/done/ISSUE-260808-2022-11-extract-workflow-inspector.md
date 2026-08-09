@@ -2,7 +2,7 @@
 id: ISSUE-260808-2022-11
 kind: issue
 category: enhancement
-status: ready-for-human
+status: done
 summary: Extract the workflow-level inspector, promote the shared agent-config fields, and move the workflow-level access-mode effect
 claimed_by: implement-issue@macmini.home
 claimed_at: 2026-08-09T13:44:31Z
@@ -113,6 +113,32 @@ Stated precisely, since earlier drafts overreached: that chain fixes the *order*
 **Terms:** no glossary — this record carries no `terms:` frontmatter and there is no `CONTEXT.md` at the repo root or under a context root. Tier skipped.
 
 **Full artifacts:** docs/issues/ISSUE-260808-2022-11-extract-workflow-inspector.md (Agent Brief + Triage Notes) · sibling records `ISSUE-260723-0823-1`, `ISSUE-260808-2022-04` under docs/issues/ · CLAUDE.md
+
+## Resolution
+
+**Commit:** `feat: extract the workflow-level inspector and shared agent-config fields (ISSUE-260808-2022-11)`
+
+**Route:** cursor (`/cursor-developer`) for the implementation and both fix rounds — a large but well-specified in-directory Svelte extraction with the coupling set enumerated in advance and every discovery step handed over as a command; no cross-module reasoning, security surface, or infrastructure work.
+
+**TDD:** n/a (linear) — behavior-preserving relocation of a template branch plus its writers and effects. The one falsifiable addition is the reset guard, which was verified red by deletion probe rather than assumed.
+
+**Review telemetry:** 6 findings, **all LOW** — no CRITICAL, HIGH, or MEDIUM. 4 FIXED, 2 deferred (L1, L5). Fix rounds used: 2 of 4. Codex returned zero findings and zero smells independently; all six originated with the Claude reviewer, which also audited Codex's ten clean claims in reverse and could falsify none. Round 1's re-verify surfaced L6 **inside the comment L2's fix had just written**, so the same-site escalation rule applied: L2 and L6 are one defect, and round 2 removed the mechanism — a hand-maintained enumeration of store transitions in a comment, duplicating knowledge the store's seven `selection = { kind: "workflow", id: null }` sites own — rather than correcting the list. 5 advisory smells appended to the ledger, none promoted (the one Duplication smell's second site is pre-existing code outside the diff, so the in-diff promotion rule does not fire).
+
+**Accepted risk — L1, recorded explicitly because the round-6 gate noted this record left it implicit.** `showAgentDefaultsFor` moved from the always-mounted parent into the branch-scoped child, so it is now destroyed on unmount *in addition to* being reset by the moved effect. The mandated reset is faithfully reproduced; the extra destruction is new behavior. It is observable only where the rendered branch flips without `store.selection` changing: `undo`/`redo` (`workflowStore.svelte.ts:564-577`) replace `workflow` without touching `selection`, so a `{kind:"node"}` selection can resolve to `null` and back. Repro: select a just-added node → undo → expand an agent-defaults panel → redo → undo. The old code kept the panel expanded; this code shows it collapsed. **No fix exists inside this slice's constraints** — strict preservation requires the state to live above the branch, which the Agent Brief mandates against ("the expanded-agent state … move[s] with it"), so this is a structural consequence of the brief rather than an implementation defect. Both reviewers confirmed the mechanism at both cited sites. Accepted on the grounds that the path is contrived, untested before and after, and the collapse is arguably the better behavior. If the drift is ever judged unacceptable, the fix is a brief-level decision on where the state lives, not a patch here.
+
+**Deferred to a follow-up record — L5.** `update("toolToggles", checked ? { webSearch: true } : undefined)` writes a whole-object replacement in both directions, so any sibling toggle the shape later grows is discarded on either transition. Latent, not live: Codex confirmed `workflow.ts:45-47` defines no sibling key today. Moved verbatim by this extraction and squarely inside this brief's Out of scope ("any change to agent-defaults semantics"), so it was not fixed here — but promotion into a shared component doubles the blast radius once a second key is added. Filed as `ISSUE-260809-1545-01`.
+
+**Suite:** green on the rebased tree — 466 Rust tests (449 unit + 17 integration) and 114 frontend tests across 10 files, 0 failures. `just typecheck` clean (598 files, 0 errors, 0 warnings).
+
+**Reset guard verified red, twice and independently.** The Claude reviewer's deletion probe during review turned `InspectorPanel.test.ts:385` failing at 14/15 and green on restore. Re-probed at close against the rebased tree: removing only the `showAgentDefaultsFor = null` assignment from the reset `$effect` produced 1 failed / 16 passed, with the failure landing on `collapses expanded agent defaults when selection clears while workflow inspector is shown`. The guard is falsifiable, not a characterization net.
+
+**Rebase onto `ISSUE-260808-2022-04`.** This record was implemented and reviewed against a baseline where the edge inspector was still inline in the parent. It was rebased onto the landed `-04` extraction before closing; the rebase was conflict-free, and `-04`'s H1 fix — the edge-*existence* branch predicate, as opposed to a selection-kind check — was confirmed intact afterwards. The full suite above was run on the rebased tree, not on the pre-park verification, which was deliberately not reused.
+
+**Bundle.** The park commit deliberately shipped **without** rebuilding `public/`, so the bundle was stale at close and was rebuilt before landing. The CSS artifact's content hash changed, which for a behavior-preserving refactor warranted proof rather than assumption: the rebuilt bundle carries **427 CSS rules before and after, none added, removed, or altered**, and all **243 global (unscoped) rules appear in identical sequence**. Only Svelte-scoped rules reordered, which is expected because they moved into `WorkflowInspector.svelte` and `AgentConfigFields.svelte`; scoped rules carry unique per-component hashes and cannot collide, so the cascade is unaffected. This check mattered because `core.hooksPath` is unset in this clone and the frontend-freshness hook is guarding nothing.
+
+**Environment note (not a code defect) — the park was avoidable.** This record parked at `ready-for-human` because `just test` aborted at `cargo test` with `command not found`, and the parking note concluded no Rust toolchain existed on this machine. The same wrong diagnosis cost `ISSUE-260808-2022-04` a park on the same day, and `ISSUE-260808-2000-07` had already established the true cause hours earlier: the toolchain was present under `~/.rustup/toolchains/`, only the `~/.cargo/bin` shim was missing. The maintainer subsequently installed the toolchain properly (`cargo`/`rustc` 1.97.1 on `PATH`). Nothing about the repo or this change caused the park; no code changed between the park and this close beyond the rebase and the bundle rebuild.
+
+**Date:** 2026-08-09 (UTC)
 
 ## Code Review
 
