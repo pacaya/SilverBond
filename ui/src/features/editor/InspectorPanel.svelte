@@ -23,7 +23,6 @@
     ValidationResponse,
     WaitConfig,
     WorkflowDocument,
-    WorkflowEdge,
     WorkflowNode,
   } from "@/lib/types/workflow";
   import PromptTextarea from "@/lib/components/PromptTextarea.svelte";
@@ -35,6 +34,7 @@
   import NodeHeader from "./NodeHeader.svelte";
   import AddSectionMenu from "./AddSectionMenu.svelte";
   import ConditionBuilder from "./ConditionBuilder.svelte";
+  import EdgeInspector from "./EdgeInspector.svelte";
   import SchemaPresets from "./SchemaPresets.svelte";
   import PaneNameField from "./PaneNameField.svelte";
   import AccessProfileField from "./AccessProfileField.svelte";
@@ -186,6 +186,12 @@
     return activeWorkflow.nodes.find((node) => node.id === selection.id) ?? null;
   });
 
+  let selectedEdge = $derived.by(() => {
+    const selection = store.selection;
+    if (selection.kind !== "edge") return null;
+    return activeWorkflow.edges.find((edge) => edge.id === selection.id) ?? null;
+  });
+
   const unlockPrompt = createPasswordPrompt();
 
   async function runSelectedNodePreview() {
@@ -208,19 +214,6 @@
     }
   }
 
-  let selectedEdge = $derived.by(() => {
-    const selection = store.selection;
-    if (selection.kind !== "edge") return null;
-    return activeWorkflow.edges.find((edge) => edge.id === selection.id) ?? null;
-  });
-  let edgeDisplayName = $derived.by(() => {
-    if (!selectedEdge) return "";
-    const fromNode = activeWorkflow.nodes.find((n) => n.id === selectedEdge.from);
-    const toNode = activeWorkflow.nodes.find((n) => n.id === selectedEdge.to);
-    const fromName = fromNode?.name || selectedEdge.from.slice(0, 8);
-    const toName = toNode?.name || selectedEdge.to.slice(0, 8);
-    return `${fromName} → ${toName}`;
-  });
   let issues = $derived(validation?.issues ?? []);
   let activeScope = $derived(activeValidationScope(store.drillStack));
   let promptSuggestions = $derived(
@@ -1584,67 +1577,7 @@
   </div>
 
 {:else if selectedEdge}
-  <div class="inspector">
-    <div class="inspector__header">
-      <div>
-        <small>Edge</small>
-        <h3>{edgeDisplayName}</h3>
-      </div>
-      <button class="button button--danger" onclick={() => store.removeEdge(selectedEdge!.id)}>
-        Delete
-      </button>
-    </div>
-
-    <section class="inspectorSection">
-      <div class="inspectorSection__title">Routing</div>
-      <label class="field">
-        <span>Outcome</span>
-        <select
-          value={selectedEdge.outcome}
-          onchange={(e) => store.updateWorkflow((wf) => {
-            const edge = wf.edges.find((ed) => ed.id === selectedEdge!.id);
-            if (edge) edge.outcome = (e.target as HTMLSelectElement).value as WorkflowEdge["outcome"];
-          })}
-        >
-          {#each (capabilities?.supportedEdgeOutcomes ?? ["success", "reject", "branch", "loop_continue", "loop_exit"]) as outcome (outcome)}
-            <option value={outcome}>{outcome}</option>
-          {/each}
-        </select>
-      </label>
-      <label class="field">
-        <span>Label</span>
-        <input
-          value={selectedEdge.label ?? ""}
-          oninput={(e) => store.updateWorkflow((wf) => {
-            const edge = wf.edges.find((ed) => ed.id === selectedEdge!.id);
-            if (edge) edge.label = (e.target as HTMLInputElement).value || null;
-          })}
-        />
-      </label>
-      <label class="field">
-        <span>Branch id</span>
-        <input
-          value={selectedEdge.branchId ?? ""}
-          oninput={(e) => store.updateWorkflow((wf) => {
-            const edge = wf.edges.find((ed) => ed.id === selectedEdge!.id);
-            if (edge) edge.branchId = (e.target as HTMLInputElement).value || null;
-          })}
-        />
-      </label>
-      <!-- Condition -->
-      <label class="field">
-        <span>Condition</span>
-        <ConditionBuilder
-          mode="structured"
-          value={selectedEdge.condition ?? null}
-          onchange={(val) => store.updateWorkflow((wf) => {
-            const edge = wf.edges.find((ed) => ed.id === selectedEdge!.id);
-            if (edge) edge.condition = val as WorkflowEdge["condition"] ?? null;
-          })}
-        />
-      </label>
-    </section>
-  </div>
+  <EdgeInspector edge={selectedEdge} {workflow} {capabilities} />
 
 {:else}
   <!-- Workflow-level inspector -->

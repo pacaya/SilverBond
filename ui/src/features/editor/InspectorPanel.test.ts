@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/svelte";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/svelte";
 import { tick } from "svelte";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { api, ApiError } from "@/lib/api/client";
@@ -7,6 +7,7 @@ import type {
   AgentCapabilities,
   RuntimeCapabilities,
   WorkflowDocument,
+  WorkflowEdge,
   WorkflowNode,
 } from "@/lib/types/workflow";
 import InspectorPanel from "./InspectorPanel.svelte";
@@ -535,6 +536,104 @@ describe("InspectorPanel", () => {
       "Kill pane after",
     ]);
     expect(fieldControlsPresentInSection(runAgentContainer, "Agent run").every(Boolean)).toBe(true);
+  });
+
+  it("renders edge inspector controls and persists outcome edits", async () => {
+    const fromNode: WorkflowNode = {
+      id: "node-a",
+      name: "Start",
+      kind: { type: "task" },
+      agent: "claude",
+      prompt: "Begin",
+      contextSources: [],
+      responseFormat: null,
+    };
+    const toNode: WorkflowNode = {
+      id: "node-b",
+      name: "End",
+      kind: { type: "task" },
+      agent: "claude",
+      prompt: "Finish",
+      contextSources: [],
+      responseFormat: null,
+    };
+    const edge: WorkflowEdge = {
+      id: "edge-ab",
+      from: fromNode.id,
+      to: toNode.id,
+      outcome: "success",
+    };
+
+    const document = workflow({
+      entryNodeId: fromNode.id,
+      nodes: [fromNode, toNode],
+      edges: [edge],
+    });
+    store.setWorkflow(document);
+    store.selectEdge(edge.id);
+
+    render(InspectorPanel, {
+      props: {
+        workflow: store.workflow!,
+        validation: null,
+        capabilities,
+      },
+    });
+
+    expect(screen.getByRole("combobox", { name: "Outcome" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Label" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Branch id" })).toBeInTheDocument();
+
+    const conditionField = screen.getByText("Condition").closest("label");
+    expect(conditionField).not.toBeNull();
+    expect(within(conditionField!).getByRole("button", { name: "Raw JSON" })).toBeInTheDocument();
+
+    const outcomeSelect = screen.getByRole("combobox", { name: "Outcome" }) as HTMLSelectElement;
+    expect(outcomeSelect.value).toBe("success");
+
+    await fireEvent.change(outcomeSelect, { target: { value: "reject" } });
+    expect(store.workflow!.edges.find((e) => e.id === edge.id)!.outcome).toBe("reject");
+  });
+
+  it("renders workflow inspector when edge selection is stale after undo", () => {
+    const fromNode: WorkflowNode = {
+      id: "node-a",
+      name: "Start",
+      kind: { type: "task" },
+      agent: "claude",
+      prompt: "Begin",
+      contextSources: [],
+      responseFormat: null,
+    };
+    const toNode: WorkflowNode = {
+      id: "node-b",
+      name: "End",
+      kind: { type: "task" },
+      agent: "claude",
+      prompt: "Finish",
+      contextSources: [],
+      responseFormat: null,
+    };
+
+    store.setWorkflow(workflow({
+      entryNodeId: fromNode.id,
+      nodes: [fromNode, toNode],
+      edges: [],
+    }));
+    store.addEdge({ from: fromNode.id, to: toNode.id, outcome: "success" });
+    store.undo();
+
+    render(InspectorPanel, {
+      props: {
+        workflow: store.workflow!,
+        validation: null,
+        capabilities,
+      },
+    });
+
+    expect(screen.getByRole("textbox", { name: "Name" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Goal" })).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Outcome" })).not.toBeInTheDocument();
   });
 
   it("renders spawn pane-config fields in specification order", () => {

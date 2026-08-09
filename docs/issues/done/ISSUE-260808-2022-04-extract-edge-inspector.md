@@ -2,7 +2,7 @@
 id: ISSUE-260808-2022-04
 kind: issue
 category: enhancement
-status: ready-for-human
+status: done
 summary: Extract the edge inspector out of InspectorPanel into its own sibling component
 claimed_by: implement-issue@macmini
 claimed_at: 2026-08-09T12:43:25Z
@@ -75,6 +75,30 @@ One branch moves into one component. The criteria are views of that single move 
 **Terms:** no glossary reachable — the record carries no `terms:` frontmatter and no `CONTEXT.md` exists at the repo root or under any context root.
 
 **Full artifacts:** docs/issues/ISSUE-260808-2022-04-extract-edge-inspector.md · CLAUDE.md
+
+## Resolution
+
+**Commit:** `feat: extract the edge inspector into its own component (ISSUE-260808-2022-04)`
+
+**Route:** cursor (`/cursor-developer`) — well-scoped single-file Svelte branch extraction with an explicit dependency surface and derived-not-assumed style and dead-code procedures; no cross-module reasoning, security surface, or infrastructure work. Both fix rounds routed to cursor for the same reason.
+
+**TDD:** n/a (linear) — behavior-preserving markup and handler relocation, and the mandated edge-render criterion is a characterization guard that is green at baseline by construction, so red-green does not apply to the extraction itself. The one test that *is* falsifiable arrived during fix round 1: the H1 regression guard was proven red against reconstructed broken semantics rather than merely asserted.
+
+**Review telemetry:** 9 findings — 1 HIGH, 4 MEDIUM, 4 LOW. 7 FIXED, 2 dismissed (L2, L3) on the brief's own contract. Fix rounds used: 2 of 4; round 2 closed with no new findings from either reviewer. Every acceptance criterion independently confirmed satisfied by both reviewers. 3 smells reported: 2 promoted into the findings track as M3/M4 under the in-diff duplication rule, 1 advisory (`EdgeInspector.svelte:14` Middle Man, borderline) appended to the ledger. No ledger row closed by this issue, per Out of scope — the `InspectorPanel.svelte:1` Divergent Change row is owned by `ISSUE-260723-0823-1`.
+
+**The HIGH finding was a real regression, and its guard is real.** H1: the extraction weakened the parent's branch predicate from an edge-existence check to a selection-kind check, so undoing an edge-add rendered a blank inspector instead of falling back to the workflow inspector. Caught empirically by baseline-vs-worktree render comparison, fixed by restoring `{:else if selectedEdge}`, and pinned by a new case in `InspectorPanel.test.ts`. Re-verified at close by reintroducing the broken predicate in a throwaway worktree: the suite went to 1 failed / 15 passed, with the failure landing on `renders workflow inspector when edge selection is stale after undo`. This test is the main durable addition beyond the extraction.
+
+**Suite:** green — 466 Rust tests (449 unit + 17 integration) and 113 frontend tests across 10 files, 0 failures. `just typecheck` clean (594 files, 0 errors, 0 warnings).
+
+**Bundle:** the embedded frontend bundle in `public/` was rebuilt and is committed with the source change, per the "Frontend bundle freshness" convention in `CLAUDE.md`. Verified at close by running `npm run build` against the parked tree and confirming `git status public/` came back empty — the committed bundle is byte-identical to a fresh build. This mattered more than usual because `core.hooksPath` is unset in this clone, so the freshness hook was guarding nothing.
+
+**Environment note (not a code defect) — the park was avoidable.** This record parked at `ready-for-human` on 2026-08-09 because `just test` aborted at `cargo test` with `command not found`, and the parking note concluded no Rust toolchain existed on this machine. That diagnosis was wrong in a way that cost two records: `ISSUE-260808-2000-07` had already hit the identical failure hours earlier and established that the toolchain *was* present at `~/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo` (1.96.0) with only the `~/.cargo/bin` shim missing. The maintainer subsequently installed the toolchain properly (`cargo`/`rustc` 1.97.1 on `PATH`), and the full gate was re-run against the parked branch with **no code change** — the green result above. Nothing about the repo or this change caused the park.
+
+**Open, non-blocking inaccuracy in the brief (maintainer call, deliberately left standing).** Under "Why this is a single slice", the sentence "no subset lands green on its own" is false: the edge-render criterion is a characterization guard that passes against the un-extracted branch. Gate rounds 2, 3, and 4 each recorded this. It is immutable under the round-4 PASS stamp, prong (b) does not depend on it, and nothing an implementer does changes because of it, so correcting it would have cost a `REOPENED` and a round 5 disproportionate to a self-description with no contract effect.
+
+**Pre-existing repo defect, confirmed independently (not fixed here, out of scope).** `ISSUE-260808-2000-07`'s Resolution reported that `.githooks/pre-commit` cannot pass as written on any commit touching `ui/src`: it symlinks `node_modules` into a `git checkout-index` snapshot, and resolving through that symlink changes Svelte's scoped-class hashes for vendored `svelte-flow` components, so the snapshot build never matches the staged `public/` byte-for-byte. The same mechanism was hit again while verifying this record — a worktree with a symlinked `node_modules` failed all 10 test files at `Cannot find module '/@fs/…/@testing-library/svelte/src/vitest.js'`, and cloning `node_modules` for real made them pass 113/113 unchanged. Two independent encounters with the same root cause; the hook stays disabled until it compares normalized output or gives the snapshot a real `node_modules`.
+
+**Date:** 2026-08-09 (UTC)
 
 ## Triage Notes
 
