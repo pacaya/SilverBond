@@ -2,8 +2,10 @@
 id: ISSUE-260808-2000-07
 kind: issue
 category: enhancement
-status: ready-for-agent
+status: done
 summary: Extract shared per-field pane-config components consumed by both run_agent and spawn, and extract the spawn panel
+claimed_by: implement-issue@macmini.home
+claimed_at: 2026-08-09T11:52:54Z
 ---
 
 ## Agent Brief
@@ -72,6 +74,66 @@ Stated precisely, since an earlier draft overreached: the two structural criteri
 - Hoisting unlock/password prompting anywhere.
 - Any change to config schemas, defaults, validation, or access-profile semantics — this is markup substitution only.
 - Any visual, styling, copy, or layout change, including field reordering.
+
+## Context Pack — generated at claim (2026-08-09T11:52:54Z)
+
+**PRD decisions relevant to this slice:** no PRD linked — the record carries no `prd:` frontmatter, and no `docs/prd/` or `docs/decisions/prd/` directory exists in this repo. The governing decisions are stated in the record's own Agent Brief and Triage Notes:
+
+- Maintainer decision (2026-08-08, gate finding G1): emit **one component per control**, not a single contiguous four-field group — the controls are non-contiguous in both consumers, so a group cannot reproduce either section's order.
+- Conversion is **in place**: no node-kind arm (including `spawn`) is extracted, and no config writer, default, merge helper, or switch case moves. Markup substitution only.
+- Each field component takes current value + a change callback already bound by the parent to that occurrence's existing writer; access-profile also takes the profile list and keeps its "registry default" empty option; working directory also takes a placeholder derived from the active workflow's working directory; extra-args keeps newline-split-and-trim parsing and short-textarea styling.
+- The working-directory component has a **third** consumer: the per-node `cwd` control in the collapsible agent-tuning block shared by `task` and `run_agent`.
+- The workflow-level working-directory control is **out of scope** — different binding semantics (binds directly, updates on input, no placeholder) and it *is* the value the in-scope occurrences show as placeholder; it moves with `ISSUE-260808-2022-11`.
+- Colocate new components with the existing editor components, matching the sibling convention in that directory.
+
+**Test seam & Testing Decisions:** observable at the editor inspector component's vitest suite (`ui/src/features/editor/InspectorPanel.test.ts`, run via `npx vitest run --config ui/vite.config.ts`); the surveying seam is `rg -n -B2 -A6 '<span>(Pane name|Access|Working directory|Extra args)</span>' ui/src/features/editor/InspectorPanel.svelte`. Testing decisions touching it:
+
+- Maintainer decision (2026-08-08, gate finding G6): require **targeted field-order coverage** for these two consumers rather than full coverage of all uncovered surfaces.
+- The order test asserts the rendered field-label sequence against the **literal sequences written in the brief** — `run_agent`: Pane name, Access, Working directory, Timeout (s), Idle seconds, Ready-stable (s), Until marker, Extra args, Kill pane after; `spawn`: Agent, Command, Pane name, Session name, Access, Working directory, Extra args. It must not derive the expectation from rendered output.
+- Preservation: every baseline test case still passes with assertions unmodified; new cases may be added, existing ones may not be relaxed; `just typecheck` reports no new errors; both green before and after.
+- Per-name `rg` greps prove naming, not consumption — the completeness criterion is a **reading** of command output, not an exit code; the order test is the real functional guard.
+- Known thin spot (gate round 3, non-blocking): the per-node working-directory writer coerces empty to `null` where config writers coerce to `undefined`; unpinned and unguarded — behavior-preserving governs.
+- Ledger closure: `rg -n 'InspectorPanel\.svelte:789' docs/issues/SMELLS-LEDGER.md` must read `fixed:` against the landing commit.
+
+**ADRs:** no ADR index found — no `docs/adr/INDEX.md` and no `docs/model/generated/`. The only decision record in-repo is `docs/decisions/tmux-bin-resolution.md`, which does not touch this slice.
+
+**Terms:** no glossary — the record carries no `terms:` frontmatter and there is no `CONTEXT.md` at the repo root or under a context root.
+
+**Full artifacts:** docs/issues/ISSUE-260808-2000-07-shared-pane-config-fields.md · docs/issues/SMELLS-LEDGER.md · CLAUDE.md
+
+## Resolution
+
+**Commit:** `feat: extract shared per-field pane-config components (ISSUE-260808-2000-07)`
+
+**Route:** cursor (`/cursor-developer`) — well-scoped single-file Svelte component extraction with a detailed spec and pre-defined field-order guards; no cross-module reasoning, security surface, or infrastructure work. Both fix rounds routed to cursor for the same reason.
+
+**TDD:** n/a (linear) — behavior-preserving markup substitution, and the mandated field-order test is a characterization guard that is green at baseline by construction, so red-green does not apply.
+
+**Review telemetry:** 7 findings — 2 MEDIUM, 3 LOW, plus 2 MEDIUM promoted from in-diff duplication smells. 5 FIXED, 1 deferred (L3), 2 dismissed (D1, D2). Fix rounds used: 2 of 4. Codex returned zero findings independently; all findings originated with the Claude reviewer or the promotion rule. 2 advisory smells appended to the ledger; graduation check emitted nothing.
+
+**Suite:** green — 466 Rust tests (449 unit + 17 integration) and 111 frontend tests across 10 files, 0 failures. `just typecheck` clean (593 files, 0 errors, 0 warnings).
+
+**Environment note (not a code defect):** the first full-suite run returned `SUITE: ERROR` because the `cargo` shim in `~/.cargo/bin` is missing from this machine, so `just test` aborted at `cargo test` with `command not found`. The toolchain itself is present at `~/.rustup/toolchains/stable-aarch64-apple-darwin/bin/cargo` (1.96.0); re-running with that directory on `PATH` produced the green result above. Nothing about the repo or this change caused it, but the shim is worth repairing — every `just test` on this machine will hit it.
+
+**Bundle:** the embedded frontend bundle in `public/` was rebuilt and is committed with the source change, per the "Frontend bundle freshness" convention in `CLAUDE.md`. Its delta is confined to one JS chunk swap plus the `index.html` script reference; the CSS artifact is byte-identical to baseline, independently corroborating that this refactor produced no styling change.
+
+**Pre-existing repo defect found while verifying the bundle (not fixed here, out of scope):** `.githooks/pre-commit` cannot pass as written, on any commit touching `ui/src`. It snapshots the staged tree with `git checkout-index` and symlinks `node_modules` into it (line 30), then diffs a build of that snapshot against the staged `public/`. Resolving `node_modules` through a symlink changes Svelte's scoped-class hashes for vendored `svelte-flow` components, so the snapshot build never matches an in-repo build byte-for-byte and the hook aborts at line 35 regardless of freshness. Verified: normalizing `svelte-[hash]` tokens away makes the committed bundle and the snapshot build **identical** in both JS and CSS — there is no content difference, only hash churn. This is likely why `core.hooksPath` is unset in this clone and why most recent `ui/src` commits carry no `public/` rebuild. A fix would make the hook compare normalized output, or give the snapshot a real `node_modules` rather than a symlink.
+
+**Date:** 2026-08-09 (UTC)
+
+## Code Review
+
+Review file: `issue-260808-2000-07-code-review-20260809-123056.md`
+
+- M1 (MEDIUM): Embedded `public/` bundle not rebuilt for the changed `ui/src` — FIXED
+- M2 (MEDIUM): Per-node `WorkingDirectoryField` call site diverges from its two siblings — FIXED
+- L1 (LOW): Order test asserts label text only, never that a control renders — FIXED
+- L2 (LOW): Two scenarios packed into one `it` with a mid-test `cleanup()` — FIXED
+- L3 (LOW): Per-node `WorkingDirectoryField` consumer has no test coverage — deferred (maintainer decision G6 scoped coverage to the two named consumers; gate round 3 recorded this gap as non-blocking)
+- D1 (MEDIUM): Placeholder derivation repeated at all three call sites — dismissed (mandated by the brief's Key interfaces)
+- D2 (MEDIUM): `PaneNameField` and `WorkingDirectoryField` structurally identical — dismissed (contradicts maintainer decision G1; fails the deletion test)
+
+Smells: 2 advisory (Mysterious Name, Speculative Generality), both appended to `docs/issues/SMELLS-LEDGER.md`. Three further Duplication smells were promoted to findings by the in-diff duplication promotion rule and appear above as M2, D1, and D2. Graduation check emitted nothing.
 
 ## Triage Notes
 

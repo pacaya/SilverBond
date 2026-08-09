@@ -57,7 +57,7 @@ One row per unique key (`file:line` + smell name). Columns:
 | `src/model.rs:2061` + Feature Envy | 1 | 2026-07-20 | open |
 | `src/driver.rs:291-305` + Primitive Obsession | 1 | 2026-07-20 | open |
 | `ui/src/features/editor/InspectorPanel.svelte:1` + Divergent Change | 1 | 2026-07-20 | open |
-| `ui/src/features/editor/InspectorPanel.svelte:789` + Duplicated Code | 1 | 2026-07-21 | open |
+| `ui/src/features/editor/InspectorPanel.svelte:789` + Duplicated Code | 1 | 2026-07-21 | fixed: ISSUE-260808-2000-07 (one component per control; run_agent/spawn/per-node consumers converted) |
 | `src/model.rs:2247` + Shotgun Surgery | 1 | 2026-07-21 | open |
 | `src/driver.rs:291` + Primitive Obsession | 1 | 2026-07-21 | open |
 | `src/driver.rs:301` + Repeated Switches | 1 | 2026-07-21 | open |
@@ -70,3 +70,5 @@ One row per unique key (`file:line` + smell name). Columns:
 | `src/model.rs:110` + Duplicated Code | 1 | 2026-07-22 | open |
 | `src/api.rs:5381` + Duplicated Code | 1 | 2026-07-22 | fixed: S4 |
 | `src/runtime.rs:1376` + Speculative Generality | 1 | 2026-07-23 | open |
+| `ui/src/features/editor/PaneNameField.svelte:7` + Mysterious Name | 1 | 2026-08-09 | open |
+| `ui/src/features/editor/AccessProfileField.svelte:20` + Speculative Generality | 1 | 2026-08-09 | open |

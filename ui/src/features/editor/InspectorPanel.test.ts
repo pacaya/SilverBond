@@ -482,4 +482,91 @@ describe("InspectorPanel", () => {
     expect(store.activeWorkflow!.runAs).toEqual({ user: "subflow-user" });
     expect(store.activeWorkflow!.limits).toEqual({ maxTotalSteps: 999, maxVisitsPerNode: 999 });
   });
+
+  function fieldLabelsInSection(container: HTMLElement, sectionTitle: string): string[] {
+    const section = Array.from(container.querySelectorAll("section.inspectorSection")).find(
+      (element) => element.querySelector(".inspectorSection__title")?.textContent === sectionTitle,
+    );
+    if (!section) throw new Error(`Section not found: ${sectionTitle}`);
+    return Array.from(section.querySelectorAll("label.field > span:first-child"))
+      .map((span) => span.textContent?.trim() ?? "");
+  }
+
+  function fieldControlsPresentInSection(container: HTMLElement, sectionTitle: string): boolean[] {
+    const section = Array.from(container.querySelectorAll("section.inspectorSection")).find(
+      (element) => element.querySelector(".inspectorSection__title")?.textContent === sectionTitle,
+    );
+    if (!section) throw new Error(`Section not found: ${sectionTitle}`);
+    return Array.from(section.querySelectorAll("label.field"))
+      .map((label) => !!label.querySelector("input,select,textarea"));
+  }
+
+  it("renders run_agent pane-config fields in specification order", () => {
+    const runAgentNode: WorkflowNode = {
+      id: "reviewer",
+      name: "Reviewer",
+      kind: {
+        type: "run_agent",
+        runAgentConfig: {
+          agent: "claude",
+          killAfter: true,
+        },
+      },
+      agent: "",
+      prompt: "",
+      contextSources: [],
+      responseFormat: null,
+    };
+
+    const { container: runAgentContainer } = renderInspector(workflow({
+      entryNodeId: runAgentNode.id,
+      nodes: [runAgentNode],
+    }), runAgentNode.id);
+
+    expect(fieldLabelsInSection(runAgentContainer, "Agent run")).toEqual([
+      "Pane name",
+      "Access",
+      "Working directory",
+      "Timeout (s)",
+      "Idle seconds",
+      "Ready-stable (s)",
+      "Until marker",
+      "Extra args",
+      "Kill pane after",
+    ]);
+    expect(fieldControlsPresentInSection(runAgentContainer, "Agent run").every(Boolean)).toBe(true);
+  });
+
+  it("renders spawn pane-config fields in specification order", () => {
+    const spawnNode: WorkflowNode = {
+      id: "worker",
+      name: "Worker",
+      kind: {
+        type: "spawn",
+        spawnConfig: {
+          agent: "claude",
+        },
+      },
+      agent: null,
+      prompt: "",
+      contextSources: [],
+      responseFormat: null,
+    };
+
+    const { container: spawnContainer } = renderInspector(workflow({
+      entryNodeId: spawnNode.id,
+      nodes: [spawnNode],
+    }), spawnNode.id);
+
+    expect(fieldLabelsInSection(spawnContainer, "Spawn")).toEqual([
+      "Agent",
+      "Command",
+      "Pane name",
+      "Session name",
+      "Access",
+      "Working directory",
+      "Extra args",
+    ]);
+    expect(fieldControlsPresentInSection(spawnContainer, "Spawn").every(Boolean)).toBe(true);
+  });
 });

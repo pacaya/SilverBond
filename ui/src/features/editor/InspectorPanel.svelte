@@ -36,6 +36,10 @@
   import AddSectionMenu from "./AddSectionMenu.svelte";
   import ConditionBuilder from "./ConditionBuilder.svelte";
   import SchemaPresets from "./SchemaPresets.svelte";
+  import PaneNameField from "./PaneNameField.svelte";
+  import AccessProfileField from "./AccessProfileField.svelte";
+  import WorkingDirectoryField from "./WorkingDirectoryField.svelte";
+  import ExtraArgsField from "./ExtraArgsField.svelte";
 
   let {
     workflow,
@@ -782,34 +786,20 @@
           <section class="inspectorSection">
             <div class="inspectorSection__title">Agent run</div>
             <small class="helperText">Spawns the agent in a PTY pane, waits for completion, then captures output.</small>
-            <label class="field">
-              <span>Pane name</span>
-              <input
-                value={rc.name ?? ""}
-                placeholder="auto"
-                onblur={(e) => updateRunAgent("name", (e.target as HTMLInputElement).value || undefined)}
-              />
-            </label>
-            <label class="field">
-              <span>Access</span>
-              <select
-                value={rc.access ?? ""}
-                onchange={(e) => updateRunAgent("access", (e.target as HTMLSelectElement).value || undefined)}
-              >
-                <option value="">registry default</option>
-                {#each selectedAgentAccessProfiles ?? [] as profile (profile)}
-                  <option value={profile}>{profile}</option>
-                {/each}
-              </select>
-            </label>
-            <label class="field">
-              <span>Working directory</span>
-              <input
-                value={rc.cwd ?? ""}
-                placeholder={activeWorkflow.cwd || "inherit workflow cwd"}
-                onblur={(e) => updateRunAgent("cwd", (e.target as HTMLInputElement).value || undefined)}
-              />
-            </label>
+            <PaneNameField
+              value={rc.name}
+              onchange={(value) => updateRunAgent("name", value)}
+            />
+            <AccessProfileField
+              value={rc.access}
+              profiles={selectedAgentAccessProfiles}
+              onchange={(value) => updateRunAgent("access", value)}
+            />
+            <WorkingDirectoryField
+              value={rc.cwd}
+              placeholder={activeWorkflow.cwd || "inherit workflow cwd"}
+              onchange={(value) => updateRunAgent("cwd", value)}
+            />
             <label class="field field--split">
               <span>Timeout (s)</span>
               <input
@@ -849,18 +839,10 @@
                 onblur={(e) => updateRunAgent("until", (e.target as HTMLInputElement).value || undefined)}
               />
             </label>
-            <label class="field">
-              <span>Extra args</span>
-              <textarea
-                value={(rc.extraArgs ?? []).join("\n")}
-                placeholder={"--flag\nvalue"}
-                onblur={(e) => {
-                  const args = (e.target as HTMLTextAreaElement).value.split("\n").map((s) => s.trim()).filter(Boolean);
-                  updateRunAgent("extraArgs", args.length ? args : undefined);
-                }}
-                class="field--shortTextarea"
-              ></textarea>
-            </label>
+            <ExtraArgsField
+              value={rc.extraArgs}
+              onchange={(value) => updateRunAgent("extraArgs", value)}
+            />
             <label class="field toggle-field">
               <span>Kill pane after</span>
               <input
@@ -944,17 +926,14 @@
             )}
 
             <!-- Per-node working directory -->
-            <label class="field">
-              <span>Working directory</span>
-              <input
-                value={selectedNode.cwd ?? ""}
-                placeholder={activeWorkflow.cwd || "inherit workflow cwd"}
-                onblur={(e) => store.updateWorkflow((wf) => {
-                  const n = wf.nodes.find((n) => n.id === selectedNode!.id);
-                  if (n) n.cwd = (e.target as HTMLInputElement).value || null;
-                })}
-              />
-            </label>
+            <WorkingDirectoryField
+              value={selectedNode.cwd}
+              placeholder={activeWorkflow.cwd || "inherit workflow cwd"}
+              onchange={(value) => store.updateWorkflow((wf) => {
+                const n = wf.nodes.find((n) => n.id === selectedNode!.id);
+                if (n) n.cwd = value || null;
+              })}
+            />
 
             <!-- Continue session from (session reuse) -->
             {#if agentCaps?.sessionReuse}
@@ -1299,14 +1278,10 @@
               onblur={(e) => updateSpawn("command", (e.target as HTMLInputElement).value || undefined)}
             />
           </label>
-          <label class="field">
-            <span>Pane name</span>
-            <input
-              value={sc.name ?? ""}
-              placeholder="auto"
-              onblur={(e) => updateSpawn("name", (e.target as HTMLInputElement).value || undefined)}
-            />
-          </label>
+          <PaneNameField
+            value={sc.name}
+            onchange={(value) => updateSpawn("name", value)}
+          />
           <label class="field">
             <span>Session name</span>
             <input
@@ -1315,38 +1290,20 @@
               onblur={(e) => updateSpawn("sessionName", (e.target as HTMLInputElement).value || undefined)}
             />
           </label>
-          <label class="field">
-            <span>Access</span>
-            <select
-              value={sc.access ?? ""}
-              onchange={(e) => updateSpawn("access", (e.target as HTMLSelectElement).value || undefined)}
-            >
-              <option value="">registry default</option>
-              {#each selectedAgentAccessProfiles ?? [] as profile (profile)}
-                <option value={profile}>{profile}</option>
-              {/each}
-            </select>
-          </label>
-          <label class="field">
-            <span>Working directory</span>
-            <input
-              value={sc.cwd ?? ""}
-              placeholder={activeWorkflow.cwd || "inherit workflow cwd"}
-              onblur={(e) => updateSpawn("cwd", (e.target as HTMLInputElement).value || undefined)}
-            />
-          </label>
-          <label class="field">
-            <span>Extra args</span>
-            <textarea
-              value={(sc.extraArgs ?? []).join("\n")}
-              placeholder={"--flag\nvalue"}
-              onblur={(e) => {
-                const args = (e.target as HTMLTextAreaElement).value.split("\n").map((s) => s.trim()).filter(Boolean);
-                updateSpawn("extraArgs", args.length ? args : undefined);
-              }}
-              class="field--shortTextarea"
-            ></textarea>
-          </label>
+          <AccessProfileField
+            value={sc.access}
+            profiles={selectedAgentAccessProfiles}
+            onchange={(value) => updateSpawn("access", value)}
+          />
+          <WorkingDirectoryField
+            value={sc.cwd}
+            placeholder={activeWorkflow.cwd || "inherit workflow cwd"}
+            onchange={(value) => updateSpawn("cwd", value)}
+          />
+          <ExtraArgsField
+            value={sc.extraArgs}
+            onchange={(value) => updateSpawn("extraArgs", value)}
+          />
         </section>
 
       {:else if selectedNode.kind.type === "send"}
