@@ -2,8 +2,10 @@
 id: ISSUE-260808-2022-11
 kind: issue
 category: enhancement
-status: ready-for-agent
+status: ready-for-human
 summary: Extract the workflow-level inspector, promote the shared agent-config fields, and move the workflow-level access-mode effect
+claimed_by: implement-issue@macmini.home
+claimed_at: 2026-08-09T13:44:31Z
 ---
 
 ## Agent Brief
@@ -89,6 +91,45 @@ Stated precisely, since earlier drafts overreached: that chain fixes the *order*
 - Closing any smells-ledger row. The `InspectorPanel.svelte:1` Divergent Change row closes on the kind-panels issue once every axis has been separated.
 - Any change to agent-defaults semantics, run-as semantics, or access-mode reconciliation behavior.
 - Any visual, styling, copy, or layout change.
+
+## Context Pack — generated at claim (2026-08-09T13:44:31Z)
+
+**PRD decisions relevant to this slice:** no PRD linked — this record carries no `prd:` frontmatter and the repo has no `docs/prd/` or `docs/decisions/prd/` tree. The binding decisions below are the maintainer decisions carried verbatim in `## Triage Notes`:
+- Promote the shared `agentConfigFields` snippet to a component (2026-08-08) — passing it down as a prop or deferring is rejected; only promotion removes the duplication instead of relocating it.
+- Move the workflow-level access-mode effect together with its trigger state, writer, and reset (2026-08-08) — taken after the gate falsified the claim that the `run_agent` arm shares both access-mode effects; it shares one.
+- Ownership of the `mergeConfig` lift belongs to this record (gate round 1/2 resolution), because the run-as helpers cannot move without it; `ISSUE-260723-0823-1` was reopened and states the module already exists at its baseline. Export name must literally be `mergeConfig` — that sibling pre-flight-checks the name; declaration form is free.
+- The kind-panels record (`ISSUE-260723-0823-1`) later extends the same module with per-kind accessors/defaults and owns the `InspectorPanel.svelte:1` Divergent Change ledger row; close no row here.
+- The access-modes module must live within `ui/src/features/editor/` — the delegation is bounded to match its directory-scoped criterion.
+
+**Test seam & Testing Decisions:** observable at `ui/src/features/editor/InspectorPanel.test.ts`, run via `npx vitest run --config ui/vite.config.ts ui/src/features/editor/InspectorPanel.test.ts`; every baseline case must still pass with assertions unmodified (new cases allowed, none relaxed), plus `just typecheck` with no new errors. Testing decisions that touch that seam:
+- The reset-guard test must drive the selection-clearing transition by **calling the store directly with nothing selected** — the only shape guaranteed to hold the branch mounted; UI routes such as drill-in unmount and remount it, so a UI-driven fixture guards nothing. The existing suite already uses this pattern and carries a comment saying why.
+- The new test must land in `InspectorPanel.test.ts` so the file-scoped preservation runner executes it.
+- The single-access-mode reconciliation case (grep `unrestricted` in that file) is where a broken reconciliation surfaces first — run it early; it is guidance, not a separate criterion.
+- Accepted-risk (recorded non-blocking at round 6): rendered-output preservation for the Workflow fields and the Variables section rests on review, not on any mechanical guard. The branch's own header markup is likewise unasserted.
+- The harness sets a workflow before mounting, so no existing case would observe the active-workflow fallback being dropped — treat that fallback as unguarded.
+
+**ADRs:** no ADR index in this repo — no `docs/adr/INDEX.md` and no `docs/model/generated/`; the only decision doc is unrelated (`docs/decisions/tmux-bin-resolution.md`). Tier skipped.
+
+**Terms:** no glossary — this record carries no `terms:` frontmatter and there is no `CONTEXT.md` at the repo root or under a context root. Tier skipped.
+
+**Full artifacts:** docs/issues/ISSUE-260808-2022-11-extract-workflow-inspector.md (Agent Brief + Triage Notes) · sibling records `ISSUE-260723-0823-1`, `ISSUE-260808-2022-04` under docs/issues/ · CLAUDE.md
+
+## Code Review
+
+Review file: `issue-260808-2022-11-code-review-20260809-141744.md`
+
+Dual review (Claude + Codex, cross-verified, adjudicated inline). Codex returned zero findings and zero smells; all five findings originated with the Claude reviewer, which also audited Codex's ten clean claims in reverse and could falsify none. No CRITICAL, HIGH, or MEDIUM findings.
+
+- L1 (LOW): Expanded-agent panel state no longer survives a branch flip that leaves `store.selection` untouched — deferred
+- L2 (LOW): The load-bearing reset effect lost its explanatory comment during the move — FIXED
+- L3 (LOW): New test's explanatory comment states an over-general rationale — FIXED
+- L4 (LOW): Constant lookup maps are rebuilt per component instance — FIXED
+- L5 (LOW): Unchecking Web search replaces the whole `toolToggles` object instead of clearing one key — deferred
+- L6 (LOW): The new reset-effect comment names a transition that does not exist and omits one that does — FIXED
+
+**ACCEPTED** after 2 fix rounds of a 4-round cap; every finding terminal (4 FIXED, 2 deferred). Round 1 fixed L2/L3/L4, both reviewers verifying. Its re-verify surfaced L6 **inside the comment L2's fix had just written**, so the same-site escalation rule applies: L2 and L6 are one defect, and round 2 redesigns the region to remove the mechanism (a hand-maintained enumeration of store transitions in a comment, duplicating knowledge the store's seven `selection = { kind: "workflow", id: null }` sites own) rather than correcting the list.
+
+Smells: 5 advisory (all LOW, none promoted — the one Duplication smell's second site is pre-existing code outside the issue diff, so the in-diff promotion rule does not fire). All five appended as new ledger rows; no graduation rows emitted.
 
 ## Triage Notes
 
@@ -252,3 +293,15 @@ Every gap `fine` or an explicit delegation; class 6 does not fire on either pron
 - The merge-helper module's location is bounded only by its criterion's directory scope, where the access-modes bullet states the bound in prose. Asymmetric but unambiguous.
 - The snippet also reaches two access-mode label constants the brief does not name; both are snippet-exclusive, so they travel and the compiler forces it.
 - The cross-record claim about the sibling's criteria is true against that record's current ungated text, which may legitimately change before its own gate. Not fixable from this side.
+
+### Parked by `/implement-issue` — full suite unrunnable in this environment (2026-08-09)
+
+**Status: `ready-for-human`. The work is complete and reviewed; only the suite gate is unsatisfiable here.** Code parked on **`wip/ISSUE-260808-2022-11`** (commit `58d02ee`). Review file: `issue-260808-2022-11-code-review-20260809-141744.md`.
+
+**What blocks:** `test-runner` returned `SUITE: ERROR`. `just test` (= `cargo test && npm test`) aborts at the Rust half with `sh: cargo: command not found` (exit 127). No Rust toolchain exists in this environment — `which -a cargo rustc rustup` finds nothing, and `~/.cargo/bin` holds only `cargo-nextest`, `claude-history`, and `tmux-tools`. This is a standing environment gap, not a transient error and not a code failure: **zero Rust tests executed**, so nothing can be attributed to this diff, and the same `SUITE: ERROR` was equally true at claim time. `SUITE: ERROR` routes to fallout by rule — infrastructure is never judged against the diff — so this record parks rather than closing, even though the failure cannot implicate the work.
+
+**What was attempted, and how far it got.** Claim-time tripwire clean (`SCALE: PASS`, `CONSTRAINTS: CLEAN`). Route `cursor` for the implementation and both fix rounds. Every acceptance criterion was verified satisfied by both reviewers independently, including the two that most needed it: the reset guard was confirmed to **go red** by deletion probe (effect removed → 14/15, restored → 15/15), and the active-workflow fallback — the record's flagged most-easily-missed dependency — was confirmed preserved at `WorkflowInspector.svelte:21`. Dual review found 6 findings, all LOW, no CRITICAL/HIGH/MEDIUM: 4 FIXED across 2 fix rounds of a 4-round cap, 2 deferred with reasons. `InspectorPanel.test.ts` 15/15; full UI unit suite 112/112 across 10 files; `just typecheck` 597 files / 0 errors / 0 warnings. **The entire half of the suite that this frontend-only diff could affect ran and matches baseline exactly.**
+
+**Two things the resumer needs to know.** First, the parked branch's `public/` bundle was deliberately **not** rebuilt — the park commits implementation files only, so `just build` must run and `public/` be staged before any real commit (this clone has no active hook to enforce it: `core.hooksPath` is unset and `.git/hooks/` holds only samples, so `just setup` has not been run here). Second, `L1` and `L5` are deferred, not dismissed; `L1` records genuine accepted behavior drift on an undo/redo path, and the round-6 gate had already noted this record lacks the explicit accepted-risk paragraph its sibling carries — `L1` is that exposure made concrete.
+
+**Maintainer decision needed (this is why it is `ready-for-human`, not retried).** Either install a Rust toolchain and re-dispatch, after which this should close immediately with no code change, or decide that a frontend-only slice's gate is the UI suite plus typecheck and amend the loop's suite step accordingly. The second is a policy question about the project's gate that `/implement-issue` cannot settle on its own. Until it is settled, **every** issue in this repo will park on the same `SUITE: ERROR`, so this is a loop-level condition rather than a fact about this record.

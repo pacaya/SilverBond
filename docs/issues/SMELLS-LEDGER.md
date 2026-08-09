@@ -73,3 +73,8 @@ One row per unique key (`file:line` + smell name). Columns:
 | `ui/src/features/editor/PaneNameField.svelte:7` + Mysterious Name | 1 | 2026-08-09 | open |
 | `ui/src/features/editor/AccessProfileField.svelte:20` + Speculative Generality | 1 | 2026-08-09 | open |
 | `ui/src/features/editor/EdgeInspector.svelte:14` + Middle Man | 1 | 2026-08-09 | open |
+| `ui/src/features/editor/mergeConfig.ts:2` + Primitive Obsession | 1 | 2026-08-09 | open |
+| `ui/src/features/editor/InspectorPanel.svelte:669` + Primitive Obsession | 1 | 2026-08-09 | open |
+| `ui/src/features/editor/InspectorPanel.test.ts:363` + Duplicated Code | 1 | 2026-08-09 | open |
+| `ui/src/features/editor/WorkflowInspector.svelte:17` + Speculative Generality | 1 | 2026-08-09 | open |
+| `ui/src/features/editor/AgentConfigFields.svelte:20` + Data Clumps | 1 | 2026-08-09 | open |
