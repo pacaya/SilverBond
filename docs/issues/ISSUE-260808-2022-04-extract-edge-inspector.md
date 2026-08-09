@@ -2,8 +2,10 @@
 id: ISSUE-260808-2022-04
 kind: issue
 category: enhancement
-status: ready-for-agent
+status: ready-for-human
 summary: Extract the edge inspector out of InspectorPanel into its own sibling component
+claimed_by: implement-issue@macmini
+claimed_at: 2026-08-09T12:43:25Z
 ---
 
 ## Agent Brief
@@ -54,6 +56,25 @@ One branch moves into one component. The criteria are views of that single move 
 - Broadening the test harness beyond what the edge-render criterion needs.
 - Closing any smells-ledger row. The `InspectorPanel.svelte:1` Divergent Change row is a whole-component judgment and closes on `ISSUE-260723-0823-1` once every axis has been separated; this issue closes no row on its own.
 - Any visual, styling, copy, or layout change.
+
+## Context Pack — generated at claim (2026-08-09T12:43:25Z)
+
+**PRD decisions relevant to this slice**: no PRD linked — the record carries no `prd:` frontmatter and the repo has no `docs/prd/` or `docs/decisions/prd/` tree; slice-governing decisions live in the Agent Brief and Triage Notes only.
+
+- Coverage exclusion reversed (maintainer, 2026-08-09): `ISSUE-260723-0823-1` excluded the edge inspector by name from targeted coverage; that exclusion does not hold for this standalone record, so an edge-render test is a required criterion.
+- The extraction is behavior-preserving: no edge semantics, validation, condition-builder, or outcome-vocabulary change — including the hardcoded outcome fallback, preserved as-is rather than corrected.
+- The delete control keeps its label verbatim; copy, styling, and layout changes are out of scope.
+- Store access is via the module singleton import, not Svelte context, so the standalone-mount test pattern keeps working.
+- This record closes no smells-ledger row; the `InspectorPanel.svelte:1` Divergent Change row is owned by `ISSUE-260723-0823-1`.
+- Scoped styles and parent-side dead code are derived by the brief's commands, never assumed in advance.
+
+**Test seam & Testing Decisions:** observable at `ui/src/features/editor/InspectorPanel.test.ts` via the existing standalone-mount harness, which drives the workflow store singleton directly (`selectEdge`) and accepts an edges patch on the fixture; the new case must build a workflow with an edge, select it, assert Outcome/Label/Branch id/Condition all render, and assert an outcome edit persists. Testing decisions that touch it: the test must land in that exact file because the preservation runner (`npx vitest run --config ui/vite.config.ts ui/src/features/editor/InspectorPanel.test.ts`) is file-scoped; every baseline case must still pass with assertions unmodified — new cases may be added, existing ones may not be relaxed; harness broadening beyond what the edge-render criterion needs is out of scope; the guard is a characterization net (it passes against the un-extracted branch), so the four-labels completeness criterion is what proves the extraction. Second preservation gate: `just typecheck` reports no new errors — note unused locals are not an error here, so it will not flag stranded parent code.
+
+**ADRs:** no ADR index reachable — the record carries no `adrs:` frontmatter, and the repo has neither `docs/adr/INDEX.md` nor `docs/model/generated/` (the only decision doc, `docs/decisions/tmux-bin-resolution.md`, is unrelated to this slice).
+
+**Terms:** no glossary reachable — the record carries no `terms:` frontmatter and no `CONTEXT.md` exists at the repo root or under any context root.
+
+**Full artifacts:** docs/issues/ISSUE-260808-2022-04-extract-edge-inspector.md · CLAUDE.md
 
 ## Triage Notes
 
@@ -143,3 +164,37 @@ Two verifications worth recording because they were done independently rather th
 - The round-3 note describing the sibling correction as made "verbatim as it stood there" is ambiguous: the two style bullets are not textually identical, and the sentence is true only under the reading that each was corrected in its own wording. Journal-only.
 
 **Disclosure — journal structure repaired before this stamp.** The round-3 stamp had been inserted into the middle of `### Gate round 2 resolved`, which orphaned that section's second paragraph under the round-3 heading and misattributed round-2 remediation to round 3; the reader caught it. The paragraph was moved back under its own heading before this stamp was written. No wording changed, no paragraph was added or removed, and no text in `## Agent Brief` was touched — the repair is paragraph placement within the journal only. Recorded here rather than left silent, since a stamp certifies the text it covers.
+
+### Parked by `/implement-issue` — full-suite gate could not run (2026-08-09)
+
+**Status: `ready-for-human`. The implementation is complete and reviewed; the blocker is environmental, not the work.**
+
+**What was attempted.** Claimed at 2026-08-09T12:43:25Z after a clean claim-time tripwire (`SCALE: PASS`, `CONSTRAINTS: CLEAN`). Routed to `cursor`, implemented as a linear (non-TDD) pure refactor. Dual review (Claude + Codex) cross-verified and adjudicated inline produced 9 findings; 7 were fixed across 2 fix rounds (cap 4) and 2 were dismissed on the brief's own contract. Round 2 closed with no new findings from either reviewer. Every acceptance criterion was independently confirmed satisfied by both reviewers.
+
+**What blocks.** Step 6's full suite returned `SUITE: ERROR`. This project's full suite is `just test` = `cargo test && npm test`, and **no Rust toolchain exists on this machine** — `cargo`, `rustc`, and `rustup` are all absent from `PATH`, and `~/.cargo/bin` contains only unrelated binaries (`cargo-nextest`, `claude-history`, `tmux-tools`). The Rust half aborted at `cargo: command not found` (exit 127). An infrastructure error is never judged against the diff, so this parks rather than closes — even though the diff is entirely frontend and the frontend half ran fully green (10 files / 113 tests, including all 16 `InspectorPanel.test.ts` cases). `just typecheck` and `just build` both succeed.
+
+**Maintainer decision needed.** This is not specific to this issue: no issue in this repo can pass the full-suite gate on this machine. Either provision the Rust toolchain, or decide whether frontend-only slices may gate on `just test-ui` + `just typecheck` alone. Re-running `cargo test` on a machine with Rust is the only outstanding step before this can close.
+
+**Where the work is.** Parked on branch `wip/ISSUE-260808-2022-04` (commit `8f8cb90`), which carries the six implementation files: the new `EdgeInspector.svelte`, the reworked `InspectorPanel.svelte` and `InspectorPanel.test.ts`, and the rebuilt `public/` bundle (`just build` output, verified byte-identical to a fresh build by both reviewers, so the frontend-freshness pre-commit hook is satisfied). The working branch was left clean of implementation changes.
+
+**Review artifact.** Full findings, evidence, and fix notes in `issue-260808-2022-04-code-review-20260809-130831.md`.
+
+**One thing worth a human's eye regardless of the toolchain question.** The review's HIGH finding (H1) was a genuine behavior regression the extraction introduced — the parent's branch predicate was weakened from an edge-existence check to a selection-kind check, so undoing an edge-add left the inspector blank instead of falling back to the workflow inspector. It was caught empirically (baseline-vs-worktree render comparison), fixed, and pinned by a new regression test that was itself proven red against reconstructed broken semantics. That test is the main durable addition beyond the extraction.
+
+## Code Review
+
+Dual review (Claude + Codex, cross-verified, adjudicated inline) — full evidence in `issue-260808-2022-04-code-review-20260809-130831.md`.
+
+- H1 (HIGH): Stale edge selection renders a blank inspector instead of the workflow inspector — FIXED
+- M1 (MEDIUM): Embedded frontend bundle under `public/` not rebuilt — FIXED
+- M2 (MEDIUM): Condition assertion checks only the label text, not that the condition editor rendered — FIXED
+- M3 (MEDIUM): Edge-selected predicate decided twice, in two components — FIXED
+- M4 (MEDIUM): Four handlers repeat the same update-workflow / locate-edge / mutate sequence — FIXED
+- L1 (LOW): Persistence assertion indexes `edges[0]` instead of finding the edge by id — FIXED
+- L4 (LOW): Fix round 1 reintroduced a stranded `WorkflowEdge` type import in the parent — FIXED
+- L2 (LOW): Delete button, header, and control order unasserted — dismissed
+- L3 (LOW): Active-document resolution runs twice per render pass — dismissed
+
+L4 was raised during round-1 fix verification and orchestrator-verified before entering the file. Two fix rounds used of a cap of 4; round 2 closed with no new findings from either reviewer.
+
+Smells: 3 reported, 2 promoted into the findings track as M3/M4 under the in-diff duplication rule, 1 advisory (`EdgeInspector.svelte:14` Middle Man, borderline) merged into the ledger. No ledger row closed by this issue, per Out of scope.
