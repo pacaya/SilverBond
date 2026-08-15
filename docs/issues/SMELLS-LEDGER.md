@@ -82,3 +82,8 @@ One row per unique key (`file:line` + smell name). Columns:
 | `ui/src/features/editor/mergeConfig.ts:72` + Divergent Change | 1 | 2026-08-15 | open |
 | `ui/src/features/editor/mergeConfig.ts:175` + Divergent Change | 1 | 2026-08-15 | open |
 | `ui/src/features/editor/mergeConfig.ts:190` + Primitive Obsession | 1 | 2026-08-15 | open |
+| `ui/src/features/editor/mergeConfig.ts:1` + Divergent Change | 1 | 2026-08-15 | open |
+| `ui/src/features/editor/AgentConfigFields.svelte:56` + Mysterious Name | 1 | 2026-08-15 | open |
+| `ui/src/features/editor/AgentConfigFields.svelte:48` + Duplicated Code | 1 | 2026-08-15 | open |
+| `ui/src/features/editor/AgentConfigFields.svelte:58` + Primitive Obsession | 1 | 2026-08-15 | open |
+| `ui/src/lib/utils/sectionUtils.ts:42` + Shotgun Surgery | 1 | 2026-08-15 | open |

@@ -21,7 +21,9 @@
     AgentCapabilities,
     AgentDefaults,
     ReasoningLevel,
+    ToolToggles,
   } from "@/lib/types/workflow";
+  import { mergeConfig } from "./mergeConfig";
   import { supportedAccessModes } from "./supportedAccessModes";
 
   let {
@@ -43,6 +45,19 @@
   const effectiveMode = $derived(
     availableModes.includes(currentMode) ? currentMode : availableModes[0],
   );
+  const webSearchSelectValue = $derived(
+    values.toolToggles?.webSearch === true
+      ? "true"
+      : values.toolToggles?.webSearch === false
+        ? "false"
+        : "",
+  );
+
+  function updateWebSearch(val: "" | "true" | "false") {
+    const webSearchValue = val === "true" ? true : val === "false" ? false : undefined;
+    const merged = mergeConfig({} as ToolToggles, values.toolToggles, "webSearch", webSearchValue);
+    update("toolToggles", Object.keys(merged).length === 0 ? undefined : merged);
+  }
 </script>
 
 <label class="field">
@@ -141,16 +156,18 @@
 {/if}
 
 {#if caps.webSearch}
-  <label class="field toggle-field">
+  <label class="field">
     <span>Web search</span>
-    <input
-      type="checkbox"
-      class="toggle"
-      checked={values.toolToggles?.webSearch ?? false}
+    <select
+      value={webSearchSelectValue}
       onchange={(e) => {
-        const checked = (e.target as HTMLInputElement).checked;
-        update("toolToggles", checked ? { webSearch: true } : undefined);
+        const val = (e.target as HTMLSelectElement).value as "" | "true" | "false";
+        updateWebSearch(val);
       }}
-    />
+    >
+      <option value="">agent default</option>
+      <option value="true">on</option>
+      <option value="false">off</option>
+    </select>
   </label>
 {/if}

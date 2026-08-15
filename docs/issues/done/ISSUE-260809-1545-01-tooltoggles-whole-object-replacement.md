@@ -2,8 +2,10 @@
 id: ISSUE-260809-1545-01
 kind: issue
 category: bug
-status: ready-for-agent
+status: done
 summary: Web search control cannot express the tri-state webSearch field — it destroys an explicit "off" and replaces the whole toolToggles object on every write
+claimed_by: implement-issue@Mac-mini-4
+claimed_at: 2026-08-15T18:00:46Z
 ---
 
 ## Agent Brief
@@ -78,6 +80,26 @@ The acceptance behavior is observable at two seams, both under `just test-ui`:
 - **Every other field in the shared component** — access mode, model, reasoning level, system prompt, max turns, max budget. Their behavior is unchanged.
 - **The `runAs` editing path.** It already merges correctly and is referenced here only as the precedent to follow.
 - **Adding a second key to `ToolToggles`,** or any change to the workflow schema or its version.
+
+## Context Pack — generated at claim (2026-08-15T18:00:46Z)
+
+**PRD decisions relevant to this slice:** no PRD linked (record carries no `prd:` frontmatter; no `docs/prd/` or `docs/decisions/prd/` in this repo).
+
+**Test seam & Testing Decisions:** observable under `just test-ui` at two seams named by the brief — (1) the shared agent-config fields component rendered directly with props (capabilities, values, spy `update`), asserting the emitted `(key, value)` pair; (2) the exported section-visibility predicate as a pure function of node + section id. No PRD Testing Decisions available (no PRD linked).
+
+**ADRs:** no `adrs:` frontmatter on this record; nothing selected from `docs/adr/INDEX.md`.
+
+**Terms:** no `terms:` frontmatter; no repo-root `CONTEXT.md` glossary present.
+
+**Slice-relevant decisions carried from the record's own triage (not from a PRD):**
+- Three-state control (inherit / on / off) over `toolToggles.webSearch`, mirroring the existing reasoning-level select whose empty option means inherit; the reviewers' `checked || undefined` fix was rejected as not reaching force-off.
+- Writes merge into the stored `toolToggles` via the existing shared merge helper (the `runAs` precedent), and collapse to `undefined` when no key is set; callers already prune the emptied parent.
+- One control in the shared component, serving both hosts (node agent-tuning form and workflow agent-defaults form).
+- The exported section-visibility predicate switches from a truthiness test to a presence test so `webSearch: false` counts as configured.
+- Out of scope: any backend/driver change (tri-state already implemented server-side), the Claude/Codex driver asymmetry, per-level inherit labelling, other fields of the shared component, the `runAs` path, and any `ToolToggles`/schema shape change.
+- Brief is immutable from the round-2 readiness-gate PASS stamp.
+
+**Full artifacts:** docs/issues/ISSUE-260809-1545-01-tooltoggles-whole-object-replacement.md · docs/adr/INDEX.md (no entries selected) · docs/issues/code-reviews/issue-260808-2022-11-code-review-20260809-141744.md
 
 ## Triage Notes
 
@@ -219,3 +241,53 @@ universal quantifier; and the Triage-Notes sweep regex under-covers helper-media
 writes, though its conclusion was independently confirmed by a different route.
 
 The brief is immutable from this stamp.
+
+## Code Review
+
+Dual review (Claude + Codex, cross-verified, adjudicated inline) — `issue-260809-1545-01-code-review-20260815-182641.md`
+
+- M1 (MEDIUM): Collapse-to-undefined path is never exercised from a populated toolToggles — FIXED (round 1)
+- M2 (MEDIUM): Tautological distinct-state assertion that exercises no code — FIXED (round 1)
+- L1 (LOW): Section-predicate test has a single positive assertion and no negative control — FIXED (round 1)
+- L2 (LOW): Presence test now counts an explicit null as configured — dismissed (not reachable frontend state)
+- L3 (LOW): Shared component gains a transitive dependency on the global workflow store — deferred
+- L4 (LOW): Stringly-typed field write with a type assertion that defeats inference — deferred
+
+Smells: 5 advisory (all appended to `docs/issues/SMELLS-LEDGER.md`; Codex reported none). No graduation rows.
+
+## Resolution
+
+**Commit:** `fix: three-state web search control merging into toolToggles (ISSUE-260809-1545-01)`
+
+**Route:** `cursor` (`/cursor-developer`, composer-2.5), both for the implementation and for the single
+fix round. Rationale: a localized frontend change in two Svelte/TS files, with the design decisions
+already settled in the brief (three-state select mirroring the reasoning-level control; reuse the
+existing `mergeConfig` helper) — no cross-module reasoning, no security surface, no ambiguity that
+would justify the codex route.
+
+**TDD:** red-green at the two seams the brief names — the shared agent-config fields component rendered
+directly, and the exported `sectionHasValues` predicate as a pure function.
+
+**Review telemetry:** dual review (Claude + Codex, cross-verified, adjudicated inline) —
+`issue-260809-1545-01-code-review-20260815-182641.md`. 6 findings: 0 CRITICAL, 0 HIGH, 2 MEDIUM,
+4 LOW. Outcomes: 3 FIXED, 2 deferred, 1 dismissed. 1 fix round used of a cap of 4. The two MEDIUM
+findings were mutual (both reviewers independently found the same defect at the same line, then AGREEd
+on each other's write-up); the four Claude-only LOW findings all drew DISAGREE from Codex and were
+adjudicated by reading the code — one kept, one dismissed, two deferred. Both reviewers reproduced the
+round-1 red-proofs themselves via mutation testing rather than trusting the fix agent's claim.
+Advisory smells: 5, all appended to `docs/issues/SMELLS-LEDGER.md` (Codex reported none); no
+in-diff duplication promotions, no graduation rows.
+
+**Note on the deferrals:** L3 (the shared component's new transitive dependency on the workflow store
+via `mergeConfig.ts`) and L4 (the stringly-typed `field: string, value: unknown` signature of the shared
+merge helper) are both real, both LOW, and both fixable only by restructuring the helper the brief
+mandates reusing — which is the `runAs` precedent path this issue places out of scope. They are carried
+in the smells ledger.
+
+**Suite:** `SUITE: PASS` — `just test` + `just typecheck`: Rust 466 passed / 0 failed (4 binaries),
+frontend 129 passed / 0 failed (13 files), svelte-check 0 errors / 0 warnings. Acceptance criterion 9
+(`cargo test` passes) is genuinely green: two reviewers had seen tmux-driven Rust tests fail in their
+sandboxes, and the authoritative run confirms those were sandbox artifacts — `tmux` is available on this
+host and every one of those tests passes.
+
+**Closed:** 2026-08-15 (UTC)

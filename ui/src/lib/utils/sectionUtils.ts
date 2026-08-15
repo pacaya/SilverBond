@@ -40,7 +40,8 @@ export function sectionHasValues(node: WorkflowNode, sectionId: SectionId): bool
   switch (sectionId) {
     case "agent-tuning":
       return !!(cfg.accessMode || cfg.model || cfg.reasoningLevel || cfg.systemPrompt ||
-        cfg.maxTurns || cfg.maxBudgetUsd || cfg.toolToggles?.webSearch || node.cwd || node.continueSessionFrom);
+        cfg.maxTurns || cfg.maxBudgetUsd || cfg.toolToggles?.webSearch !== undefined ||
+        node.cwd || node.continueSessionFrom);
     case "guards-retry":
       return !!(node.timeout || node.retryCount || node.retryDelay);
     case "loop-control":
