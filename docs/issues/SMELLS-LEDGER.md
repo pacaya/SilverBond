@@ -56,7 +56,7 @@ One row per unique key (`file:line` + smell name). Columns:
 | `src/runtime.rs:1-12785` + Divergent Change | 1 | 2026-07-20 | fixed: S2 |
 | `src/model.rs:2061` + Feature Envy | 1 | 2026-07-20 | open |
 | `src/driver.rs:291-305` + Primitive Obsession | 1 | 2026-07-20 | open |
-| `ui/src/features/editor/InspectorPanel.svelte:1` + Divergent Change | 1 | 2026-07-20 | open |
+| `ui/src/features/editor/InspectorPanel.svelte:1` + Divergent Change | 1 | 2026-07-20 | fixed: ISSUE-260723-0823-01 (four axes separated across ISSUE-260808-2000-07, -2022-04, -2022-11 and this record; capability/unlock hoist deliberately out of scope per M25/L20) |
 | `ui/src/features/editor/InspectorPanel.svelte:789` + Duplicated Code | 1 | 2026-07-21 | fixed: ISSUE-260808-2000-07 (one component per control; run_agent/spawn/per-node consumers converted) |
 | `src/model.rs:2247` + Shotgun Surgery | 1 | 2026-07-21 | open |
 | `src/driver.rs:291` + Primitive Obsession | 1 | 2026-07-21 | open |
@@ -78,3 +78,7 @@ One row per unique key (`file:line` + smell name). Columns:
 | `ui/src/features/editor/InspectorPanel.test.ts:363` + Duplicated Code | 1 | 2026-08-09 | open |
 | `ui/src/features/editor/WorkflowInspector.svelte:17` + Speculative Generality | 1 | 2026-08-09 | open |
 | `ui/src/features/editor/AgentConfigFields.svelte:20` + Data Clumps | 1 | 2026-08-09 | open |
+| `ui/src/features/editor/InspectorPanel.svelte:250` + Middle Man | 1 | 2026-08-15 | open |
+| `ui/src/features/editor/mergeConfig.ts:72` + Divergent Change | 1 | 2026-08-15 | open |
+| `ui/src/features/editor/mergeConfig.ts:175` + Divergent Change | 1 | 2026-08-15 | open |
+| `ui/src/features/editor/mergeConfig.ts:190` + Primitive Obsession | 1 | 2026-08-15 | open |

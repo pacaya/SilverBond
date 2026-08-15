@@ -2,9 +2,11 @@
 id: ISSUE-260723-0823-01
 kind: issue
 category: enhancement
-status: ready-for-agent
+status: done
 summary: Decompose InspectorPanel.svelte — extract per-node-kind config panels and inspector siblings
 blocked_by: [ISSUE-260808-2000-07, ISSUE-260808-2022-04, ISSUE-260808-2022-11]
+claimed_by: implement-issue@Mac-mini-4
+claimed_at: 2026-08-15T16:27:52Z
 ---
 
 ## Agent Brief
@@ -80,6 +82,99 @@ This record makes no claim to be atomic with its siblings. The edge inspector, t
 - No backend changes.
 - No visual, styling, copy, or layout changes — the decomposition is behavior-preserving.
 - Not a fix for any open access-profile or privilege finding; those are tracked separately.
+
+## Context Pack — generated at claim (2026-08-15T16:27:52Z)
+
+**PRD decisions relevant to this slice:** no PRD linked — this record carries no `prd:` frontmatter and the repo has no `docs/prd/` or `docs/decisions/prd/`. Governing decisions live in the record's own `## Agent Brief` and the maintainer rulings journaled in its Triage Notes:
+
+- Panels own their writes through the workflow-store singleton; parent-bound update callbacks are rejected (leaves the smell half-cured).
+- Config plumbing (per-kind `DEFAULT_*_CONFIG` constants, pure `node → config` accessors) lifts into the shared importable editor module that `ISSUE-260808-2022-11` already created for `mergeConfig` — extend it, do not create it.
+- In-scope kinds: `decide`, `parallel_batch`, `spawn`, `send`, `wait`, `capture`, `kill`, `subflow`/`call` (one shared panel). `task`/`run_agent` stays inline with its writer and switch case; `approval`/`split`/`collector` stay inline (no typed config, no seam).
+- The inputs-binding snippet is promoted to a shared component consumed (rendered, not merely imported) by both panels that used it.
+- Store access via direct module-singleton import, never Svelte context — context would break the standalone-mount test.
+- Capability interpretation and unlock/password prompting stay in the parent; no hoist to the app shell (M25 dismissed, reaffirmed by L20).
+- Accessor fallback semantics are preserved verbatim; `capture`/`kill` fall back to their default constants (H9 backfill) — highest-risk change in the slice.
+- Behavior-preserving: no schema/default/validation changes, no visual or copy changes, no backend changes; the store-side `defaultKind` divergence stays untouched.
+
+**Test seam & Testing Decisions:** observable at the editor component's unit test file (`ui/src/features/editor/InspectorPanel.test.ts`), run via `npx vitest run --config ui/vite.config.ts`; every baseline case must still pass with assertions unmodified, plus `just typecheck` green before and after. Maintainer decision (2026-08-08, refined 2026-08-09): new coverage is concentrated where risk concentrates rather than demanded per extracted panel — several panels are guarded only by review and typecheck, and where each sibling's tests landed is a baseline question to settle with the record's own enumeration commands, not an assumption. Locate the `configless` cases before touching the `capture`/`kill` accessors.
+
+**ADRs:** no `adrs:` frontmatter on this record. Index neighbors, for orientation only:
+
+- ADR-260809-1601-01 — Adopt the shared record conventions for issues, decisions, and reviews (accepted).
+
+**Terms:** no `terms:` frontmatter, and the repo has no glossary `CONTEXT.md` — tier skipped.
+
+**Full artifacts:** docs/issues/ISSUE-260723-0823-01-decompose-inspectorpanel-node-config.md · docs/adr/INDEX.md · docs/issues/code-reviews/feature-tmux-panes-code-review-20260720-032528.md (S3, S6, H9) · docs/issues/SMELLS-LEDGER.md · sibling records ISSUE-260808-2000-07, ISSUE-260808-2022-04, ISSUE-260808-2022-11
+
+## Code Review
+
+Review file: `issue-260723-0823-01-code-review-20260815-165416.md`
+
+- M1 (MEDIUM): Config plumbing landed in a new module instead of extending the existing shared one — FIXED (round 1)
+- M2 (MEDIUM): `SpawnPanel` re-derives the access-profile list the brief requires the parent to pass down — FIXED (round 1)
+- M3 (MEDIUM): The per-panel writer body is hand-copied into all eight panels (promoted in-diff duplication smell) — FIXED (rounds 1–4, clustered with M4)
+- M4 (MEDIUM): The writer factory erases the compile-time kind→config-field guarantee the baseline writers had — FIXED (round 4)
+- L7 (LOW): Accessors hand-index `kindTypes` while the writer iterates it, so the two can silently disagree — FIXED (round 3)
+- L1 (LOW): The behavior-bearing rationale comment on `numOrUndef` was dropped in the move — FIXED (round 1)
+- L2 (LOW): The `public/` bundle was not rebuilt after the scoped styles moved — FIXED (close step)
+- L3 (LOW): The Divergent Change smells-ledger row is still open — FIXED (close step)
+- L4 (LOW): No coverage was added for the promoted `InputBindingsEditor` — dismissed (pre-accepted by the record)
+- L5 (LOW): Module-level default configs share mutable arrays process-wide — dismissed (no live defect)
+- L6 (LOW): The parent's one-case config switch was replaced by an if-guard — dismissed (criterion satisfied, behavior identical)
+- L8 (LOW): Union-annotated defaults escape the exactness check — deferred (unreachable from any real declaration; recorded so it is not rediscovered as new)
+
+Smells: 4 advisory, merged into `docs/issues/SMELLS-LEDGER.md` (all `appended`, 2026-08-15), re-anchored
+against the final tree. A fifth (Repeated Switches on the accessors) was dropped: the `ConfigTarget` table the
+M4 redesign introduced is that smell's own prescribed fix. Graduation check emitted no rows.
+
+## Resolution
+
+**Commit:** `feat: decompose InspectorPanel into per-node-kind config panels (ISSUE-260723-0823-01)`
+
+**Route:** `cursor` for the implementation and for fix rounds 1, 3 and 4; `codex` for fix round 2. Rationale:
+`route-picker` classified the implementation as well-scoped multi-file component extraction with mechanical
+acceptance criteria and no cross-module or ambiguity signals. Round 2 was routed to Codex as a type-level
+redesign over a discriminated union after a cheaper attempt had already failed; rounds 3 and 4 returned to
+Cursor once the remedy was precisely specified and, in round 4, empirically validated by a reviewer.
+
+**TDD:** `n/a (linear)` — behavior-preserving refactor; no acceptance criterion names a seam for new behavior.
+The suite was the safety net rather than the driver, and new coverage was added by the review loop, not by the
+brief.
+
+**What landed:** the eight in-scope kinds (`decide`, `parallel_batch`, `spawn`, `send`, `wait`, `capture`,
+`kill`, and `subflow`/`call` sharing one panel) each render through a dedicated component under
+`ui/src/features/editor/panels/`; the config plumbing lifted into the existing shared `mergeConfig.ts` rather
+than a new module; the inputs-binding snippet became `InputBindingsEditor.svelte`, rendered by both
+`DecidePanel` and `SubflowPanel`; and `InspectorPanel.svelte` lost 575 lines, retaining only the out-of-scope
+`run_agent` writer. Panels own their writes through the store singleton, so the parent's per-kind switch cases
+are gone.
+
+**Review telemetry:** 12 findings — 0 CRITICAL, 0 HIGH, 4 MEDIUM, 8 LOW. Outcomes: **8 FIXED**, **3
+dismissed**, **1 deferred**. Fix rounds used: **4 of 4** (cap reached, but with every finding terminal).
+Reviewers: Claude + Codex, cross-verified and adjudicated inline; both stayed resident across all four rounds
+and re-verified each one.
+
+Two adjudications shaped the outcome. First, a **promoted in-diff duplication smell** (M3): the per-panel
+writer body was hand-copied into all eight new files, and because every cited site lay inside the diff, the
+promotion rule moved it from advisory into the findings track. Second, **same-site escalation** fired on the
+M3/M4 cluster: round 1's fix produced a finding in the very function it had just written, so round 2 switched
+to redesign mode against explicit checkable properties. That took three more rounds to actually close —
+round 2 shipped an untyped factory, round 3 traded a narrow hole for a wider one by dropping an assignability
+check while adding an exactness check — and the loop only converged because both reviewers kept compiling
+adversarial probes rather than reading the code. Worth recording as precedent: the escalation rule's premise,
+that a redesign can ship its own fresh defects, was borne out twice here.
+
+**Suite:** `SUITE: PASS` on the landing tree — Rust 466 passed / 0 failed; frontend vitest 124 passed across
+11 files (`InspectorPanel.test.ts` unmodified at 17/17, new `mergeConfig.test.ts` at 10); `just typecheck` 0
+errors / 0 warnings with no unused `@ts-expect-error` directives. Two pre-existing cargo dead-code warnings
+are untouched by this work. `public/` was rebuilt with `just build` and staged, since the relocated
+`.contractBox*` rules changed their Svelte scope hash.
+
+**Ledger:** the `ui/src/features/editor/InspectorPanel.svelte:1` + Divergent Change row is closed against this
+issue, its four-axis precondition satisfied by the three `blocked_by` siblings having landed first. Four new
+advisory smells were appended.
+
+**Date:** 2026-08-15 (UTC).
 
 ## Triage Notes
 

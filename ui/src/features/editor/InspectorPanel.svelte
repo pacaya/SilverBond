@@ -4,20 +4,11 @@
   import type {
     AgentCapabilities,
     AgentNodeConfig,
-    BatchConfig,
-    CaptureConfig,
     ContextSource,
-    DecideConfig,
-    InputBinding,
-    KillConfig,
     RunAgentConfig,
     RuntimeCapabilities,
-    SendConfig,
     SplitFailurePolicy,
-    SpawnConfig,
-    SubflowConfig,
     ValidationResponse,
-    WaitConfig,
     WorkflowDocument,
     WorkflowNode,
   } from "@/lib/types/workflow";
@@ -38,7 +29,15 @@
   import ExtraArgsField from "./ExtraArgsField.svelte";
   import AgentConfigFields from "./AgentConfigFields.svelte";
   import WorkflowInspector from "./WorkflowInspector.svelte";
-  import { mergeConfig } from "./mergeConfig";
+  import DecidePanel from "./panels/DecidePanel.svelte";
+  import ParallelBatchPanel from "./panels/ParallelBatchPanel.svelte";
+  import SpawnPanel from "./panels/SpawnPanel.svelte";
+  import SendPanel from "./panels/SendPanel.svelte";
+  import WaitPanel from "./panels/WaitPanel.svelte";
+  import CapturePanel from "./panels/CapturePanel.svelte";
+  import KillPanel from "./panels/KillPanel.svelte";
+  import SubflowPanel from "./panels/SubflowPanel.svelte";
+  import { mergeConfig, numOrUndef, spawnConfig } from "./mergeConfig";
   import { supportedAccessModes } from "./supportedAccessModes";
 
   let {
@@ -170,20 +169,6 @@
   );
 
   const DEFAULT_RUN_AGENT_CONFIG: RunAgentConfig = { killAfter: true };
-  const DEFAULT_DECIDE_CONFIG: DecideConfig = { prompt: "", inputs: [], outcomes: [] };
-  const MAX_BATCH_CONCURRENT = 32;
-  const DEFAULT_BATCH_CONFIG: BatchConfig = {
-    itemsBinding: "",
-    maxConcurrent: 4,
-    itemVar: "item",
-    bodyEntry: "",
-  };
-  const DEFAULT_SPAWN_CONFIG: SpawnConfig = {};
-  const DEFAULT_SEND_CONFIG: SendConfig = { text: "", enter: true };
-  const DEFAULT_WAIT_CONFIG: WaitConfig = { mode: "idle" };
-  const DEFAULT_CAPTURE_CONFIG: CaptureConfig = { all: false, ansi: false };
-  const DEFAULT_KILL_CONFIG: KillConfig = {};
-  const DEFAULT_SUBFLOW_CONFIG: SubflowConfig = { workflowName: "", inputs: [], maxDepth: 10 };
 
   function nodeAgentConfig(node: WorkflowNode | null): AgentNodeConfig {
     if (!node) return {};
@@ -195,44 +180,6 @@
     return node.kind.type === "run_agent"
       ? node.kind.runAgentConfig ?? DEFAULT_RUN_AGENT_CONFIG
       : DEFAULT_RUN_AGENT_CONFIG;
-  }
-
-  function decideConfig(node: WorkflowNode): DecideConfig {
-    return node.kind.type === "decide" ? node.kind.decideConfig : DEFAULT_DECIDE_CONFIG;
-  }
-
-  function batchConfig(node: WorkflowNode): BatchConfig {
-    return node.kind.type === "parallel_batch" ? node.kind.batchConfig : DEFAULT_BATCH_CONFIG;
-  }
-
-  function spawnConfig(node: WorkflowNode): SpawnConfig {
-    return node.kind.type === "spawn" ? node.kind.spawnConfig ?? DEFAULT_SPAWN_CONFIG : DEFAULT_SPAWN_CONFIG;
-  }
-
-  function sendConfig(node: WorkflowNode): SendConfig {
-    return node.kind.type === "send" ? node.kind.sendConfig ?? DEFAULT_SEND_CONFIG : DEFAULT_SEND_CONFIG;
-  }
-
-  function waitConfig(node: WorkflowNode): WaitConfig {
-    return node.kind.type === "wait" ? node.kind.waitConfig ?? DEFAULT_WAIT_CONFIG : DEFAULT_WAIT_CONFIG;
-  }
-
-  function captureConfig(node: WorkflowNode): CaptureConfig {
-    return node.kind.type === "capture"
-      ? node.kind.captureConfig ?? DEFAULT_CAPTURE_CONFIG
-      : DEFAULT_CAPTURE_CONFIG;
-  }
-
-  function killConfig(node: WorkflowNode): KillConfig {
-    return node.kind.type === "kill"
-      ? node.kind.killConfig ?? DEFAULT_KILL_CONFIG
-      : DEFAULT_KILL_CONFIG;
-  }
-
-  function subflowConfig(node: WorkflowNode): SubflowConfig {
-    return node.kind.type === "subflow" || node.kind.type === "call"
-      ? node.kind.subflowConfig
-      : DEFAULT_SUBFLOW_CONFIG;
   }
 
   /** Get the capabilities object for the currently selected node's agent */
@@ -292,81 +239,15 @@
     });
   }
 
-  function numOrUndef(v: string): number | undefined {
-    const n = Number(v);
-    // Guard against non-finite values (e.g. "1e999" → Infinity): return
-    // undefined so the field is omitted from the JSON rather than serialized
-    // as null, preserving the backend's number-or-absent contract.
-    return v !== "" && Number.isFinite(n) ? n : undefined;
-  }
-
-  /** Merge a field into a node's typed config object; pass undefined to clear it. */
-  function updateConfig(configKey: string, field: string, value: unknown) {
+  function updateRunAgentConfig(field: string, value: unknown) {
     store.updateWorkflow((wf) => {
       const n = wf.nodes.find((x) => x.id === selectedNode!.id);
-      if (!n) return;
-      switch (configKey) {
-        case "runAgentConfig":
-          if (n.kind.type === "run_agent") {
-            n.kind.runAgentConfig = mergeConfig(DEFAULT_RUN_AGENT_CONFIG, n.kind.runAgentConfig, field, value);
-          }
-          break;
-        case "decideConfig":
-          if (n.kind.type === "decide") {
-            n.kind.decideConfig = mergeConfig(DEFAULT_DECIDE_CONFIG, n.kind.decideConfig, field, value);
-          }
-          break;
-        case "batchConfig":
-          if (n.kind.type === "parallel_batch") {
-            n.kind.batchConfig = mergeConfig(DEFAULT_BATCH_CONFIG, n.kind.batchConfig, field, value);
-          }
-          break;
-        case "spawnConfig":
-          if (n.kind.type === "spawn") {
-            n.kind.spawnConfig = mergeConfig(DEFAULT_SPAWN_CONFIG, n.kind.spawnConfig, field, value);
-          }
-          break;
-        case "sendConfig":
-          if (n.kind.type === "send") {
-            n.kind.sendConfig = mergeConfig(DEFAULT_SEND_CONFIG, n.kind.sendConfig, field, value);
-          }
-          break;
-        case "waitConfig":
-          if (n.kind.type === "wait") {
-            n.kind.waitConfig = mergeConfig(DEFAULT_WAIT_CONFIG, n.kind.waitConfig, field, value);
-          }
-          break;
-        case "captureConfig":
-          if (n.kind.type === "capture") {
-            n.kind.captureConfig = mergeConfig(DEFAULT_CAPTURE_CONFIG, n.kind.captureConfig, field, value);
-          }
-          break;
-        case "killConfig":
-          if (n.kind.type === "kill") {
-            n.kind.killConfig = mergeConfig(DEFAULT_KILL_CONFIG, n.kind.killConfig, field, value);
-          }
-          break;
-        case "subflowConfig":
-          if (n.kind.type === "subflow" || n.kind.type === "call") {
-            n.kind.subflowConfig = mergeConfig(DEFAULT_SUBFLOW_CONFIG, n.kind.subflowConfig, field, value);
-          }
-          break;
-      }
+      if (!n || n.kind.type !== "run_agent") return;
+      n.kind.runAgentConfig = mergeConfig(DEFAULT_RUN_AGENT_CONFIG, n.kind.runAgentConfig, field, value);
     });
   }
 
-  const updateRunAgent = (f: string, v: unknown) => updateConfig("runAgentConfig", f, v);
-  const updateDecide = (f: string, v: unknown) => updateConfig("decideConfig", f, v);
-  const updateBatch = (f: string, v: unknown) => updateConfig("batchConfig", f, v);
-  const updateSpawn = (f: string, v: unknown) => updateConfig("spawnConfig", f, v);
-  const updateSend = (f: string, v: unknown) => updateConfig("sendConfig", f, v);
-  const updateWait = (f: string, v: unknown) => updateConfig("waitConfig", f, v);
-  const updateCapture = (f: string, v: unknown) => updateConfig("captureConfig", f, v);
-  const updateKill = (f: string, v: unknown) => updateConfig("killConfig", f, v);
-  const updateSubflow = (f: string, v: unknown) => updateConfig("subflowConfig", f, v);
-
-  /** Available subflow names from the workflow's embedded catalog. */
-  let subflowNames = $derived(Object.keys(activeWorkflow.subflows ?? {}));
+  const updateRunAgent = (f: string, v: unknown) => updateRunAgentConfig(f, v);
 
   /** Capability badge labels for agent dropdown */
   const capBadges: Array<{ key: keyof AgentCapabilities; label: string }> = [
@@ -389,47 +270,6 @@
     }
   });
 </script>
-
-<!-- Reusable input-binding editor (decide / subflow / call). `update` writes the whole list. -->
-{#snippet inputBindings(list: InputBinding[], update: (field: string, value: unknown) => void)}
-  <section class="inspectorSection">
-    <div class="inspectorSection__title">Inputs</div>
-    <small class="helperText">Bind named inputs from context / variables / templates.</small>
-    {#if list.length > 0}
-      <div class="contextRow contextRow--header">
-        <span class="columnLabel">Name</span>
-        <span class="columnLabel">Source</span>
-        <span></span>
-      </div>
-    {/if}
-    {#each list as binding, index (index)}
-      <div class="contextRow">
-        <input
-          value={binding.name}
-          placeholder="name"
-          oninput={(e) => update("inputs", list.map((b, i) => i === index ? { ...b, name: (e.target as HTMLInputElement).value } : b))}
-        />
-        <input
-          value={binding.source}
-          placeholder={"{{previous_output}} / alias"}
-          oninput={(e) => update("inputs", list.map((b, i) => i === index ? { ...b, source: (e.target as HTMLInputElement).value } : b))}
-        />
-        <button
-          class="button button--ghost"
-          onclick={() => update("inputs", list.filter((_, i) => i !== index))}
-        >
-          Remove
-        </button>
-      </div>
-    {/each}
-    <button
-      class="button button--ghost"
-      onclick={() => update("inputs", [...list, { name: "", source: "" } satisfies InputBinding])}
-    >
-      + Add input
-    </button>
-  </section>
-{/snippet}
 
 {#if selectedNode}
   {@const nodeIssues = issues.filter(
@@ -898,384 +738,33 @@
         </section>
 
       {:else if selectedNode.kind.type === "decide"}
-        {@const dc = decideConfig(selectedNode)}
-        <section class="inspectorSection">
-          <div class="inspectorSection__title">Decide</div>
-          <small class="helperText">An LLM reads the inputs and picks one outcome; each outcome maps to a branch edge.</small>
-          <div class="field field--prompt">
-            <span>Decision prompt</span>
-            <PromptTextarea
-              value={dc.prompt}
-              suggestions={promptSuggestions}
-              oninput={(e) => updateDecide("prompt", (e.target as HTMLTextAreaElement).value)}
-            />
-          </div>
-          <label class="field">
-            <span>Model</span>
-            <input
-              value={dc.model ?? ""}
-              placeholder="claude-haiku-4-5"
-              onblur={(e) => updateDecide("model", (e.target as HTMLInputElement).value || undefined)}
-            />
-          </label>
-          <label class="field">
-            <span>Outcomes (one per line)</span>
-            <textarea
-              value={(dc.outcomes ?? []).join("\n")}
-              placeholder={"approve\nreject\nescalate"}
-              onblur={(e) => {
-                const list = (e.target as HTMLTextAreaElement).value.split("\n").map((s) => s.trim()).filter(Boolean);
-                updateDecide("outcomes", list);
-              }}
-              class="field--shortTextarea"
-            ></textarea>
-            <small class="helperText">Use these as branch ids on the outgoing edges.</small>
-          </label>
-        </section>
-        {@render inputBindings(dc.inputs ?? [], updateDecide)}
+        <DecidePanel node={selectedNode} {promptSuggestions} />
 
       {:else if selectedNode.kind.type === "parallel_batch"}
-        {@const bc = batchConfig(selectedNode)}
-        <section class="inspectorSection">
-          <div class="inspectorSection__title">Parallel batch</div>
-          <small class="helperText">Fans out over a collection, running the body subgraph once per item.</small>
-          <label class="field">
-            <span>Items binding</span>
-            <input
-              value={bc.itemsBinding}
-              placeholder={"e.g. {{previous_output}} or context alias"}
-              onblur={(e) => updateBatch("itemsBinding", (e.target as HTMLInputElement).value)}
-            />
-          </label>
-          <label class="field">
-            <span>Item variable</span>
-            <input
-              value={bc.itemVar}
-              placeholder="item"
-              onblur={(e) => updateBatch("itemVar", (e.target as HTMLInputElement).value)}
-            />
-          </label>
-          <label class="field">
-            <span>Body entry node</span>
-            <select
-              value={bc.bodyEntry}
-              onchange={(e) => updateBatch("bodyEntry", (e.target as HTMLSelectElement).value)}
-            >
-              <option value="">Select node</option>
-              {#each activeWorkflow.nodes.filter((n) => n.id !== selectedNode!.id) as n (n.id)}
-                <option value={n.id}>{n.name}</option>
-              {/each}
-            </select>
-          </label>
-          <label class="field field--split">
-            <span>Max concurrent</span>
-            <input
-              type="number"
-              min="1"
-              value={bc.maxConcurrent}
-              oninput={(e) => {
-                const raw = numOrUndef((e.target as HTMLInputElement).value) ?? 1;
-                updateBatch(
-                  "maxConcurrent",
-                  Math.max(1, Math.min(MAX_BATCH_CONCURRENT, raw)),
-                );
-              }}
-            />
-          </label>
-          <label class="field">
-            <span>Collector variable</span>
-            <input
-              value={bc.collectorVar ?? ""}
-              placeholder="optional — name to gather results"
-              onblur={(e) => updateBatch("collectorVar", (e.target as HTMLInputElement).value || undefined)}
-            />
-          </label>
-        </section>
+        <ParallelBatchPanel node={selectedNode} workflow={activeWorkflow} />
 
       {:else if selectedNode.kind.type === "spawn"}
-        {@const sc = spawnConfig(selectedNode)}
-        <section class="inspectorSection">
-          <div class="inspectorSection__title">Spawn</div>
-          <small class="helperText">Launches a long-lived agent/command into a managed PTY pane.</small>
-          <label class="field">
-            <span>Agent</span>
-            <select
-              value={sc.agent ?? ""}
-              onchange={(e) => updateSpawn("agent", (e.target as HTMLSelectElement).value || undefined)}
-            >
-              <option value="">(use command)</option>
-              {#each Object.entries(capabilities?.agents ?? {}) as [agent, info] (agent)}
-                <option value={agent} disabled={!info.available}>{agent}{!info.available ? " (not installed)" : ""}</option>
-              {/each}
-            </select>
-          </label>
-          <label class="field">
-            <span>Command</span>
-            <input
-              value={sc.command ?? ""}
-              placeholder="overrides agent, e.g. npm run dev"
-              onblur={(e) => updateSpawn("command", (e.target as HTMLInputElement).value || undefined)}
-            />
-          </label>
-          <PaneNameField
-            value={sc.name}
-            onchange={(value) => updateSpawn("name", value)}
-          />
-          <label class="field">
-            <span>Session name</span>
-            <input
-              value={sc.sessionName ?? ""}
-              placeholder="optional tmux session"
-              onblur={(e) => updateSpawn("sessionName", (e.target as HTMLInputElement).value || undefined)}
-            />
-          </label>
-          <AccessProfileField
-            value={sc.access}
-            profiles={selectedAgentAccessProfiles}
-            onchange={(value) => updateSpawn("access", value)}
-          />
-          <WorkingDirectoryField
-            value={sc.cwd}
-            placeholder={activeWorkflow.cwd || "inherit workflow cwd"}
-            onchange={(value) => updateSpawn("cwd", value)}
-          />
-          <ExtraArgsField
-            value={sc.extraArgs}
-            onchange={(value) => updateSpawn("extraArgs", value)}
-          />
-        </section>
+        <SpawnPanel
+          node={selectedNode}
+          workflow={activeWorkflow}
+          {capabilities}
+          accessProfiles={selectedAgentAccessProfiles}
+        />
 
       {:else if selectedNode.kind.type === "send"}
-        {@const sd = sendConfig(selectedNode)}
-        <section class="inspectorSection">
-          <div class="inspectorSection__title">Send</div>
-          <small class="helperText">Sends text / keystrokes to a running pane.</small>
-          <label class="field">
-            <span>Target pane</span>
-            <input
-              value={sd.target ?? ""}
-              placeholder="active pane"
-              onblur={(e) => updateSend("target", (e.target as HTMLInputElement).value || undefined)}
-            />
-          </label>
-          <div class="field field--prompt">
-            <span>Text</span>
-            <PromptTextarea
-              value={sd.text}
-              suggestions={promptSuggestions}
-              oninput={(e) => updateSend("text", (e.target as HTMLTextAreaElement).value)}
-            />
-          </div>
-          <label class="field toggle-field">
-            <span>Press Enter after</span>
-            <input
-              type="checkbox"
-              class="toggle"
-              checked={sd.enter ?? true}
-              onchange={(e) => updateSend("enter", (e.target as HTMLInputElement).checked)}
-            />
-          </label>
-        </section>
+        <SendPanel node={selectedNode} {promptSuggestions} />
 
       {:else if selectedNode.kind.type === "wait"}
-        {@const wc = waitConfig(selectedNode)}
-        <section class="inspectorSection">
-          <div class="inspectorSection__title">Wait</div>
-          <small class="helperText">Blocks until the target pane is idle, ready, or prints a marker.</small>
-          <label class="field">
-            <span>Target pane</span>
-            <input
-              value={wc.target ?? ""}
-              placeholder="active pane"
-              onblur={(e) => updateWait("target", (e.target as HTMLInputElement).value || undefined)}
-            />
-          </label>
-          <label class="field">
-            <span>Mode</span>
-            <select value={wc.mode} onchange={(e) => updateWait("mode", (e.target as HTMLSelectElement).value)}>
-              <option value="idle">idle</option>
-              <option value="ready">ready</option>
-              <option value="until">until (marker)</option>
-            </select>
-          </label>
-          {#if wc.mode === "until"}
-            <label class="field">
-              <span>Marker</span>
-              <input
-                value={wc.marker ?? ""}
-                placeholder="text to wait for"
-                onblur={(e) => updateWait("marker", (e.target as HTMLInputElement).value || undefined)}
-              />
-            </label>
-          {/if}
-          {#if wc.mode === "idle"}
-            <label class="field field--split">
-              <span>Idle seconds</span>
-              <input
-                type="number"
-                min="0"
-                step="0.5"
-                value={wc.idleSeconds ?? ""}
-                placeholder="default"
-                oninput={(e) => updateWait("idleSeconds", numOrUndef((e.target as HTMLInputElement).value))}
-              />
-            </label>
-          {/if}
-          {#if wc.mode === "ready"}
-            <label class="field field--split">
-              <span>Ready-stable (s)</span>
-              <input
-                type="number"
-                min="0"
-                step="0.5"
-                value={wc.readyStableSeconds ?? ""}
-                placeholder="default"
-                oninput={(e) => updateWait("readyStableSeconds", numOrUndef((e.target as HTMLInputElement).value))}
-              />
-            </label>
-          {/if}
-          <label class="field field--split">
-            <span>Timeout (s)</span>
-            <input
-              type="number"
-              value={wc.timeout ?? ""}
-              placeholder="none"
-              oninput={(e) => updateWait("timeout", numOrUndef((e.target as HTMLInputElement).value))}
-            />
-          </label>
-        </section>
+        <WaitPanel node={selectedNode} />
 
       {:else if selectedNode.kind.type === "capture"}
-        {@const cc = captureConfig(selectedNode)}
-        <section class="inspectorSection">
-          <div class="inspectorSection__title">Capture</div>
-          <small class="helperText">Captures pane output into the run context for downstream nodes.</small>
-          <label class="field">
-            <span>Target pane</span>
-            <input
-              value={cc.target ?? ""}
-              placeholder="active pane"
-              onblur={(e) => updateCapture("target", (e.target as HTMLInputElement).value || undefined)}
-            />
-          </label>
-          <label class="field field--split">
-            <span>Lines</span>
-            <input
-              type="number"
-              value={cc.lines ?? ""}
-              placeholder="visible"
-              disabled={cc.all}
-              oninput={(e) => updateCapture("lines", numOrUndef((e.target as HTMLInputElement).value))}
-            />
-          </label>
-          <label class="field toggle-field">
-            <span>Capture all scrollback</span>
-            <input
-              type="checkbox"
-              class="toggle"
-              checked={cc.all ?? false}
-              onchange={(e) => updateCapture("all", (e.target as HTMLInputElement).checked)}
-            />
-          </label>
-          <label class="field toggle-field">
-            <span>Include ANSI</span>
-            <input
-              type="checkbox"
-              class="toggle"
-              checked={cc.ansi ?? false}
-              onchange={(e) => updateCapture("ansi", (e.target as HTMLInputElement).checked)}
-            />
-          </label>
-        </section>
+        <CapturePanel node={selectedNode} />
 
       {:else if selectedNode.kind.type === "kill"}
-        {@const kc = killConfig(selectedNode)}
-        <section class="inspectorSection">
-          <div class="inspectorSection__title">Kill</div>
-          <small class="helperText">Terminates a running pane or tmux session.</small>
-          <label class="field">
-            <span>Target pane</span>
-            <input
-              value={kc.target ?? ""}
-              placeholder="active pane"
-              onblur={(e) => updateKill("target", (e.target as HTMLInputElement).value || undefined)}
-            />
-          </label>
-          <label class="field">
-            <span>Session name</span>
-            <input
-              value={kc.sessionName ?? ""}
-              placeholder="optional tmux session"
-              onblur={(e) => updateKill("sessionName", (e.target as HTMLInputElement).value || undefined)}
-            />
-          </label>
-        </section>
+        <KillPanel node={selectedNode} />
 
       {:else if selectedNode.kind.type === "subflow" || selectedNode.kind.type === "call"}
-        {@const fc = subflowConfig(selectedNode)}
-        {@const referenced = activeWorkflow.subflows?.[fc.workflowName]}
-        <section class="inspectorSection">
-          <div class="inspectorSection__title">Compound ({selectedNode.kind.type})</div>
-          <small class="helperText">References a reusable saved subgraph. Double-click the node on the canvas to drill in.</small>
-          <label class="field">
-            <span>Subflow</span>
-            <select
-              value={fc.workflowName}
-              onchange={(e) => updateSubflow("workflowName", (e.target as HTMLSelectElement).value)}
-            >
-              <option value="">Select subflow</option>
-              {#each subflowNames as name (name)}
-                <option value={name}>{name}</option>
-              {/each}
-              {#if fc.workflowName && !subflowNames.includes(fc.workflowName)}
-                <option value={fc.workflowName}>{fc.workflowName} (unresolved)</option>
-              {/if}
-            </select>
-          </label>
-          {#if referenced}
-            <div class="contractBox">
-              <div class="contractBox__row">
-                <span class="contractBox__label">entry</span>
-                <span class="contractBox__value">{referenced.nodes.find((n) => n.id === referenced.entryNodeId)?.name ?? "—"}</span>
-              </div>
-              <div class="contractBox__row">
-                <span class="contractBox__label">exit</span>
-                <span class="contractBox__value">{referenced.nodes.find((n) => n.id === fc.exitNodeId)?.name ?? "(single terminal)"}</span>
-              </div>
-              <div class="contractBox__row">
-                <span class="contractBox__label">nodes</span>
-                <span class="contractBox__value">{referenced.nodes.length}</span>
-              </div>
-            </div>
-            <label class="field">
-              <span>Exit node</span>
-              <select
-                value={fc.exitNodeId ?? ""}
-                onchange={(e) => updateSubflow("exitNodeId", (e.target as HTMLSelectElement).value || undefined)}
-              >
-                <option value="">Infer single terminal</option>
-                {#each referenced.nodes as n (n.id)}
-                  <option value={n.id}>{n.name}</option>
-                {/each}
-              </select>
-            </label>
-            <button class="button button--ghost" onclick={() => store.drillIntoSubflow(selectedNode!.id)}>
-              Open subgraph →
-            </button>
-          {:else if fc.workflowName}
-            <div class="issue issue--warning">Subflow "{fc.workflowName}" is not defined in this workflow.</div>
-          {/if}
-          <label class="field field--split">
-            <span>Max depth</span>
-            <input
-              type="number"
-              min="1"
-              value={fc.maxDepth ?? 10}
-              oninput={(e) => updateSubflow("maxDepth", numOrUndef((e.target as HTMLInputElement).value) ?? 10)}
-            />
-          </label>
-        </section>
-        {@render inputBindings(fc.inputs ?? [], updateSubflow)}
+        <SubflowPanel node={selectedNode} workflow={activeWorkflow} />
       {/if}
     </div>
 
@@ -1336,39 +825,3 @@
   onsubmit={(value) => unlockPrompt.submit(value)}
   oncancel={() => unlockPrompt.cancel()}
 />
-
-<style>
-  .contractBox {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    margin: 6px 0 4px;
-    padding: 8px 10px;
-    border: 1px solid rgba(56, 189, 248, 0.3);
-    border-radius: 10px;
-    background: rgba(56, 189, 248, 0.06);
-  }
-
-  .contractBox__row {
-    display: flex;
-    justify-content: space-between;
-    gap: 8px;
-    font-size: 12px;
-  }
-
-  .contractBox__label {
-    color: var(--text-dim);
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    font-size: 10px;
-  }
-
-  .contractBox__value {
-    color: var(--text-bright);
-    text-align: right;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-</style>
