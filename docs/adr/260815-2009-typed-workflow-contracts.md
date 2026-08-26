@@ -1,7 +1,8 @@
 ---
 id: ADR-260815-2009-01
 status: accepted
-terms: [Workflow Contract, Variable, Boundary Normalization]
+terms: [Workflow, Workflow Contract, Variable, Boundary Normalization]
+prd: PRD-260826-0009-01
 ---
 
 # Typed workflow contracts over a JSON-valued variable store

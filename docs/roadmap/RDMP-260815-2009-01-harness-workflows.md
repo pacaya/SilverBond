@@ -4,7 +4,7 @@ scale: initiative
 stakes: internal
 gate: passed 2026-08-16
 adrs: [ADR-260815-2009-01, ADR-260815-2009-02, ADR-260815-2009-03, ADR-260815-2009-04, ADR-260815-2009-05]
-prds: []
+prds: [PRD-260826-0009-01]
 source: grilling 2026-08-15 (conversation-entered; research ingested at docs/sources/prior-art-workflow-engines.md)
 ---
 
@@ -64,9 +64,9 @@ The user's agent harness (issue-dev, implement-issue, and kin) lives as chat-ski
 
 ## docs-truth: Documentation from the Rust truth
 
-Status: pending
+Status: active (PRD-260826-0009-01)
 
-Rewrite `docs/workflow-schema.md` and `docs/execution-model.md` from the Rust source: all 14 node kinds, v4 tagged shapes, edges with conditions, subflows, variables, the tmux node family, and run/checkpoint semantics. No engine code changes. This epic establishes the baseline, not a frozen snapshot: every later schema-changing epic owns updating these two documents for its delta. Sharpest exclusion: no schema changes are designed here — this documents what exists so later epics diff against truth.
+Rewrite `docs/workflow-schema.md` and `docs/execution-model.md` from the Rust source: all 14 node kinds, v4 tagged shapes, edges with conditions, subflows, variables, the tmux node family, and run/checkpoint semantics. No engine code changes. This epic establishes the baseline, not a frozen snapshot: every later schema-changing epic owns updating these two documents, and its `CONTEXT.md` terms, for its delta — the terms it owns are those its ADRs name (`grep '(planned' CONTEXT.md` for the outstanding set). Sharpest exclusion: no schema changes are designed here — this documents what exists so later epics diff against truth.
 
 ## typed-contracts: Typed workflow contracts
 
