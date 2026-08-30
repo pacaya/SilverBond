@@ -21,7 +21,7 @@ Returns runtime capabilities including supported agents and their features.
 ```json
 {
   "workflowVersion": 4,
-  "supportedNodeTypes": ["task", "approval", "split", "collector"],
+  "supportedNodeTypes": ["task", "approval", "split", "collector", "decide", "parallel_batch", "subflow", "call", "spawn", "send", "wait", "capture", "kill", "run_agent"],
   "supportedEdgeOutcomes": ["success", "reject", "branch", "loop_continue", "loop_exit"],
   "features": {
     "split": true,
@@ -141,7 +141,7 @@ Preview a task node's resolved prompt without executing it.
 **Request body:**
 ```json
 {
-  "node": { "id": "n1", "type": "task", "prompt": "Research {{var:topic}}" },
+  "node": { "id": "n1", "name": "Research", "kind": { "type": "task" }, "prompt": "Research {{var:topic}}" },
   "cwd": "/workspace",
   "mockContext": { "topic": "AI safety" }
 }

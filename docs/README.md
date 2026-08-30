@@ -17,7 +17,6 @@ SilverBond is a local-first graph workflow runner that executes multi-step workf
 | [Tauri Desktop](tauri-desktop.md) | Optional desktop packaging with Tauri |
 | [Testing](testing.md) | Test infrastructure and how to run tests |
 | [Svelte Specifics](svelte-specifics.md) | Critical Svelte 5 / SvelteFlow patterns and pitfalls |
-| [Agent Improvements Plan](agent-improvements-plan.md) | Stage 1-9 agent abstraction implementation plan |
 
 ## Quick Reference
 
