@@ -9,7 +9,7 @@ just setup          # npm install + configure repository Git hooks
 just dev            # Vite dev server on :5173 (proxies /api to :3333)
 just server         # Rust backend on :3333
 just build          # Build frontend to public/
-just test           # Run all tests (cargo test && npm test)
+just test           # Run all tests (Rust suite + npm test)
 just test-rust      # Rust tests only
 just test-ui        # Frontend vitest unit tests
 just test-e2e       # Build + Playwright e2e tests
@@ -28,7 +28,7 @@ to disable the repository hooks for this clone.
 
 - Frontend unit tests: `npm test` (runs `vitest run --config ui/vite.config.ts`)
 - E2e tests: `npm run test:e2e` (builds frontend, starts Rust backend, runs Playwright)
-- Rust tests: `cargo test`
+- Rust tests: `cargo test --locked`
 
 ## Conventions
 

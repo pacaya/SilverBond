@@ -40,13 +40,12 @@ tauri-build:
     npm run tauri:build
 
 # Run all tests (Rust + frontend unit)
-test:
-    cargo test
+test: test-rust
     npm test
 
 # Rust tests only
 test-rust:
-    cargo test
+    cargo test --locked
 
 # Frontend vitest unit tests
 test-ui:

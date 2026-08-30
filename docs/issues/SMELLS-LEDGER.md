@@ -87,3 +87,6 @@ One row per unique key (`file:line` + smell name). Columns:
 | `ui/src/features/editor/AgentConfigFields.svelte:48` + Duplicated Code | 1 | 2026-08-15 | open |
 | `ui/src/features/editor/AgentConfigFields.svelte:58` + Primitive Obsession | 1 | 2026-08-15 | open |
 | `ui/src/lib/utils/sectionUtils.ts:42` + Shotgun Surgery | 1 | 2026-08-15 | open |
+| `.github/workflows/rust-tests.yml:3-13` + Duplicated Code | 1 | 2026-08-30 | open |
+| `.github/workflows/rust-tests.yml:32` + Duplicated Code | 1 | 2026-08-30 | open |
+| `.github/workflows/rust-tests.yml:15-18` + Speculative Generality | 1 | 2026-08-30 | open |
