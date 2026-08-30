@@ -2,11 +2,126 @@
 id: ISSUE-260826-1648-02
 kind: issue
 category: bug
-status: needs-triage
+status: ready-for-agent
 origin: docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md
 terms: [Decide Outcome]
 summary: Decide-node validation compares outcome labels to branch-edge labels untrimmed while the runtime trims, so a whitespace-padded label validates clean and then misses at runtime, reaching an arm that is otherwise unreachable
 ---
+
+## Agent Brief
+
+**Category:** bug
+**Summary:** Reject whitespace-padded decide labels at validation, closing the one path by which a validated document reaches the fallthrough arm the docs call unreachable.
+
+**Current behavior:**
+Decide-node validation and decide routing disagree about surrounding whitespace.
+
+Validation collects the labels of the node's outgoing branch edges into a set of raw strings and
+tests each declared outcome for raw membership in that set. The one trim on that path is the guard
+that rejects an empty outcome; the membership comparison itself sees both sides untouched. Read that
+as scoped to the outcome-membership path, not to the routine — the routine trims in several other
+places, including its own branch-edge label emptiness guard, and both sides of the correspondence
+still need checking per **Key interfaces** below.
+
+Routing trims the node's selected outcome before comparing it against the branch edge's raw label.
+
+So a decide node declaring an outcome with surrounding whitespace, wired to a branch edge whose
+label carries the same padding, validates clean — raw equals raw — and then fails to match when the
+run reaches it, because a trimmed outcome is compared against an untrimmed label. The miss lands in
+the arm that emits a workflow error and degrades to the plain success edge. Both the glossary entry
+for the term and the execution-model documentation describe that arm as unreachable from a validated
+document; this is the sole path found by which a validated document reaches it, so a run can route
+down the success edge exactly where the documentation says routing cannot happen.
+
+A related asymmetry sits inside outcome selection itself: the arm that reads a structured response
+compares the model's label against the declared outcomes with neither side trimmed, while the arm
+that falls back to free text compares against a trimmed response. Confirm this from the source
+rather than from this brief, and see the note on it under **Out of scope**.
+
+**Desired behavior:**
+A decide node whose declared outcome labels, or whose outgoing branch-edge labels, carry leading or
+trailing whitespace fails validation with an error-severity issue that names whitespace as the
+reason. The invariant established is that a decide label is its own trimmed form; both sides of the
+outcome/branch-label correspondence are held to it.
+
+Routing is not changed. With padded labels refused at the document boundary, the existing raw
+comparison at the routing site can no longer be reached with a padded label, and the fallthrough
+arm becomes genuinely unreachable from a validated document rather than approximately so.
+
+**Rejected alternative, and why.** Trimming both sides of the validation membership comparison is
+the more obvious repair and is wrong here. The duplicate-outcome check inserts raw labels into its
+seen-set, so two outcomes differing only in padding would pass as distinct and then collide onto a
+single route once compared trimmed — converting a mis-route into an ambiguous one and requiring the
+routing site to trim as well to stay coherent. Refusing padding is a single-point fix that needs no
+runtime change and leaves no pair of distinct-but-equivalent labels in a valid document.
+
+**Key interfaces:**
+- The decide-node validation routine in the model module — it owns the outcome/branch-label
+  correspondence, the empty-label guard, and the duplicate-outcome check. The new refusal belongs
+  beside them, and must be checked against both the declared outcome list and the branch-edge labels
+  of the node, not only whichever side the reported reproduction used.
+- The validation issue type — error severity, node-scoped, following the message conventions of the
+  sibling decide errors already emitted by that routine.
+- The routing site that selects a branch edge for a decide node, and the outcome-selection helper
+  it depends on — read for confirmation, not for modification.
+
+**Binding constraint — the documentation framing does not change.** That the fallthrough arm is
+unreachable from a validated document is a recorded maintainer decision, and the glossary entry for
+the decide-outcome term carries an explicit `_Avoid_` clause banning any description of the success
+fallthrough as behaviour an author can meet. That clause stands. This work removes the exception to
+the claim; it must not soften, hedge, or restate the claim, and must not add prose anywhere
+describing the padded-label route as something an author could rely on.
+
+**Acceptance criteria:**
+- [ ] A decide node declaring an outcome with leading or trailing whitespace, wired to a branch edge
+      whose label carries the same padding, fails validation with an error-severity issue. This is
+      the case that validates clean before this change, so the criterion goes from green to red at
+      the document boundary and the new issue is what makes it red.
+- [ ] The refusal is identified by a signal unique to this defect: the issue's message names
+      whitespace or padding as the reason. Asserting merely that validation reports some error does
+      not satisfy this — a padded branch-edge label paired with an unpadded outcome already produces
+      the pre-existing "does not match an outgoing branch edge label" error, so a test keyed on
+      error-presence alone is green before this change and proves nothing.
+- [ ] A decide node whose outcome labels are padded is refused independently of how its branch edges
+      are labelled, and a decide node whose branch-edge labels are padded is refused independently of
+      how its outcomes are declared. Both sides carry the invariant; neither is refused only as a
+      side effect of mismatching the other.
+- [ ] A decide node whose labels carry no surrounding whitespace validates exactly as it does today,
+      with the same issue set. (Preservation criterion: green before and after.)
+- [ ] Routing behaviour for a valid decide document is unchanged — the same branch edge is selected
+      for the same model output. (Preservation criterion: green before and after.)
+- [ ] The validation catalog in `docs/workflow-schema.md` gains a row for the new error, among the
+      decide rows of that catalog, matching the existing rows' `| Severity | Condition | Source |`
+      column shape. Observable:
+
+      ```
+      rg -n '^\| error \| `decide`.*(whitespace|padding)' docs/workflow-schema.md
+      ```
+
+      returns the new row; it returns no matches before this change. The observable is anchored to
+      the row shape rather than to the bare word so that an unrelated later use of "whitespace"
+      elsewhere in the document cannot satisfy it while this record waits to be claimed.
+- [ ] `just test` passes, including the docs catalog generator's committed-markdown assertion.
+
+**Out of scope:**
+- **Trimming anywhere in the runtime.** The routing site and the outcome-selection helper are read
+  for confirmation and left alone. The structured-versus-free-text asymmetry noted above is expected
+  to become harmless once no valid document can declare a padded outcome — confirm that this is so
+  and say so in the change; if it turns out to survive the fix, file it rather than widening this
+  issue.
+- **The glossary entry and the execution-model prose.** Both already state the unreachability this
+  work makes true, so neither needs editing. Per the binding constraint above, do not restate or
+  soften them.
+- **Whitespace policy for any other label, name, or identifier in the schema.** Edge labels outside
+  decide nodes, node names, variable names, and outcome labels on non-decide kinds keep their current
+  handling. This issue establishes the invariant only where the validator/runtime disagreement was
+  demonstrated.
+- **Unicode normalization, zero-width characters, or internal whitespace.** Leading and trailing
+  whitespace only, by the same definition the existing empty-label guard already uses.
+- **The regeneration story for the validation catalog's source citations.** That catalog is
+  hand-written prose whose per-row source citations are not machine-checked, so edits to the model
+  module shift line references in rows this issue did not touch. That fragility is pre-existing and
+  owned by no one here; add the new row and leave the rest.
 
 ## Triage Notes
 
@@ -43,3 +158,87 @@ rather than the framing.
 comparison, or trimming neither and rejecting padded labels at validation. Whoever picks it up
 should check whether any other validator/runtime pair in the decide path has the same asymmetry
 before choosing, rather than patching the one comparison.
+
+**Readiness gate (cold-reader): PASS** (round 1)
+
+Independent cold reader, no planning context, 2026-08-30. All seven acceptance observables and the
+one discovery command executed against the tree rather than reasoned about. Classes 1–7 and 9 all
+walked; none fired. Class 8 inert (never-stamped record).
+
+Findings worth recording:
+
+- **Class 1 resolved both cited authorities.** The `_Avoid_` clause is `CONTEXT.md`'s **Decide
+  Outcome** entry, verbatim as the brief describes; the "recorded maintainer decision" resolves to
+  `ISSUE-260826-0637-08`'s instruction to describe the arm as unreachable rather than as behaviour an
+  author can meet, realized in `docs/execution-model.md` and originating in PRD-260826-0009-01's
+  user story 40. The Out-of-scope claim that neither document needs editing was checked directly:
+  neither contains "whitespace" or "padding".
+- **The rejected alternative was verified, not accepted on assertion.** The reader confirmed the
+  duplicate-outcome check inserts raw labels, so trimming only the membership comparison really would
+  let two padding-distinct outcomes pass as distinct and then collide onto one route.
+- **Class 9 arm B req. 2 confirmed necessary and satisfied.** The brief's claim that a padded edge
+  label paired with an unpadded outcome already trips the pre-existing mismatch error was verified
+  against the source. Of the four padded shapes, three are green-before under an error-presence-only
+  test; only the identically-padded pair is red-before. Criterion 2's whitespace-naming requirement is
+  what makes the other three falsifying. `rg -n -i 'whitespace|padding' src/model.rs` confirms no
+  validation message currently names either, so the signal is genuinely new.
+- **Criterion 6 observable confirmed red-before**: `rg -n -i 'whitespace' docs/workflow-schema.md`
+  returns nothing (exit 1) on the current tree.
+- **Blast radius checked beyond the brief's claims**: no shipped template carries a padded decide
+  label, and the frontend has no mirrored decide validation to keep in sync.
+
+Two non-blocking nits recorded, both verdict `fine`, addressed in round 2 below.
+
+**Readiness gate (cold-reader): REOPENED** (round 2, 2026-08-30, acting on round-1 nits)
+
+Reopening to act on both nits rather than leaving them. Neither changes what gets built; both make
+the brief harder to misread and harder to rot.
+
+1. **"The only place it trims"** is count-shaped prose that is false under a routine-wide reading —
+   the branch-edge label guard trims too. The round-1 reader scoped it charitably to the
+   outcome-membership loop, where it is exactly true, and found no build impact because Key
+   interfaces separately requires checking both sides. Tightening it to name the path it means.
+2. **Criterion 6's observable is a document-wide word search.** It is red-before today, but any
+   unrelated future use of "whitespace" anywhere in that document would silently make it
+   green-before, defeating the criterion while the record sits in `ready-for-agent`. Replacing it
+   with a row-shaped observable anchored to the validation-catalog table.
+
+**Readiness gate (cold-reader): PASS** (round 3, full-enumeration)
+
+Independent cold reader, no planning context, 2026-08-30. Full gate on the whole brief, not a diff
+review. Classes 1–7 and 9 walked; none fired. Both round-2 edits assessed and found to have achieved
+their stated purpose without introducing a new defect.
+
+- **Edit 1 verified against source both ways**: exactly one `.trim()` inside the outcome-membership
+  loop, and four more elsewhere in the routine including the named branch-edge guard. The "several
+  other places" hedge was argued as a possible class-7(a) figure and ruled acceptable qualitative
+  hedging — it is a retraction of precision whose only checkable component is a named, locatable
+  site, and its build instruction is structural rather than numeric. Magnitude derived anyway and
+  found true.
+- **Edit 2 was checked for the opposite failure** — overshooting into an unachievable criterion. The
+  reader constructed eleven candidate rows from the table's real format and tested the pattern
+  against them rather than trusting the brief. Four match, and they are the four a builder reading
+  the neighbouring rows would actually write. Judged achievable rather than over-tight for two
+  independent reasons: criterion 2 already forces the word whitespace or padding into the issue
+  message, and the catalog's own stated convention is that a row restates the message. Also confirmed
+  the round-1 observable was *also* red-before, so the edit hardened a working criterion against
+  future drift rather than repairing a broken one.
+- **A conflict between criteria 6 and 7 was checked and does not exist**: the validation catalog sits
+  outside every generated block, so a hand-written row cannot trip the generator's idempotency
+  assertion.
+- **Round-1's own blast-radius claim was re-derived rather than inherited** — six template files
+  swept ignore-blind, zero padded decide labels — and the no-frontend-mirror claim re-confirmed.
+
+Five non-blocking nits recorded, all verdict `fine`, none requiring action. Two are noted here rather
+than acted on:
+
+- The reader suggested criterion 7 be marked a preservation criterion like 4 and 5. Fair, and left
+  alone deliberately: it is a regression gate on every brief in this repo, marking it changes nothing
+  a builder does, and a further reopen/re-gate cycle to relabel it would cost more than it returns.
+- The reader flagged `ready-for-agent` in the round-2 stamp as outside the repo's frontmatter
+  vocabulary, having inventoried existing records and found only `needs-triage`/`done`/`wontfix` in
+  use. **Dismissed with reason**: `ready-for-agent` is a defined status in the triage state machine;
+  the inventory reflects that no record currently sits in it, not that it is invalid. This is the
+  expected cost of a cold reader with no planning context, and the gate is worth that cost.
+
+Brief is immutable from this stamp. Promoting to `ready-for-agent`.

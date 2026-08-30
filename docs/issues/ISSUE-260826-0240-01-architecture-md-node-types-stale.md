@@ -2,10 +2,120 @@
 id: ISSUE-260826-0240-01
 kind: issue
 category: bug
-status: needs-triage
+status: ready-for-agent
 origin: docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md
 summary: ARCHITECTURE.md states four "current first-class node types" where the engine has fourteen, and docs/backend.md names ten
 ---
+
+## Agent Brief
+
+**Category:** bug
+**Summary:** Correct the node-kind lists in `ARCHITECTURE.md` and `docs/backend.md` so neither
+document presents a strict subset of its enum as the complete set.
+
+**Current behavior:**
+`ARCHITECTURE.md` carries a `### Node types today` section whose bullet list is introduced by the
+sentence "Current first-class node types:". That list omits node kinds the engine executes. Because
+the introducing sentence asserts completeness, this is a false statement about the present rather
+than merely an incomplete list, and the same document contradicts itself elsewhere by naming
+omitted control kinds in its description of the tmux layer.
+
+`docs/backend.md` has the same defect in a different spelling. Its `**Core enums:**` list carries a
+one-line entry presenting `WorkflowNodeType` as a short list of Rust variant names. That entry omits
+variants the type actually declares, in the section that purports to define it.
+
+Derive both enums' real variant sets yourself, from the tree as it stands when you do the work —
+these commands return each enum's declaration block for you to read the variants off:
+
+```
+rg -n --pcre2 --multiline '(?s)^pub enum NodeKind \{.*?^\}' src/model.rs
+rg -n --pcre2 --multiline '(?s)^pub enum WorkflowNodeType \{.*?^\}' src/model.rs
+```
+
+Neither command is pinned to a commit, deliberately: this brief wants each set as it stands at
+implementation time, not a set frozen at authoring time. Do not take any membership claim in this
+record's `## Triage Notes` as current — that is filing narrative, and the commands above are the
+authority.
+
+**Desired behavior:**
+Each of those two lists enumerates the complete variant set of the enum it describes, derived from
+the Rust source rather than copied from another document or from this brief. Each keeps its own
+existing spelling convention: `ARCHITECTURE.md` lists serialized wire tags (the lower-case
+`snake_case` form the workflow document and `/api/capabilities` use), `docs/backend.md`'s Core-enums
+entry lists Rust variant identifiers, all on one physical line as that list's other entries are.
+Nothing else in either document changes.
+
+**Key interfaces:**
+- `NodeKind` — the serde-tagged workflow-model enum. Its `tag = "type"` with
+  `rename_all = "snake_case"` is what produces the wire tags a workflow document and the
+  capabilities endpoint carry, so the **variant declarations themselves**, mechanically lower-cased,
+  are the authority for `ARCHITECTURE.md`'s list. A hand-written string projection over the node
+  kinds also exists in the same module, but read it only as a cross-check: it delegates to the other
+  enum below, and hand-written exhaustive projections over these enums are exactly the drift-prone
+  shape that `ISSUE-260826-0520-01` exists to remove. The declaration is the safer source.
+- `WorkflowNodeType` — a separate bare enum in the same model module carrying one unit variant per
+  node kind, with a `From` conversion bridging it to `NodeKind`. Its variant identifiers are the
+  authority for the `docs/backend.md` Core-enums entry. It is a distinct type, not an alias; read
+  its own declaration rather than assuming the two enums agree.
+
+**Acceptance criteria:**
+- [ ] The bullet list under `ARCHITECTURE.md`'s `### Node types today` heading contains exactly one
+      entry per wire tag `NodeKind` serializes, and no entry that is not one. (The prose sentence in
+      that section about planned `join` nodes is not a list entry; it stays — see Out of scope.)
+      Observable, both bounded to that section so a mention elsewhere in the file cannot satisfy
+      them — each returns a match after this change, and neither matches before it:
+
+      ```
+      rg --pcre2 --multiline -n '(?s)^### Node types today\n(?:(?!^### ).)*?\bparallel_batch\b' ARCHITECTURE.md
+      rg --pcre2 --multiline -n '(?s)^### Node types today\n(?:(?!^### ).)*?\bspawn\b' ARCHITECTURE.md
+      ```
+
+      The second is the one that proves the bound: the file names `spawn` elsewhere today, so an
+      unbounded search for it would return a match before this change.
+
+- [ ] The `WorkflowNodeType` entry in `docs/backend.md`'s `**Core enums:**` list names every variant
+      of that enum, and remains a single physical line. Observable, both anchored to that one entry
+      — each returns a match after this change, and neither matches before it:
+
+      ```
+      rg -n '^- `WorkflowNodeType`.*\bParallelBatch\b' docs/backend.md
+      rg -n '^- `WorkflowNodeType`.*\bRunAgent\b' docs/backend.md
+      ```
+
+      The second is the one that proves the anchor: the file names `RunAgent` on a different line
+      today, so an unanchored search would return a match before this change.
+
+- [ ] Each list's membership equals its enum's variant set, and the two lists agree with each other
+      kind for kind, allowing for the two spelling conventions. Verify by re-running the two
+      discovery commands above against the tree you are working in and comparing, not by reading
+      membership off this brief.
+
+- [ ] `cargo test --locked` and `npm test` pass unchanged. (Preservation criterion: this change
+      touches only prose, and nothing should move.)
+
+**Out of scope:**
+- **`ARCHITECTURE.md`'s `### Edge outcomes today` section.** Its list was checked during triage
+  against `WorkflowEdgeOutcome` and was complete and correct. Confirm that still holds before
+  leaving it alone — `rg -n --pcre2 --multiline '(?s)^pub enum WorkflowEdgeOutcome \{.*?^\}' src/model.rs`
+  returns that enum's declaration — and if it no longer does, stop and report rather than folding a
+  second correction into this record.
+- **`ARCHITECTURE.md`'s sentence that explicit `join` nodes are still planned.** Verified during
+  triage: neither enum declares a join variant, and the two discovery commands above let you
+  re-confirm it. The sentence is accurate and is not part of the bullet list. Keep it.
+- **`docs/backend.md`'s description of which node kinds the tmux node-routing helper dispatches.**
+  That is a claim about one function's dispatch table, not about enum membership. It is an exact
+  match for the kinds that helper actually routes — the remaining kinds hit an arm that refuses them
+  by name — so it is correct as written. Leave it alone.
+- **Building any mechanism that keeps these lists in sync.** A generated node-kind catalog already
+  exists for `docs/workflow-schema.md`, driven by an in-repo test that regenerates fenced blocks
+  from constructed Rust values and fails when they are stale. Extending it to cover narrative prose
+  in `ARCHITECTURE.md` and `docs/backend.md` is a design decision about marker placement and format
+  that this issue does not own. Correct the prose by hand.
+- **The canonical schema-version statement in `ARCHITECTURE.md`,** which the `typed-contracts` epic
+  already pins for editing at the version bump. Do not touch it here, and do not attempt any wider
+  version sweep.
+- **Any change to Rust source.** Both enums are correct as they stand; only the two documents are
+  wrong.
 
 ## Triage Notes
 
@@ -47,3 +157,113 @@ Triage may reasonably route this to that epic instead of scheduling it standalon
 
 **Evidence base.** The full documentation drift inventory is
 `docs/sources/workflow-schema-drift-260825.md` (item X4 covers cross-document node-kind coverage).
+
+---
+
+**Readiness gate (cold-reader): FAIL** (round 1, 2026-08-30)
+
+Independent cold reader, no planning context. Classes 1–6, 8 and 9 do not fire; class 9 arm A was
+executed and all four acceptance observables were confirmed red at baseline, with positive and bound
+controls proving both regexes can go green and that neither can be satisfied by an incidental match
+elsewhere in its file. Forty-one class-7 surfaces swept.
+
+Blocked on class 7 kind (a), **rule-violation figure, brief text under edit** — the unconditional row
+of the class-7 decision table. Six bare cardinalities in the `## Agent Brief` (the completeness of
+each of the two node-kind lists, each enum's variant count, and the edge-outcome section's variant
+count) were asserted as facts with no discovery command deriving them. Every figure was verified
+correct at the time of writing; correctness is not the escape, and the remedy is substitution, never
+a refreshed numeral.
+
+The reader grounded the call in this repo rather than in abstract strictness: sibling
+`ISSUE-260826-0520-01` passed its gate carrying no cardinality anywhere, stating magnitudes
+qualitatively ("in more than one place") beside `rg` commands. It also showed the rule doing real
+work on this very record — see the correction below.
+
+**Remedy applied, 2026-08-30 (no `REOPENED` stamp: the record had never been stamped `PASS` or
+`WAIVED`, so the brief was not yet immutable).** All six figures replaced with `rg` discovery
+commands over the two enum declaration blocks, with polarity stated qualitatively and an explicit
+note that the commands are deliberately unpinned because the brief wants each set as of
+implementation time. No numeral was refreshed. Also fixed in the same edit, from the round's
+non-blocking notes:
+
+- The Key-interfaces claim that the node-kind enum's string projection is "the safest single place"
+  to read the tags from was imprecise — that projection delegates to the other enum, and the literals
+  live there. The brief now names the serde representation on the declarations as the authority and
+  demotes the projection to a cross-check, noting it is the drift-prone shape `ISSUE-260826-0520-01`
+  exists to remove.
+- The first acceptance criterion said "the section", which a literal reader could take as licence to
+  delete the `join` sentence that lives inside it. Now scoped to the bullet list, with the sentence
+  named as excluded.
+- The `docs/backend.md` observable requires the Core-enums entry to stay on one physical line. The
+  desired behavior now states that constraint, so a correct-but-wrapped edit cannot produce a red
+  observable.
+- The tmux dispatch-table exclusion is now stated as exact rather than as a tolerable subset, which
+  makes it self-checking.
+- The edge-outcome and `join` exclusions now carry the discovery command that re-confirms them,
+  rather than resting on an unrepeatable "checked during triage".
+
+**Correction to the filing narrative above (appended, not edited — this section is append-only).**
+The paragraph beginning "The phrase 'Current first-class node types:'" cites the
+`docs/api-reference.md:24` claim as one that `PRD-260826-0009-01` "does fix", present tense. That
+fix has since landed (`ISSUE-260826-0637-02`); that line now carries the complete tag list. The
+sentence reads correctly only as a statement about the PRD's scope, not as a pointer to a live
+defect.
+
+Relatedly: the membership figures in the filing narrative above are historical evidence from
+2026-08-25, not contract. The Agent Brief deliberately carries no membership claim of its own and
+directs the implementer to the discovery commands instead.
+
+**Deliberate decision — frontmatter `summary:` keeps its figures.** It is outside the class-7
+partition (which covers `## Agent Brief`, `## Triage Notes`, and `## Context Pack`), it is written
+once and feeds the generated digest, and rewriting it would trade a durable identifier for a
+marginal consistency gain. Recorded here so it reads as a decision rather than an oversight.
+
+---
+
+**Readiness gate (cold-reader): PASS** (round 2, 2026-08-30, full-enumeration)
+
+Independent cold reader, no planning context. Full round, re-judged from scratch rather than as a
+diff against round 1 — the acceptance observables were re-executed rather than inherited. Classes
+1-7 and 9 all `fine`; class 6 does not fire in either prong; class 8 inert. Seventy class-7 surfaces
+swept against an extraction list of the same size.
+
+- **The remedy self-check passed on all three items.** A mechanical sweep for digits across the
+  whole brief returns only the `rg` command text and one issue ID — no numeric repo-state figure
+  survives, so no round-1 cardinality was refreshed rather than replaced. The number-words that
+  remain (`two lists`, `one physical line`, `exactly one entry per wire tag`) are scope and
+  structural statements, not occurrence counts.
+- **Anchoring was proved rather than accepted.** The reader built its own positive and bound
+  controls for all four observables: each goes green when the tag is written into the target
+  section or list entry, and each stays red when the same tag is planted just outside it. It also
+  ran a control the brief did not claim — a correct-but-wrapped `docs/backend.md` entry leaves both
+  observables red — confirming the observables really do enforce the single-physical-line constraint
+  the Desired behavior states.
+- **The no-pin claim was checked against the "required pin" definition and upheld.** This brief's
+  use of the derived set depends on it being the set at implementation time, not the same set later;
+  pinning would reintroduce the defect if a variant lands before the work does.
+- **Every out-of-scope premise was independently re-derived**, and one is stronger than the brief
+  claims: `docs/backend.md`'s tmux dispatch description is an exact match for the kinds that helper
+  routes, with the remaining kinds refused by name in the complement arm, so the complement is
+  complete over the whole enum.
+- **The append-only correction leaves no actionable contradiction.** The uncorrected present-tense
+  sentence in the filing narrative points at an out-of-scope file and carries no instruction, and
+  the appended correction resolves it accurately.
+
+Seven non-blocking notes. Three worth carrying for whoever claims this:
+
+- The section-bounding regex stops at `### ` only, not at `## ` or `# `. The window is tight today
+  because the next heading is `### Edge outcomes today`, and the bound control confirms it — but if
+  that heading were ever promoted or the section moved to the end of a `##` block, the bound would
+  leak downward silently. A durability consideration for a record that may sit in the queue.
+- The observables are necessary, not sufficient: the `spawn` observable would also go green if the
+  tag were written into the `join` prose sentence rather than the bullet list. AC1's prose and AC3
+  carry the real contract; close-time review catches that, not the gate.
+- The reader flagged a systemic risk rather than a defect here: the brief's disclaimer that its
+  Triage Notes are not current is doing real work in this round's class-7 outcome. It is reinforced
+  structurally on this record — the brief carries no membership figure, AC3 forces re-derivation, and
+  every disclaimed figure was independently verified still true — but if that disclaimer became
+  boilerplate across records it would hollow out the "the Triage Notes the brief relies on"
+  qualifier. Worth watching across siblings.
+
+Brief is immutable from this stamp. Promoting to `ready-for-agent`.
+
