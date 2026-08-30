@@ -1557,8 +1557,209 @@ on serialize when absent (`src/model.rs:43-54`).
 
 ## Validation catalog
 
-The validation-issue catalog is deferred to a later pass; `validate_workflow` and `ValidationIssue`
-in `src/model.rs` are the authority until then.
+`validate_workflow` (`src/model.rs:1422`) is the validation entry point. Saving a workflow does not
+run it (`save_workflow`, `src/api.rs`). Validation runs on an explicit `POST /api/validate-workflow`
+request (`validate_workflow_route`, `src/api.rs:559-570`), where it is advisory: the response is 200
+and carries every issue, errors included. Three earlier failures short-circuit the request before the
+full validation result is assembled — an ingest failure returns 400 (`src/api.rs:563-564`), a
+subflow-hydration failure returns 500 (`src/api.rs:565`, via `ApiError::internal`), and an
+input-bound rejection returns 422 carrying that single issue in its `details` body
+(`src/api.rs:566`, `:572-582`). Validation is **enforced at run start** (`create_run`,
+`src/api.rs:751-766`),
+where any `error`-severity issue refuses the run. A clean catalog therefore predicts run refusal, not
+save success.
+
+Each issue is a `ValidationIssue`: `{severity, nodeId?, scope?, message}` (`src/model.rs:973-979`).
+`severity` is an unconstrained string the engine only ever sets to `error` or `warning` — there is
+no informational severity. Warnings are issues too; they do not block run start.
+
+Besides `issues`, a `ValidationResult` carries the normalized `workflow`, ingest `notices`, and
+`graph` metadata (`src/model.rs:1003-1009`). Graph metadata — `reachableNodeIds`,
+`unreachableNodeIds`, and `deadEndNodeIds` (`GraphMetadata`, `src/model.rs:984-990`) — is a
+separate field, not an issue and not a severity. Unreachable nodes also produce warning issues
+(`src/model.rs:1468-1480`); the reachable and dead-end lists are computed for inspection only. On the
+root graph, the **terminal node** warning predicate (`src/model.rs:1916-1922`) and membership in
+`deadEndNodeIds` (`src/model.rs:3153-3158`) currently coincide — every root dead end is warned. The
+genuine asymmetry is coverage: `deadEndNodeIds` is computed for the root document only
+(`src/model.rs:1468`), while the terminal warning is also emitted inside every catalogued subflow
+body (`validate_graph_body` re-entered per subflow, `src/model.rs:2526-2532`).
+
+`scope` names the subflow a nested issue came from (for example `subflow:myFlow`). Root-graph
+issues have no `scope`. Issues raised while validating a subflow graph body are stamped with `scope`
+and prefixed in the message (`scope_graph_body_issues`, `src/model.rs:2168-2176`). Exceptions:
+issues raised *about* a subflow from the root pass (for example subflow `runAs`/`limits` warnings,
+subflow `entryNodeId` errors) and input-bound failures name the subflow in the message where
+applicable but carry no `scope`.
+
+A missing or unsupported `version` is an ingest error (`migrate_workflow_value_to_v4`,
+`src/model.rs:1134-1172`) — it never becomes a `ValidationIssue` and never appears on the issues
+channel. See **Version and migration contract** in **Document grammar**.
+
+Entries below are grouped by the subject being validated. The unit is one row per **distinct
+trigger condition** — a message an author could be holding — not per Rust construction site. One
+site fed by several labels or reason strings expands to several rows.
+
+### Document and input bounds
+
+Input-bound rejections run in `validate_workflow_input_bounds` (`src/model.rs:1491-1573`) before the
+main pass. When one fires inside `validate_workflow`, the function returns immediately with that
+single issue and default graph metadata (`src/model.rs:1424-1430`). The validate and run-start
+routes also call `enforce_workflow_input_bounds` (`src/api.rs:566`, `:750`) so oversized documents
+fail with HTTP 422 before the full result is assembled.
+
+| Severity | Condition | Source |
+| --- | --- | --- |
+| error | Subflow body contains a nested `subflows` catalog | `src/model.rs:1392-1400` |
+| error | Internal invariant: subflow-scope validation invoked without a subflow name (defensive; unreachable from current callers — `reject_nested_subflow_catalogs` always supplies one, `src/model.rs:1409-1418`) | `src/model.rs:1385-1390` |
+| error | Subflow count exceeds `MAX_WORKFLOW_SUBFLOWS` (1024) across the root catalog | `src/model.rs:1495-1503` |
+| error | Subflow/call node count (only nodes with a non-blank `subflowConfig.workflowName`) exceeds `MAX_SUBFLOW_CALL_EDGES` (4096) across root and catalog | `src/model.rs:1516-1524` |
+| error | Node count exceeds `MAX_WORKFLOW_NODES` (50_000) across root and catalog | `src/model.rs:1534-1542` |
+| error | Edge count exceeds `MAX_WORKFLOW_EDGES` (100_000) across root and catalog | `src/model.rs:1544-1552` |
+| error | Node `retryCount` exceeds `MAX_NODE_RETRY_COUNT` (10) | `src/model.rs:1557-1567` |
+
+Constants: `src/model.rs:13-17`.
+
+### Graph topology and edges
+
+| Severity | Condition | Source |
+| --- | --- | --- |
+| error | `entryNodeId` references a non-existent node | `src/model.rs:1453-1462` |
+| warning | Node is unreachable from the entry node (root graph only — subflow bodies are not checked for reachability) | `src/model.rs:1468-1480` |
+| error | Duplicate node id | `src/model.rs:1599-1605` |
+| error | Duplicate edge id | `src/model.rs:2138-2145` |
+| error | Edge references an unknown source node | `src/model.rs:2147-2153` |
+| error | Edge references an unknown target node | `src/model.rs:2155-2161` |
+| error | Non-split node has more than one `success` edge | `src/model.rs:1829-1837` |
+| error | Node has more than one `reject` edge | `src/model.rs:1839-1845` |
+| error | Node mixes `branch` and loop control edges | `src/model.rs:1847-1853` |
+| error | Node has a `loop_continue` edge but no `loop_exit` edge | `src/model.rs:1863-1872` |
+| error | `approval` node has `branch` outbound edges | `src/model.rs:1874-1883` |
+| warning | Node has `loopCondition` but `responseFormat` is not `json` | `src/model.rs:1885-1894` |
+| warning | Node has deterministic `branch` edge conditions but `responseFormat` is not `json` | `src/model.rs:1896-1914` |
+| warning | Node is a terminal node (no outbound control edges) | `src/model.rs:1916-1922` |
+| warning | `split` node carries task-execution fields that are ignored | `src/model.rs:1925-1941` |
+| warning | `collector` node carries task-execution fields that are ignored | `src/model.rs:1925-1941` |
+| error | `split` node has outbound edges other than `success` | `src/model.rs:1944-1955` |
+| error | `split` node has no outbound `success` edges | `src/model.rs:1956-1962` |
+| warning | `split` node fans out to fewer than two `success` branches | `src/model.rs:1963-1970` |
+| error | `collector` node has no inbound edges | `src/model.rs:1974-1980` |
+| error | `collector` node does not have exactly one outbound `success` edge | `src/model.rs:1982-1991` |
+| error | `collector` node has outbound edges other than `success` | `src/model.rs:1993-2003` |
+| error | `collector` node has duplicate inbound merge keys | `src/model.rs:2005-2018` |
+| error | `continueSessionFrom` source node is not `task` or `run_agent` | `src/model.rs:2026-2038` |
+| error | `continueSessionFrom` target and source use different agents | `src/model.rs:2040-2052` |
+| error | `continueSessionFrom` source has a broader access profile than the target | `src/model.rs:2080-2089` |
+| warning | `continueSessionFrom` cannot verify the target agent's access profile (unregistered agent or resolve failure); pane adoption is refused at run time | `src/model.rs:2092-2100` |
+| warning | `continueSessionFrom` cannot verify the source agent's access profile (unregistered agent or resolve failure); pane adoption is refused at run time | `src/model.rs:2101-2109` |
+| error | `continueSessionFrom` target and source resolve to different working directories | `src/model.rs:2113-2122` |
+| error | `continueSessionFrom` references an unknown node id | `src/model.rs:2124-2133` |
+
+### Node kinds
+
+Checked for every kind (node-field rules independent of `kind`):
+
+| Severity | Condition | Source |
+| --- | --- | --- |
+| warning | `outputSchema` is set but `responseFormat` is not `json` | `src/model.rs:1608-1617` |
+| error | `skipCondition` regex is invalid (only `kind: "regex"` is compile-checked) | `src/model.rs:1631-1640` |
+
+Kind-specific rules:
+
+| Severity | Condition | Source |
+| --- | --- | --- |
+| error | `task` node has no agent assigned | `src/model.rs:1671-1677` |
+| warning | `task` node has an empty prompt | `src/model.rs:1680-1686` |
+| error | `spawn` node has neither an agent nor a `command` | `src/model.rs:1713-1722` |
+| error | `send` node has neither `sendConfig.text` nor node `prompt` | `src/model.rs:1749-1755` |
+| error | `run_agent` node has no agent | `src/model.rs:1776-1782` |
+| warning | `run_agent` node has an empty prompt | `src/model.rs:1788-1794` |
+| error | `wait` node with `until` mode has no marker | `src/model.rs:2461-2470` |
+| error | Any non-blank `waitConfig.marker` (regardless of wait mode) or non-blank `runAgentConfig.until` must be a valid regex | `src/model.rs:2473-2481` |
+| error | `idleSeconds` (message: `idle_seconds`) is not a finite non-negative number (`wait` or `run_agent`) | `src/model.rs:2484-2500` |
+| error | `readyStableSeconds` (message: `ready_stable_seconds`) is not a finite non-negative number (`wait` or `run_agent`) | `src/model.rs:2484-2500` |
+| warning | `decide` node has an empty prompt | `src/model.rs:2923-2929` |
+| error | `decide` input binding has an empty name or source | `src/model.rs:2934-2943` |
+| error | `decide` node has duplicate input bindings | `src/model.rs:2945-2954` |
+| error | `decide` node has no outcomes | `src/model.rs:2958-2967` |
+| error | `decide` outcome label is empty | `src/model.rs:2978-2985` |
+| error | `decide` node has duplicate outcome labels | `src/model.rs:2987-2996` |
+| error | `decide` outcome label does not match an outgoing `branch` edge label | `src/model.rs:2998-3007` |
+| error | `decide` node does not have exactly one `branch` edge per outcome | `src/model.rs:3015-3024` |
+| error | `decide` `branch` edge is missing a label matching an outcome | `src/model.rs:3026-3041` |
+| error | `parallel_batch` node is missing `itemsBinding` | `src/model.rs:3051-3060` |
+| error | `parallel_batch` node is missing `itemVar` | `src/model.rs:3062-3068` |
+| error | `parallel_batch` node is missing `bodyEntry` | `src/model.rs:3070-3076` |
+| error | `parallel_batch` `bodyEntry` references a non-existent node (existence only; dispatchability is resolved at run time) | `src/model.rs:3077-3086` |
+| error | `parallel_batch` `maxConcurrent` is zero | `src/model.rs:3088-3097` |
+| error | `parallel_batch` `collectorVar` is empty when set | `src/model.rs:3099-3112` |
+
+### Subflows and calls
+
+| Severity | Condition | Source |
+| --- | --- | --- |
+| warning | Subflow body defines `runAs` (only the root workflow `runAs` is honored) | `src/model.rs:1353-1361` |
+| warning | Subflow body defines non-canonical `limits` (only root limits are honored; see **Limits**) | `src/model.rs:1364-1372` |
+| error | Subflow `entryNodeId` references a non-existent node | `src/model.rs:2514-2523` |
+| error | `subflow`/`call` node is missing `subflowConfig.workflowName` | `src/model.rs:2545-2556` |
+| error | `subflow`/`call` node references an unknown subflow name | `src/model.rs:2562-2571` |
+| error | `subflow`/`call` references a subflow whose `entryNodeId` is invalid | `src/model.rs:2579-2588` |
+| error | Referenced subflow does not expose exactly one terminal exit node | `src/model.rs:2591-2603` |
+| error | `subflowConfig.exitNodeId` is not terminal (has outbound edges) | `src/model.rs:2613-2622` |
+| error | `subflowConfig.exitNodeId` references a non-existent node | `src/model.rs:2625-2633` |
+| error | `subflowConfig.exitNodeId` is required when the referenced subflow has other than one terminal node | `src/model.rs:2635-2644` |
+| error | `subflowConfig.maxDepth` is zero | `src/model.rs:2647-2653` |
+| error | `subflow`/`call` input binding has an empty name or source | `src/model.rs:2659-2668` |
+| error | `subflow`/`call` node has duplicate input bindings | `src/model.rs:2670-2679` |
+| error | `subflow`/`call` binds an unknown subflow variable name (name check only; resolution happens at call time) | `src/model.rs:2681-2690` |
+| error | `subflow`/`call` does not bind a required subflow input (variable with empty `default`) | `src/model.rs:2694-2705` |
+| warning | Subflow call cycle detected among catalogued subflows (`maxDepth` bounds recursion at run time) | `src/model.rs:2727-2771` |
+
+### Agent launch configuration
+
+Absolute working-directory enforcement (`validate_absolute_cwd`, `src/model.rs:1321-1337`) applies
+whenever a path is non-empty on these surfaces:
+
+| Severity | Condition | Source |
+| --- | --- | --- |
+| error | Root workflow `cwd` is not an absolute path | `src/model.rs:1585-1591` |
+| error | Subflow body `cwd` is not an absolute path (scoped) | `src/model.rs:1585-1591` |
+| error | Node-level `cwd` is not an absolute path | `src/model.rs:1620-1626` |
+| error | `spawnConfig.cwd` is not an absolute path | `src/model.rs:1724-1730` |
+| error | `runAgentConfig.cwd` is not an absolute path | `src/model.rs:1796-1802` |
+
+`extraArgs` on `spawn` and `run_agent` nodes is validated by `validate_agent_launch_config`
+(`src/model.rs:2252-2360`); each rejection is pushed by `reject_agent_extra_arg`
+(`src/model.rs:2428-2444`). `access` is validated on `run_agent` nodes and on agent-launched `spawn`
+nodes that do not have a non-blank custom `spawnConfig.command` (command-driven spawn passes
+`access: None` and skips access checks, `src/model.rs:1734-1736`). Option-syntax arguments (any
+token starting with `-` other than a lone `-`) are rejected unless allowlisted. Allowlisted options:
+`--model` (and `--model=…`) for `claude` and `codex`; `--search` for `codex`; `-c` / `--config`
+(and `--config=…`) for `codex` with `KEY=VALUE` validation. Any configuration key containing
+`sandbox` or `approval` is rejected.
+
+| Severity | Condition | Source |
+| --- | --- | --- |
+| error | `access` profile is not defined for a registered agent | `src/model.rs:2263-2271` |
+| warning | `access` profile cannot be verified because the agent is not registered | `src/model.rs:2273-2280` |
+| error | `extraArgs` `--model` requires a following non-option value (`claude`/`codex`) | `src/model.rs:2288-2298` |
+| error | `extraArgs` `-c` / `--config` requires a following non-option value (`codex`) | `src/model.rs:2317-2335` |
+| error | `extraArgs` `--config` override is not `KEY=VALUE` syntax | `src/model.rs:2374-2383` |
+| error | `extraArgs` `--config` override has an empty key | `src/model.rs:2385-2394` |
+| error | `extraArgs` `--config` override uses unsupported key syntax | `src/model.rs:2396-2405` |
+| error | `extraArgs` `--config` override changes sandbox or approval settings | `src/model.rs:2407-2415` |
+| error | `extraArgs` argument is option-syntax but not allowlisted | `src/model.rs:2348-2356` |
+
+`access` here is the named argv bundle selected by `spawnConfig.access` or `runAgentConfig.access`
+— distinct from the `accessMode` enum on `agentConfig`.
+
+### Run identity
+
+| Severity | Condition | Source |
+| --- | --- | --- |
+| error | `runAs.command` is empty | `src/model.rs:2189-2195` |
+| error | `runAs.command` contains blank tokens | `src/model.rs:2196-2202` |
+| error | `runAs.user` is empty | `src/model.rs:2207-2213` |
+| error | `runAs.user` contains shell metacharacters | `src/model.rs:2214-2220` |
 
 ## Regenerating this document
 
