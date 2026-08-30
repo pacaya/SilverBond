@@ -96,3 +96,7 @@ One row per unique key (`file:line` + smell name). Columns:
 | `tests/docs_catalog.rs:556` + Speculative Generality | 1 | 2026-08-30 | open |
 | `tests/docs_catalog.rs:117` + Repeated Switches | 1 | 2026-08-30 | open |
 | `tests/docs_catalog.rs:89` + Data Clumps | 1 | 2026-08-30 | open |
+| docs/workflow-schema.md:1292 — Duplicated Code | 1 | 2026-08-30 | open |
+| docs/workflow-schema.md:1346-1348 — Duplicated Code | 1 | 2026-08-30 | open |
+| docs/workflow-schema.md:1451-1453 — Duplicated Code | 1 | 2026-08-30 | open |
+| docs/workflow-schema.md:1496 — Primitive Obsession | 1 | 2026-08-30 | open |

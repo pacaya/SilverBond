@@ -1265,18 +1265,295 @@ is skipped on serialize when equal to `RunAgentConfig::default()`.
 
 ## Edges and conditions
 
-Edge, outcome, and condition field tables are deferred to a later pass; `src/model.rs` (`WorkflowEdge`,
-`WorkflowEdgeOutcome`, `StructuredCondition`) is the authority until then.
+An edge deserializes to `WorkflowEdge` (`src/model.rs`). Wire keys use camelCase
+(`rename_all = "camelCase"` on the struct). There are no serde aliases on endpoint fields — the
+wire names are `from` and `to`, not `source` or `target`.
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `id` | string | Yes | — | Edge identifier; must be unique within the workflow. Duplicate ids are a validation error (`validate_graph_body`, `src/model.rs:2138-2145`). |
+| `from` | string | Yes | — | Source node id. |
+| `to` | string | Yes | — | Target node id. |
+| `outcome` | `success` \| `reject` \| `branch` \| `loop_continue` \| `loop_exit` | Yes | — | Traversal channel (`WorkflowEdgeOutcome`, `src/model.rs:215-221`). |
+| `label` | string or absent | No | absent | Branch label for `branch` edges (matched against decide outcomes) and collector merge keys (see below). |
+| `branchId` | string or absent | No | absent | Branch identifier reported as `chosenBranch` on the `branch_decision` event, falling back to the edge `id` when absent (`src/runtime.rs:6575`). |
+| `condition` | `{field, operator, value}` or absent | No | absent | Post-execution deterministic guard (`StructuredCondition`, `src/model.rs:128-134`). Only `branch`-outcome edges on non-`decide` nodes consult it (`src/runtime.rs:6527-6539`); `success`, `reject`, `loop_continue`, and `loop_exit` edges deserialize it but never evaluate it, and validation does not flag that (`src/model.rs:1896-1914` warns only for branch edges). `decide` nodes return before condition evaluation (`src/runtime.rs:6383-6443`). Evaluation runs only when `result.parsed_output` is present (`src/runtime.rs:6529`); `responseFormat: json` produces parsed output for prompt-driven nodes (`parse_structured_output`, `src/runtime.rs:7208-7226`), while system-output kinds (`capture`, `parallel_batch`, `decide`, `split`, `collector`) populate it unconditionally. See **Condition leaf**. |
+
+*Source: `WorkflowEdge` (`src/model.rs:922-935`).*
+
+### Edge outcomes
+
+There is no `failure` outcome in v4 — a node failure always ends its cursor; outside a split
+family that fails the whole run. A sixth `failure` outcome is planned in
+[ADR-260815-2009-02](adr/260815-2009-single-condition-dialect.md) and is not present behavior.
+
+Saving a workflow does not validate it (`save_workflow`, `src/api.rs`). Graph rules below are
+enforced by `validate_workflow` on an explicit validate request and at run start, where
+error-severity issues refuse the run. A document with a branch edge leaving a split loads and
+saves cleanly and fails when someone tries to run it.
+
+### Split and collector graph rules
+
+**Split.** Fan-out is over **success** edges only. Any `branch`, `loop_continue`, `loop_exit`, or
+`reject` edge leaving a split is a validation error (`src/model.rs:1944-1955`). A split with zero
+outbound success edges is an error (`:1956-1962`); exactly one success edge is a warning
+(`:1963-1970`).
+
+**Collector.** A collector needs at least one inbound edge (error when empty,
+`src/model.rs:1974-1980`), exactly one outbound **success** edge (error otherwise, `:1982-1991`),
+and no `branch`, `loop_continue`, `loop_exit`, or `reject` outbound edges (`:1993-2003`). Expected
+inputs are keyed by each inbound edge's `label`, falling back to the source node `from` id
+(`:2005-2007`). Two inbound edges sharing a merge key are a **validation error**, not a silent
+merge (`:2008-2018`).
+
+If validation were bypassed, the barrier builder would dedupe duplicate merge keys into a set
+behind a log warning (`collector_required_inputs`, `src/runtime.rs:1929-1942`) — that collapse is
+not behavior an author will meet on a validated document.
+
+### Condition leaf
+
+Edge conditions and `loopCondition` share one flat leaf shape — `StructuredCondition`
+(`src/model.rs:128-134`). All three fields are required when the object is present; there is no
+nested condition AST in v4 (a planned replacement is described in
+[ADR-260815-2009-02](adr/260815-2009-single-condition-dialect.md)).
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `field` | string | Yes | — | Dot-path field lookup against the source node's parsed JSON output (`get_nested_field`, `src/model.rs:3174-3180`). |
+| `operator` | string | Yes | — | Comparison operator; see **Operators** below. |
+| `value` | string | Yes | — | Right-hand operand, always a string on the wire. |
+
+*Source: `StructuredCondition` (`src/model.rs:128-134`), `evaluate_condition`
+(`src/model.rs:3182-3236`).*
+
+#### Operators
+
+The operator set exists only inside `evaluate_condition` as string comparisons — there is no enum
+to enumerate. The complete set of recognised operator strings is:
+
+| Operator | Behaviour |
+| --- | --- |
+| `==` | String equality after coercing the field value to string. |
+| `!=` | String inequality. |
+| `contains` | `value_as_string.contains(target)`. |
+| `matches` | Regex match; patterns longer than 256 UTF-8 bytes are rejected at run time with an error string (`src/model.rs:3201-3207`; the runtime message says "chars"). Invalid regex syntax returns an error string. |
+| `>` `<` `>=` `<=` | Numeric comparison after parsing both sides as `f64`; non-numeric operands return an error string (`src/model.rs:3213-3233`). |
+
+An **unrecognised** operator does not match — `evaluate_condition` returns
+`(false, Some("unknown operator: …"))` (`src/model.rs:3234-3235`), not a silent false. A missing
+field returns `(false, Some("field not found: …"))` (`:3186-3188`).
 
 ## Document-level fields
 
-Top-level `WorkflowV3` field tables are deferred to a later pass; `src/model.rs` is the authority
-until then.
+A workflow document deserializes to `WorkflowV3` (`src/model.rs:939-969`). Wire keys use camelCase.
+Only two top-level keys are genuinely required at deserialization time: `version` and `entryNodeId`
+(see **Required top-level keys** in **Document grammar**). Every other field carries a serde
+default or is optional.
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `version` | non-negative integer | Yes | — | Canonical value is `4` (`WORKFLOW_SCHEMA_VERSION`, `src/model.rs`). Rewritten by `ensure_defaults` and migration (`src/model.rs:1116-1117`, `:1170`). |
+| `name` | string or absent | No | absent | Skipped on serialize when absent (`skip_serializing_if = "Option::is_none"`, `src/model.rs:941-942`). |
+| `goal` | string | No | `""` | Always emitted. |
+| `cwd` | string | No | `""` | Workflow working directory. Always emitted. |
+| `useOrchestrator` | boolean | No | `false` | Always emitted. |
+| `runAs` | `{user?, command?}` or absent | No | absent | Skipped on serialize when absent (`src/model.rs:949-950`). |
+| `entryNodeId` | string | Yes | — | Id of the first node to execute. |
+| `variables` | array of `{name, default}` | No | `[]` | Always emitted. See **Variables** below. |
+| `limits` | `{maxTotalSteps, maxVisitsPerNode}` | No | see **Limits** | Always emitted. |
+| `nodes` | array of node objects | No | `[]` | Always emitted. |
+| `edges` | array of edge objects | No | `[]` | Always emitted. |
+| `agentDefaults` | map of agent name → config object | No | `{}` | `BTreeMap` — keys are sorted and deterministic on serialize (`src/model.rs:960-961`). Skipped when empty. |
+| `subflows` | map of name → workflow body | No | `{}` | Root-level subflow catalog (`src/model.rs:962-966`). Skipped when empty. See **Subflow catalog**. |
+| `ui` | `{canvas?}` or absent | No | absent | Editor canvas state. Skipped when absent (`src/model.rs:967-968`). |
+
+*Source: `WorkflowV3` (`src/model.rs:939-969`).*
+
+### Limits
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `maxTotalSteps` | non-negative integer | No | `50` | `default_max_total_steps` (`src/model.rs:232-234`). |
+| `maxVisitsPerNode` | non-negative integer | No | `10` | `default_max_visits_per_node` (`src/model.rs:236-238`). |
+
+`ensure_defaults` (`src/model.rs:1116-1131`) rewrites any `0` limit back to its default on the
+**root** workflow only — a zero does **not** mean unlimited. Subflow `limits` are ignored at
+execution and are not recursively normalized; a `{0,0}` pair on a subflow body survives
+serialization unchanged. On the root, the pair `{maxTotalSteps: 0, maxVisitsPerNode: 0}` is
+treated as absent-equivalent by `limits_are_canonical` (`src/model.rs:240-245`) and normalizes to
+`50` / `10`.
+
+*Source: `WorkflowLimits` (`src/model.rs:223-230`), `ensure_defaults` (`src/model.rs:1116-1131`).*
+
+### Variables
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `name` | string | Yes | — | Variable name within the cursor scope. |
+| `default` | string | No | `""` | String-valued initial content (`WorkflowVariable`, `src/model.rs:115-119`). |
+
+On a **subflow** body, a variable with an empty `default` is a **required input binding** — the
+calling `subflow` or `call` node must supply an `inputs` entry for that name, or validation fails
+at run start (`src/model.rs:2694-2705`). Root-level variable names are not checked for uniqueness;
+only subflow input bindings on a call node are deduped (`src/model.rs:2656-2679`).
+
+*Source: `WorkflowVariable` (`src/model.rs:115-119`).*
+
+### Subflow catalog
+
+Each entry in `subflows` is a full `WorkflowV3` body keyed by the subflow name. Names are globally
+scoped at the root — a subflow body that contains its own `subflows` map is rejected outright
+(`validate_workflow_body_for_scope`, `src/model.rs:1392-1400`). Subflow bodies warn when they
+define root-only fields that execution ignores: non-canonical `limits` and a `runAs` block
+(`validate_subflow_body_root_only_fields`, `src/model.rs:1348-1374`).
+
+| Constraint | Severity | Notes |
+| --- | --- | --- |
+| Nested `subflows` on a catalog entry | error | Rejected at validation ingress (`src/model.rs:1392-1400`). |
+| `runAs` on a subflow body | warning | Only the root workflow `runAs` is honored (`src/model.rs:1353-1361`). |
+| Non-canonical `limits` on a subflow body | warning | Only root limits are honored (`src/model.rs:1364-1372`). |
+
+*Source: `WorkflowV3::subflows` (`src/model.rs:962-966`), `validate_workflow_body_for_scope`
+(`src/model.rs:1376-1407`).*
+
+### UI viewport
+
+`ui.canvas.viewport` (`WorkflowCanvasViewport`, `src/model.rs:652-658`) has three required
+sub-fields (`x`, `y`, `zoom`) with no per-field serde defaults. Omitting the whole `viewport`
+object deserializes to `WorkflowCanvasViewport::default()` via the parent `#[serde(default)]`
+(`WorkflowCanvasUi`, `src/model.rs:680-681`), but a **partial** viewport object (for example only
+`x`) fails deserialization.
+
+*Source: `WorkflowCanvasViewport` (`src/model.rs:652-668`), `WorkflowCanvasUi`
+(`src/model.rs:677-684`).*
 
 ## Templates and agent config
 
-Template-token and agent-configuration tables are deferred to a later pass; `src/model.rs` and
-`src/runtime.rs` (`resolve_template_vars`) are the authority until then.
+### Template tokens
+
+Prompt text is scanned for `{{…}}` substitution forms by `resolve_template_vars`
+(`src/runtime.rs:7063-7154`). There are exactly ten forms and no others:
+
+| Form | Resolves from |
+| --- | --- |
+| `{{var:<name>}}` | Cursor variable map (`var_map`). |
+| `{{<nodeId>}}` | Named node's `output` string. |
+| `{{node:<nodeId>.output}}` | Same as the bare node-id form. |
+| `{{node:<nodeId>.output.<path>}}` | Dot-path field inside the node's JSON `output` (parsed when possible). |
+| `{{node:<nodeId>.parsedOutput.<path>}}` | Dot-path field inside the node's `parsedOutput` value. |
+| `{{context:<name>}}` | Output of the node registered under that name in `contextSources`. |
+| `{{previous_output}}` | The cursor's `last_output`. |
+| `{{branch_origin}}` | The cursor's `last_branch_origin_id`, or empty. |
+| `{{branch_choice}}` | The cursor's `last_branch_choice`, or empty. |
+| `{{all_predecessors}}` | Direct inbound predecessors only — see below. |
+
+Node ids carry no constraint beyond duplicate detection within a workflow
+(`src/model.rs:1598-1606`). **Which form matches.** `resolve_template_vars` applies forms in this
+order: `{{var:<name>}}`, then bare `{{<nodeId>}}` and `{{node:<nodeId>.output}}`, then the two
+dot-path regexes, then `{{context:<name>}}`, then `{{previous_output}}`, `{{branch_origin}}`,
+`{{branch_choice}}`, and finally `{{all_predecessors}}` (`src/runtime.rs:7065-7152`). An earlier
+match shadows later forms. A completed node whose id is `previous_output` or `context:name`
+consumes that token first; a node whose id is `var:name` consumes a `{{var:name}}` token only when
+no variable of that name is bound. The dot-path regexes capture the node id as `[^.}]+`
+(`src/runtime.rs:7073-7075`, `:7096-7098`); a token whose node id contains `.` (for example
+`build.step`) matches neither regex and is left in the prompt verbatim.
+
+**Miss behaviour, given a form matched.** Nothing errors on a miss. The two dot-path forms
+(`output.<path>` and `parsedOutput.<path>`) substitute the **empty string** when the node or field
+is absent. The four name-keyed forms (`{{var:<name>}}`, `{{<nodeId>}}`,
+`{{node:<nodeId>.output}}`, `{{context:<name>}}`) are left in the prompt **verbatim** when their
+binding is missing. The remaining forms (`{{previous_output}}`, `{{branch_origin}}`,
+`{{branch_choice}}`, `{{all_predecessors}}`) always substitute, using an empty string when there
+is no value.
+
+`contextSources` on a node registers a `{{context:<name>}}` substitution — it does **not** inject
+text into the prompt. The token has no effect unless the prompt names it
+(`src/runtime.rs:7119-7123`).
+
+`{{all_predecessors}}` covers **direct** inbound predecessors only (`inbound_map` for the current
+node, `src/runtime.rs:7135-7152`). Empty outputs are dropped. Non-empty outputs are joined with
+`\n---\n`. Results marked stale are prefixed with `[preserved from prior run]\n`.
+
+*Source: `resolve_template_vars` (`src/runtime.rs:7063-7154`), `CONTEXT.md` **Template Token**.*
+
+### `skipCondition`
+
+Pre-execution guard on a node (`SkipCondition`, `src/model.rs:136-144`). Distinct from edge and
+loop conditions — evaluated before the node runs (`should_skip_cursor_node`,
+`src/runtime.rs:2702-2733`).
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `source` | string | No | `"previous_output"` | When `"previous_output"`, uses the cursor's `last_output`. Any other value is treated as a node id; a missing result defaults to `""` (`src/runtime.rs:2711-2718`). |
+| `type` | `contains` \| `not_contains` \| `regex` | Yes | — | Wire key is `type`; the Rust field is `kind` (`#[serde(rename = "type")]`, `src/model.rs:141-142`). |
+| `value` | string | Yes | — | Operand for the chosen type. |
+
+An unrecognised `type` evaluates **false** silently — the node runs (`src/runtime.rs:2731-2732`).
+Only `regex` is compile-checked at validation time; an invalid pattern is an error-severity issue
+(`src/model.rs:1629-1642`) and fails the run before any node executes.
+
+*Source: `SkipCondition` (`src/model.rs:136-144`), `should_skip_cursor_node`
+(`src/runtime.rs:2702-2733`).*
+
+### Agent configuration
+
+Workflow-level defaults live in `agentDefaults`, keyed by agent name (`AgentDefaults`,
+`src/model.rs:256-277`). Per-node overrides use `agentConfig` inside `kind` on `task` and
+`run_agent` nodes (`AgentNodeConfig`, `src/model.rs:287-296`), which `#[serde(flatten)]`s the
+shared defaults and adds node-exclusive tool lists.
+
+Resolution order for shared fields: node `agentConfig` → workflow `agentDefaults[agent]` →
+built-in defaults (`resolve_agent_config`, `src/model.rs:298-354`). The `access` field on
+`spawnConfig` and `runAgentConfig` is applied **outside** this merge chain as
+`access_profile_override` (`src/model.rs:324-330`) — distinct from `accessMode`; see
+`CONTEXT.md` **Access Profile**.
+
+#### Workflow `agentDefaults` fields
+
+All `or absent` fields below are omitted on serialize (`skip_serializing_if = "Option::is_none"`,
+`src/model.rs:259-276`).
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `model` | string or absent | No | absent | |
+| `reasoningLevel` | `low` \| `medium` \| `high` or absent | No | absent | `ReasoningLevel` (`src/driver.rs:494-500`). |
+| `systemPrompt` | string or absent | No | absent | |
+| `accessMode` | `read_only` \| `edit` \| `execute` \| `unrestricted` or absent | No | absent | Resolves to `execute` — not `read_only` — when unset (`AccessMode::default()`, `src/driver.rs:503-511`). |
+| `toolToggles` | `{webSearch?: boolean}` or absent | No | absent | Exactly one toggle key (`ToolToggles`, `src/driver.rs:514-519`). |
+| `maxTurns` | non-negative integer or absent | No | absent | |
+| `maxBudgetUsd` | number or absent | No | absent | |
+| `autoApprove` | boolean or absent | No | absent | Resolves to `false` when unset (`src/model.rs:351`). |
+| `orchestrator` | object or absent | No | absent | See **Orchestrator config**. |
+
+*Source: `AgentDefaults` (`src/model.rs:256-277`).*
+
+#### Node `agentConfig` fields
+
+All `agentDefaults` fields above, plus:
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `allowedTools` | array of strings or absent | No | absent | Node-exclusive allow list. |
+| `disallowedTools` | array of strings or absent | No | absent | Node-exclusive deny list. |
+
+*Source: `AgentNodeConfig` (`src/model.rs:287-296`).*
+
+#### Orchestrator config
+
+Nested under `orchestrator` on `agentDefaults` or node `agentConfig` (`OrchestratorConfig`,
+`src/model.rs:40-55`). `enabled` and `activation` are always emitted; all other fields are omitted
+on serialize when absent (`src/model.rs:43-54`).
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `enabled` | boolean | No | `false` | |
+| `model` | string or absent | No | absent | |
+| `activation` | `stale_only` \| `always_on` | No | `stale_only` | `OrchestratorActivation` (`src/model.rs:29-37`). |
+| `systemPrompt` | string or absent | No | absent | |
+| `staleTimeoutSecs` | non-negative integer or absent | No | absent | |
+| `subagentTimeoutSecs` | non-negative integer or absent | No | absent | |
+
+*Source: `OrchestratorConfig` (`src/model.rs:40-55`).*
 
 ## Validation catalog
 
