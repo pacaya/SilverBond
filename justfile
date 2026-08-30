@@ -71,6 +71,10 @@ check:
 check-v4-docs:
     bash scripts/check-canonical-v4-docs.sh
 
+# Regenerate node-catalog blocks in docs/workflow-schema.md
+regen-docs:
+    SB_REGEN_DOCS=1 cargo test --locked --test docs_catalog regeneration_writes_to_disk -- --ignored --exact
+
 # Clean frontend build output
 clean:
     rm -rf public/assets

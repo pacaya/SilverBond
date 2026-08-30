@@ -68,9 +68,9 @@ silently ignored and the override is lost (see **Unknown keys** above).
 }
 ```
 
-The fourteen `type` values and their config shapes will be listed in the generated node catalog
-below once the catalog is populated; until then `NodeKind` (`src/model.rs`) is the authority.
-`/api/capabilities` publishes the same wire tags as `supportedNodeTypes` (`src/api.rs`).
+The fourteen `type` values and their config shapes are listed in the generated node catalog
+below; `NodeKind` (`src/model.rs`) remains the schema authority for fields not shown in an
+example. `/api/capabilities` publishes the same wire tags as `supportedNodeTypes` (`src/api.rs`).
 
 ### Version and migration contract
 
@@ -131,121 +131,923 @@ errors), are skipped with a `tracing::warn!` and left byte-unchanged.
 
 ## Node catalog
 
-The node-catalog generator (ISSUE-260826-0637-04) will emit one readable **fragment** block and
-one complete **workflow** block per node kind. Block IDs will follow
-`node-catalog:<wire-tag>:fragment` and `node-catalog:<wire-tag>:workflow`, where `<wire-tag>` is
-the node's `kind.type` value (`WorkflowNodeType::as_str`, `src/model.rs`).
+The node-catalog generator emits one readable **fragment** block and one complete **workflow**
+block per node kind. Block IDs follow `node-catalog:<wire-tag>:fragment` and
+`node-catalog:<wire-tag>:workflow`, where `<wire-tag>` is the node's `kind.type` value
+(`WorkflowNodeType::as_str`, `src/model.rs`).
 
 ### task
 
 <!-- BEGIN GENERATED: node-catalog:task:fragment -->
+```json
+{
+  "agent": "claude",
+  "id": "example",
+  "kind": {
+    "type": "task"
+  },
+  "name": "Task",
+  "prompt": "Complete the step."
+}
+```
 <!-- END GENERATED: node-catalog:task:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:task:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [],
+  "entryNodeId": "example",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "agent": "claude",
+      "id": "example",
+      "kind": {
+        "type": "task"
+      },
+      "name": "Task",
+      "prompt": "Complete the step."
+    }
+  ],
+  "useOrchestrator": false,
+  "variables": [],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:task:workflow -->
 
 ### approval
 
 <!-- BEGIN GENERATED: node-catalog:approval:fragment -->
+```json
+{
+  "id": "example",
+  "kind": {
+    "type": "approval"
+  },
+  "name": "Approval",
+  "prompt": ""
+}
+```
 <!-- END GENERATED: node-catalog:approval:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:approval:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [],
+  "entryNodeId": "example",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "id": "example",
+      "kind": {
+        "type": "approval"
+      },
+      "name": "Approval",
+      "prompt": ""
+    }
+  ],
+  "useOrchestrator": false,
+  "variables": [],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:approval:workflow -->
 
 ### split
 
 <!-- BEGIN GENERATED: node-catalog:split:fragment -->
+```json
+{
+  "id": "example",
+  "kind": {
+    "type": "split"
+  },
+  "name": "Split",
+  "prompt": ""
+}
+```
 <!-- END GENERATED: node-catalog:split:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:split:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [
+    {
+      "from": "example",
+      "id": "split_a",
+      "outcome": "success",
+      "to": "branch_a"
+    },
+    {
+      "from": "example",
+      "id": "split_b",
+      "outcome": "success",
+      "to": "branch_b"
+    }
+  ],
+  "entryNodeId": "example",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "id": "example",
+      "kind": {
+        "type": "split"
+      },
+      "name": "Split",
+      "prompt": ""
+    },
+    {
+      "agent": "claude",
+      "id": "branch_a",
+      "kind": {
+        "type": "task"
+      },
+      "name": "Branch A",
+      "prompt": "Complete the step."
+    },
+    {
+      "agent": "claude",
+      "id": "branch_b",
+      "kind": {
+        "type": "task"
+      },
+      "name": "Branch B",
+      "prompt": "Complete the step."
+    }
+  ],
+  "useOrchestrator": false,
+  "variables": [],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:split:workflow -->
 
 ### collector
 
 <!-- BEGIN GENERATED: node-catalog:collector:fragment -->
+```json
+{
+  "id": "example",
+  "kind": {
+    "type": "collector"
+  },
+  "name": "Collector",
+  "prompt": ""
+}
+```
 <!-- END GENERATED: node-catalog:collector:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:collector:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [
+    {
+      "from": "split",
+      "id": "split_a",
+      "outcome": "success",
+      "to": "branch_a"
+    },
+    {
+      "from": "split",
+      "id": "split_b",
+      "outcome": "success",
+      "to": "branch_b"
+    },
+    {
+      "from": "branch_a",
+      "id": "a_collect",
+      "label": "a",
+      "outcome": "success",
+      "to": "example"
+    },
+    {
+      "from": "branch_b",
+      "id": "b_collect",
+      "label": "b",
+      "outcome": "success",
+      "to": "example"
+    },
+    {
+      "from": "example",
+      "id": "collect_after",
+      "outcome": "success",
+      "to": "after"
+    }
+  ],
+  "entryNodeId": "split",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "id": "split",
+      "kind": {
+        "type": "split"
+      },
+      "name": "Split",
+      "prompt": ""
+    },
+    {
+      "agent": "claude",
+      "id": "branch_a",
+      "kind": {
+        "type": "task"
+      },
+      "name": "Branch A",
+      "prompt": "Complete the step."
+    },
+    {
+      "agent": "claude",
+      "id": "branch_b",
+      "kind": {
+        "type": "task"
+      },
+      "name": "Branch B",
+      "prompt": "Complete the step."
+    },
+    {
+      "id": "example",
+      "kind": {
+        "type": "collector"
+      },
+      "name": "Collector",
+      "prompt": ""
+    },
+    {
+      "agent": "claude",
+      "id": "after",
+      "kind": {
+        "type": "task"
+      },
+      "name": "After",
+      "prompt": "Complete the step."
+    }
+  ],
+  "useOrchestrator": false,
+  "variables": [],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:collector:workflow -->
 
 ### decide
 
 <!-- BEGIN GENERATED: node-catalog:decide:fragment -->
+```json
+{
+  "id": "example",
+  "kind": {
+    "decideConfig": {
+      "outcomes": [
+        "yes",
+        "no"
+      ],
+      "prompt": "Choose a path"
+    },
+    "type": "decide"
+  },
+  "name": "Decide",
+  "prompt": ""
+}
+```
 <!-- END GENERATED: node-catalog:decide:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:decide:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [
+    {
+      "from": "example",
+      "id": "decide_yes",
+      "label": "yes",
+      "outcome": "branch",
+      "to": "yes_node"
+    },
+    {
+      "from": "example",
+      "id": "decide_no",
+      "label": "no",
+      "outcome": "branch",
+      "to": "no_node"
+    }
+  ],
+  "entryNodeId": "example",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "id": "example",
+      "kind": {
+        "decideConfig": {
+          "outcomes": [
+            "yes",
+            "no"
+          ],
+          "prompt": "Choose a path"
+        },
+        "type": "decide"
+      },
+      "name": "Decide",
+      "prompt": ""
+    },
+    {
+      "agent": "claude",
+      "id": "yes_node",
+      "kind": {
+        "type": "task"
+      },
+      "name": "Yes",
+      "prompt": "Complete the step."
+    },
+    {
+      "agent": "claude",
+      "id": "no_node",
+      "kind": {
+        "type": "task"
+      },
+      "name": "No",
+      "prompt": "Complete the step."
+    }
+  ],
+  "useOrchestrator": false,
+  "variables": [],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:decide:workflow -->
 
 ### parallel_batch
 
 <!-- BEGIN GENERATED: node-catalog:parallel_batch:fragment -->
+```json
+{
+  "id": "example",
+  "kind": {
+    "batchConfig": {
+      "bodyEntry": "body",
+      "itemVar": "item",
+      "itemsBinding": "items",
+      "maxConcurrent": 4
+    },
+    "type": "parallel_batch"
+  },
+  "name": "Batch",
+  "prompt": ""
+}
+```
 <!-- END GENERATED: node-catalog:parallel_batch:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:parallel_batch:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [],
+  "entryNodeId": "example",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "id": "example",
+      "kind": {
+        "batchConfig": {
+          "bodyEntry": "body",
+          "itemVar": "item",
+          "itemsBinding": "items",
+          "maxConcurrent": 4
+        },
+        "type": "parallel_batch"
+      },
+      "name": "Batch",
+      "prompt": ""
+    },
+    {
+      "agent": "claude",
+      "id": "body",
+      "kind": {
+        "type": "task"
+      },
+      "name": "Body",
+      "prompt": "Complete the step."
+    }
+  ],
+  "useOrchestrator": false,
+  "variables": [
+    {
+      "default": "[\"a\",\"b\"]",
+      "name": "items"
+    }
+  ],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:parallel_batch:workflow -->
 
 ### subflow
 
 <!-- BEGIN GENERATED: node-catalog:subflow:fragment -->
+```json
+{
+  "id": "example",
+  "kind": {
+    "subflowConfig": {
+      "maxDepth": 10,
+      "workflowName": "child"
+    },
+    "type": "subflow"
+  },
+  "name": "Subflow",
+  "prompt": ""
+}
+```
 <!-- END GENERATED: node-catalog:subflow:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:subflow:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [],
+  "entryNodeId": "example",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "id": "example",
+      "kind": {
+        "subflowConfig": {
+          "maxDepth": 10,
+          "workflowName": "child"
+        },
+        "type": "subflow"
+      },
+      "name": "Subflow",
+      "prompt": ""
+    }
+  ],
+  "subflows": {
+    "child": {
+      "cwd": "",
+      "edges": [],
+      "entryNodeId": "exit",
+      "goal": "Illustrate a node kind",
+      "limits": {
+        "maxTotalSteps": 0,
+        "maxVisitsPerNode": 0
+      },
+      "name": "child",
+      "nodes": [
+        {
+          "agent": "claude",
+          "id": "exit",
+          "kind": {
+            "type": "task"
+          },
+          "name": "Exit",
+          "prompt": "Complete the step."
+        }
+      ],
+      "useOrchestrator": false,
+      "variables": [],
+      "version": 4
+    }
+  },
+  "useOrchestrator": false,
+  "variables": [],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:subflow:workflow -->
 
 ### call
 
 <!-- BEGIN GENERATED: node-catalog:call:fragment -->
+```json
+{
+  "id": "example",
+  "kind": {
+    "subflowConfig": {
+      "maxDepth": 10,
+      "workflowName": "child"
+    },
+    "type": "call"
+  },
+  "name": "Call",
+  "prompt": ""
+}
+```
 <!-- END GENERATED: node-catalog:call:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:call:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [],
+  "entryNodeId": "example",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "id": "example",
+      "kind": {
+        "subflowConfig": {
+          "maxDepth": 10,
+          "workflowName": "child"
+        },
+        "type": "call"
+      },
+      "name": "Call",
+      "prompt": ""
+    }
+  ],
+  "subflows": {
+    "child": {
+      "cwd": "",
+      "edges": [],
+      "entryNodeId": "exit",
+      "goal": "Illustrate a node kind",
+      "limits": {
+        "maxTotalSteps": 0,
+        "maxVisitsPerNode": 0
+      },
+      "name": "child",
+      "nodes": [
+        {
+          "agent": "claude",
+          "id": "exit",
+          "kind": {
+            "type": "task"
+          },
+          "name": "Exit",
+          "prompt": "Complete the step."
+        }
+      ],
+      "useOrchestrator": false,
+      "variables": [],
+      "version": 4
+    }
+  },
+  "useOrchestrator": false,
+  "variables": [],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:call:workflow -->
 
 ### spawn
 
 <!-- BEGIN GENERATED: node-catalog:spawn:fragment -->
+```json
+{
+  "id": "example",
+  "kind": {
+    "spawnConfig": {
+      "agent": "claude",
+      "sessionName": "catalog-spawn"
+    },
+    "type": "spawn"
+  },
+  "name": "spawn",
+  "prompt": ""
+}
+```
 <!-- END GENERATED: node-catalog:spawn:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:spawn:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [],
+  "entryNodeId": "example",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "id": "example",
+      "kind": {
+        "spawnConfig": {
+          "agent": "claude",
+          "sessionName": "catalog-spawn"
+        },
+        "type": "spawn"
+      },
+      "name": "spawn",
+      "prompt": ""
+    }
+  ],
+  "useOrchestrator": false,
+  "variables": [],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:spawn:workflow -->
 
 ### send
 
 <!-- BEGIN GENERATED: node-catalog:send:fragment -->
+```json
+{
+  "id": "example",
+  "kind": {
+    "sendConfig": {
+      "enter": true,
+      "target": "catalog-session",
+      "text": "hello"
+    },
+    "type": "send"
+  },
+  "name": "send",
+  "prompt": ""
+}
+```
 <!-- END GENERATED: node-catalog:send:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:send:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [],
+  "entryNodeId": "example",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "id": "example",
+      "kind": {
+        "sendConfig": {
+          "enter": true,
+          "target": "catalog-session",
+          "text": "hello"
+        },
+        "type": "send"
+      },
+      "name": "send",
+      "prompt": ""
+    }
+  ],
+  "useOrchestrator": false,
+  "variables": [],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:send:workflow -->
 
 ### wait
 
 <!-- BEGIN GENERATED: node-catalog:wait:fragment -->
+```json
+{
+  "id": "example",
+  "kind": {
+    "type": "wait",
+    "waitConfig": {
+      "mode": "idle",
+      "target": "catalog-session"
+    }
+  },
+  "name": "wait",
+  "prompt": ""
+}
+```
 <!-- END GENERATED: node-catalog:wait:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:wait:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [],
+  "entryNodeId": "example",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "id": "example",
+      "kind": {
+        "type": "wait",
+        "waitConfig": {
+          "mode": "idle",
+          "target": "catalog-session"
+        }
+      },
+      "name": "wait",
+      "prompt": ""
+    }
+  ],
+  "useOrchestrator": false,
+  "variables": [],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:wait:workflow -->
 
 ### capture
 
 <!-- BEGIN GENERATED: node-catalog:capture:fragment -->
+```json
+{
+  "id": "example",
+  "kind": {
+    "captureConfig": {
+      "all": false,
+      "ansi": true,
+      "lines": 50,
+      "target": "catalog-session"
+    },
+    "type": "capture"
+  },
+  "name": "capture",
+  "prompt": ""
+}
+```
 <!-- END GENERATED: node-catalog:capture:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:capture:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [],
+  "entryNodeId": "example",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "id": "example",
+      "kind": {
+        "captureConfig": {
+          "all": false,
+          "ansi": true,
+          "lines": 50,
+          "target": "catalog-session"
+        },
+        "type": "capture"
+      },
+      "name": "capture",
+      "prompt": ""
+    }
+  ],
+  "useOrchestrator": false,
+  "variables": [],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:capture:workflow -->
 
 ### kill
 
 <!-- BEGIN GENERATED: node-catalog:kill:fragment -->
+```json
+{
+  "id": "example",
+  "kind": {
+    "killConfig": {
+      "target": "catalog-session"
+    },
+    "type": "kill"
+  },
+  "name": "kill",
+  "prompt": ""
+}
+```
 <!-- END GENERATED: node-catalog:kill:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:kill:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [],
+  "entryNodeId": "example",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "id": "example",
+      "kind": {
+        "killConfig": {
+          "target": "catalog-session"
+        },
+        "type": "kill"
+      },
+      "name": "kill",
+      "prompt": ""
+    }
+  ],
+  "useOrchestrator": false,
+  "variables": [],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:kill:workflow -->
 
 ### run_agent
 
 <!-- BEGIN GENERATED: node-catalog:run_agent:fragment -->
+```json
+{
+  "id": "example",
+  "kind": {
+    "runAgentConfig": {
+      "agent": "claude",
+      "killAfter": true,
+      "prompt": "Run a short command"
+    },
+    "type": "run_agent"
+  },
+  "name": "run_agent",
+  "prompt": ""
+}
+```
 <!-- END GENERATED: node-catalog:run_agent:fragment -->
 
 <!-- BEGIN GENERATED: node-catalog:run_agent:workflow -->
+```json
+{
+  "cwd": "",
+  "edges": [],
+  "entryNodeId": "example",
+  "goal": "Illustrate a node kind",
+  "limits": {
+    "maxTotalSteps": 0,
+    "maxVisitsPerNode": 0
+  },
+  "name": "node-catalog-example",
+  "nodes": [
+    {
+      "id": "example",
+      "kind": {
+        "runAgentConfig": {
+          "agent": "claude",
+          "killAfter": true,
+          "prompt": "Run a short command"
+        },
+        "type": "run_agent"
+      },
+      "name": "run_agent",
+      "prompt": ""
+    }
+  ],
+  "useOrchestrator": false,
+  "variables": [],
+  "version": 4
+}
+```
 <!-- END GENERATED: node-catalog:run_agent:workflow -->
 
 ## Node fields
@@ -281,12 +1083,12 @@ generator; all other sections are hand-written prose cross-referenced to the sou
 `### <wire-tag>` headings in **Node catalog** are hand-maintained and must be updated when the
 `NodeKind` variant set changes.
 
-ISSUE-260826-0637-04 will supply the catalog generator and the refresh command:
+The catalog generator lives in `tests/docs_catalog.rs`. Refresh generated blocks with:
 
 ```bash
 just regen-docs
 ```
 
-That recipe will wrap `SB_REGEN_DOCS=1` around the catalog generator test. Once the generator
-lands, `cargo test` will regenerate in memory and assert the committed markdown matches — it will
-not rewrite tracked files.
+That recipe runs the catalog generator test with `SB_REGEN_DOCS=1` so it writes
+`docs/workflow-schema.md`. A normal `cargo test` regenerates in memory only and asserts the
+committed markdown matches — it does not rewrite tracked files.

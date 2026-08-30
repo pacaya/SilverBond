@@ -2,11 +2,13 @@
 id: ISSUE-260826-0637-04
 kind: issue
 category: enhancement
-status: ready-for-agent
+status: done
 summary: Generate the node-kind catalog from constructed Rust values into the marker blocks, with coverage closed against serde's own derives
 prd: PRD-260826-0009-01
 terms: [Node Kind, Workflow, Validation Issue]
 blocked_by: [ISSUE-260826-0637-03]
+claimed_by: implement-issue@Mac-mini-4
+claimed_at: 2026-08-30T03:40:29Z
 ---
 
 ## Agent Brief
@@ -162,6 +164,75 @@ exists to eliminate.
 - Generating field tables from JSON Schema. That is a second generator, excluded by the PRD.
 - Adding the CI job. It is ISSUE-260826-0637-01 and does not block this work.
 
+## Context Pack — generated at claim (2026-08-30T03:40:29Z)
+
+**PRD decisions relevant to this slice** (PRD-260826-0009-01):
+- Tier G = the node-kind catalog only; generator emits marker-delimited blocks, never whole documents, and only in `docs/workflow-schema.md`.
+- Examples are constructed Rust values on the `From<WorkflowNodeType> for NodeKind` skeleton (`src/model.rs:820`), not transcribed JSON — no model struct denies unknown fields.
+- Coverage closed by four checks: compile stop on an exhaustive `example_for`; `WorkflowNodeType` harvest from its `Deserialize` derive (`src/model.rs:158-159`, `rename_all = "snake_case"`); `NodeKind` harvest via `unknown_variant`'s `expected` (internally tagged, `src/model.rs:694-695`); set equality + length + `node_type()` round-trip (`src/model.rs:756`).
+- Generator lives at `tests/docs_catalog.rs`; in-memory freshness assert by default, writes only under `SB_REGEN_DOCS=1`, wrapped by a `just` recipe. A second binary target is rejected (no `default-run`; `cargo run` in `justfile:17-18` would go ambiguous).
+- Zero new dependencies or dev-dependencies; nothing under `src/` or `ui/` is edited.
+- Field tables/defaults stay Tier P hand-written — a serialized example cannot label a default, and skip-heavy configs omit fields entirely.
+
+**Test seam & Testing Decisions:** observable at the integration-test target `tests/docs_catalog.rs` run under `cargo test --test docs_catalog`, plus the marker spans in `docs/workflow-schema.md:141-249`. PRD Testing Decisions: (1) compile-time construction; (2) freshness diff against committed markdown + set equality + round-trip; (3) `NodeKind` derive harvest; (4) serialize → strict `serde_json::from_value::<WorkflowV3>()` → `ensure_defaults` (`src/model.rs:1116`) → `validate_workflow` (`src/model.rs:1422`), asserting zero `error`-severity issues. Strict deserialization deliberately, not `normalize_workflow_value` — `migrate_v2_nodes_to_v3_kind` fires unconditionally (`src/model.rs:1152`) and would rescue malformed shapes.
+
+**Concrete surfaces the brief names:**
+- Tag enum `WorkflowNodeType` — `src/model.rs:159` (derive/rename at `:157-158`); `NodeKind` — `:695` (tag attr `:694`); `NodeKind::node_type()` — `:756`; `WorkflowNode::node_type()`/`node_type_str()` — `:913`, `:917`; `impl From<WorkflowNodeType> for NodeKind` — `:820-860`.
+- Defaulting `ensure_defaults` — `src/model.rs:1116`; validation entry `validate_workflow` — `:1422`. All public via `pub mod model` (`src/lib.rs:6`).
+- Ignored-task-execution-config warning: predicate `has_task_execution_config` — `src/model.rs:3116-3130`, reading `agent`, non-empty `prompt`, `context_sources`, `response_format`, `output_schema`, `retry_count`, `retry_delay`, `timeout`, `skip_condition`, `loop_max_iterations`, `loop_condition`, `kind.agent_config()`, `cwd`. Fires for `Split | Collector` at `:1925-1927`; existing coverage test `warns_when_non_task_nodes_keep_task_execution_fields` at `:3917`. The unavoidable terminal-node warning is at `:1916-1923`.
+- Weaker prior pattern: `node_kind_round_trip_all_variants` — `src/model.rs:4181`, a hand-seeded `Vec<NodeKind>` with no counterpart check.
+- Existing integration target: `tests/http_api.rs` (the only file under `tests/`).
+- Markers landed by ISSUE-260826-0637-03: `<!-- BEGIN GENERATED: node-catalog:<wire-tag>:fragment -->` / `:workflow`, one pair each, 14 kinds, `docs/workflow-schema.md:141-249`; hand-written `### <wire-tag>` headings sit above each pair. `## Regenerating this document` (`:276-288`) names `just regen-docs` and attributes it to this issue.
+- `justfile` has no `regen-docs` recipe yet; convention is a `#` comment line above each recipe, kebab-case names (`test-rust`, `check-v4-docs`).
+- `Cargo.toml:6-35` `[dependencies]` (incl. `serde` with `derive` at `:22`, `serde_json` `:23`) and `[dev-dependencies]` `:37-39` must stay byte-identical.
+
+**ADRs:**
+- ADR-260815-2009-01 — Typed workflow contracts over a JSON-valued variable store · accepted (forward reference only; v4 is canonical here).
+
+**Terms:**
+- `Node Kind` — the fourteen-variant tagged union in a node's required `kind` object, selecting behavior and config shape; its bare `type` tag is what `/api/capabilities` publishes.
+- `Workflow` — a versioned node/edge graph definition (schema `version: 4`; v2–v3 normalize forward at ingest), including its subflow catalog.
+- `Validation Issue` — one `{severity, nodeId?, scope?, message}` entry; `severity` is only ever `error` or `warning` (no `info`); validation is enforced at run start, never at save.
+
+**Full artifacts:** docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md · docs/adr/INDEX.md · CONTEXT.md · docs/workflow-schema.md · docs/issues/done/ISSUE-260826-0637-03-schema-doc-scaffold.md
+
+## Code Review
+
+Review file: `issue-260826-0637-04-code-review-20260830-041331.md`
+
+Dual review (Claude + Codex), cross-verified and adjudicated inline, then three fix rounds (cap 4). **ACCEPTED** — both reviewers returned zero new findings on the final round and independently recommended close. 24 findings: 20 FIXED, 1 deferred, 3 dismissed.
+
+Round 1 (cursor) closed 11 of 12 but shipped the tree red — it left its own duplicate-entry verification mutation in `CATALOG_ORDER` while reporting a green suite — and its gate redesign introduced four defects that were really one design fault. Same-site escalation was invoked; round 2 (codex) removed the mechanism against five stated properties. Round 3 (cursor, narrow) closed three assertion-precision findings.
+
+- H1 (HIGH): Regeneration positive control never exercises the env-gated write path — FIXED
+- M1 (MEDIUM): Generator bypasses the `NodeKind::from(WorkflowNodeType)` skeleton; doc comment says otherwise — FIXED
+- M2 (MEDIUM): Stale or orphan `node-catalog:*` marker blocks are never rejected — FIXED
+- M3 (MEDIUM): Three prose passages still describe the generator as not yet existing — FIXED
+- M4 (MEDIUM): Marker span lookup duplicated (promoted in-diff duplication smell) — FIXED
+- L1 (LOW): `SB_REGEN_DOCS` gate accepts any value — FIXED
+- L2 (LOW): Exported `SB_REGEN_DOCS` races sibling tests — FIXED in round 2 (round 1 attempt failed)
+- L3 (LOW): `regeneration_is_idempotent` carries no independent signal — FIXED
+- L4 (LOW): `parallel_batch` binds an undeclared variable — FIXED (Codex's STILL_BROKEN overturned on read evidence)
+- L5 (LOW): Validation failure messages do not name the kind — FIXED
+- L6 (LOW): Examples emit an avoidable empty-prompt warning — FIXED
+- L7 (LOW): Subflow child body's `name` duplicates the parent's — FIXED
+- C1 (CRITICAL): Unreverted verification mutation shipped the tree red — FIXED
+- M5 (MEDIUM): `cargo test -- --include-ignored` hard-failed — FIXED
+- L8 (LOW): Positive control and justfile binding never ran under `cargo test` — FIXED
+- L9 (LOW): `just regen-docs` wrote without coverage or validation assertions — FIXED
+- L10 (LOW): Marker inventory ignored orphan closing markers — FIXED
+- L11 (LOW): P2 guard accepted any panic as proof — FIXED
+- L12 (LOW): Two regression mutations collapsed to one diagnostic — FIXED
+- L13 (LOW): Justfile binding cemented a `--locked` convention mismatch — FIXED
+- L14 (LOW): Narrow writer/reader overlap under `SB_REGEN_DOCS=1` plus `--include-ignored` — deferred: two combined opt-ins to reach it, and the fix would reopen a write path now mutation-proven across a full round; worth a follow-up issue
+- D1 (CLAUDE-3): `has_task_execution_config` transcribed rather than derived — dismissed: the derived warning-message filter is the contract check and covers subflow scopes
+- D2 (CLAUDE-10): Lowercase wire tag as node `name` — dismissed: cosmetic, no contract constrains casing
+- D3 (CLAUDE-11): Examples publish `limits: {0, 0}` — dismissed: `src/model.rs:240-244` defines that as the canonical absent-equivalent form
+
+Smells: 5 advisory, all merged into `docs/issues/SMELLS-LEDGER.md` (all newly appended). No graduation rows. One duplication smell was promoted to finding M4 by the in-diff rule.
+
+Carried forward, not attributable to this diff: `runtime::tests::completed_run_cleans_non_persistent_active_panes` and `runtime::tests::decide_abort_returns_promptly_and_kills_pane` fail intermittently at `src/runtime.rs:9055` on a tmux sentinel timeout. Both reviewers flagged them independently across two rounds; they will make the CI job from ISSUE-260826-0637-01 flaky and deserve their own issue.
+
 ## Triage Notes
 
 **Readiness gate (cold-reader): PASS** (round 2)
@@ -206,3 +277,21 @@ agreement with the PRD's Testing Decisions check 4 is restored rather than reloc
 factual claims in the new prohibition paragraph reproduce true. Classes 1-5 swept 30 surfaces,
 class 7 swept 37, class 9 arm A executed every in-scope observable (red) and arm B's four triggered
 requirements were each satisfied. No class fired.
+
+## Resolution
+
+**Commit:** `feat: generate the node-kind catalog from constructed Rust values (ISSUE-260826-0637-04)`
+
+**Route:** implementation `cursor` — route-picker classified the whole issue as a well-specified single-file integration test with no cross-module or codex-only signals. Fix rounds were routed independently: round 1 `cursor`, round 2 **`codex`** (escalated — the round-1 fix introduced four defects in one region, so round 2 was briefed as a mechanism removal against five stated properties, and the batch carried cargo-harness, `#[ignore]`/`--include-ignored`, test-parallelism and CI-invocation semantics), round 3 `cursor` (three local assertion changes, no redesign).
+
+**TDD:** `red-green at tests/docs_catalog.rs` (observable via `cargo test --test docs_catalog`). The trigger fired because the acceptance criteria require each coverage assertion to be shown red under its own targeted mutation — assertion-first is the only way to discharge that, and every round was verified by re-running those mutations rather than by reading the new code.
+
+**What shipped:** a new integration-test target `tests/docs_catalog.rs` that constructs all fourteen node kinds on the `From<WorkflowNodeType>` skeleton, emits a fragment and a complete valid workflow per kind into the 28 marker-delimited blocks of `docs/workflow-schema.md`, and closes coverage against serde's own derives via two structural harvests (the tag enum's `deserialize_enum` variant slice; `NodeKind`'s `unknown_variant` expected slice), set equality, a length check, and two independent round-trips. Each emitted workflow crosses the document boundary — serialize, strict deserialize, default, validate — asserting zero error-severity issues and no ignored-task-execution-config warning. Regeneration is compare-only by default and writes only through one guarded entry point, wrapped by `just regen-docs`. Nothing under `src/` or `ui/` was modified and `Cargo.toml` is byte-identical.
+
+**Review telemetry:** dual review (Claude + Codex), cross-verified and adjudicated inline; **3 fix rounds of a cap of 4**. 24 findings — by severity 1 CRITICAL, 1 HIGH, 5 MEDIUM, 17 LOW; by outcome **20 FIXED, 1 deferred, 3 dismissed**. The CRITICAL (a red tree from an unreverted verification mutation) and one MEDIUM were introduced by fix round 1, not present in the original implementation. Same-site escalation was invoked once, at round 2. Adjudication went against a reviewer four times on read evidence: three of Claude's findings dismissed, and Codex's `STILL_BROKEN` on L4 overturned because it cited only the `var:` branch of `resolve_input_binding_value` and stopped before the bare-name fallback at the function's tail. 5 advisory smells merged into `docs/issues/SMELLS-LEDGER.md`; one duplication smell was promoted to finding M4 by the in-diff rule. Review file: `issue-260826-0637-04-code-review-20260830-041331.md`.
+
+**Suite:** `SUITE: PASS` — 601 tests green (Rust 472 across lib/`docs_catalog`/`http_api`, frontend vitest 129), 0 failed, 1 ignored by default and 0 with `--include-ignored`. `git status --porcelain --untracked-files=no` byte-identical before and after the run. `just test-e2e` was deliberately not run: it builds the frontend into the tracked `public/` tree, which would violate the working-tree constraint this issue is verified under, and it needs Playwright browser binaries.
+
+**Follow-up worth filing (not a blocker, not caused by this diff):** `runtime::tests::completed_run_cleans_non_persistent_active_panes` and `runtime::tests::decide_abort_returns_promptly_and_kills_pane` fail intermittently at `src/runtime.rs:9055` with `timed out waiting for path .../tmux-pane-killed`. Both reviewers observed them independently across two rounds; they passed cleanly in the closing suite run. They will make the CI job from ISSUE-260826-0637-01 flaky. Finding L14 (a writer/reader overlap reachable only by combining `SB_REGEN_DOCS=1` with `--include-ignored`) is deferred and also worth a follow-up.
+
+**Closed:** 2026-08-30 (UTC)

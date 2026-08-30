@@ -91,3 +91,8 @@ One row per unique key (`file:line` + smell name). Columns:
 | `.github/workflows/rust-tests.yml:32` + Duplicated Code | 1 | 2026-08-30 | open |
 | `.github/workflows/rust-tests.yml:15-18` + Speculative Generality | 1 | 2026-08-30 | open |
 | docs/api-reference.md:24 Duplicated Code | 1 | 2026-08-30 | open |
+| `tests/docs_catalog.rs:310` + Mysterious Name | 1 | 2026-08-30 | open |
+| `tests/docs_catalog.rs:477` + Duplicated Code | 1 | 2026-08-30 | open |
+| `tests/docs_catalog.rs:556` + Speculative Generality | 1 | 2026-08-30 | open |
+| `tests/docs_catalog.rs:117` + Repeated Switches | 1 | 2026-08-30 | open |
+| `tests/docs_catalog.rs:89` + Data Clumps | 1 | 2026-08-30 | open |
