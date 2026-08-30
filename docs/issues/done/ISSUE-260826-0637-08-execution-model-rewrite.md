@@ -2,12 +2,14 @@
 id: ISSUE-260826-0637-08
 kind: issue
 category: enhancement
-status: ready-for-agent
+status: done
 summary: Rewrite the execution model document around runtime mechanism, covering subflows, call frames, the scheduler's two dispatch classes, collector barriers, checkpoints and the pane kinds
 prd: PRD-260826-0009-01
 adrs: [ADR-260815-2009-02]
 terms: [Run, Run Status, Cursor, Cursor Runtime State, Cursor Terminal Status, Checkpoint, Execution Epoch, Node Result, Runner Kind, Immediate Kind, Execution Log, Runtime Event, Stagnation Detection, Split Family, Copy-on-Split, Collector, Collector Barrier, Barrier Key, Merge Key, Representative Cursor, Parallel Batch, Batch Item, Call Frame, Decide Node, Decide Outcome, Approval Queue, Pane Kind, Active Pane Registry]
 blocked_by: [ISSUE-260826-0637-03]
+claimed_by: implement-issue@Mac-mini-4.local
+claimed_at: 2026-08-30T09:18:56Z
 ---
 
 ## Agent Brief
@@ -261,6 +263,95 @@ subsystems' documents, and any hand-written enumeration this issue neither narra
 - Documenting the PTY interaction tiers beyond correcting the claim that interaction pauses the
   run — it blocks only the calling task's receiver while sibling cursors keep executing.
 
+## Context Pack — generated at claim (2026-08-30T09:18:56Z)
+
+**PRD decisions relevant to this slice** (PRD-260826-0009-01):
+- `docs/execution-model.md` is Tier C — conceptual prose about mechanism, deliberately not lists; **nothing in it is generated** and the PRD does not pretend otherwise.
+- Content is tiered by who can maintain it: Tier G (generated node catalog, schema doc only), Tier P (hand-written, source-cross-referenced), Tier C (prose), Tier D (deleted). The generator emits the node catalog and **nothing else** — never this document.
+- The **event vocabulary is the one Tier P table this file owns**; `RuntimeEvent.kind` is an unconstrained `String` with names as literals at scattered emission sites, so there is no enum to enumerate.
+- Rewrite scope named by the PRD: run/cursor lifecycle, the scheduler loop and the dispatched-vs-inline split, call frames and two-branch variable resolution, collector barriers (keying, merge keys, failure arrivals, representative selection), checkpoint/dedup/resume/restart, pane kinds, failure classification and run-killers, event vocabulary.
+- Node-kind *enumeration* does not live here; cross-reference the schema reference's generated `## Node catalog` for shapes.
+- **No engine changes**: this epic reads `src/`, writes `docs/`. Behavior found wrong is documented as-is and filed separately (ISSUE-260826-0004-01 carries the unreachable orchestrator fallback and the silent first-branch default).
+- Tier D deletion: hand-written enumerations that are neither generated, cross-referenced nor narrated, plus narrative claims about other subsystems.
+- **v4 is canonical, v5 is decided and unlanded** (ADR-260815-2009-01, `typed-contracts`); cite v5 features as forward references only.
+- `CONTEXT.md` is the terminology authority: an unmarked entry is true of `src/` at HEAD; `_(planned — ADR-…)_` means not accepted by the engine yet.
+- Consistency of voice: one author per document (the PRD's recorded sequencing decision).
+- The drift audit `docs/sources/workflow-schema-drift-260825.md` is the work order (Part 2, §2.1–2.7), cited on both sides against commit `5f2f2c7`.
+
+**Test seam & Testing Decisions:** observable at the committed markdown of `docs/execution-model.md` plus a production-only sweep of runtime event-construction sites — the PRD states plainly that **Tier C prose is not machine-checkable at all** and no attempt is made to fake it; it rests on citations and review. The mechanical gates that must stay green are `just check-v4-docs` and `cargo test` (the generator/freshness checks belong to the schema doc, not this one). `scripts/check-canonical-v4-docs.sh` is recorded as the negative example — a five-phrase blacklist that cannot verify — so passing it is necessary, never sufficient. Scope the event sweep to production code: test modules construct events with throwaway kind strings.
+
+**ADRs:**
+- ADR-260815-2009-02 — One condition dialect: owned nested AST, typed operators, `onMissing` · accepted. Cite as the **forward reference** that adds a failure outcome, never as present behavior.
+- Neighbors the INDEX shows for this cluster: ADR-260815-2009-01 (typed workflow contracts / v5 bump — do not edit its write-once wording, out of scope) and ADR-260815-2009-05 (cursor-local variable writes; cross-branch data only through collectors — constrains Collector and Representative Cursor).
+
+**Terms** (all unmarked in `CONTEXT.md`, i.e. true of HEAD; honour each `_Avoid_`):
+- `Run` / `Run Status` — one execution with frozen snapshot; `running|paused|completed|failed|aborted|restarted`, `paused` never assigned outside tests. _Avoid_: job, instance, run state.
+- `Cursor` / `Cursor Runtime State` — `runnable|running|waiting_collector|waiting_approval`, no terminal variants: a finished cursor is removed, not marked. _Avoid_: cursor status.
+- `Cursor Terminal Status` — `success|failure|timeout|cancelled`, recorded only on barrier arrival; `cancelled` is never constructed and reads zero.
+- `Checkpoint` / `Execution Epoch` — serialized full state, sole authority for resume/restart; the epoch is stamped everywhere but read only on the epoch-0 resume migration. _Avoid_: calling the epoch the guard against pre-restart state — the clear does that.
+- `Node Result` — run-global map at root scope, innermost call frame's `subflow_results` inside a subflow; **replaced** on loop re-execution. _Avoid_: node output.
+- `Runner Kind` / `Immediate Kind` — dispatched into the `JoinSet` vs resolved synchronously in the loop (a batch's fan-out blocks it). _Avoid_: dispatch tier.
+- `Execution Log` — accumulated on the checkpoint as the run proceeds, persisted separately at finalize. _Avoid_: audit log, history.
+- `Runtime Event` — unconstrained `kind` (wire name `type`), flattened data, monotonic `seq` making SSE resumable. _Avoid_: log entry, message.
+- `Stagnation Detection` — three consecutive identical outputs, keyed by call-frame path + node id (no cursor id); abort clears every cursor. _Avoid_: cursor-scoped node key.
+- `Split Family` / `Copy-on-Split` — one family per enclosing split, policy applies across all a cursor belongs to; children deep-copy the whole scope including the call stack.
+- `Collector` / `Collector Barrier` / `Barrier Key` / `Merge Key` — keyed `{inputs, summary}` aggregate; barriers re-arm after release; key is `(scope, collector_id, epoch)`; merge key is edge `label` falling back to `from`, duplicates being a validation error. _Avoid_: join (noun), rendezvous; presenting the dedupe as what an author meets.
+- `Representative Cursor` — first still-live waiter in arrival order, others deleted and their writes discarded; all-dead path resurrects the first terminal arrival's snapshot. _Avoid_: surviving cursor, winner.
+- `Parallel Batch` / `Batch Item` — succeeds only if every item succeeded; ephemeral cursors never enter the cursor list, results keyed by index.
+- `Call Frame` — snapshot of caller variables, counters and branch markers restored on exit, plus a separate `subflow_results` namespace; the snapshotted last output is never restored — exit overwrites it with the subflow's exit-node output. _Avoid_: stack frame.
+- `Decide Node` / `Decide Outcome` — bypasses the task pipeline entirely; outcome matched exactly against a branch edge label, the fall-through-to-success arm unreachable from a validated document. _Avoid_: bare "outcome".
+- `Approval Queue` — one active approval at a time, re-bound on resume; rejection with no `reject` edge fails the cursor, and outside a split family the run.
+- `Pane Kind` / `Active Pane Registry` — `send`/`wait`/`capture`/`kill` parse their target and gate on the owned-target set, then register under their own node key; the registry serves session reuse and the HTTP pane-context endpoints, and does **not** resolve a pane node's target. _Avoid_: describing `spawn` as the only registrant; the registry as the pane-node lookup.
+- Also relevant: `Edge Outcome`'s `_Avoid_` bans "terminal for its cursor" phrasing for node failure.
+
+**Full artifacts:** docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md · docs/adr/INDEX.md · docs/adr/260815-2009-single-condition-dialect.md · CONTEXT.md · docs/sources/workflow-schema-drift-260825.md (Part 2, §2.1–2.7) · docs/execution-model.md
+
+## Code Review
+
+Review file: `issue-260826-0637-08-code-review-20260830-094611.md`
+
+Dual review (Claude + Codex), cross-verified and adjudicated inline; 3 of 4 fix rounds used, result
+**ACCEPTED**. Seventeen findings, all terminal as FIXED — none deferred, none dismissed.
+
+The initial review produced 14 adjudicated findings. Codex agreed with 11 of Claude's 12 and Claude
+with all 6 of Codex's; the one split (L5) was adjudicated against source. Round 1 fixed all 14, and
+both reviewers independently confirmed 14/14 with no regressions. The round-1 re-verify then raised
+two findings sitting on the lines round 1 had just edited, triggering the same-site escalation rule:
+round 2 ran as a redesign removing the shared mechanism — the document stating one mechanism in two
+sections and letting the copies drift — rather than two more point patches. Round 2 satisfied five of
+its six checkable properties; round 3 closed the sixth.
+
+- H1 (HIGH): `cursor_cancelled` falsely claimed to fire on every terminal cursor removal — FIXED
+- M1 (MEDIUM): pane ownership bookkeeping misstated in both directions — FIXED
+- M2 (MEDIUM): post-resume pane-context trace stated but never completed — FIXED
+- M3 (MEDIUM): `anyhow` backstop conflated with the panic path — FIXED
+- M4 (MEDIUM): three-way failure classification wrong (success/failure/timeout vs aborted/timeout/failure) — FIXED
+- M5 (MEDIUM): event sweep size wrong — 57 claimed, 55 actual — FIXED
+- M6 (MEDIUM): checkpoint and restart inventories omit the retained `total_executed` budget — FIXED
+- M7 (MEDIUM): all-cursors-at-collector stall asserted three times (promoted in-diff duplication smell) — FIXED
+- L1 (LOW): approval rejection mis-cited to `activate_next_approval` — FIXED
+- L2 (LOW): `initial_checkpoint` is not a real symbol — FIXED
+- L3 (LOW): cursor-registration count of five under-counts under the document's own rule — FIXED
+- L4 (LOW): `aggregate_merged` table row describes per-arrival behavior — FIXED
+- L5 (LOW): the effect of `cancel_requested` is never stated — FIXED (split verdict, adjudicated)
+- L6 (LOW): barrier scope omits the legacy `call_node_id` fallback — FIXED
+- L7 (LOW): dispatch-filter shorthand at `:21` not updated with the `:11` correction — FIXED (round-2 redesign)
+- L8 (LOW): §Pane kinds still gave the pre-M2 picture of the HTTP pane-context path — FIXED (round-2 redesign)
+- L9 (LOW): `PaneUnavailable` outcome still stated in two sections — FIXED (round 3, over a recorded Codex dissent)
+
+Two orchestrator adjudications are recorded in full in the review file rather than resolved away.
+L5: Codex was right that the original sentence asserted nothing false, so the finding was retained on
+the narrower ground that the document never stated what `cancel_requested` does. L9/P3 at round 3:
+Codex held the finding still broken; ruled fixed, because `:61` names the fallback without describing
+it and so carries no divergence surface, and because Codex's stricter reading would have flipped both
+P4 (acceptance criterion 11's separate-degradation coverage) and P6 — a consequence Codex's own P4
+verdict acknowledged. The dissent stands in the review file as a warning to future editors.
+
+Smells: 1 advisory (Divergent Change at `docs/execution-model.md:61`; merged into
+`docs/issues/SMELLS-LEDGER.md` as `appended`) — the same duplication the round-2 redesign removed. A
+second smell (Duplication) was promoted into the findings track as M7 under the in-diff duplication
+promotion rule. Graduation advisory: none emitted.
+
 ## Triage Notes
 
 **Readiness gate (cold-reader): PASS** (round 5, full-enumeration)
@@ -276,3 +367,69 @@ decision surfaces, class 7 swept 57 extracted surfaces, class 9 arm A executed a
 observables against the tree (all red at baseline) and arm B found no triggered requirement among
 15 criteria, class 6 prong (b) was argued at length and declined on the PRD's recorded
 one-author-per-document decision, and class 8 was inert on a never-stamped record. No class fired.
+
+## Resolution
+
+**Commit:** `feat: rewrite the execution model document around runtime mechanism (ISSUE-260826-0637-08)`
+**Date:** 2026-08-30 (UTC)
+
+**Route:** `cursor` for the implementation (route-picker: single-file documentation rewrite with clear
+acceptance criteria, reading and synthesising runtime behavior rather than changing cross-module
+code). Fix rounds re-routed per round: round 1 `codex` (the batch carried the one HIGH-severity
+finding), rounds 2 and 3 `cursor` (single-file prose restructuring and a one-clause trim).
+
+**TDD:** `n/a (linear)` — documentation-only work with no behavior change and no code seam. Every
+acceptance criterion is a `rg` observable or a read-against-source check, so the red-green loop had
+nothing to bite on. The mechanical gates stood in for it.
+
+**Review telemetry:** 17 findings — 1 HIGH, 7 MEDIUM, 9 LOW. All 17 FIXED; 0 deferred, 0 dismissed.
+Fix rounds used: 3 of 4. Dual review (Claude + Codex) cross-verified and adjudicated inline, with the
+reviewers held alive across all three rounds for re-verification.
+
+The shape of the loop is worth recording, since it is the comparison datum this epic is collecting.
+The initial review produced 14 findings, every one a factual-accuracy defect — the prose asserting
+something the runtime does not do — rather than a structural or stylistic problem. Cross-verification
+was unusually convergent: Codex agreed with 11 of Claude's 12 findings, Claude with all 6 of Codex's,
+and Codex reversed one of its own Step-A verified-clean entries under cross-examination. Two
+orchestrator adjudications were needed and both are recorded in full in the review file rather than
+resolved away: L5, where Codex was right that the original sentence asserted nothing false and the
+finding was retained on narrower ground; and L9/P3 at round 3, where Codex held the finding still
+broken and was overruled because the stricter reading would have flipped two other properties and an
+acceptance criterion — a consequence Codex's own P4 verdict conceded.
+
+Round 1 fixed all 14 and both reviewers independently confirmed 14/14 with no regressions. The
+round-1 re-verify then raised two findings sitting on the very lines round 1 had just edited, which
+triggered the same-site escalation rule: round 2 ran as a redesign removing the shared mechanism —
+the document stating one mechanism in two sections and letting the copies drift — under six
+checkable properties, rather than as two more point patches. That was the right call: the duplication
+was independently flagged as a Divergent Change smell in the reviewers' first pass, and round 1 had
+already demonstrated its cost by generating both findings as a by-product of its own corrections.
+Round 2 satisfied five of the six properties; round 3 closed the sixth.
+
+**Suite:** `SUITE: PASS` — `just check-v4-docs && just test`; 601 passed, 0 failed, 1 skipped
+(~36.6s). Rust `cargo test --locked` 472 passed across 5 binaries; UI vitest 129 passed across 13
+files. Both acceptance-criteria gates green explicitly. The 7 tmux/socket `Operation not permitted`
+failures a reviewer saw in its sandbox did not reproduce on the host — zero occurrences in the log —
+confirming them environmental. No pre-existing failures to record.
+
+**Event sweep size (required by the acceptance criteria, derived not quoted):** the production sweep
+of the runtime module found **55** `RuntimeEvent::new` construction sites yielding **29** distinct
+event kinds, and the document's event table carries exactly those 29 rows — no omission, no invented
+row. Both reviewers re-derived this independently at every round; the figure of 57 the implementation
+first reported was traced to this record's own triage note, which the criterion explicitly forbade as
+a source, and was corrected as finding M5.
+
+**Cursor-creation counting rule (required by the brief):** the document reports both counts it was
+asked to distinguish — six sites that mint a fresh cursor id, and six that construct a `CursorState`
+and register it on the Run's cursor list — and names the rule used for each. The second count was
+five as first written and was corrected to six under the document's own stated rule (finding L3),
+which Codex confirmed after reversing its initial position.
+
+**Behavior found wrong and left unfixed, per the brief's out-of-scope boundary:** nothing under
+`src/` or `ui/` was touched. The unreachable orchestrator branch fallback and the silent first-branch
+default remain documented as they are and filed as `ISSUE-260826-0004-01`. Two further inaccuracies
+were found in upstream artifacts rather than in code and are noted here rather than fixed: drift-audit
+D51 (`docs/sources/workflow-schema-drift-260825.md:521`) asserts that `cursor_cancelled` fires on
+every terminal cursor removal, which is false and was the source of finding H1; and work-order item D8
+naming `total_executed` was left undischarged by the first pass and became finding M6.
+

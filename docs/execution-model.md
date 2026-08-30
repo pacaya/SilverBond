@@ -1,244 +1,123 @@
 # Execution Model
 
-The runtime engine (`runtime.rs`) drives workflow execution using a multi-cursor, checkpoint-based model with durable concurrency.
+The runtime module (`src/runtime.rs`) is the authority for how a workflow Run executes. Storage owns checkpoint persistence and workflow-snapshot migration (`src/storage.rs`). This document explains mechanism in prose — not generated catalogs. For node-kind shapes, see the generated `## Node catalog` in `docs/workflow-schema.md`. Terminology follows `CONTEXT.md`; unmarked entries there describe the engine as it is today.
 
-## Run Lifecycle
+## Run and cursor lifecycle
 
-1. Client submits a workflow to `POST /api/runs`
-2. Backend validates the workflow
-3. Runtime creates an initial checkpoint with one cursor at the entry node
-4. Execution begins on the Tokio runtime
-5. For each cursor, the runtime traverses the graph depth-first
-6. Events are appended to SQLite and published to in-memory SSE subscribers
-7. Terminal state and execution log are persisted when the run completes
+A Run is one execution of a workflow against a frozen snapshot. The client submits via `POST /api/runs`; the backend validates at run start, then `build_initial_checkpoint` seeds a `RuntimeCheckpoint` with a single Cursor at the entry node and `execute_workflow` drives the scheduler loop until every Cursor is gone or the Run reaches a terminal Run Status.
 
-## Cursor Model
+A Cursor is an independent execution pointer inside a Run. It carries its own variable scope (`var_map`), call stack (`call_stack`), loop and visit counters, branch-decision markers, split-family membership, and the Cursor Runtime State that the scheduler consults. Finished Cursors are removed from `active_cursors` rather than marked terminal — a checkpoint from a completed or failed Run will never list a Cursor in a failed or succeeded state. Terminal-ness is a separate concept: `CursorTerminalStatus` (`success`, `failure`, `timeout`, `cancelled`) is recorded only on Collector Barrier arrivals, never on the Cursor itself. The `cancelled` tally in collector summaries is always zero because nothing in production constructs that status.
 
-Execution proceeds through **cursors** — independent execution pointers that traverse the workflow graph. A simple linear workflow uses a single cursor. Split nodes spawn multiple cursors for parallel branches.
+The Cursor Runtime State has exactly four variants — `Runnable`, `Running`, `WaitingCollector`, and `WaitingApproval` in `CursorRuntimeState` (serialized as `runnable`, `running`, `waiting_collector`, `waiting_approval`). There are no terminal variants. The scheduler dispatch filter requires both `Runnable` and `cancel_requested == false` (`execute_workflow`); a Cursor in `running` is already inside the concurrent task set, one in `waiting_collector` is blocked at a Collector Barrier, and one in `waiting_approval` is parked on the Approval Queue. Terminal removal is not a complete event stream: `handle_terminal_cursor_status` removes the Cursor and emits `cursor_cancelled` on the failure/timeout path only. `finish_cursor`, the terminal path through `handle_skipped_task`, and the non-representative-waiter deletion in `release_collectors_if_ready` all remove a Cursor without emitting that event.
 
-### Cursor State
+**Where Cursors come from.** Counting by sites that mint a fresh cursor id via `new_cursor_id`, there are six production call sites: run start (`build_initial_checkpoint`), restart (`restart_from`), resume rehydration when `active_cursors` is empty (`rehydrate_checkpoint_for_execution`), split fan-out (`handle_split_node`, once per branch edge), parallel-batch item dispatch (`spawn_batch_item_task`, once per concurrent item), and collector release when no live waiter survives (`release_collectors_if_ready`). Counting by sites that construct a `CursorState` and register it on the Run's cursor list, there are six: run start, restart, resume rehydration, split fan-out, collector resurrection pushing a cloned snapshot, and collector continuation reconstructing and re-registering the representative under the same id. Parallel-batch item Cursors are the exception: `spawn_batch_item_task` builds a full `CursorState` and passes it into `run_cursor_task`, but that value never enters `active_cursors` — it is ephemeral for the duration of one batch item.
 
-Each cursor tracks:
+Split children are created by Copy-on-Split: each child deep-copies the parent's whole scope — `last_output`, counters, `var_map`, `call_stack`, and branch markers — so sibling writes never reconverge. Split membership is sticky: once enrolled in a Split Family, a Cursor keeps in-split failure treatment for the rest of the Run.
 
-```
-CursorState {
-  cursor_id         — unique identifier
-  node_id           — current position in the graph
-  execution_epoch   — epoch counter for restart isolation
-  parent_cursor_id  — cursor that spawned this one (for splits)
-  incoming_edge_id  — edge that led to this node
-  incoming_node_id  — previous node
-  split_family_ids  — split families this cursor belongs to
-  last_output       — output from the last executed node
-  loop_counters     — per-node loop iteration counts
-  visit_counters    — per-node visit counts
-  last_branch_*     — last branch decision metadata
-  cancel_requested  — whether cancellation was requested
-  state             — Running | WaitingAtCollector | WaitingInteraction | Done | Cancelled | Failed
-}
-```
+Run Status values are `running`, `paused`, `completed`, `failed`, `aborted`, and `restarted`. `paused` is never assigned outside tests — a Run blocked on approval stays `running`. Limit violations (`max_total_steps`, `max_visits_per_node`) abort the whole Run with `aborted`, not `failed`.
 
-### Cursor Lifecycle
+## The scheduler loop
 
-```
-                    ┌──────────┐
-                    │ Running  │
-                    └────┬─────┘
-                         │
-              ┌──────────┼──────────┐
-              │          │          │
-              ▼          ▼          ▼
-     ┌────────────┐ ┌────────┐ ┌───────────────────┐
-     │   Done     │ │ Failed │ │ WaitingAtCollector │
-     └────────────┘ └────────┘ └─────────┬─────────┘
-                                         │
-                                         ▼
-                                   ┌──────────┐
-                                   │ Released │ (continues as Running)
-                                   └──────────┘
-```
+Execution is not depth-first graph traversal. `execute_workflow` runs a scheduler loop: it drains Immediate Kind nodes synchronously via `process_immediate_cursors`, dispatches every Runner Kind that passes the dispatch filter above into a concurrent `JoinSet`, then `select!`s across task completions, approval resolution, and a 250 ms timer. Runner Kinds (`task`, `decide`, `spawn`, `send`, `wait`, `capture`, `kill`, `run_agent` per `is_runner_node_kind`) run concurrently when dispatched. Immediate Kinds (`approval`, `split`, `collector`, `parallel_batch`, `subflow`, `call` per `process_immediate_cursors`) resolve inside the loop itself. A Parallel Batch node's entire fan-out runs inside that loop and blocks it until every item completes; the batch node succeeds only when every item succeeded (`handle_parallel_batch_node`).
 
-## Node Execution
+The split between Runner and Immediate Kinds has exactly one crossing. In `process_immediate_cursors`, when a Runner Kind node's skip condition fires (`should_skip_cursor_node`), the node is resolved inline via `handle_skipped_task` rather than being dispatched; only when the skip does not fire does the cursor fall through to the dispatch pass in `execute_workflow` and enter the task set. Presenting the two classes as cleanly separated would be false.
 
-### Task Nodes
+When every active Cursor sits at `waiting_collector` and no tasks are running, the Run fails hard with a workflow error. A second stall backstop (`fail_run_on_idle_unschedulable_cursors`) can also terminate a Run that cannot make progress.
 
-For each task node, the runtime:
+## Call frames and result scoping
 
-1. **Resolves the prompt** — substitutes `{{var:name}}`, `{{previous_output}}`, `{{node_name:field}}`, `{{all_predecessors}}`
-2. **Checks skip condition** — if the condition matches, skips the node and emits `node_skipped`
-3. **Resolves agent config** — merges node-level → workflow defaults → driver defaults
-4. **Optionally refines the prompt** — if `useOrchestrator` is enabled and the agent supports it
-5. **Builds CLI arguments** — via the agent driver's `build_args()` method
-6. **Spawns the agent subprocess** — runs the CLI command with configured timeout
-7. **Parses output** — via the agent driver's `parse_output()` method
-8. **Validates structured output** — if `outputSchema` is set
-9. **Handles retries** — on failure, retries up to `retryCount` times with `retryDelay`
-10. **Persists checkpoint** — saves cursor state and node result to SQLite
-11. **Emits events** — `node_start`, `node_done` (or `node_retry`, `node_skipped`)
+Subflows and `call` nodes enter a callee workflow through `handle_subflow_node`, which pushes a Call Frame onto the cursor's `call_stack`. The frame snapshots the caller's variable map, loop and visit counters, and branch markers into `parent_*` fields, carries a separate `subflow_results` namespace for callee Node Results, and records `parent_last_output` — a field written into every checkpoint carrying a call frame but read nowhere in production (a write-only vestige alongside the checkpoint-level `loop_counters` and `visit_counters` maps, which are also permanently empty for any Run started by current code).
 
-### Approval Nodes
+Entry wipes the cursor's `last_output`, counters, and branch markers and replaces `var_map` wholesale rather than layering over it. A zero-variable subflow therefore sees an empty scope rather than inheriting the caller's map. Exit (`complete_subflow_if_at_exit`) pops the frame and restores five of the six snapshotted fields — counters, branch markers, and the variable map — but deliberately not `last_output`. Exit overwrites `last_output` with the subflow exit-node output and writes the call node's own Node Result into the caller's scope via `insert_result_for_cursor_index`. That pair is the subflow return mechanism: an author expecting `{{previous_output}}` after a call node to hold the pre-call output gets the subflow's result instead.
 
-1. Run pauses and emits `approval_required`
-2. Checkpoint is persisted with pending approval state
-3. Client calls `POST /api/runs/{id}/approve` with `approved` boolean and optional `userInput`
-4. On approval: cursor follows `success` edges
-5. On rejection: cursor follows `reject` edges
+Variable resolution is a two-branch selection, not a cascade. `var_map_for_cursor` returns `checkpoint.var_map` only when the cursor's own `var_map` and `call_stack` are both empty; otherwise it returns `cursor.var_map`. There is no fallback from a non-empty cursor map to the checkpoint map. Nested frames hold parent maps that no lookup consults.
 
-### Split Nodes
+Node Results are shared between split siblings at root scope but private inside a subflow — a single fact implemented by two mechanisms. Split children clone the parent's call stack wholesale, and each Call Frame carries its own `subflow_results`. `results_for_cursor` returns the innermost frame's map or the run-global `all_results` and never both; `all_results_for_cursor` is a plain clone with no merge. Two branches of a split at root scope see each other's Node Results; the same two branches inside a subflow do not. Node Results are replaced on loop re-execution (`insert_result_for_cursor_index` is a plain map insert with no occupancy guard).
 
-1. The split node executes (may use orchestrator for branch determination)
-2. For each outgoing `branch` edge, a new cursor is spawned
-3. Each cursor gets a unique ID, shares the parent's execution epoch
-4. All cursors are registered in a **split family** with the configured failure policy
-5. Cursors execute their branches independently and concurrently
+## Collector barriers
 
-### Collector Nodes
+A Collector implements barrier semantics keyed by Barrier Key: `(scope, collector_id, execution_epoch)`, where `scope` is `"root"` or the innermost call frame's `frame_id`, falling back to its `call_node_id` for a legacy frame whose `frame_id` is empty (`collector_barrier_scope`). The same collector reached from two concurrent subflow calls gets two barriers rather than colliding.
 
-1. Collector implements **barrier semantics**
-2. When a cursor arrives, it registers in the collector's barrier
-3. If not all expected inputs have arrived, the cursor enters `WaitingAtCollector` state
-4. When all inputs arrive, the barrier releases
-5. The collected outputs are aggregated and available via `{{all_predecessors}}`
-6. A single cursor continues past the collector
+Expected inputs are Merge Keys derived from inbound edge labels falling back to the source node id (`merge_key_for_edge`, `collector_required_inputs`). Two inbound edges sharing a key are a validation error (`src/model.rs` collector input validation), so a runnable workflow never has them; the barrier builder's dedupe into a set behind a log warning is reachable only if validation is bypassed. Duplicate arrivals at an already-recorded key are dropped (`insert_collector_arrival`).
 
-## Split Families and Failure Policies
+Failed and timed-out Cursors also arrive at a barrier (`handle_terminal_cursor_status` registers arrivals before removing the cursor). That is what lets the default `best_effort_continue` Split Family policy release a barrier after a branch died.
 
-Split families track related cursors spawned by a split node:
+The aggregate shape is a keyed `inputs` object beside a `summary` carrying the required count and per-status tallies (`release_collectors_if_ready`). A reader addresses a branch by its merge key, never by position. A barrier releases only when every required key has arrived; every arrival is keyed by an inbound edge of that collector, so `summary.total` equals the number of inputs whenever the aggregate is built. Barriers re-arm after release (`reset_released_collector_barrier`), which is what makes a loop through a collector work.
 
-| Policy | Behavior |
-|--------|----------|
-| `best_effort_continue` | If some branches fail, continue with successful ones |
-| `fail_fast_cancel` | On first branch failure, cancel all sibling cursors immediately |
-| `drain_then_fail` | Wait for all branches to complete, then fail if any failed |
+Representative selection is first-still-live-in-arrival-order, not "whichever branch won." `release_collectors_if_ready` picks the first waiter still present in `active_cursors`; every other waiter is deleted and its variable writes discarded silently. With no live survivor, the engine resurrects the first terminal arrival's snapshot (`representative_snapshot`), whose struct comment flags that the snapshot may be stale if another branch mutated globals after capture. Release is gated on arrival count alone and never checks liveness, so under the default split failure policy the all-dead path is reachable.
 
-## Branching and Loops
+## Checkpoint, resume, and restart
 
-### Branch Decisions
+The Checkpoint is the serialized full state of a Run — the sole authority for resume and restart (`RuntimeCheckpoint`). Beyond the cursor list and run-global `all_results`, it carries mid-batch item results (`batch_item_results`), stagnation-detector output hashes (`output_hashes`), the Approval Queue (`queued_approvals` plus the single active `pending_approval`), limits frozen at start (`max_total_steps`, `max_visits_per_node`) and the consumed global-step counter (`total_executed`), split families, collector barriers, and the Execution Log accumulated as the Run proceeds. Checkpoint-level `loop_counters` and `visit_counters` are vestigial: `prepare_cursor_visit` increments per-cursor counters only.
 
-When a node has multiple outgoing `branch` edges, the runtime needs to choose which path to follow. If `useOrchestrator` is enabled and the agent supports `branchChoice`, the orchestrator evaluates the node's output and selects the appropriate branch.
+Persistence uses a content-hash dedup guard (`checkpoint_content_hash`, `persist_checkpoint`): a djb2 hash with `updated_at` blanked skips the write entirely when nothing changed. There is no checkpoint versioning — forward compatibility rests on serde defaults.
 
-### Loop Decisions
+Resume is reconciliation, not merely reading the last row. `resume_run` rejects terminal or already-active Runs, backfills tmux invocation for legacy rows, then `rehydrate_checkpoint_for_execution` synthesizes a cursor when needed, normalizes `running` cursors back to `runnable`, and runs inconsistency passes that drop orphaned approval state (`drop_inconsistent_pending_approval`, `drop_inconsistent_waiting_approval_cursors`). Approval is re-bound through `restore_pending_approval` / `activate_next_approval`. Execution Epoch 0 checkpoints migrate to epoch 1 on resume without clearing barriers, which can strand arrivals keyed at 0.
 
-When a node has `loop_continue` and `loop_exit` edges:
+Restart (`restart_from`) drains the live executor, increments Execution Epoch, reseeds exactly one cursor from the global `var_map`, clears all split families and collector barriers, deletes Node Results for all graph descendants, marks survivors `stale`, mints a new `run_id`, and marks the old Run `restarted`. It preserves `total_executed`, so the new Run inherits the consumed portion of the frozen `max_total_steps` budget. Stale predecessors emit `sys_warn` and are prefixed `[preserved from prior run]` in `{{all_predecessors}}`. Restart resets Execution Log header fields — run id, start and end time, duration, terminal reason, aborted flag — but leaves accumulated node executions, decisions, and transitions in place, so a restarted Run's persisted log still carries the prior Run's entries.
 
-1. The runtime checks `loopMaxIterations` — if exceeded, forces exit
-2. If `useOrchestrator` is enabled, the orchestrator evaluates `loopCondition` against the node output
-3. On `loop_continue`: cursor returns to the loop target, loop counter increments
-4. On `loop_exit`: cursor follows the exit edge
+The Execution Log is accumulated on the checkpoint throughout the Run (`execution_log` on `RuntimeCheckpoint`) and separately persisted at finalize (`finalize_run` calls `save_execution_log` and emits `log_saved`). It is written as the Run proceeds via `node_executions`, `decisions`, and `transitions` pushes throughout execution.
 
-## Checkpoints
+Neither the Active Pane Registry nor the owned-target set appears in the checkpoint — both live on the in-memory `RunRegistry` run object. A resumed Run starts with both empty. For pane nodes the consequence runs through the ownership gate: the production tmux path always constructs `ActivePaneRegistration` (`tmux_exec.rs` runner), and `resolve_pane_target` gates on `owns_pane` — a membership test against the owned-target set. With an empty set after resume, a `send` or `capture` against a still-live pane is refused with a not-owned-by-this-run error rather than silently retargeting. Session reuse and the HTTP pane-context path both depend on the Active Pane Registry as described in §Pane kinds; with the rebuilt registry empty after resume, continuation fails outright and the HTTP path survives only through its persisted-checkpoint fallback.
 
-After each significant state change, the runtime persists a checkpoint to SQLite. A checkpoint contains:
+## Pane kinds
 
-```
-Checkpoint {
-  executionEpoch      — monotonic epoch counter
-  activeCursors[]     — all cursor states with outputs and counters
-  splitFamilies[]     — split tracking with member cursors and failure policy
-  collectorBarriers[] — barrier state with arrivals and waiting cursors
-  nodeResults{}       — per-node execution results
-  variables{}         — resolved workflow variables
-  pendingApproval     — approval state if paused
-  executionLog        — accumulated log entries
-}
-```
+Pane Kinds (`spawn`, `send`, `wait`, `capture`, `kill`) interact with tmux panes rather than LLM prompts. Their configured target (or a pane alias carried in the previous node's output) is parsed through the tmux-tools target parser, then gated on the Run's owned-target set: a Run may only address panes it owns (`resolve_pane_target`). `spawn` alone establishes that membership through `ActivePaneRegistration::register_owned_target`; control kinds only check it through `owns_pane` or `owns_session` before their respective update or clear of the Active Pane Registry.
 
-Checkpoints enable:
-- **Resume after crash** — `POST /api/runs/{id}/resume` restores from last checkpoint
-- **Restart from node** — `POST /api/runs/{id}/restart-from/{nodeId}` creates a new run with incremented epoch
+The Active Pane Registry is a separate per-run map. `resolve_active_pane` recognizes registered keys, resolves `active`/`current` only when exactly one pane is registered, and picks the highest sequence for a node-id prefix. Session-continuing nodes (`continueSessionFrom` via `resolve_reused_pane`) consult only this registry. The HTTP pane-context endpoints (`resolve_run_pane_context`) try the registry first; when that lookup misses, they recover candidates reconstructed from persisted checkpoint Node Results and Execution Log entries and apply a distinct `active`/`current` rule via `match_pane_candidate` — current-node candidate when present, otherwise the last candidate — returning `PaneUnavailable` only when candidate recovery also fails. The registry does not resolve a pane node's target. `send`, `wait`, and `capture` each register their resolved target in the registry under their own node key after resolving it by other means. A pane `kill` clears registry entries for both its resolved target and its node key; a session `kill` clears only its node key. Neither path removes owned-target membership: that set has no removal path and persists until the Run's registry entry is torn down. The separation is about resolution, not writes: pane kinds write or clear the registry even though none of them reads it to find its target.
 
-### Execution Epochs
+`spawn` registers in both the Active Pane Registry and the owned-target set. PTY interaction during task or `run_agent` execution blocks only the calling task's receiver; sibling cursors keep executing. It does not pause the Run.
 
-The execution epoch is a monotonic counter that increments on restart. It prevents stale split/collector state from the previous epoch from contaminating the restarted execution path.
+## Failure and termination
 
-## Session Persistence
+There is no failure Edge Outcome — `WorkflowEdgeOutcome` is exactly `success`, `reject`, `branch`, `loop_continue`, and `loop_exit`. ADR-260815-2009-02 describes the forward addition of a sixth failure channel; it is not present behavior. A node failure always ends its cursor (`handle_terminal_cursor_status`). Outside any Split Family, that failure fails the whole Run and sets `cancel_requested` on every other cursor; the dispatch guard described above then suppresses any further dispatch for those siblings. Split-family membership is sticky as described above.
 
-Task nodes can continue an agent session from a previous node using `continueSessionFrom`. The runtime:
+A failed task result is classified three ways: aborted, timeout, or failure. The aborted branch — a Run abort flag or `error_type == "aborted"` — short-circuits the whole Run to `aborted` and clears every Cursor before a `CursorTerminalStatus` is chosen; only timeout and failure become a `CursorTerminalStatus` on a Collector Barrier arrival. Whether the Run dies for those latter outcomes depends on split-family membership and policy. Split failure policies (`best_effort_continue`, `drain_then_fail`, `fail_fast_cancel`) apply across every family a cursor belongs to, so nested splits stack: `best_effort_continue` no-ops on sibling failure; `drain_then_fail` sets `force_failed`; `fail_fast_cancel` additionally cancels siblings and fails the Run.
 
-1. Pre-scans the workflow to identify which nodes need persistent sessions
-2. When executing a node that needs session persistence, passes the `session_id` flag to the agent
-3. When a downstream node references `continueSessionFrom`, passes the upstream node's `session_id` for session resumption
+Run-killers beyond per-cursor failure include limit violations (abort whole Run, `aborted` status), stagnation detection (three consecutive identical outputs on a run-global key of call-frame path plus node id aborts every cursor), the all-cursors-at-collector stall, and the `anyhow` backstop: when `execute_workflow` returns an error, `execute_workflow_to_terminal` calls `fail_workflow_after_error`, which fails and finalizes the Run. A panic or cancellation in the supervised task follows a separate `spawn_supervised_run` path that only clears the in-memory registry entry; the persisted Run can remain `running`.
 
-This enables multi-turn agent conversations across workflow nodes.
+Approval rejection with no `reject` edge fails the cursor; outside a split family that fails the Run (`handle_approval_resolution`). A dropped approval channel is treated as rejection.
 
-## Event Vocabulary
+## Decide nodes
 
-Events emitted during execution:
+Decide nodes bypass the task pipeline entirely on entry — `run_cursor_task` short-circuits to `run_decide_node` with no orchestrator refinement, no retries, no session continuation, and no agent-defaults merge. Routing is two-stage. Outcome selection (`select_decide_outcome`): a structured `{"outcome": …}` label outside the declared set fails without falling back to prose; otherwise exact trimmed match, then word-boundary scan. Edge selection (`select_next_decision`): the outcome is matched exactly against a branch edge label; an outcome with no matching branch edge is a validation error, so the emit-`workflow_error`-and-degrade-to-success arm in `select_next_decision` is unreachable from a validated document.
 
-| Event | Description |
-|-------|-------------|
+Branch routing's real default for non-decide nodes: when branch edges exist and parsed output is present, the first edge whose condition matches wins; if none match, the first branch edge is taken silently. There is no "no condition matched" outcome and nothing marks the route as defaulted — a `branch_decision` event fires either way with the same `chosenBranch` and `chosenLabel` fields. The orchestrator branch fallback (`run_orchestrator_branch`) is unreachable dead code because `chosen` is seeded from `branch_edges.first()` before the orchestrator guard; see `ISSUE-260826-0004-01`. The `branchChoice` agent capability is advertised but never read on the routing path.
+
+Loop decisions are deterministic only (`loop_decision` with `deterministic: true`). `loopMaxIterations` defaults to 5; the loop condition is consulted only when both `loop_condition` and `parsed_output` are present.
+
+## Event vocabulary
+
+`RuntimeEvent` carries an unconstrained `kind` string (wire name `type`), a flattened data map, and a monotonic `seq` stamped by `emit_event` when the event is appended to the database — the `seq` is what makes the SSE stream resumable. Event kinds are literals at scattered emission sites; there is no enum. The production runtime module sweep found 55 construction sites yielding 29 distinct kinds (test modules elsewhere use throwaway strings and are excluded).
+
+| Event kind | Description |
+|------------|-------------|
 | `run_start` | Workflow execution begins |
 | `run_resumed` | Run resumed from checkpoint |
 | `node_start` | Node execution begins |
-| `node_done` | Node execution completed (success or failure) |
+| `node_done` | Node execution completed |
 | `node_retry` | Node execution being retried |
 | `node_skipped` | Node skipped due to skip condition |
-| `branch_decision` | Orchestrator chose a branch path |
-| `loop_decision` | Orchestrator decided loop continue/exit |
-| `cursor_spawned` | New cursor created (split fan-out) |
+| `branch_decision` | Branch edge chosen (matched condition or silent first-edge default) |
+| `loop_decision` | Loop continue/exit from deterministic condition |
+| `loop_max_reached` | Loop node hit `loopMaxIterations` |
+| `cursor_spawned` | New cursor created (split fan-out or parallel-batch item) |
 | `collector_waiting` | Cursor waiting at collector barrier |
-| `aggregate_merged` | Collector merged an arriving input |
-| `collector_released` | All inputs arrived, collector proceeding |
-| `approval_queued` | Approval node reached |
-| `approval_required` | Run paused waiting for user approval |
-| `cursor_cancelled` | Cursor cancelled (failure policy) |
+| `aggregate_merged` | Collector barrier released; carries the full keyed inputs object |
+| `collector_released` | All required inputs arrived; collector proceeding |
+| `approval_queued` | Approval node reached; queued |
+| `approval_required` | Active approval waiting for user response |
+| `cursor_cancelled` | Cursor removed on the failure/timeout terminal path |
 | `transition` | Cursor moving to next node |
-| `agent_interaction_required` | PTY prompt detected, waiting for human response |
-| `agent_interaction_resolved` | Human responded to PTY interaction prompt |
-| `workflow_error` | Runtime error occurred |
+| `subflow_start` | Subflow or call entry |
+| `subflow_done` | Subflow or call exit |
+| `orchestrator_start` | Orchestrator prompt refinement begins |
+| `orchestrator_done` | Orchestrator refinement completed |
+| `orchestrator_warn` | Orchestrator refinement failed; using original prompt |
+| `agent_interaction_required` | PTY prompt detected; waiting for human response |
+| `agent_interaction_resolved` | Human responded to PTY interaction |
+| `workflow_error` | Runtime error |
+| `workflow_warn` | Recoverable workflow warning |
+| `sys_warn` | System warning (e.g. stale predecessor outputs) |
+| `log_saved` | Execution log persisted at finalize |
 | `done` | Run completed (success, failed, or aborted) |
-
-## Run Statuses
-
-| Status | Description |
-|--------|-------------|
-| `running` | Actively executing |
-| `paused` | Waiting for approval or external input |
-| `completed` | All cursors finished successfully |
-| `failed` | Execution failed (error or limit exceeded) |
-| `aborted` | User-initiated abort |
-| `restarted` | Run was restarted from a specific node |
-
-## Interactive PTY Prompts
-
-When task and agent nodes execute inside tmux panes (managed by `tmux_exec.rs` and tracked in the runtime's per-run `active_panes` registry), agent CLIs may emit interactive prompts — trust dialogs, permission requests, or destructive-action warnings. SilverBond handles these through a **4-tier escalation model**:
-
-### Tier 1: Auto-Respond (Warmup)
-
-Known low-risk patterns (e.g., "trust this folder?" prompts) are automatically answered during session warmup. Each driver declares these via `interaction_patterns()` with `InteractionKind::AutoRespond`. No user intervention is needed.
-
-### Tier 2: Auto-Approve with Destructive Blocklist
-
-When `autoApprove` is enabled in agent defaults, permission-request patterns (`InteractionKind::PermissionRequest`) are automatically approved — **unless** the prompt matches the driver's destructive blocklist. The shared blocklist catches patterns like `rm -rf`, `DROP TABLE`, `force push`, `chmod 777`, and similar dangerous operations.
-
-### Tier 3: Orchestrator Classification (Scaffolded)
-
-When the orchestrator is configured with `activation: "always_on"`, it can classify ambiguous prompts. This tier is scaffolded in the `OrchestratorConfig` type but not yet active — the infrastructure exists for future use.
-
-### Tier 4: Human-in-the-Loop
-
-Any prompt that is not auto-responded or auto-approved escalates to the user via the UI. The runtime emits an `agent_interaction_required` event, the frontend renders an interaction card in the RunPanel, and the run pauses until a response arrives. The user can approve, reject, or type a free-form response. Once submitted, the runtime sends the response into the active tmux pane via `send-keys` and emits `agent_interaction_resolved`.
-
-Destructive-blocklist matches (`InteractionKind::DestructiveWarning`) **always** escalate to Tier 4, regardless of auto-approve settings.
-
-## Orchestrator
-
-When `useOrchestrator` is enabled, the runtime uses the orchestrator agent (Claude by default) for decision-making:
-
-1. **Prompt refinement** — enhances task prompts before execution
-2. **Branch choice** — selects which branch to follow at decision points
-3. **Loop verdict** — decides whether to continue or exit a loop
-4. **Interaction classification** — (scaffolded) classifies ambiguous PTY prompts when `activation` is `"always_on"`
-
-The orchestrator is only used when the selected agent supports the relevant capability.
-
-## Limits and Guards
-
-- `maxTotalSteps` — maximum total node executions across all cursors
-- `maxVisitsPerNode` — maximum times any single node can be visited
-- `loopMaxIterations` — maximum iterations for a loop
-- `timeout` — per-node execution timeout
-- `maxBudgetUsd` — per-node cost limit
-- `maxTurns` — per-node agent turn limit
-
-When any limit is exceeded, the node fails with the corresponding error outcome (`error_timeout`, `error_max_budget`, `error_max_turns`).

@@ -101,3 +101,4 @@ One row per unique key (`file:line` + smell name). Columns:
 | docs/workflow-schema.md:1451-1453 — Duplicated Code | 1 | 2026-08-30 | open |
 | docs/workflow-schema.md:1496 — Primitive Obsession | 1 | 2026-08-30 | open |
 | docs/workflow-schema.md:1603 Duplicated Code | 1 | 2026-08-30 | open |
+| docs/execution-model.md:61 — Divergent Change | 1 | 2026-08-30 | open |
