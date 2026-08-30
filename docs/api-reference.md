@@ -143,7 +143,7 @@ Preview a task node's resolved prompt without executing it.
 {
   "node": { "id": "n1", "name": "Research", "kind": { "type": "task" }, "prompt": "Research {{var:topic}}" },
   "cwd": "/workspace",
-  "mockContext": { "topic": "AI safety" }
+  "mockContext": { "variables": { "topic": "AI safety" } }
 }
 ```
 

@@ -142,7 +142,7 @@ Workflows can set a top-level `runAs` field to run agents under a dedicated Unix
 }
 ```
 
-This isolates agent sessions on an automatic per-run tmux socket in the target user's per-UID socket directory (mode `0700`). Control commands run as the target user via `sudo -u <user>`, and agent workloads launch through `zsh -lic`. See [Workflow Schema](workflow-schema.md#run-as-runas) for the full `runAs` shape.
+This isolates agent sessions on an automatic per-run tmux socket in the target user's per-UID socket directory (mode `0700`). Control commands run as the target user via `sudo -u <user>`, and agent workloads launch through `zsh -lic`. See [Workflow Schema](workflow-schema.md#document-level-fields) for the full `runAs` shape.
 
 ### Watching Running Agents
 
