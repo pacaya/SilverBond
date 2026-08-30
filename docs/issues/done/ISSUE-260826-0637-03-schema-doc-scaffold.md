@@ -2,11 +2,13 @@
 id: ISSUE-260826-0637-03
 kind: issue
 category: enhancement
-status: ready-for-agent
+status: done
 summary: Restructure the workflow schema reference into a marker-bearing scaffold with the document grammar written and the false content deleted
 prd: PRD-260826-0009-01
 adrs: [ADR-260815-2009-01]
 terms: [Workflow, Node Kind, Edge Outcome, Condition, Validation Issue]
+claimed_by: implement-issue@Mac-mini-4
+claimed_at: 2026-08-30T02:40:24Z
 ---
 
 ## Agent Brief
@@ -145,6 +147,57 @@ says "see the source" is honest; one that says nothing is a hole.
 - Describing the v5 grammar as present. v5 is decided in ADR-260815-2009-01 and delivered by the
   `typed-contracts` epic; cite it as a forward reference only.
 
+## Context Pack — generated at claim (2026-08-30T02:40:24Z)
+
+**PRD decisions relevant to this slice** (PRD-260826-0009-01):
+- `docs/workflow-schema.md` is restructured, not patched: grammar first (nested `kind`, the two genuinely required top-level keys, silent acceptance of unknown keys), then the generated catalog, then Tier P tables, then authority/regeneration.
+- The generator emits blocks, not documents: generated content lives only between `<!-- BEGIN GENERATED: <block-id> -->` … `<!-- END GENERATED: <block-id> -->`, and the generator rewrites only that span — so the markers must exist before it can run (Further Notes: sequencing puts this scaffold first).
+- Content is tiered by who can maintain it correctly: Tier G generated catalog, Tier P hand-written but source-cross-referenced, Tier C conceptual prose, Tier D deleted. Tier D is exactly the unowned hand-written enumerations and the narrative claims about other subsystems.
+- The version/migration contract is **Tier C, not Tier P** — prose, because a table cannot carry it: missing `version` is a hard ingest error not a default; version rejection is an ingest `bail!` that never reaches the validation-issue channel; the version is force-rewritten on every path reaching validation; subflows migrate recursively; the flat→nested `kind` migration fires on any declared version.
+- Version framing: v4 is canonical, v5 is decided (ADR-260815-2009-01) and unlanded — cite it as a forward reference, never present tense.
+- The regeneration command is cited by the docs themselves (a `just` recipe wrapping `SB_REGEN_DOCS=1`); this issue names the contract, the generator issue supplies the command.
+- `src/model.rs` is stated as the authority, with which parts are generated and how to regenerate them.
+- No engine changes: this epic reads `src/`, writes `docs/`.
+- Terminology follows `CONTEXT.md`, whose unmarked entries are true of `src/` at HEAD; `_(planned — ADR-…)_` entries are not accepted by the engine yet.
+- `docs/sources/workflow-schema-drift-260825.md` is the work order; this slice owns Part 1 items 1–2, §1.5 items 36 and 39, all of §1.10, and §1.12.
+
+**Test seam & Testing Decisions:** observable at the committed markdown of `docs/workflow-schema.md` — headings, marker pairs and example shape are checked by reading and by the brief's `rg` observables, plus `just check-v4-docs` and `cargo test`. Testing Decisions that touch it: the primary guarantee is generation plus a freshness diff (regenerate, diff, fail on difference), so marker pairs must be addressable and balanced; all of Tier P and Tier C is explicitly **not** machine-checked and rests on per-claim source citations and review — which is why every surviving assertion must carry a citation a reader can follow in one jump; a field's requiredness is the one drift class no check catches.
+
+**ADRs:**
+- ADR-260815-2009-01 — Typed workflow contracts over a JSON-valued variable store · accepted (the decided v5 bump; forward reference only)
+- ADR-260815-2009-02 — One condition dialect: owned nested AST, typed operators, `onMissing` · accepted (neighbor: cited by the `Condition` and `Edge Outcome` glossary entries this slice's grammar prose touches; also forward-reference only)
+
+**Terms:**
+- `Workflow` — versioned node/edge graph definition (schema `version: 4`; v2–v3 documents normalize forward at ingest), including its subflow catalog; `Decisions:` cites ADR-260815-2009-01 (bumps to v5). Avoid: pipeline, flow.
+- `Node Kind` — the fourteen-variant tagged union in a node's required `kind` object, selecting both what the node does and which config shape it carries; the bare `type` tag is what `/api/capabilities` publishes. Avoid: step type.
+- `Edge Outcome` — the channel an edge is traversed on: `success | reject | branch | loop_continue | loop_exit`, the complete set — no failure channel. Avoid: edge type, transition.
+- `Condition` — the engine's single post-execution deterministic branching form (edge and loop conditions): one flat `{field, operator, value}` leaf, evaluated by the engine and never by an LLM; `skipCondition` is a separate pre-execution form. Avoid: expression, rule.
+- `Validation Issue` — one entry in a validation result (`{severity, nodeId?, scope?, message}`, severity only ever `error` or `warning`); validation is enforced only at run start, saving never validates, and a version rejection never reaches this channel. Avoid: save-time validation, lint.
+
+**Full artifacts:** docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md · docs/adr/INDEX.md · CONTEXT.md · docs/sources/workflow-schema-drift-260825.md
+
+## Code Review
+
+Review file: `issue-260826-0637-03-code-review-20260830-030625.md`
+
+- M1 (MEDIUM): Root `agentConfig` documented as "not accepted" when it is silently ignored — FIXED
+- M2 (MEDIUM): Document asserts a save-time validation-issue channel that does not exist — FIXED
+- M3 (MEDIUM): Regeneration contract written as an operational command that does not exist — FIXED
+- M4 (MEDIUM): Repo-wide `deny_unknown_fields` negative carries no followable citation — FIXED
+- M5 (MEDIUM): Version failure modes and their messages are conflated — FIXED
+- M6 (MEDIUM): Startup snapshot re-normalization stated as unconditional — FIXED
+- L1 (LOW): Unknown-key leniency overstated — FIXED
+- L2 (LOW): Catalog described as already listing config shapes — FIXED
+- L3 (LOW): Flat→nested migration paragraph omits two silent-data-loss behaviours — FIXED (round 2, same-site redesign)
+- L4 (LOW): "Execution and UI fields" — `WorkflowNode` carries no UI fields — FIXED
+- L5 (LOW): Fourteen `### <wire-tag>` headings hand-maintained outside every generated span — FIXED
+- L6 (LOW): Accepted-version qualifier buried the v4 case (admitted round 1, drift §1.10 item 78) — FIXED
+
+Dismissed on adjudication: CODEX-5, CLAUDE-7, CLAUDE-11, CLAUDE-12 (rationale in the review file).
+Fix rounds used: 2 of 4. Round 2 ran under the same-site escalation rule as a paragraph redesign against ten checkable properties; both reviewers returned MECHANISM: GONE, all properties PASS, all round-1 fixes HELD, no new findings.
+Smells: 0 (both reviewers returned empty blocks; the one candidate was folded into L5 rather than double-counted).
+Two advisory nits recorded in the review file, deliberately not spent as a third round.
+
 ## Triage Notes
 
 **Readiness gate (cold-reader): PASS** (round 2)
@@ -203,3 +256,25 @@ The residue: the exclusion says to file the repoint separately but names no reco
 analogous `ARCHITECTURE.md` exclusion points at a real one. Deliberately not fixed here — another
 full-enumeration round costs more than the pointer is worth, and the follow-up record is being filed
 alongside this batch.
+
+## Resolution
+
+**Commit:** `feat: restructure workflow schema reference into a marker-bearing scaffold (ISSUE-260826-0637-03)`
+
+**Route:** `cursor` (both the implementation pass and both fix rounds). Rationale: a single-file documentation restructure with explicit acceptance criteria and no DevOps, security, architecture or large-context signal — the route-picker returned `cursor` on all three dispatches independently.
+
+**TDD:** `n/a (linear)` — documentation work, no behaviour-changing seam. The acceptance criteria's `rg` observables plus `just check-v4-docs` are the verification surface; no test was added, and none of the epic's engine code was touched.
+
+**Review telemetry:** dual review (Claude + Codex, cross-verified, adjudicated inline). Claude raised 14 findings, Codex 9; after merging five independent confirmations and dismissing four on adjudication, **11 findings** entered the file — 6 MEDIUM, 5 LOW, no CRITICAL or HIGH. One further finding (L6) was admitted mid-loop from a round-1 re-verification. Final: **12 FIXED, 0 deferred, 4 dismissed**, 0 smells. **2 of 4 fix rounds used.**
+
+Round 2 ran under the **same-site escalation rule**: L3 came back `STILL_BROKEN` and a new finding landed in the same paragraph the round-1 fix had just edited, so the two were treated as one defect and the **Flat-to-nested `kind` migration** paragraph was rewritten end-to-end from `migrate_workflow_value_to_v4` and `migrate_v2_node_to_v3_kind` in call order, against ten checkable properties, rather than patched again. Both reviewers returned `MECHANISM: GONE` with all ten properties passing and all round-1 fixes held.
+
+The four dismissals, with their grounds: the `/api/capabilities` sentence is mandated by `CONTEXT.md`'s **Node Kind** entry and §1.12 sanctions folding rather than deleting; the subflow-omitting-`version` case is already covered by the ingest contract stated in the same section; and the `docs/getting-started.md` anchor and `docs/README.md` blurb are both explicitly out of scope, the former already filed as ISSUE-260826-1648-01.
+
+Two advisory nits are recorded in the review file and deliberately not spent as a third round — a relative clause that a careless reader could misparse, and drift §1.10 item 80 (the `capture`/`kill` arms injecting an empty config), which was never part of any finding as adjudicated and changes no reader's behaviour.
+
+**Suite:** `just test` (→ `cargo test --locked` then `npm test`) — **595 passed, 0 failed, 0 skipped** (Rust 449 + 17 across 4 binaries; vitest 129 in 13 files). `just check-v4-docs` exits 0 ("No stale v3 canonical-format references found") — the one check that reads the changed file; it is not part of the `just test` aggregate and was run separately. No generator freshness test exists in this tree; that is expected-absent and arrives with ISSUE-260826-0637-04.
+
+**Known consequence, accepted by the brief:** `docs/getting-started.md`'s deep link to the removed `runAs` subsection now dangles. Repointing it was deliberately withheld from this issue and is filed as ISSUE-260826-1648-01; the repo is link-broken in the window between the two.
+
+**Date:** 2026-08-30 (UTC)

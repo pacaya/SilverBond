@@ -1,390 +1,292 @@
-# Workflow Schema Reference (v4)
+# Workflow Schema Reference
 
-SilverBond uses a graph-native workflow schema. The canonical format is version `4`. Legacy versions `2` and `3` are accepted as migration inputs and are silently upgraded to version `4` during normalization — they are not rejected at validation time.
+SilverBond workflows are versioned node/edge graph documents. The canonical schema version is `4`
+(`WORKFLOW_SCHEMA_VERSION` in `src/model.rs`). Versions `2` and `3` are accepted as migration
+inputs and normalize forward at ingest. A future version `5` is decided in
+[ADR-260815-2009-01](adr/260815-2009-typed-workflow-contracts.md) and delivered by the
+`typed-contracts` epic; this document describes the present engine only.
 
-## Top-Level Document
+## Document grammar
 
-```json
-{
-  "version": 4,
-  "name": "My Workflow",
-  "goal": "What this workflow should accomplish",
-  "cwd": "/path/to/working/directory",
-  "useOrchestrator": true,
-  "entryNodeId": "node-1",
-  "variables": [
-    { "name": "topic", "default": "AI safety" }
-  ],
-  "limits": {
-    "maxTotalSteps": 50,
-    "maxVisitsPerNode": 10
-  },
-  "nodes": [],
-  "edges": [],
-  "agentDefaults": {},
-  "runAs": {
-    "user": "agent-sandbox"
-  },
-  "ui": {}
-}
-```
+A workflow document deserializes to `WorkflowV3` (`src/model.rs`). It is a JSON object whose wire
+keys use camelCase (`rename_all = "camelCase"` on the struct).
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `version` | `number` | Yes | Must be `4` for new workflows; versions `2` and `3` are accepted as migration inputs |
-| `name` | `string` | No | Display name of the workflow |
-| `goal` | `string` | Yes | High-level description of what the workflow achieves |
-| `cwd` | `string` | No | Default working directory for agent execution |
-| `useOrchestrator` | `boolean` | No | Enable orchestrator for prompt refinement, branch choice, and loop verdicts |
-| `runAs` | `RunAsConfig` | No | User sandbox for tmux-based agent execution (see below) |
-| `entryNodeId` | `string` | Yes | ID of the first node to execute |
-| `variables` | `Variable[]` | No | Workflow-level variables available in prompt templates |
-| `limits` | `Limits` | No | Execution guardrails |
-| `nodes` | `Node[]` | Yes | Array of workflow nodes |
-| `edges` | `Edge[]` | Yes | Array of directed edges between nodes |
-| `agentDefaults` | `Record<string, AgentDefaults>` | No | Per-agent default configuration |
-| `ui` | `UiMetadata` | No | Canvas layout metadata (does not affect runtime) |
+### Required top-level keys
 
-### Variables
+Only two top-level keys are genuinely required at deserialization time:
 
-```json
-{ "name": "topic", "default": "machine learning" }
-```
+- `version` (`WorkflowV3::version`, `src/model.rs`) — must be present as a JSON non-negative
+  integer (`Value::as_u64`, `migrate_workflow_value_to_v4`, `src/model.rs`). A missing `version`,
+  or a value that is not a non-negative integer (for example a string `"4"`, a float, or a
+  negative number), is a hard ingest error with message `workflow version is required` — there is
+  no default.
+- `entryNodeId` (`WorkflowV3::entry_node_id`, `src/model.rs`) — the id of the first node to
+  execute.
 
-Variables are referenced in prompts with `{{var:name}}` syntax.
+Every other top-level field carries a serde default or is optional, so an omitted key deserializes
+to an empty value rather than failing load.
 
-### Limits
+### Unknown keys
 
-```json
-{
-  "maxTotalSteps": 50,
-  "maxVisitsPerNode": 10
-}
-```
+No struct in `src/` uses `deny_unknown_fields` (verify with `rg 'deny_unknown_fields' src/`). An
+additional unknown key, or a misspelled name on an optional or defaulted field, is silently
+ignored on ingest. Misspelling a required field (`version`, `entryNodeId`, a node's `id`, `name`,
+or `kind`, an edge's `id`, `from`, `to`, or `outcome`, or a `NodeKind` tag key) still fails
+deserialization. A document that saves cleanly is therefore not evidence that every field name was
+correct.
 
-Guards against runaway execution. If either limit is hit, the run fails.
+### Node shape
 
-### Run As (`runAs`)
+Each entry in `nodes` deserializes to `WorkflowNode` (`src/model.rs`). A node always carries
+`id`, `name`, and a required nested `kind` object. Execution fields common across kinds (`agent`,
+`prompt`, `contextSources`, `responseFormat`, `outputSchema`, retry and loop fields,
+`splitFailurePolicy`, `cwd`, `continueSessionFrom`, and others) sit on the node object beside
+`kind`
+(`WorkflowNode`, `src/model.rs`).
 
-Workflow-level sandbox configuration for tmux-based agent execution. All agents — worker tasks and lightweight classifier calls — run in tmux panes under the identity specified here and an automatic per-run socket.
-
-```json
-{
-  "runAs": {
-    "user": "agent-sandbox",
-    "command": ["sudo", "-u", "agent-sandbox", "-H", "--"]
-  }
-}
-```
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `user` | `string` | Synthesizes a `sudo -u <user> -H --` prefix for tmux control commands |
-| `command` | `string[]` | Verbatim argv-prefix escape hatch; overrides the synthesized `sudo` prefix when set |
-
-When both `user` and `command` are set, `command` takes precedence. The user switch happens once at the tmux server boundary: every run gets a dedicated `silverbond-<run-id>` socket in the target user's per-UID socket directory (mode `0700`), control commands run through the prefix, and agent workloads launch via `zsh -lic`.
-
-**Execution modes:** SilverBond currently runs all agents in interactive CLI TUI mode (tmux panes). A future direct-API mode (headless, no tmux) is planned but not yet implemented.
-
-**Observability:** To watch a running agent pane, attach with:
-
-```
-sudo -u <user> tmux -L silverbond-<run-id> attach -t <session>
-```
-
-The capabilities endpoint (`GET /api/capabilities`) exposes `features.runAs` and per-run `attachCommand` hints. Session observability is via tmux attach, not a dedicated history API.
-
-## Node Types
-
-### Task Node
-
-Executes a prompt using a local agent CLI launched in a tmux pane.
+`kind` is an internally-tagged union (`NodeKind`, `src/model.rs`): the tag key is `type`, and its
+value selects both what the node does and which config object, if any, is carried inside `kind`.
+Variant-specific config (`agentConfig` on `task` and `run_agent`, `decideConfig`, `batchConfig`,
+`subflowConfig`, `spawnConfig`, and the other `*Config` keys) lives inside `kind`, not on the node
+root. For example, a task node nests agent overrides under `kind.agentConfig`
+(`NodeKind::Task`, `src/model.rs`); the canonical serialized v4 shape keeps variant config inside
+`kind`. On a canonical v4 document that already has `kind`, a root-level `agentConfig` is
+silently ignored and the override is lost (see **Unknown keys** above).
 
 ```json
 {
   "id": "research",
   "name": "Research Phase",
-  "type": "task",
+  "kind": {
+    "type": "task",
+    "agentConfig": {
+      "model": "claude-opus-4"
+    }
+  },
   "agent": "claude",
-  "prompt": "Research {{var:topic}} and provide a summary.",
-  "contextSources": [
-    { "name": "previousContext", "nodeId": "prior-node" }
-  ],
-  "responseFormat": "text",
-  "outputSchema": {
-    "type": "object",
-    "properties": {
-      "summary": { "type": "string" },
-      "confidence": { "type": "number" }
-    },
-    "required": ["summary"]
-  },
-  "retryCount": 2,
-  "retryDelay": 1000,
-  "timeout": 30000,
-  "skipCondition": {
-    "source": "previous_output",
-    "type": "contains",
-    "value": "SKIP"
-  },
-  "loopMaxIterations": 5,
-  "loopCondition": "Evaluate if more research is needed",
-  "agentConfig": {
-    "model": "claude-opus-4",
-    "reasoningLevel": "medium",
-    "systemPrompt": "You are an expert researcher.",
-    "accessMode": "read_only",
-    "toolToggles": { "webSearch": true },
-    "maxTurns": 10,
-    "maxBudgetUsd": 5.0,
-    "allowedTools": ["Read", "Grep", "Glob"],
-    "disallowedTools": ["Bash"]
-  },
-  "cwd": "/custom/working/directory",
-  "continueSessionFrom": "prior-node-id"
+  "prompt": "Research {{var:topic}} and provide a summary."
 }
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `id` | `string` | Yes | Unique node identifier |
-| `name` | `string` | Yes | Display name |
-| `type` | `"task"` | Yes | Node type |
-| `agent` | `string` | No | Agent to use (`claude`, `codex`, `cursor`, `agy`, or any registry profile). Defaults to `claude` |
-| `prompt` | `string` | Yes | Prompt text with template substitution support |
-| `contextSources` | `ContextSource[]` | No | Additional context from other nodes |
-| `responseFormat` | `"text" \| "json"` | No | Expected response format |
-| `outputSchema` | `object` | No | JSON Schema for structured output validation |
-| `retryCount` | `number` | No | Number of retries on failure |
-| `retryDelay` | `number` | No | Milliseconds between retries |
-| `timeout` | `number` | No | Execution timeout in milliseconds |
-| `skipCondition` | `SkipCondition` | No | Condition to skip this node |
-| `loopMaxIterations` | `number` | No | Maximum loop iterations (when node has `loop_continue` edge) |
-| `loopCondition` | `string` | No | Prompt for orchestrator to evaluate loop exit |
-| `agentConfig` | `AgentNodeConfig` | No | Per-node agent configuration override |
-| `cwd` | `string` | No | Working directory override for this node |
-| `continueSessionFrom` | `string` | No | Node ID whose agent session to continue |
+The fourteen `type` values and their config shapes will be listed in the generated node catalog
+below once the catalog is populated; until then `NodeKind` (`src/model.rs`) is the authority.
+`/api/capabilities` publishes the same wire tags as `supportedNodeTypes` (`src/api.rs`).
 
-### Approval Node
+### Version and migration contract
 
-Pauses execution and waits for human approval.
+Ingest runs `normalize_workflow_value` (`src/model.rs`), which calls `migrate_workflow_value_to_v4`
+before deserialization. This path owns version acceptance and structural migration; it is separate
+from `validate_workflow`, which emits `ValidationIssue` values.
 
-```json
-{
-  "id": "approve",
-  "name": "Review Results",
-  "type": "approval",
-  "prompt": "Do the generated results look correct?"
-}
+**Missing or unsupported `version`.** If `version` is absent, or present but not a JSON
+non-negative integer (`Value::as_u64`, `migrate_workflow_value_to_v4`, `src/model.rs`), ingest
+fails with `workflow version is required` — there is no default version. If `version` is a
+non-negative integer outside the accepted set, ingest fails with `Only workflow versions 2, 3, and
+4 are supported. Received version N.` (`anyhow::bail!` in `migrate_workflow_value_to_v4`,
+`src/model.rs`). Both paths are ingest errors; neither becomes a `ValidationIssue` and neither
+reaches the validation-issue channel exposed by run creation or the validation endpoint. Saving
+a workflow does not validate (`save_workflow`, `src/api.rs`).
+
+**Canonical rewrite.** On every path that reaches validation, `version` is force-rewritten to the
+canonical value: `migrate_workflow_value_to_v4` sets `version` to `WORKFLOW_SCHEMA_VERSION` after
+migration (`src/model.rs`), and `ensure_defaults` assigns `workflow.version = WORKFLOW_SCHEMA_VERSION`
+again at the start of `validate_workflow` (`src/model.rs`). Validation therefore cannot reject a
+document for its version number.
+
+**Subflow catalog.** Entries in the root `subflows` map (`WorkflowV3::subflows`, `src/model.rs`)
+are migrated recursively — each nested body is passed through `migrate_workflow_value_to_v4`
+(`src/model.rs`). A subflow whose declared version is an accepted legacy or current version migrates
+forward with its root; only a subflow whose `version` the ingest path does not accept at all rejects
+the whole document.
+
+**Flat-to-nested `kind` migration.** In `migrate_workflow_value_to_v4` (`src/model.rs`), the
+declared `version` is read and matched before any node migration runs; only after that match
+accepts the document does `migrate_v2_nodes_to_v3_kind` (`src/model.rs`) run. That call is not
+gated on legacy versions — it runs for every accepted declared version, including a document that
+already declares version `4`, not only versions `2` or `3`. `migrate_v2_nodes_to_v3_kind` walks the
+`nodes` array and calls `migrate_v2_node_to_v3_kind` (`src/model.rs`) only when a node object has
+a top-level `type` key and no `kind` key; nodes that already carry `kind` are skipped entirely.
+
+`migrate_v2_node_to_v3_kind` (`src/model.rs`) removes the top-level `type` string and builds a new
+`kind` object whose `type` field carries that tag. A `match` on the tag moves recognized config
+fields from the node root into `kind` — for example the `"task"` arm calls `move_v2_config_field`
+for `agentConfig`, the `"decide"` arm for `decideConfig`, and so on (`migrate_v2_node_to_v3_kind`,
+`src/model.rs`). After that `match`, a loop over a fixed array of eleven literal root key names —
+`agentConfig`, `decideConfig`, `batchConfig`, `parallelBatchConfig`, `subflowConfig`, `spawnConfig`,
+`sendConfig`, `waitConfig`, `captureConfig`, `killConfig`, `runAgentConfig` — calls `node.remove`
+on each (`migrate_v2_node_to_v3_kind`, `src/model.rs`); any config object left at the node root
+because its key was not moved for the node's `type` is discarded without error. An unrecognized
+`type` string hits the `_ => {}` catch-all (`migrate_v2_node_to_v3_kind`, `src/model.rs`), leaving
+`kind` with only the tag, which then fails `NodeKind` deserialization.
+
+Legacy `outputSchema` shorthand is rewritten only when the declared document version is below `4` —
+`if version < WORKFLOW_SCHEMA_VERSION as u64` gates the call to
+`migrate_legacy_output_schemas_in_workflow` (`migrate_workflow_value_to_v4`, `src/model.rs`),
+unlike the flat-to-nested `kind` migration above.
+
+On database init, `upgrade_run_workflow_json` (`src/storage.rs`) attempts to re-normalize stored
+run snapshots whose `workflow_json` is not version `4`. Valid supported legacy snapshots are
+rewritten; rows with invalid JSON, or normalization failures (unsupported versions or other ingest
+errors), are skipped with a `tracing::warn!` and left byte-unchanged.
+
+## Node catalog
+
+The node-catalog generator (ISSUE-260826-0637-04) will emit one readable **fragment** block and
+one complete **workflow** block per node kind. Block IDs will follow
+`node-catalog:<wire-tag>:fragment` and `node-catalog:<wire-tag>:workflow`, where `<wire-tag>` is
+the node's `kind.type` value (`WorkflowNodeType::as_str`, `src/model.rs`).
+
+### task
+
+<!-- BEGIN GENERATED: node-catalog:task:fragment -->
+<!-- END GENERATED: node-catalog:task:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:task:workflow -->
+<!-- END GENERATED: node-catalog:task:workflow -->
+
+### approval
+
+<!-- BEGIN GENERATED: node-catalog:approval:fragment -->
+<!-- END GENERATED: node-catalog:approval:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:approval:workflow -->
+<!-- END GENERATED: node-catalog:approval:workflow -->
+
+### split
+
+<!-- BEGIN GENERATED: node-catalog:split:fragment -->
+<!-- END GENERATED: node-catalog:split:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:split:workflow -->
+<!-- END GENERATED: node-catalog:split:workflow -->
+
+### collector
+
+<!-- BEGIN GENERATED: node-catalog:collector:fragment -->
+<!-- END GENERATED: node-catalog:collector:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:collector:workflow -->
+<!-- END GENERATED: node-catalog:collector:workflow -->
+
+### decide
+
+<!-- BEGIN GENERATED: node-catalog:decide:fragment -->
+<!-- END GENERATED: node-catalog:decide:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:decide:workflow -->
+<!-- END GENERATED: node-catalog:decide:workflow -->
+
+### parallel_batch
+
+<!-- BEGIN GENERATED: node-catalog:parallel_batch:fragment -->
+<!-- END GENERATED: node-catalog:parallel_batch:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:parallel_batch:workflow -->
+<!-- END GENERATED: node-catalog:parallel_batch:workflow -->
+
+### subflow
+
+<!-- BEGIN GENERATED: node-catalog:subflow:fragment -->
+<!-- END GENERATED: node-catalog:subflow:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:subflow:workflow -->
+<!-- END GENERATED: node-catalog:subflow:workflow -->
+
+### call
+
+<!-- BEGIN GENERATED: node-catalog:call:fragment -->
+<!-- END GENERATED: node-catalog:call:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:call:workflow -->
+<!-- END GENERATED: node-catalog:call:workflow -->
+
+### spawn
+
+<!-- BEGIN GENERATED: node-catalog:spawn:fragment -->
+<!-- END GENERATED: node-catalog:spawn:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:spawn:workflow -->
+<!-- END GENERATED: node-catalog:spawn:workflow -->
+
+### send
+
+<!-- BEGIN GENERATED: node-catalog:send:fragment -->
+<!-- END GENERATED: node-catalog:send:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:send:workflow -->
+<!-- END GENERATED: node-catalog:send:workflow -->
+
+### wait
+
+<!-- BEGIN GENERATED: node-catalog:wait:fragment -->
+<!-- END GENERATED: node-catalog:wait:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:wait:workflow -->
+<!-- END GENERATED: node-catalog:wait:workflow -->
+
+### capture
+
+<!-- BEGIN GENERATED: node-catalog:capture:fragment -->
+<!-- END GENERATED: node-catalog:capture:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:capture:workflow -->
+<!-- END GENERATED: node-catalog:capture:workflow -->
+
+### kill
+
+<!-- BEGIN GENERATED: node-catalog:kill:fragment -->
+<!-- END GENERATED: node-catalog:kill:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:kill:workflow -->
+<!-- END GENERATED: node-catalog:kill:workflow -->
+
+### run_agent
+
+<!-- BEGIN GENERATED: node-catalog:run_agent:fragment -->
+<!-- END GENERATED: node-catalog:run_agent:fragment -->
+
+<!-- BEGIN GENERATED: node-catalog:run_agent:workflow -->
+<!-- END GENERATED: node-catalog:run_agent:workflow -->
+
+## Node fields
+
+Per-field tables for `WorkflowNode` and each `NodeKind` config shape are deferred to a later
+pass; `src/model.rs` is the authority until then.
+
+## Edges and conditions
+
+Edge, outcome, and condition field tables are deferred to a later pass; `src/model.rs` (`WorkflowEdge`,
+`WorkflowEdgeOutcome`, `StructuredCondition`) is the authority until then.
+
+## Document-level fields
+
+Top-level `WorkflowV3` field tables are deferred to a later pass; `src/model.rs` is the authority
+until then.
+
+## Templates and agent config
+
+Template-token and agent-configuration tables are deferred to a later pass; `src/model.rs` and
+`src/runtime.rs` (`resolve_template_vars`) are the authority until then.
+
+## Validation catalog
+
+The validation-issue catalog is deferred to a later pass; `validate_workflow` and `ValidationIssue`
+in `src/model.rs` are the authority until then.
+
+## Regenerating this document
+
+`src/model.rs` is the schema authority. The **Node catalog** section is generated: each block
+between a matched HTML comment pair (block id in the comment) will be rewritten by the catalog
+generator; all other sections are hand-written prose cross-referenced to the source. The per-kind
+`### <wire-tag>` headings in **Node catalog** are hand-maintained and must be updated when the
+`NodeKind` variant set changes.
+
+ISSUE-260826-0637-04 will supply the catalog generator and the refresh command:
+
+```bash
+just regen-docs
 ```
 
-When the runtime reaches an approval node:
-1. The run pauses and emits an `approval_required` event
-2. The frontend shows an approval card with the prompt and last node output
-3. The user approves (follows `success` edges) or rejects (follows `reject` edges)
-4. Optional user input can be attached to the approval decision
-
-### Split Node
-
-Fans out execution to multiple parallel branches.
-
-```json
-{
-  "id": "split",
-  "name": "Branch by topic",
-  "type": "split",
-  "prompt": "Determine which research path to take",
-  "splitFailurePolicy": "best_effort_continue"
-}
-```
-
-| `splitFailurePolicy` | Description |
-|----------------------|-------------|
-| `best_effort_continue` | Continue with successful branches even if some fail |
-| `fail_fast_cancel` | Cancel all branches immediately on first failure |
-| `drain_then_fail` | Wait for all branches to finish, then fail if any failed |
-
-Split nodes spawn multiple cursors, one per outgoing `branch` edge.
-
-### Collector Node
-
-Convergence point that waits for all incoming branches to arrive.
-
-```json
-{
-  "id": "collect",
-  "name": "Merge Results",
-  "type": "collector",
-  "prompt": "Synthesize all research findings into a final report.",
-  "responseFormat": "json"
-}
-```
-
-Collectors implement barrier semantics — they wait until all expected inputs have arrived before executing. The `{{all_predecessors}}` template variable provides all collected outputs.
-
-## Edges
-
-```json
-{
-  "source": "node-1",
-  "target": "node-2",
-  "outcome": "success",
-  "label": "On success"
-}
-```
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `source` | `string` | Yes | Source node ID |
-| `target` | `string` | Yes | Target node ID |
-| `outcome` | `string` | Yes | Edge outcome type |
-| `label` | `string` | No | Display label |
-
-### Edge Outcomes
-
-| Outcome | Usage | Visual |
-|---------|-------|--------|
-| `success` | Normal forward flow from any node | Solid green line |
-| `reject` | Rejection path from approval nodes | Dashed red line |
-| `branch` | Split branch (one per parallel path) | Dashed orange line |
-| `loop_continue` | Loop iteration (back-edge to earlier node) | Dashed teal line |
-| `loop_exit` | Exit from a loop | Dashed teal line |
-
-## Prompt Templates
-
-Prompts support template substitution with `{{...}}` syntax:
-
-| Pattern | Description |
-|---------|-------------|
-| `{{var:name}}` | Substitutes the value of workflow variable `name` |
-| `{{previous_output}}` | Output from the immediately preceding node |
-| `{{node_name:field}}` | Specific field from a named node's structured output |
-| `{{all_predecessors}}` | All ancestor node outputs (useful in collectors) |
-
-### Context Sources
-
-Context sources let a node explicitly reference output from another node:
-
-```json
-{
-  "contextSources": [
-    { "name": "previousContext", "nodeId": "research" }
-  ]
-}
-```
-
-The referenced node's output is injected as additional context in the prompt.
-
-## Agent Defaults
-
-Workflow-level default configuration per agent:
-
-```json
-{
-  "agentDefaults": {
-    "claude": {
-      "model": "claude-opus-4",
-      "reasoningLevel": "medium",
-      "systemPrompt": "You are a helpful assistant.",
-      "accessMode": "execute",
-      "toolToggles": { "webSearch": false },
-      "maxTurns": 20,
-      "maxBudgetUsd": 10.0,
-      "autoApprove": true,
-      "orchestrator": {
-        "enabled": true,
-        "model": "claude-sonnet-4",
-        "activation": "stale_only",
-        "systemPrompt": "You classify prompts.",
-        "staleTimeoutSecs": 30,
-        "subagentTimeoutSecs": 120
-      }
-    },
-    "codex": {
-      "model": "o4-mini",
-      "accessMode": "edit"
-    }
-  }
-}
-```
-
-Resolution order: node-level `agentConfig` overrides → workflow-level `agentDefaults` → driver defaults.
-
-### Auto-Approve
-
-When `autoApprove` is `true`, permission-request prompts detected during tmux pane execution are automatically approved — unless the prompt matches the destructive blocklist. Destructive patterns always require human confirmation.
-
-### OrchestratorConfig
-
-Optional orchestrator configuration for interaction classification and prompt refinement:
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `enabled` | `boolean` | `false` | Enable the orchestrator |
-| `model` | `string` | — | Model to use for orchestrator calls |
-| `activation` | `OrchestratorActivation` | `"stale_only"` | When to activate |
-| `systemPrompt` | `string` | — | System prompt for orchestrator |
-| `staleTimeoutSecs` | `number` | — | Seconds before considering output stale |
-| `subagentTimeoutSecs` | `number` | — | Timeout for subagent detection |
-
-### OrchestratorActivation
-
-| Value | Description |
-|-------|-------------|
-| `"stale_only"` | Activate only when output goes stale |
-| `"always_on"` | Classify all ambiguous prompts |
-
-### Access Modes
-
-| Mode | Description |
-|------|-------------|
-| `read_only` | Agent can only read files |
-| `edit` | Agent can read and edit files |
-| `execute` | Agent can read, edit, and execute commands |
-| `unrestricted` | No restrictions on agent actions |
-
-### Agent Config Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `model` | `string` | Model to use (e.g., `claude-opus-4`, `o4-mini`) |
-| `reasoningLevel` | `"low" \| "medium" \| "high"` | Reasoning effort level |
-| `systemPrompt` | `string` | System prompt for the agent |
-| `accessMode` | `string` | Permission level (see above) |
-| `toolToggles` | `{ webSearch?: boolean }` | Toggle specific tools |
-| `maxTurns` | `number` | Maximum conversation turns |
-| `maxBudgetUsd` | `number` | Maximum cost in USD |
-| `allowedTools` | `string[]` | Whitelist of allowed tools (node-level only) |
-| `disallowedTools` | `string[]` | Blacklist of disallowed tools (node-level only) |
-| `autoApprove` | `boolean` | Auto-approve tmux permission prompts (blocked by destructive blocklist) |
-| `orchestrator` | `OrchestratorConfig` | Orchestrator configuration for interaction classification |
-
-Not all agents support all fields. The frontend shows only capability-supported fields per agent. See [Agent Drivers](agent-drivers.md) for capability details.
-
-## UI Metadata
-
-Layout metadata that does not affect runtime behavior:
-
-```json
-{
-  "ui": {
-    "canvas": {
-      "viewport": { "x": 0, "y": 0, "zoom": 1 },
-      "nodes": {
-        "node-1": { "x": 180, "y": 180 },
-        "node-2": { "x": 400, "y": 300 }
-      }
-    }
-  }
-}
-```
-
-## Validation
-
-The backend validates workflows and returns issues with severity and location:
-
-- **Errors**: Missing entry node, duplicate node IDs, edges to nonexistent targets, task nodes without prompts
-- **Warnings**: Unreachable nodes, dead-end nodes (no outgoing edges)
-- **Info**: Graph metadata (reachable nodes, entry point analysis)
-
-Legacy `outputSchema` in `{"field": "type"}` format is automatically migrated to full JSON Schema format when importing workflow versions 2 or 3. Canonical version-4 documents are left unchanged (including `$ref`-only and `$schema`/`$id` schemas).
+That recipe will wrap `SB_REGEN_DOCS=1` around the catalog generator test. Once the generator
+lands, `cargo test` will regenerate in memory and assert the committed markdown matches — it will
+not rewrite tracked files.
