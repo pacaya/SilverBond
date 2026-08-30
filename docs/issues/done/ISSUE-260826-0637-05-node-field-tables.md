@@ -2,11 +2,13 @@
 id: ISSUE-260826-0637-05
 kind: issue
 category: enhancement
-status: ready-for-agent
+status: done
 summary: Write the common node field table and the per-kind config field tables with real types, requiredness and defaults
 prd: PRD-260826-0009-01
 terms: [Node Kind, Skip Condition, Condition, Access Profile]
 blocked_by: [ISSUE-260826-0637-04]
+claimed_by: implement-issue@Mac-mini-4
+claimed_at: 2026-08-30T05:41:20Z
 ---
 
 ## Agent Brief
@@ -139,6 +141,71 @@ serialized example, the harvested variant set or any validation result. Write th
 - Any change under `src/` or `ui/`, including adding derives to make the tables generable.
 - Describing v5 field shapes as present.
 
+## Context Pack — generated at claim (2026-08-30T05:41:20Z)
+
+**PRD decisions relevant to this slice** (PRD-260826-0009-01):
+- Tier P — hand-written, source-cross-referenced: the common `WorkflowNode` field table and the per-kind config field tables live here, each citing the source location that owns it.
+- Generated examples cannot state defaults, so field tables stay hand-written: a serialized example shows *a* value and never marks it as the default; skip-heavy configs (`SpawnConfig`, `RunAgentConfig` skipping 10 of 11) omit the field entirely.
+- Requiredness is the one drift class no check catches — a serde attribute can change without touching the construction API, catalog, or validation. Write the tables knowing they go stale silently.
+- Bare unit variants (`approval`, `split`, `collector`) carry no config object and get a stated one-liner; `task`'s only in-`kind` payload is agent config, owned by the agent-config table (ISSUE-260826-0637-06).
+- Today's doc mislabels: it presents universal node fields as task-node fields and `splitFailurePolicy` as split-only — a named drift-audit finding.
+- No engine code changes: this epic reads `src/`, writes `docs/`. No derives added to make tables generable.
+- `schemars`-derived field tables are excluded — a second generator, not an extension.
+- v4 is canonical (`WORKFLOW_SCHEMA_VERSION = 4`); v5 is cited as a forward reference (ADR-260815-2009-01), never described as present.
+- Generated blocks are owned by the generator; only the span between `BEGIN GENERATED`/`END GENERATED` markers is machine-written, and prose around it is hand-edited.
+- Terminology follows `CONTEXT.md`: unmarked entries are true of `src/` at HEAD; `_(planned — ADR-…)_` entries are not accepted by the engine yet.
+- Catalog order (established by ISSUE-260826-0637-04, now done) fixes the order of per-kind subsections.
+
+**Test seam & Testing Decisions:** observable at `docs/workflow-schema.md` § `## Node fields` via section-anchored `rg --pcre2 --multiline` matches (subsection presence; `splitFailurePolicy` inside the section), plus reading the tables against each struct's serde-visible fields. Testing Decisions that touch it: Tier P is explicitly *not* machine-checked — the common node field table and the per-kind config tables head the "honest limits" inventory; the only machine gates this slice must keep green are the generator's freshness/coverage assertions under `cargo test` and `just check-v4-docs`, which this issue must not disturb since it edits prose around generated blocks.
+
+**ADRs:**
+- ADR-260815-2009-01 — Typed workflow contracts over a JSON-valued variable store · accepted (the decided-but-unlanded v5 bump; cite as forward reference only)
+- ADR-260815-2009-02 — One condition dialect: owned nested AST, typed operators, onMissing · accepted (neighbor: replaces today's flat `Condition`, so `loopCondition` rows describe the v4 flat leaf)
+
+**Terms:**
+- `Node Kind` — the fourteen-variant tagged union in a node's required `kind` object, selecting both what the node does and which config shape it carries; the bare `type` tag is what `/api/capabilities` publishes. _Avoid_: step type.
+- `Condition` — the engine's single post-execution deterministic branching form (edge and loop conditions): one flat `{field, operator, value}` leaf over a dot-path field, evaluated by the engine and never by an LLM. _Avoid_: expression, rule.
+- `Skip Condition` — a node's pre-execution guard (`{source, type, value}`, `type` one of `contains | not_contains | regex`); unknown type evaluates false silently, invalid regex fails the run before any node executes. _Avoid_: bare "condition".
+- `Access Profile` — the named argv bundle a `spawn` or `run_agent` node selects with `access`, validated against the Agents Registry names for that agent and applied outside the agent-defaults merge chain; distinct from `accessMode`, the four-variant driver-level enum defaulting to `execute` (that one is -06's row). _Avoid_: access mode, bare "profile".
+
+**Full artifacts:** docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md · docs/adr/INDEX.md · CONTEXT.md · docs/sources/workflow-schema-drift-260825.md (Part 1 §§1.2–1.3) · docs/issues/done/ISSUE-260826-0637-04-node-catalog-generator.md
+
+## Code Review
+
+Review file: `issue-260826-0637-05-code-review-20260830-060732.md`
+
+Dual review (Claude + Codex) over the issue diff vs `02fb8f43`, cross-verified and adjudicated
+inline, then four fix rounds (the full cap). Codex's two findings were both confirmed by Claude and
+merged (H1, M5). Codex agreed with eight of Claude's fourteen; the six it disputed were split
+verdicts adjudicated against the source — three upheld, three dismissed. Two further findings were
+opened during fix rounds (M7, L8), each verified against the source before being recorded.
+
+- H1 (HIGH): `contextSources` documents a wire shape that cannot deserialize — FIXED
+- M1 (MEDIUM): Common `agent` row understates the validation rule — `run_agent` also hard-errors — FIXED
+- M2 (MEDIUM): Per-kind tables omit the node-level fallback chain, making "Default: absent" misleading — FIXED (rounds 1-3)
+- M3 (MEDIUM): `retryDelay`'s runtime default (2 seconds) is omitted — FIXED
+- M4 (MEDIUM): `idleSeconds` / `readyStableSeconds` runtime defaults omitted in the wait and run_agent tables — FIXED (rounds 1-2)
+- M5 (MEDIUM): Per-kind preamble overclaims field-level skip-on-serialize coverage — FIXED
+- M6 (MEDIUM): `skipCondition` forward reference points at a section that does not document it — dismissed
+- M7 (MEDIUM): Common `cwd` row promises a per-node override the engine applies only to `spawn` — FIXED (rounds 3-4)
+- L1 (LOW): Common and run_agent `cwd` rows omit the absolute-path requirement — FIXED
+- L2 (LOW): `outputSchema` Notes says "JSON Schema object" but the field accepts any JSON value — FIXED
+- L3 (LOW): Common-section preamble contradicts its own table on `kind` — FIXED
+- L4 (LOW): Per-kind preamble drops the "requiredness is serde, not validation" caveat — FIXED
+- L5 (LOW): `task`, `approval`, `split`, `collector` subsections cite source without line ranges — FIXED
+- L6 (LOW): `prompt` note reads as exclusive to task nodes — dismissed
+- L7 (LOW): Inline Notes citations lack line numbers — dismissed
+- L8 (LOW): "read only by `spawn` nodes" is literally inaccurate — the read happens, it just has no
+  effect — **deferred**. Surfaced on the round-4 re-verify with the fix cap exhausted. The cell's
+  behavioral conclusion is correct and both reviewers agree on it; only the word "read" overstates,
+  because `resolve_agent_config` (`src/runtime.rs:3912`) reads `node.cwd` (`src/model.rs:332`) on
+  every dispatch before the value is discarded at `src/driver.rs:457`. Remedy is one phrase, fully
+  specified in the review file; `ISSUE-260826-0637-06` re-enters this document and is the natural
+  place to land it.
+
+Smells: 0 (both reviewers returned empty blocks; the brief-mandated subflow/call table duplication
+was suppressed at source as the documented standard overriding the baseline).
+
 ## Triage Notes
 
 **Readiness gate (cold-reader): PASS** (round 5, full-enumeration)
@@ -152,3 +219,37 @@ no wider than the facts. Classes 1-5 swept 30 decision surfaces, class 7 swept 4
 surfaces, class 9 arm A executed every embedded observable against the tree (all red), arm B found
 no triggered requirement, class 6 was re-examined cold on both prongs, and class 8 was inert on a
 never-stamped record. No class fired.
+
+## Resolution
+
+**Commit:** `feat: write the common node field table and per-kind config field tables (ISSUE-260826-0637-05)`
+
+**Route:** cursor (`/cursor-developer`) for the implementation and all four fix rounds. Chosen by
+`route-picker` each time: a single documentation file, well-scoped, with the accuracy burden lying in
+reading serde attributes rather than in cross-module reasoning.
+
+**TDD:** n/a (linear) — documentation prose, no behavior-changing seam.
+
+**Review telemetry:** 16 findings recorded — 1 HIGH, 8 MEDIUM, 7 LOW. 12 FIXED, 3 dismissed, 1
+deferred (L8, LOW). Fix rounds used: 4 of 4. Two reviewers (Claude + Codex), cross-verified; 6 of the
+14 first-round findings drew a split verdict and were adjudicated by the orchestrator reading the
+source, as were both fix-round disputes (M2 in Codex's favor, M7 in Claude's, L8 in Codex's).
+
+**Note for the epic.** Three of the four fix rounds shipped a wrong or mislabelled source citation:
+round 1 cited the run-agent code path for wait-node defaults, round 2 an off-by-one, round 3 a
+validation-time reader filed under an execution-time label. The last two originated in the
+orchestrator's own fix briefs, not in fixer error, and none was catchable by `just check-v4-docs`,
+the generator freshness assertion, or any test — `tests/docs_catalog.rs` is the only test that reads
+this file and it checks generated spans, not hand-written prose. This is the Tier P silent-staleness
+risk PRD-260826-0009-01 names, demonstrated three times inside a single issue. Round 3 onward
+required each citation to be re-derived with `rg -n` and the command output pasted into the fix
+report, which is what stopped the pattern.
+
+**Suite:** `SUITE: PASS` — `just check-v4-docs` green; `cargo test --locked` 449 + 6 + 17 passed, 0
+failed, 1 ignored; `npm test` 129 passed across 13 files. `tests/docs_catalog.rs` 6 passed / 1
+ignored, including `node_catalog_generator` and `freshness_check_is_compare_only_by_construction`, so
+the generated blocks are undisturbed. Playwright e2e was not run — it is not part of `just test` and
+a prose-only change cannot reach it. The 7 socket/tmux tests that failed with `Operation not
+permitted` inside a reviewer's sandbox passed in this unsandboxed session.
+
+**Date:** 2026-08-30 (UTC)

@@ -1052,8 +1052,216 @@ block per node kind. Block IDs follow `node-catalog:<wire-tag>:fragment` and
 
 ## Node fields
 
-Per-field tables for `WorkflowNode` and each `NodeKind` config shape are deferred to a later
-pass; `src/model.rs` is the authority until then.
+### Common node fields
+
+Every node deserializes to `WorkflowNode` (`src/model.rs`). The table below lists every field on
+that struct, including the required nested `kind` object. Requiredness reflects serde attributes, not
+runtime validation — a field marked optional may still trigger a validation error for a specific
+kind.
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `id` | string | Yes | — | Node identifier; must be unique within the workflow. |
+| `name` | string | Yes | — | Display name. |
+| `kind` | object | Yes | — | Internally-tagged `NodeKind` union (`type` tag plus variant config). See **Per-kind config fields** and the generated **Node catalog**. |
+| `agent` | string or absent | No | absent | Carries `#[serde(default)]` but no default *value* — an omitted key deserializes to absent, not to an agent name. A `task` or `run_agent` node with no agent is a hard validation error at run start; the runtime `DEFAULT_AGENT` fallback never rescues a document. |
+| `prompt` | string | No | `""` | An empty prompt is only a warning for `task` nodes. |
+| `contextSources` | array of `{name, nodeId}` | No | `[]` | `ContextSource` entries (`src/model.rs:121-126`); `nodeId` is the referenced node identifier. Registers `{{context:<name>}}` substitutions; does not inject text into the prompt. |
+| `responseFormat` | `"text"` \| `"json"` or absent | No | absent | |
+| `outputSchema` | JSON value or absent | No | absent | Raw, unvalidated JSON value (legacy `{field: type}` shorthand is converted only during v2/v3→v4 migration, `src/model.rs:372-379`). Setting it while `responseFormat != "json"` produces a warning (`src/model.rs:1608-1618`). |
+| `retryCount` | non-negative integer or absent | No | absent | Treated as `0` when absent. Values above `MAX_NODE_RETRY_COUNT` (10, `src/model.rs`) are a hard validation error that short-circuits the whole validation pass. |
+| `retryDelay` | non-negative integer or absent | No | absent | Delay in seconds between retries. Runtime uses `2` seconds when unset (`src/runtime.rs:3970`). |
+| `timeout` | non-negative integer or absent | No | absent | Per-node execution timeout in seconds. |
+| `skipCondition` | object or absent | No | absent | Pre-execution guard; shape is documented in **Templates and agent config**. |
+| `loopMaxIterations` | non-negative integer or absent | No | absent | Runtime default is `5` when unset (`src/runtime.rs`). Reaching the cap without a `loop_exit` edge fails the run. |
+| `loopCondition` | `{field, operator, value}` or absent | No | absent | `StructuredCondition` (`src/model.rs`) — a flat deterministic leaf evaluated by the engine, never by an LLM. Not a prompt string. |
+| `splitFailurePolicy` | `"best_effort_continue"` \| `"fail_fast_cancel"` \| `"drain_then_fail"` | No | `best_effort_continue` | Universal node field (`WorkflowNode::split_failure_policy`, `src/model.rs`). Explicit JSON `null` deserializes to `best_effort_continue` via a custom deserializer. |
+| `cwd` | string or absent | No | absent | Validated as absolute when set (`src/model.rs:1620`). At execution time it is read only by `spawn` nodes (`src/tmux_exec.rs:767-771`); at validation time it also feeds `continueSessionFrom`'s matching-working-directory check (`src/model.rs:2111-2112`). `task` and `run_agent` execution ignores it: a `task` node runs in the scoped workflow cwd (`src/runtime.rs:2925`), and a `run_agent` node uses `runAgentConfig.cwd` when set, falling back to that same scoped workflow cwd (`src/tmux_exec.rs:1051-1053`). |
+| `continueSessionFrom` | string (node id) or absent | No | absent | Adopts an agent session from another node. Validation enforces five constraints: the source node must exist; its kind must be `task` or `run_agent`; resolved agents must match; the source's access profile must be no broader than the target's; resolved working directories must match. |
+
+*Source: `WorkflowNode` (`src/model.rs:862-910`).*
+
+### Per-kind config fields
+
+Subsections follow the **Node catalog** order. Wire keys use camelCase (`rename_all = "camelCase"`
+on each config struct). Config *objects* omitted from serialized output when default-valued are
+noted; individual fields are additionally skipped when default-valued — see the struct's serde
+attributes. Requiredness reflects serde attributes, not runtime validation — a field marked
+optional may still trigger a validation error for a specific kind. An absent key and an explicit
+default deserialize the same.
+
+#### task
+
+The only in-`kind` payload is `agentConfig` (agent overrides). That object is documented in
+**Templates and agent config** (ISSUE-260826-0637-06).
+
+*Source: `NodeKind::Task` (`src/model.rs:696-703`).*
+
+#### approval
+
+Carries no config object — `approval` is a bare unit variant (`NodeKind::Approval`,
+`src/model.rs:704`).
+
+#### split
+
+Carries no config object — `split` is a bare unit variant (`NodeKind::Split`, `src/model.rs:705`).
+
+#### collector
+
+Carries no config object — `collector` is a bare unit variant (`NodeKind::Collector`,
+`src/model.rs:706`).
+
+#### decide
+
+Config key: `decideConfig` (inside `kind`).
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `inputs` | array of `{name, source}` | No | `[]` | Input bindings for the decide prompt. |
+| `prompt` | string | No | `""` | |
+| `model` | string or absent | No | absent | When absent, the runtime resolves `"claude-haiku-4-5"` (`default_decide_model`, `src/model.rs`). |
+| `outcomes` | array of strings | No | `[]` | Branch labels; each needs a matching `branch` edge. |
+
+*Source: `DecideConfig` (`src/model.rs:441-452`).*
+
+#### parallel_batch
+
+Config key: `batchConfig` inside `kind`. The wrapper also accepts the legacy alias
+`parallelBatchConfig` (`NodeKind::ParallelBatch`, `src/model.rs`).
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `itemsBinding` | string | Yes* | `""` if `batchConfig` omitted | Variable name holding the array to iterate. |
+| `maxConcurrent` | non-negative integer | No | `4` | Clamped to `1`…`MAX_PARALLEL_BATCH_CONCURRENT` (32) at runtime (`src/runtime.rs`). |
+| `itemVar` | string | Yes* | `""` if `batchConfig` omitted | Loop variable name for each item. |
+| `bodyEntry` | string | Yes* | `""` if `batchConfig` omitted | Node id of the batch body entry point. |
+| `collectorVar` | string or absent | No | absent | Optional variable to collect body outputs. |
+
+\*When `batchConfig` is present, `itemsBinding`, `itemVar`, and `bodyEntry` have no per-field
+serde default and must be supplied. When the whole `batchConfig` object is omitted, the struct's
+`Default` supplies empty strings.
+
+*Source: `BatchConfig` (`src/model.rs:461-471`), wrapper alias (`src/model.rs:711-713`).*
+
+#### subflow
+
+Config key: `subflowConfig` (inside `kind`).
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `workflowName` | string | No | `""` | Also accepted as `workflow` or `subflowName` (serde aliases, `src/model.rs`). |
+| `exitNodeId` | string or absent | No | absent | Optional early-exit node inside the subflow body. |
+| `inputs` | array of `{name, source}` | No | `[]` | Bindings passed into the subflow body. |
+| `maxDepth` | non-negative integer | No | `10` | Nesting depth cap (`default_max_call_depth`, `src/model.rs`). |
+
+*Source: `SubflowConfig` (`src/model.rs:628-639`), `NodeKind::Subflow` (`src/model.rs:715-717`).*
+
+#### call
+
+Config key: `subflowConfig` (inside `kind`) — same struct as `subflow`.
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `workflowName` | string | No | `""` | Also accepted as `workflow` or `subflowName` (serde aliases, `src/model.rs`). |
+| `exitNodeId` | string or absent | No | absent | Optional early-exit node inside the called workflow body. |
+| `inputs` | array of `{name, source}` | No | `[]` | Bindings passed into the called workflow. |
+| `maxDepth` | non-negative integer | No | `10` | Nesting depth cap (`default_max_call_depth`, `src/model.rs`). |
+
+*Source: `SubflowConfig` (`src/model.rs:628-639`), `NodeKind::Call` (`src/model.rs:719-721`).*
+
+#### spawn
+
+Config key: `spawnConfig` (inside `kind`). The whole object is skipped on serialize when equal to
+`SpawnConfig::default()`.
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `agent` | string or absent | No | absent | Agent driver to spawn. Falls back to node-level `agent` when absent (`src/model.rs:60-71`). |
+| `command` | string or absent | No | absent | Shell command alternative to an agent launch. |
+| `access` | string or absent | No | absent | Named access profile from the Agents Registry; distinct from `accessMode` on agent defaults. |
+| `extraArgs` | array of strings | No | `[]` | |
+| `cwd` | string or absent | No | absent | Must be absolute when set. Falls back to node-level `cwd`, then workflow cwd, when absent (`src/tmux_exec.rs:767-771`). |
+| `name` | string or absent | No | absent | Pane display name. |
+| `sessionName` | string or absent | No | absent | Tmux session name. |
+
+*Source: `SpawnConfig` (`src/model.rs:485-502`).*
+
+#### send
+
+Config key: `sendConfig` (inside `kind`). The whole object is skipped on serialize when equal to
+`SendConfig::default()`.
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `target` | string or absent | No | absent | Session or pane target. |
+| `text` | string | No | `""` | Text to send. |
+| `enter` | boolean | No | `true` | Press Enter after sending. |
+
+*Source: `SendConfig` (`src/model.rs:504-521`).*
+
+#### wait
+
+Config key: `waitConfig` (inside `kind`). The whole object is skipped on serialize when equal to
+`WaitConfig::default()`.
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `target` | string or absent | No | absent | Session or pane target. |
+| `mode` | `"idle"` \| `"ready"` \| `"until"` | No | `idle` | `WaitMode` (`src/model.rs`). |
+| `marker` | string or absent | No | absent | Marker string for `until` mode. |
+| `timeout` | non-negative integer or absent | No | absent | Timeout in seconds. Falls back to node-level `timeout` when absent (`src/runtime.rs:2132`). |
+| `idleSeconds` | number or absent | No | absent | Idle duration for `idle` mode. Runtime uses `2.0` seconds when unset (`src/tmux_exec.rs:2338`). |
+| `readyStableSeconds` | number or absent | No | absent | Stability window for `ready` mode. Runtime uses `DEFAULT_READY_STABLE_SECONDS` (`2.0`) when unset (`src/tmux_exec.rs:2339-2341`). |
+
+*Source: `WaitConfig` (`src/model.rs:532-560`).*
+
+#### capture
+
+Config key: `captureConfig` (inside `kind`). The whole object is skipped on serialize when equal to
+`CaptureConfig::default()`.
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `target` | string or absent | No | absent | Session or pane target. |
+| `lines` | non-negative integer or absent | No | absent | Line count when `all` is false. |
+| `all` | boolean | No | `false` | Capture entire scrollback. |
+| `ansi` | boolean | No | `false` | Include ANSI escape sequences. |
+
+*Source: `CaptureConfig` (`src/model.rs:562-573`).*
+
+#### kill
+
+Config key: `killConfig` (inside `kind`). The whole object is skipped on serialize when equal to
+`KillConfig::default()`.
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `target` | string or absent | No | absent | Session or pane target. |
+| `sessionName` | string or absent | No | absent | Alternative session identifier. |
+
+*Source: `KillConfig` (`src/model.rs:575-582`).*
+
+#### run_agent
+
+Config keys: `runAgentConfig` and `agentConfig` (both inside `kind`). The `runAgentConfig` object
+is skipped on serialize when equal to `RunAgentConfig::default()`.
+
+| Wire field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `agent` | string or absent | No | absent | Agent driver to run. Falls back to node-level `agent` when absent (`src/model.rs:60-71`). Validation requires an agent from either this key or node-level `agent` (`src/model.rs:1772-1783`). |
+| `prompt` | string or absent | No | absent | Prompt text for the agent. Falls back to node-level `prompt` when absent (`src/model.rs:1784-1787`). |
+| `cwd` | string or absent | No | absent | Working directory override. Must be absolute when set. Falls back to the active workflow cwd when absent (`src/tmux_exec.rs:1051-1053`, with the scoped workflow cwd resolved at `src/runtime.rs:2925`). Node-level `cwd` does not feed this chain at execution time — the config-then-node-then-workflow resolution in `working_directory_for_node` (`src/model.rs:97-110`) is reached only by `continueSessionFrom` validation (`src/model.rs:2111-2112`). |
+| `access` | string or absent | No | absent | Named access profile; distinct from `accessMode` on agent defaults. |
+| `extraArgs` | array of strings | No | `[]` | |
+| `name` | string or absent | No | absent | Pane display name. |
+| `timeout` | non-negative integer or absent | No | absent | Timeout in seconds. Falls back to node-level `timeout` when absent (`src/runtime.rs:2131`). |
+| `idleSeconds` | number or absent | No | absent | Runtime uses `2.0` seconds when unset (`src/tmux_exec.rs:1058-1061`). |
+| `readyStableSeconds` | number or absent | No | absent | Runtime uses `DEFAULT_READY_STABLE_SECONDS` (`2.0`) when unset (`src/tmux_exec.rs:1059-1061`). |
+| `until` | string or absent | No | absent | Marker string for ready/until waits. |
+| `killAfter` | boolean | No | `true` | Tear down the pane after the agent exits. |
+| `agentConfig` | object or absent | No | absent | Agent overrides alongside `runAgentConfig`; documented in **Templates and agent config** (ISSUE-260826-0637-06). Sibling payload of the variant, not a field of `RunAgentConfig`. |
+
+*Source: `RunAgentConfig` (`src/model.rs:584-626`), `NodeKind::RunAgent` (`src/model.rs:743-752`).*
 
 ## Edges and conditions
 
