@@ -55,6 +55,7 @@ use crate::{
         RuntimeCheckpoint, RuntimeEvent, RuntimeStatus, available_agents, check_cli,
         load_or_resolve_run_tmux_invocation, run_node_preview,
     },
+    serde_wire_tags::{workflow_edge_outcome_tags, workflow_node_type_tags},
     util::constant_time_eq,
 };
 
@@ -213,8 +214,8 @@ async fn capabilities() -> Result<Json<Value>, ApiError> {
     }
     Ok(Json(json!({
         "workflowVersion": WORKFLOW_SCHEMA_VERSION,
-        "supportedNodeTypes": ["task", "approval", "split", "collector", "decide", "parallel_batch", "subflow", "call", "spawn", "send", "wait", "capture", "kill", "run_agent"],
-        "supportedEdgeOutcomes": ["success", "reject", "branch", "loop_continue", "loop_exit"],
+        "supportedNodeTypes": workflow_node_type_tags(),
+        "supportedEdgeOutcomes": workflow_edge_outcome_tags(),
         "agents": agents,
         "features": {
             "split": true,

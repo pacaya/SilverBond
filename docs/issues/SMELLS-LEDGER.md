@@ -107,3 +107,7 @@ One row per unique key (`file:line` + smell name). Columns:
 | `src/runtime.rs:6357` + Speculative Generality | 1 | 2026-08-30 | open |
 | `ARCHITECTURE.md:293-306` + Duplicated Code | 1 | 2026-08-31 | open |
 | `ARCHITECTURE.md:291` + Mysterious Name | 1 | 2026-08-31 | open |
+| `tests/docs_catalog.rs:382` + Duplicated Code | 1 | 2026-08-31 | open |
+| `ui/src/features/editor/GraphEditor.svelte:270` + Duplicated Code | 1 | 2026-08-31 | open |
+| `src/serde_wire_tags.rs:71` + Middle Man | 1 | 2026-08-31 | open |
+| `ui/src/features/editor/InspectorPanel.test.ts:569` + Duplicated Code | 1 | 2026-08-31 | open |

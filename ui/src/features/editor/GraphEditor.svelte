@@ -30,10 +30,12 @@
     workflow,
     validation,
     capabilities,
+    capabilitiesError = false,
   }: {
     workflow: WorkflowDocument;
     validation: ValidationResponse | null;
     capabilities: RuntimeCapabilities | undefined;
+    capabilitiesError?: boolean;
   } = $props();
 
   // The canvas always renders the *active* document — root, or a subflow we
@@ -237,9 +239,7 @@
     }
   }
 
-  const supportedNodeTypes = $derived(
-    capabilities?.supportedNodeTypes ?? ["task", "approval", "split", "collector"],
-  );
+  const supportedNodeTypes = $derived(capabilities?.supportedNodeTypes);
 
   let canSaveCompound = $derived(
     store.multiSelectedNodeIds.length > 0 || store.selection.kind === "node",
@@ -268,64 +268,70 @@
     <Controls />
     <Panel position="top-left">
       <div class="canvasToolbar">
-        {#if supportedNodeTypes.includes("task")}
-          <button class="button button--ghost" onclick={(event) => {
-            event.stopPropagation();
-            store.addNode("task");
-          }}>
-            + Task
-          </button>
-        {/if}
-        {#if supportedNodeTypes.includes("approval")}
-          <button class="button button--ghost" onclick={(event) => {
-            event.stopPropagation();
-            store.addNode("approval");
-          }}>
-            + Approval
-          </button>
-        {/if}
-        {#if supportedNodeTypes.includes("split")}
-          <button class="button button--ghost" onclick={(event) => {
-            event.stopPropagation();
-            store.addNode("split");
-          }}>
-            + Split
-          </button>
-        {/if}
-        {#if supportedNodeTypes.includes("collector")}
-          <button class="button button--ghost" onclick={(event) => {
-            event.stopPropagation();
-            store.addNode("collector");
-          }}>
-            + Collector
-          </button>
-        {/if}
-
-        {#if PRIMITIVE_TYPES.some((t) => supportedNodeTypes.includes(t.type))}
-          <div class="canvasToolbar__more">
+        {#if supportedNodeTypes}
+          {#if supportedNodeTypes.includes("task")}
             <button class="button button--ghost" onclick={(event) => {
               event.stopPropagation();
-              showMoreNodes = !showMoreNodes;
+              store.addNode("task");
             }}>
-              + More ▾
+              + Task
             </button>
-            {#if showMoreNodes}
-              <!-- svelte-ignore a11y_click_events_have_key_events -->
-              <!-- svelte-ignore a11y_no_static_element_interactions -->
-              <div class="canvasToolbar__backdrop" onclick={() => showMoreNodes = false}></div>
-              <div class="canvasToolbar__menu">
-                {#each PRIMITIVE_TYPES.filter((t) => supportedNodeTypes.includes(t.type)) as item (item.type)}
-                  <button class="canvasToolbar__menuItem" onclick={(event) => {
-                    event.stopPropagation();
-                    store.addNode(item.type);
-                    showMoreNodes = false;
-                  }}>
-                    + {item.label}
-                  </button>
-                {/each}
-              </div>
-            {/if}
-          </div>
+          {/if}
+          {#if supportedNodeTypes.includes("approval")}
+            <button class="button button--ghost" onclick={(event) => {
+              event.stopPropagation();
+              store.addNode("approval");
+            }}>
+              + Approval
+            </button>
+          {/if}
+          {#if supportedNodeTypes.includes("split")}
+            <button class="button button--ghost" onclick={(event) => {
+              event.stopPropagation();
+              store.addNode("split");
+            }}>
+              + Split
+            </button>
+          {/if}
+          {#if supportedNodeTypes.includes("collector")}
+            <button class="button button--ghost" onclick={(event) => {
+              event.stopPropagation();
+              store.addNode("collector");
+            }}>
+              + Collector
+            </button>
+          {/if}
+
+          {#if PRIMITIVE_TYPES.some((t) => supportedNodeTypes.includes(t.type))}
+            <div class="canvasToolbar__more">
+              <button class="button button--ghost" onclick={(event) => {
+                event.stopPropagation();
+                showMoreNodes = !showMoreNodes;
+              }}>
+                + More ▾
+              </button>
+              {#if showMoreNodes}
+                <!-- svelte-ignore a11y_click_events_have_key_events -->
+                <!-- svelte-ignore a11y_no_static_element_interactions -->
+                <div class="canvasToolbar__backdrop" onclick={() => showMoreNodes = false}></div>
+                <div class="canvasToolbar__menu">
+                  {#each PRIMITIVE_TYPES.filter((t) => supportedNodeTypes.includes(t.type)) as item (item.type)}
+                    <button class="canvasToolbar__menuItem" onclick={(event) => {
+                      event.stopPropagation();
+                      store.addNode(item.type);
+                      showMoreNodes = false;
+                    }}>
+                      + {item.label}
+                    </button>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          {/if}
+        {:else}
+          <span class="canvasToolbar__meta">
+            {capabilitiesError ? "Node types unavailable." : "Loading node types…"}
+          </span>
         {/if}
 
         <button

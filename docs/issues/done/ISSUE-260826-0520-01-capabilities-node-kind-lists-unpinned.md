@@ -2,9 +2,11 @@
 id: ISSUE-260826-0520-01
 kind: issue
 category: bug
-status: ready-for-agent
+status: done
 origin: docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md
 summary: /api/capabilities hardcodes supportedNodeTypes and supportedEdgeOutcomes as string literals instead of deriving them from NodeKind and WorkflowEdgeOutcome, so the endpoint can drift from the enums silently
+claimed_by: implement-issue@Mac-mini-4
+claimed_at: 2026-08-31T00:58:21Z
 ---
 
 ## Agent Brief
@@ -161,6 +163,67 @@ divergence, is what this issue removes.
 - Redesigning the editor toolbar, the palette's grouping, or which kinds are offered once
   capabilities resolve. The only change to the resolved-state palette is that it stops being
   reachable from a guessed list.
+
+## Context Pack — generated at claim (2026-08-31T00:58:21Z)
+
+**PRD decisions relevant to this slice** (PRD-260826-0009-01, parent via `origin:`):
+- Enumeration is closed by harvesting wire tags from serde's own derives, not from hand-maintained lists or source-text scans — "coverage enforced against serde's own derives, with zero new dependencies."
+- The harvest technique for a plain `rename_all` enum: supply a throwaway `Deserializer` that captures the `&'static [&'static str]` serde's derive passes to `deserialize_enum`, then error out without a visitor. Exhaustive by construction.
+- `strum::EnumIter` was explicitly rejected: it resolves only from `[dependencies]` (a runtime dep the roadmap forbids) and requires editing `src/model.rs`.
+- Hand-written `ALL`/`CATALOG_ORDER`-style constants are only acceptable when wrapped in set-equality plus length checks against a derive harvest — a bare constant is the same drift defect one level down.
+- An exhaustive `match` proves every *input* is handled but does not produce one value per variant, so it cannot by itself guarantee a set is complete (two earlier drafts were falsified on exactly this).
+- PRD scope forbids engine changes and edits under `src/`; this issue is the complement — it is the code-side pin the epic deliberately could not make.
+
+**Test seam & Testing Decisions:** observable at the endpoint's integration test under `tests/` (the capabilities response assertion) plus the frontend component render seam (existing inspector-panel suite for the edge inspector; the node palette has no render seam and needs a `ResizeObserver` shim in the repo's vitest setup, alongside the existing one). Testing Decisions that touch it: check 2 — emitted wire names must *equal* the serde-harvested variant set, catching both omission and duplication; the expected side is always harvested, never transcribed, or both sides drift together. Harvesters live in an integration-test crate, so the technique is copied/extracted, not imported. Note carried from the readiness gate: no `tests/` probe exists for edge-outcome tags, so the "harvested, not written out" criterion is the only instrument covering that half — and edge outcomes have no compile-time backstop.
+
+**ADRs:**
+- ADR-260815-2009-02 — One condition dialect: owned nested AST, typed operators, onMissing · accepted (adds the sixth edge outcome `failure`)
+- ADR-260815-2009-03 — Script input indirection: no templating into source, exit-code-only success · accepted (adds the fifteenth node kind `script`)
+- Neighbor: ADR-260815-2009-01 — Typed workflow contracts over a JSON-valued variable store · accepted (`typed-contracts` lands the `script` variant in the v5 grammar earlier still)
+
+**Terms:**
+- `Node Kind` — the fourteen-variant tagged union in a node's required `kind` object; the bare `type` tag alone is what `/api/capabilities` publishes as `supportedNodeTypes`.
+- `Edge Outcome` — the channel an edge is traversed on: `success | reject | branch | loop_continue | loop_exit`, the complete set; there is no failure channel today. Decisions: ADR-260815-2009-02 adds a sixth.
+- `Runner Kind` / `Immediate Kind` — dispatch partitions over Node Kind; both are separate hand-maintained lists, out of scope here.
+
+**Constraint (binding, from RDMP-260815-2009-01):** zero new dependencies, runtime *or* dev — the existing serde/tokio/serde_json/rusqlite set suffices; the derive-harvest technique is dependency-free and is why this constraint costs nothing.
+
+**Full artifacts:** docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md (§ Implementation Decisions, § Testing Decisions) · docs/roadmap/RDMP-260815-2009-01-harness-workflows.md · docs/adr/INDEX.md · CONTEXT.md
+
+## Code Review
+
+Review file: `issue-260826-0520-01-code-review-20260831-021621.md`
+
+Dual review (Claude + Codex), cross-verified and adjudicated inline. 15 raw findings from the two
+reviewers reduced to 8 after merging two cross-reviewer duplicates and dropping four on adjudication;
+one further finding (L5) was raised on fix-round-1 re-verification. **ACCEPTED** — all 9 terminal.
+
+- H1 (HIGH): Capabilities drift test uses the production generator as its own expected value — FIXED
+- H2 (HIGH): The shipped `public/` bundle still contains the deleted fallback — FIXED
+- M1 (MEDIUM): A failed capabilities fetch renders "Loading…" forever and leaves the editor unusable — FIXED
+- M2 (MEDIUM): New GraphEditor test exceeds Vitest's default timeout and carries no explicit budget — FIXED
+- L1 (LOW): Toolbar block indentation not updated for the new guard — FIXED
+- L2 (LOW): Per-request allocation for a value that is already `&'static` — FIXED
+- L3 (LOW): `<label class="field">` wraps no form control in the pending branch — FIXED
+- L4 (LOW): `aria-live="polite"` is inert on both edges of the transition — FIXED
+- L5 (LOW): Fix round 1 dropped the edge seam's pending-state coverage — FIXED (same-site escalation: redesign round)
+
+Dropped on adjudication (reasoning in the review file): CLAUDE-5, CLAUDE-7, CLAUDE-10, CLAUDE-11.
+
+Fix rounds used: 2 of 4. Round 1 routed to codex (8 findings, all fixed); round 2 routed to cursor as a
+redesign brief under the same-site escalation rule (L5 landed in the exact region M1's fix had rewritten).
+
+Both reviewers verified every fix independently. Notable: the L5 assertions were mutation-tested, and the
+round-1 re-verification **corrected the record on M2** — the ~8.5s timings behind CLAUDE-3/CODEX-3 were
+almost entirely machine load (load average ~620 on 8 cores at review time); the test measures 329-364 ms
+on an unloaded machine. The explicit timeout was kept as a guard regardless.
+
+Recorded but not filed as findings: no test exercises the `AppShell` capabilities-error wiring itself —
+both seam tests pass `capabilitiesError` in directly, so a wiring-level regression would be caught only by
+the typechecker.
+
+Smells: 4 advisory, none promoted (duplication-promotion rule applied; no smell had every cited site
+inside the issue diff). Graduation advisory: no rows emitted.
 
 ## Triage Notes
 
@@ -356,3 +419,55 @@ reason**, recorded here so the finding survives for whoever claims this:
   instruction.
 
 Brief is immutable from this stamp. Promoting to `ready-for-agent`.
+
+## Resolution
+
+**Commit:** `fix: derive /api/capabilities tag lists from their enums (ISSUE-260826-0520-01)`
+
+**Route:** `cursor` for the implementation — a well-scoped multi-file change with the derivation
+technique already present in-repo to copy, no architectural ambiguity. Fix round 1 routed to `codex`
+(two HIGH-severity findings; severity is itself a routing risk signal), fix round 2 back to `cursor`
+(one LOW finding in a single frontend test file).
+
+**TDD:** red-green at the component render seam (`ui/src/features/editor/` — the edge inspector via the
+existing inspector-panel suite; the node palette needed a new render seam, which required `ResizeObserver`
+and `matchMedia` shims alongside the existing `<dialog>` shim in the vitest setup file) and at the
+capabilities integration seam under `tests/`.
+
+**What landed.** `src/serde_wire_tags.rs` harvests a serde enum's wire tags by driving its `Deserialize`
+impl with a throwaway `Deserializer` that captures the `&'static [&'static str]` the derive passes to
+`deserialize_enum` — the technique the docs-catalog generator already used, dependency-free and exhaustive
+by construction. The capabilities handler publishes both arrays from that harvest instead of literals. The
+endpoint's integration test harvests its expected side independently, via its own test-local probe rather
+than the production helpers. Both frontend fallback lists are gone, replaced by explicit pending and
+unavailable affordances. The embedded `public/` bundle was rebuilt so the served application matches.
+
+**Review telemetry.** Dual review (Claude + Codex), cross-verified and adjudicated inline. 15 raw findings
+→ 8 kept after merging two cross-reviewer duplicates and dropping four on adjudication; one more (L5)
+surfaced during fix-round-1 re-verification, for 9 total. By severity: 2 HIGH, 2 MEDIUM, 5 LOW. Outcomes:
+**9 FIXED, 0 deferred, 0 dismissed.** Fix rounds used: **2 of 4**. Round 2 was dispatched as a redesign
+brief under the same-site escalation rule, since L5 landed in the exact region round 1's M1 fix had
+rewritten; both reviewers judged the named mechanism removed rather than patched around.
+
+**Suite:** `just test` — **PASS**, 604 passed / 0 failed / 1 skipped (~38s). Rust 473 across 5 binaries
+including 1 ignored; vitest 131 across 14 files. No pre-existing failures.
+
+**Three things worth carrying forward.**
+
+1. The `public/` bundle was **already stale at HEAD** before this work — commit `72c6e24` landed four
+   `ui/src/` files with no rebuild, and `public/` was last built at `a831cfa`. Rebuilding therefore also
+   swept unrelated `AgentConfigFields`/`sectionUtils` deltas into this commit. That is the repository's
+   build-artifact convention being honoured, not scope creep, but the sweep is real and is recorded here
+   rather than left to be discovered in the diff. Separately: this clone's `core.hooksPath` is unset, so
+   `.githooks/pre-commit` never fired — the freshness hook that would have caught this is not active until
+   someone runs `just setup`.
+2. The review **corrected its own record on M2.** Two reviewers independently measured the new GraphEditor
+   test at ~8.2-8.5s against a 5s default budget and filed it as a real defect. On re-verification at
+   normal load the same test measured 329-364 ms: the original timings were almost entirely machine load
+   (average ~620 on 8 cores at review time). The explicit timeout was kept as a guard, but the "SvelteFlow
+   is intrinsically expensive to mount" reasoning behind the finding was wrong.
+3. **Uncovered seam, noted not filed:** no test exercises the `AppShell` capabilities-error wiring itself —
+   both component seam tests pass `capabilitiesError` in directly, so a wiring-level regression there would
+   be caught only by the typechecker.
+
+**Closed:** 2026-08-31 (UTC).

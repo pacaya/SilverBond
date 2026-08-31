@@ -4,6 +4,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use http_body_util::BodyExt;
+use serde::de::{self, Deserialize, Deserializer, Visitor};
 use serde_json::{Value, json};
 use silverbond::{
     api,
@@ -11,14 +12,80 @@ use silverbond::{
         AppPaths, AppState, PaneStreamRegistry, SecurityConfig, UnlockThrottle,
         sha256_unlock_password_hash,
     },
+    model::{WorkflowEdgeOutcome, WorkflowNodeType},
     runtime::{PersistedRun, RuntimeContext, RuntimeStatus},
     storage::{Database, TemplateStore, WorkflowStore},
 };
-use std::time::{Duration, Instant};
+use std::{
+    error::Error as StdError,
+    fmt::{self, Display},
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
 const SEC_FETCH_SITE: &str = "sec-fetch-site";
+
+#[derive(Debug)]
+struct HarvestError;
+
+impl StdError for HarvestError {}
+
+impl Display for HarvestError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "harvest")
+    }
+}
+
+impl de::Error for HarvestError {
+    fn custom<T: Display>(_msg: T) -> Self {
+        HarvestError
+    }
+}
+
+struct EnumVariantProbe<'a> {
+    tags: &'a mut Option<&'static [&'static str]>,
+}
+
+impl<'de> Deserializer<'de> for EnumVariantProbe<'de> {
+    type Error = HarvestError;
+
+    fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        Err(HarvestError)
+    }
+
+    fn deserialize_enum<V>(
+        self,
+        _name: &'static str,
+        variants: &'static [&'static str],
+        _visitor: V,
+    ) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        *self.tags = Some(variants);
+        Err(HarvestError)
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map struct identifier ignored_any
+    }
+}
+
+fn harvest_serde_enum_tags<T>() -> Vec<&'static str>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    let mut tags = None;
+    let probe = EnumVariantProbe { tags: &mut tags };
+    let _ = T::deserialize(probe);
+    tags.expect("serde enum variant harvest").to_vec()
+}
 
 async fn test_router() -> (TempDir, Router) {
     let (temp, router, _) = test_router_with_db().await;
@@ -1022,22 +1089,11 @@ async fn exposes_capabilities() {
     assert_eq!(capabilities["workflowVersion"], 4);
     assert_eq!(
         capabilities["supportedNodeTypes"],
-        json!([
-            "task",
-            "approval",
-            "split",
-            "collector",
-            "decide",
-            "parallel_batch",
-            "subflow",
-            "call",
-            "spawn",
-            "send",
-            "wait",
-            "capture",
-            "kill",
-            "run_agent"
-        ])
+        json!(harvest_serde_enum_tags::<WorkflowNodeType>())
+    );
+    assert_eq!(
+        capabilities["supportedEdgeOutcomes"],
+        json!(harvest_serde_enum_tags::<WorkflowEdgeOutcome>())
     );
     assert_eq!(capabilities["features"]["split"], true);
     assert_eq!(capabilities["features"]["collector"], true);

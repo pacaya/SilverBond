@@ -44,10 +44,12 @@
     workflow,
     validation,
     capabilities,
+    capabilitiesError = false,
   }: {
     workflow: WorkflowDocument;
     validation: ValidationResponse | null;
     capabilities: RuntimeCapabilities | undefined;
+    capabilitiesError?: boolean;
   } = $props();
 
   // Operate on the document currently shown on the canvas (root, or a subflow
@@ -812,7 +814,7 @@
   </div>
 
 {:else if selectedEdge}
-  <EdgeInspector edge={selectedEdge} {workflow} {capabilities} />
+  <EdgeInspector edge={selectedEdge} {workflow} {capabilities} {capabilitiesError} />
 
 {:else}
   <WorkflowInspector {workflow} {capabilities} />

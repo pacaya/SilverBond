@@ -1,5 +1,32 @@
 import "@testing-library/jest-dom/vitest";
 
+/* jsdom does not implement ResizeObserver; SvelteFlow and pane terminals need a shim. */
+if (typeof globalThis.ResizeObserver === "undefined") {
+  class ResizeObserverShim implements ResizeObserver {
+    readonly [Symbol.toStringTag] = "ResizeObserver";
+
+    observe(): void {}
+    unobserve(): void {}
+    disconnect(): void {}
+  }
+
+  globalThis.ResizeObserver = ResizeObserverShim;
+}
+
+/* jsdom does not implement matchMedia; SvelteFlow queries prefers-reduced-motion. */
+if (typeof globalThis.matchMedia === "undefined") {
+  globalThis.matchMedia = (query: string) => ({
+    matches: false,
+    media: query,
+    onchange: null,
+    addListener: () => {},
+    removeListener: () => {},
+    addEventListener: () => {},
+    removeEventListener: () => {},
+    dispatchEvent: () => false,
+  });
+}
+
 /* jsdom does not implement <dialog> modal methods; provide a minimal shim so
    dialog-based components (ConfirmDialog, PasswordDialog) can be tested. */
 if (typeof HTMLDialogElement !== "undefined") {

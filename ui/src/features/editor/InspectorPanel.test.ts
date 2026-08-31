@@ -565,6 +565,67 @@ describe("InspectorPanel", () => {
     expect(fieldControlsPresentInSection(runAgentContainer, "Agent run").every(Boolean)).toBe(true);
   });
 
+  it("distinguishes unavailable edge outcomes from pending capabilities", async () => {
+    const fromNode: WorkflowNode = {
+      id: "node-a",
+      name: "Start",
+      kind: { type: "task" },
+      agent: "claude",
+      prompt: "Begin",
+      contextSources: [],
+      responseFormat: null,
+    };
+    const toNode: WorkflowNode = {
+      id: "node-b",
+      name: "End",
+      kind: { type: "task" },
+      agent: "claude",
+      prompt: "Finish",
+      contextSources: [],
+      responseFormat: null,
+    };
+    const edge: WorkflowEdge = {
+      id: "edge-ab",
+      from: fromNode.id,
+      to: toNode.id,
+      outcome: "success",
+    };
+
+    store.setWorkflow(workflow({
+      entryNodeId: fromNode.id,
+      nodes: [fromNode, toNode],
+      edges: [edge],
+    }));
+    store.selectEdge(edge.id);
+
+    const workflowDoc = store.workflow!;
+
+    const { rerender } = render(InspectorPanel, {
+      props: {
+        workflow: workflowDoc,
+        validation: null,
+        capabilities: undefined,
+        capabilitiesError: false,
+      },
+    });
+
+    expect(screen.getByText("Loading outcomes…")).toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Outcome" })).not.toBeInTheDocument();
+
+    await rerender({
+      workflow: workflowDoc,
+      validation: null,
+      capabilities: undefined,
+      capabilitiesError: true,
+    });
+
+    const unavailable = screen.getByText("Outcomes unavailable.");
+    expect(unavailable).toBeInTheDocument();
+    expect(unavailable.closest("div.field")).not.toBeNull();
+    expect(screen.queryByText("Loading outcomes…")).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", { name: "Outcome" })).not.toBeInTheDocument();
+  });
+
   it("renders edge inspector controls and persists outcome edits", async () => {
     const fromNode: WorkflowNode = {
       id: "node-a",

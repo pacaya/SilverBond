@@ -106,6 +106,7 @@
   let workflows = $derived(workflowsQuery.data ?? []);
   let templates = $derived(templatesQuery.data ?? []);
   let capabilities = $derived(capabilitiesQuery.data);
+  let capabilitiesError = $derived(capabilitiesQuery.isError);
   let workflowsLoading = $derived(workflowsQuery.isLoading);
 
   let issueSummary = $derived.by(() => {
@@ -407,6 +408,7 @@
           workflow={store.workflow}
           validation={store.validation}
           {capabilities}
+          {capabilitiesError}
         />
         <!-- svelte-ignore a11y_no_static_element_interactions -->
         <div
@@ -418,6 +420,7 @@
           workflow={store.workflow}
           validation={store.validation}
           {capabilities}
+          {capabilitiesError}
         />
       </div>
     {:else}

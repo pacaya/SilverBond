@@ -11,10 +11,12 @@
     edge,
     workflow,
     capabilities,
+    capabilitiesError = false,
   }: {
     edge: WorkflowEdge;
     workflow: WorkflowDocument;
     capabilities: RuntimeCapabilities | undefined;
+    capabilitiesError?: boolean;
   } = $props();
 
   let activeWorkflow = $derived(store.activeWorkflow ?? workflow);
@@ -48,19 +50,28 @@
 
   <section class="inspectorSection">
     <div class="inspectorSection__title">Routing</div>
-    <label class="field">
-      <span>Outcome</span>
-      <select
-        value={edge.outcome}
-        onchange={(e) => updateSelectedEdge((found) => {
-          found.outcome = (e.target as HTMLSelectElement).value as WorkflowEdge["outcome"];
-        })}
-      >
-        {#each (capabilities?.supportedEdgeOutcomes ?? ["success", "reject", "branch", "loop_continue", "loop_exit"]) as outcome (outcome)}
-          <option value={outcome}>{outcome}</option>
-        {/each}
-      </select>
-    </label>
+    {#if capabilities?.supportedEdgeOutcomes}
+      <label class="field">
+        <span>Outcome</span>
+        <select
+          value={edge.outcome}
+          onchange={(e) => updateSelectedEdge((found) => {
+            found.outcome = (e.target as HTMLSelectElement).value as WorkflowEdge["outcome"];
+          })}
+        >
+          {#each capabilities.supportedEdgeOutcomes as outcome (outcome)}
+            <option value={outcome}>{outcome}</option>
+          {/each}
+        </select>
+      </label>
+    {:else}
+      <div class="field">
+        <span>Outcome</span>
+        <span class="field__pending">
+          {capabilitiesError ? "Outcomes unavailable." : "Loading outcomes…"}
+        </span>
+      </div>
+    {/if}
     <label class="field">
       <span>Label</span>
       <input
@@ -92,3 +103,10 @@
     </label>
   </section>
 </div>
+
+<style>
+  .field__pending {
+    color: var(--text-dim);
+    font-size: 13px;
+  }
+</style>

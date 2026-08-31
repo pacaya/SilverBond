@@ -7,6 +7,7 @@ pub mod model;
 pub(crate) mod proc;
 pub mod pty_output;
 pub mod runtime;
+pub mod serde_wire_tags;
 pub mod storage;
 pub mod tmux_exec;
 pub mod util;
