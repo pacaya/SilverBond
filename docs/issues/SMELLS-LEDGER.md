@@ -91,11 +91,11 @@ One row per unique key (`file:line` + smell name). Columns:
 | `.github/workflows/rust-tests.yml:32` + Duplicated Code | 1 | 2026-08-30 | open |
 | `.github/workflows/rust-tests.yml:15-18` + Speculative Generality | 1 | 2026-08-30 | open |
 | docs/api-reference.md:24 Duplicated Code | 1 | 2026-08-30 | open |
-| `tests/docs_catalog.rs:310` + Mysterious Name | 1 | 2026-08-30 | open |
-| `tests/docs_catalog.rs:477` + Duplicated Code | 1 | 2026-08-30 | open |
-| `tests/docs_catalog.rs:556` + Speculative Generality | 1 | 2026-08-30 | open |
-| `tests/docs_catalog.rs:117` + Repeated Switches | 1 | 2026-08-30 | open |
-| `tests/docs_catalog.rs:89` + Data Clumps | 1 | 2026-08-30 | open |
+| `tests/docs_catalog.rs:310` + Mysterious Name | 1 | 2026-08-30 | retired: names at the site read fine (example_id, yes_node, a_collect); the mild wart is a bare positional "split" passed as entry_node_id, which is positional coupling and cosmetic, not a naming defect |
+| `tests/docs_catalog.rs:477` + Duplicated Code | 1 | 2026-08-30 | retired: real but cosmetic -- two near-identical panic arms in the catalog length assertion, no correctness stake; the larger four-way duplication in the adjacent set-equality assertion is the same class and is likewise not actioned |
+| `tests/docs_catalog.rs:556` + Speculative Generality | 1 | 2026-08-30 | open (promoted -> ISSUE-260831-0626-01; mislabelled -- the site is a verbatim copy of a private validator predicate, not unused generality) |
+| `tests/docs_catalog.rs:117` + Repeated Switches | 1 | 2026-08-30 | retired: load-bearing -- example_for and example_workflow match the same enum at different levels (kind data vs workflow scaffolding) and the second calls the first; two exhaustive matches are the compiler-enforced mechanism that makes adding a node type fail loudly in both places, which is this file's purpose |
+| `tests/docs_catalog.rs:89` + Data Clumps | 1 | 2026-08-30 | retired: category error -- base_workflow's four params are the natural workflow constructor signature, not a clump; the nearby real nit (a repeated "node-catalog-example" literal across match arms) is Duplicated Code and cosmetic |
 | docs/workflow-schema.md:1292 — Duplicated Code | 1 | 2026-08-30 | open |
 | docs/workflow-schema.md:1346-1348 — Duplicated Code | 1 | 2026-08-30 | open |
 | docs/workflow-schema.md:1451-1453 — Duplicated Code | 1 | 2026-08-30 | open |
@@ -107,7 +107,7 @@ One row per unique key (`file:line` + smell name). Columns:
 | `src/runtime.rs:6357` + Speculative Generality | 1 | 2026-08-30 | open |
 | `ARCHITECTURE.md:293-306` + Duplicated Code | 1 | 2026-08-31 | open |
 | `ARCHITECTURE.md:291` + Mysterious Name | 1 | 2026-08-31 | open |
-| `tests/docs_catalog.rs:382` + Duplicated Code | 1 | 2026-08-31 | open |
+| `tests/docs_catalog.rs:382` + Duplicated Code | 1 | 2026-08-31 | retired: mechanism difference is essential -- WorkflowNodeType is a plain enum probed via a custom Deserializer intercepting deserialize_enum, NodeKind is internally tagged and must capture unknown_variant's expected list; the two harvests cannot be unified |
 | `ui/src/features/editor/GraphEditor.svelte:270` + Duplicated Code | 1 | 2026-08-31 | open |
 | `src/serde_wire_tags.rs:71` + Middle Man | 1 | 2026-08-31 | open |
 | `ui/src/features/editor/InspectorPanel.test.ts:569` + Duplicated Code | 1 | 2026-08-31 | open |
