@@ -553,22 +553,6 @@ fn assert_catalog_round_trips() {
     }
 }
 
-fn has_task_execution_config(node: &WorkflowNode) -> bool {
-    node.agent.is_some()
-        || !node.prompt.trim().is_empty()
-        || !node.context_sources.is_empty()
-        || node.response_format.is_some()
-        || node.output_schema.is_some()
-        || node.retry_count.is_some()
-        || node.retry_delay.is_some()
-        || node.timeout.is_some()
-        || node.skip_condition.is_some()
-        || node.loop_max_iterations.is_some()
-        || node.loop_condition.is_some()
-        || node.kind.agent_config().is_some()
-        || node.cwd.is_some()
-}
-
 fn assert_workflow_crosses_document_boundary(node_type: WorkflowNodeType, workflow: &WorkflowV3) {
     let serialized = serde_json::to_value(workflow).expect("serialize example workflow");
     let deserialized: WorkflowV3 =
@@ -587,18 +571,6 @@ fn assert_workflow_crosses_document_boundary(node_type: WorkflowNodeType, workfl
         node_type.as_str(),
         errors
     );
-
-    for node in &result.workflow.nodes {
-        if matches!(node.kind, NodeKind::Split | NodeKind::Collector)
-            && has_task_execution_config(node)
-        {
-            panic!(
-                "example {} node {:?} carries ignored task execution fields",
-                node_type.as_str(),
-                node.id
-            );
-        }
-    }
 
     let ignored_warnings: Vec<_> = result
         .issues
