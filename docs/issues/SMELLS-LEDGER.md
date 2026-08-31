@@ -114,3 +114,6 @@ One row per unique key (`file:line` + smell name). Columns:
 | src/model.rs:3055 — Speculative Generality | 1 | 2026-08-31 | open |
 | src/model.rs:2969 — Duplicated Code | 1 | 2026-08-31 | open |
 | src/model.rs:6140 — Mysterious Name | 1 | 2026-08-31 | open |
+| `templates/research-and-summarize.json:77` + Mysterious Name | 1 | 2026-08-31 | open |
+| `templates/research-and-summarize.json:30` + Mysterious Name | 1 | 2026-08-31 | open |
+| `tests/bundled_templates.rs:53` + Primitive Obsession | 1 | 2026-08-31 | open |

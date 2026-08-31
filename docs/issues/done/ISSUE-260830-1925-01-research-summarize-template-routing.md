@@ -2,9 +2,11 @@
 id: ISSUE-260830-1925-01
 kind: issue
 category: bug
-status: ready-for-agent
+status: done
 origin: docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md
 summary: The bundled Research & Summarize template can never reach its Quick summary branch, because its branch edges carry no conditions and depend on an unreachable orchestrator fallback
+claimed_by: implement-issue@Mac-mini-4
+claimed_at: 2026-08-31T04:25:05Z
 ---
 
 ## Agent Brief
@@ -153,6 +155,92 @@ layout that still reads left-to-right with the new node placed sensibly among th
   for the sake of routing.
 - **Any change to how templates are installed into the workflow store.** A later epic owns the
   template-install operation.
+
+## Context Pack — generated at claim (2026-08-31T04:25:05Z)
+
+**PRD decisions relevant to this slice** (PRD-260826-0009-01, reached via `origin:`):
+- **No engine code changes** — the epic reads `src/`, writes `docs/`; engine behavior defects are filed separately (ISSUE-260826-0004-01 carries the unreachable orchestrator fallback and the silent first-branch-edge default). This slice must change no Rust routing code.
+- Decide-node routing is described in two stages: an outcome the model names with no matching branch edge is **rejected by validation before the run starts**, which makes the runtime's degrade-to-the-success-edge arm unreachable from a validated document (User Story 40).
+- Decide nodes **bypass retries, orchestrator refinement, and the agent-defaults merge** — node config does not apply to them (User Story 41).
+- The real branch-routing default is recorded as: an unmatched condition **silently takes the first branch edge** (User Story 60) — the mechanism this template's defect rests on.
+- Branch-edge/condition semantics are deterministic and engine-evaluated, never LLM-evaluated; `loopCondition` is a structured object, not a prompt (User Stories 7, 8).
+- The four unpinned bundled templates — including `research-and-summarize.json` — have **no schema pin**; extending the generator to them is explicitly out of scope for the PRD, which leaves per-template guards to records like this one.
+- Bundled-template reading pattern: the PRD names the bundled-template pins (`src/model.rs` inline test module, reading from `CARGO_MANIFEST_DIR`) as the repo's prior art for reading a repo file from a test.
+
+**Test seam & Testing Decisions:** observable at the bundled `templates/` corpus enumerated **from the filesystem** inside `cargo test` (integration-test style, per the PRD's `tests/`-crate precedent). The checker returns a diagnostic containing the fixed phrase `unroutable branch edge`, asserted at run time against a witness built in memory from a real bundled document by exactly one change (re-pointing a branch edge's source to a non-`decide` node) — once for a top-level edge, once for a subflow-catalog edge. PRD Testing Decisions that touch this: tests must observe **what a reader/user would observe** rather than reach into internals; validation runs at the explicit validate route and at run creation (which rejects error-severity documents) — **saving never validates**, so there is no save-time gate, and nothing validates a bundled template read off disk. Confirm call sites with `rg -n 'validate_workflow' src/`.
+
+**ADRs:**
+- ADR-260815-2009-01 — Typed workflow contracts over a JSON-valued variable store · accepted (the v5 bump; forward reference only, does not govern v4 routing here).
+- ADR-260815-2009-02 — One condition dialect: owned nested AST, typed operators, `onMissing` · accepted (planned successor to today's flat condition form; do not write its shape into this template).
+
+**Terms:**
+- `Workflow` — a versioned node/edge graph definition (schema `version: 4`; v2–v3 normalize forward at ingest), including its subflow catalog.
+- `Condition` — the engine's single post-execution deterministic branching form (edge and loop conditions): one flat `{field, operator, value}` leaf over a dot-path field, evaluated by the engine and never by an LLM.
+- `Skip Condition` — a node's pre-execution guard (`{source, type, value}`); a separate form from the branch condition — do not conflate.
+- `Subflow` — a workflow invoked as a callable block from another workflow via a call frame; the subflow catalog is the second traversal arm the guard test must cover.
+- `Runtime Event` — one item in a run's event stream (`kind`, flattened data, monotonic `seq`); the routing event carries `chosenLabel`, which is why the existing branch labels are kept verbatim.
+
+**Full artifacts:** docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md · docs/adr/INDEX.md · CONTEXT.md · docs/issues/ISSUE-260826-0004-01-*.md · docs/issues/ISSUE-260830-1925-02-*.md
+
+## Code Review
+
+Dual review (Claude + Codex, cross-verified, adjudicated inline) — `issue-260830-1925-01-code-review-20260831-045844.md`
+
+Round 1 review — 14 raw findings (Claude 11, Codex 3) merged and adjudicated to 9 kept + 5 dismissed. Three in-diff Duplication smells promoted to MEDIUM per the promotion rule.
+
+Fix round 1 — 8 of 9 verified fixed by both reviewers. H1 split (Claude VERIFIED_FIXED, Codex STILL_BROKEN); adjudicated by reading the code: the payload half landed but the fix introduced a new defect in the same region, so per the same-site escalation rule CODEX-4, CLAUDE-12 and CLAUDE-13 were folded into H1 as one defect and round 2 redesigned the region instead of patching it.
+
+Fix round 4 — M6 closed. The combined decide-prompt witness was split into two bounded, oracle-checked witnesses; both reviewers independently re-ran the full pinning matrix and confirmed each arm fails its own witness and only its own. Both returned VERIFIED_FIXED with no new findings. **ACCEPTED** — every finding terminal: 13 FIXED, 5 dismissed, 0 deferred, 4 of 4 fix rounds used.
+
+Fix round 3 — L11 and L12 verified fixed by both reviewers. M6 split (Claude VERIFIED_FIXED, Codex STILL_BROKEN): its production half landed, but the new witness masks its own P2 arm, so CODEX-6 is folded into M6 and round 4 splits the witness.
+
+Fix round 2 — H1's redesign verified fixed by both reviewers against four stated checkable properties, with Codex withdrawing the rs2 half of its round-1 objection. L9 and L10 fixed. Three new findings, all coverage holes in the round-2 fixture itself, each demonstrated concretely rather than argued.
+
+- H1 (HIGH): Prompt slots on the branched paths resolve conditionally — FIXED (round-2 redesign; absorbed CODEX-4, CLAUDE-12, CLAUDE-13)
+- M1 (MEDIUM): Guard test's fixed-phrase oracle is tautological — FIXED
+- M2 (MEDIUM): New decide node overlaps the entry node on the canvas — FIXED
+- M3 (MEDIUM): Duplicated witness-edge selector logic — FIXED
+- M4 (MEDIUM): Duplicated witness re-pointing helpers — FIXED
+- M5 (MEDIUM): Duplicated witness assertion block — FIXED
+- M6 (MEDIUM): The new P1/P2 fixture silently skips decide nodes — FIXED (absorbed CODEX-6)
+- L1 (LOW): Template enumeration fails open on per-entry read errors — FIXED
+- L2 (LOW): Dangling-source branch edge reported as "(type task)" — FIXED
+- L3 (LOW): Witness edge selectors do not require a condition-free edge — FIXED
+- L9 (LOW): The M3/M4 extractions left two pass-through wrappers — FIXED
+- L10 (LOW): The L2 fix computes a discarded suffix and looks the source up twice — FIXED
+- L11 (LOW): The P1/P2 assertion passes vacuously if the template loses its decide node — FIXED
+- L12 (LOW): Two divergences between the prompt simulation and the engine's substitution — FIXED
+- L4-L8 (LOW): dismissed on adjudication (see the review file for each reason)
+
+Smells: 3 advisory (2 Mysterious Name, 1 Primitive Obsession), merged into `docs/issues/SMELLS-LEDGER.md` (3 appended). No graduation rows emitted.
+
+## Resolution
+
+**Commit:** `fix: route the Research & Summarize template through a decide node (ISSUE-260830-1925-01)`
+
+**Route:** `cursor` (`/cursor-developer`) for the implementation and all four fix rounds — `route-picker` classified each batch independently and returned `cursor` every time: two files, well-scoped, no DevOps/security/cross-module signals. The round-2 redesign and the round-3/4 fixture work were the hardest slices and Composer handled both.
+
+**TDD:** `red-green at the bundled-templates corpus guard`. The guard test was written against the unrepaired template and confirmed red before the template changed; each later fixture change was likewise required to flip a specific reviewer demonstration from green to red before being accepted.
+
+**Review telemetry:** dual review (Claude + Codex), cross-verified and adjudicated inline; review file `issue-260830-1925-01-code-review-20260831-045844.md`.
+
+- Raw findings: 20 across all rounds (Claude 18, Codex 6, with overlaps merged).
+- Adjudicated to 18 tracked findings: 1 HIGH, 6 MEDIUM, 11 LOW.
+- Outcomes: **13 FIXED, 5 dismissed, 0 deferred.** No finding was left unfixed.
+- Fix rounds used: **4 of 4.**
+- Three in-diff Duplication smells were promoted to MEDIUM findings per the promotion rule; 3 advisory smells were merged into `docs/issues/SMELLS-LEDGER.md` (3 appended, none suppressed). No graduation rows.
+- Two same-site escalations fired. Round 1's H1 patch introduced a defect in the region it patched, so CODEX-4/CLAUDE-12/CLAUDE-13 were folded into H1 and round 2 redesigned the region against four stated checkable properties instead of patching again. Round 3's M6 fix left its own witness self-masking, so CODEX-6 was folded into M6 and round 4 split the witness.
+- Both of Codex's `STILL_BROKEN` verdicts were sustained on adjudication, and both were established by executing code rather than reading it — the H1 payload leak and the self-masking M6 witness would each have survived a source-only review.
+
+**What the change actually is:** the template now routes its depth choice through a `decide` node whose declared outcomes equal its branch-edge labels verbatim (`Deep dive`, `Quick summary`), with `useOrchestrator` off. Because a decide node's output is the outcome label and `{{context:<name>}}` only substitutes when its bound node executed, the consumer prompts were re-plumbed onto always-resolving labelled slots, so no unresolved placeholder ships on either path. Known limit, stated rather than papered over: on the quick path rs3 renders `Refined research: Quick summary` and rs2's first iteration renders `Prior step: Deep dive` — the routing label under its label. No template-only placeholder can do better; repairing the engine's substitution asymmetry is out of scope here and belongs with the routing-semantics record.
+
+**Guard added:** `tests/bundled_templates.rs`, 8 tests — a filesystem-enumerated corpus guard rejecting unroutable branch edges (top-level and subflow-catalog arms, each with its own run-time witness built by exactly one change and an oracle asserting the literal `unroutable branch edge`), plus a path-safety fixture for this template with three witnesses of its own. Every guard was mutation-tested by both reviewers: each fix fails its own witness and only its own.
+
+**Suite:** `just test` green on the first run — 492 Rust tests passed (461 lib, 8 `bundled_templates`, 17 `http_api`, 6 `pre_commit` with 1 ignored), 0 failed; 131 frontend tests passed across 14 files.
+
+**Recorded against the repo, not this issue:** both reviewers observed intermittent tmux-contention failures in `cargo test --locked` with a failing set that changes between runs and no code change — variously `tests/http_api.rs`, `src/tmux_exec.rs` tests, and two `api`/`runtime` tests, all untouched by this diff. They passed in this run and in isolation. It makes "`cargo test --locked` passes" an unreliable acceptance gate and is worth its own record.
+
+**Closed:** 2026-08-31 (UTC).
 
 ## Triage Notes
 

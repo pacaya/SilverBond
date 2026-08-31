@@ -4,7 +4,7 @@
   "description": "Research a topic with branching depth, iterative refinement, and final summary.",
   "goal": "Research the given topic thoroughly and produce a concise summary",
   "cwd": "",
-  "useOrchestrator": true,
+  "useOrchestrator": false,
   "entryNodeId": "rs1",
   "variables": [
     {
@@ -27,10 +27,36 @@
       }
     },
     {
+      "id": "rs-decide",
+      "name": "Decide Research Depth",
+      "kind": {
+        "type": "decide",
+        "decideConfig": {
+          "inputs": [
+            {
+              "name": "research",
+              "source": "node:rs1.output"
+            }
+          ],
+          "prompt": "Based on the initial research below, choose the next step. Return \"Deep dive\" if the topic warrants deeper investigation with iterative refinement, or \"Quick summary\" if the overview is sufficient and a concise final summary should be produced directly.\n\nInitial research:\n{{research}}",
+          "outcomes": [
+            "Deep dive",
+            "Quick summary"
+          ]
+        }
+      }
+    },
+    {
       "id": "rs2",
       "name": "Refine Research",
       "agent": "claude",
-      "prompt": "Expand on the research so far. Add more detail, find additional perspectives, and address gaps:\n\n{{previous_output}}",
+      "prompt": "Expand on the research so far. Add more detail, find additional perspectives, and address gaps:\n\n{{context:research}}\n\nPrior step:\n{{previous_output}}",
+      "contextSources": [
+        {
+          "name": "research",
+          "nodeId": "rs1"
+        }
+      ],
       "loopMaxIterations": 3,
       "kind": {
         "type": "task"
@@ -40,7 +66,13 @@
       "id": "rs3",
       "name": "Final Summary",
       "agent": "claude",
-      "prompt": "Synthesize all findings into a concise, well-structured summary report:\n\n{{all_predecessors}}",
+      "prompt": "Synthesize all findings into a concise, well-structured summary report:\n\n{{context:research}}\n\nRefined research:\n{{previous_output}}",
+      "contextSources": [
+        {
+          "name": "research",
+          "nodeId": "rs1"
+        }
+      ],
       "kind": {
         "type": "task"
       }
@@ -48,8 +80,14 @@
   ],
   "edges": [
     {
-      "id": "rs1-branch-deep",
+      "id": "rs1-success-decide",
       "from": "rs1",
+      "to": "rs-decide",
+      "outcome": "success"
+    },
+    {
+      "id": "rs1-branch-deep",
+      "from": "rs-decide",
       "to": "rs2",
       "outcome": "branch",
       "label": "Deep dive",
@@ -57,7 +95,7 @@
     },
     {
       "id": "rs1-branch-quick",
-      "from": "rs1",
+      "from": "rs-decide",
       "to": "rs3",
       "outcome": "branch",
       "label": "Quick summary",
@@ -90,12 +128,16 @@
           "x": 120,
           "y": 140
         },
-        "rs2": {
+        "rs-decide": {
           "x": 400,
+          "y": 140
+        },
+        "rs2": {
+          "x": 680,
           "y": 60
         },
         "rs3": {
-          "x": 680,
+          "x": 920,
           "y": 140
         }
       }
