@@ -1682,10 +1682,12 @@ Kind-specific rules:
 | error | `decide` node has duplicate input bindings | `src/model.rs:2945-2954` |
 | error | `decide` node has no outcomes | `src/model.rs:2958-2967` |
 | error | `decide` outcome label is empty | `src/model.rs:2978-2985` |
+| error | `decide` outcome label has leading or trailing whitespace | `src/model.rs:3012-3020` |
 | error | `decide` node has duplicate outcome labels | `src/model.rs:2987-2996` |
 | error | `decide` outcome label does not match an outgoing `branch` edge label | `src/model.rs:2998-3007` |
 | error | `decide` node does not have exactly one `branch` edge per outcome | `src/model.rs:3015-3024` |
 | error | `decide` `branch` edge is missing a label matching an outcome | `src/model.rs:3026-3041` |
+| error | `decide` `branch` edge label has leading or trailing whitespace | `src/model.rs:3075-3083` |
 | error | `parallel_batch` node is missing `itemsBinding` | `src/model.rs:3051-3060` |
 | error | `parallel_batch` node is missing `itemVar` | `src/model.rs:3062-3068` |
 | error | `parallel_batch` node is missing `bodyEntry` | `src/model.rs:3070-3076` |

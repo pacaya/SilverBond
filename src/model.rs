@@ -2914,6 +2914,26 @@ fn subflow_strongly_connected_components(
     components
 }
 
+fn decide_padded_label_issue(
+    node_id: &str,
+    node_name: &str,
+    label: &str,
+    label_role: &str,
+) -> Option<ValidationIssue> {
+    if label == label.trim() {
+        return None;
+    }
+    Some(ValidationIssue {
+        severity: "error".to_string(),
+        node_id: Some(node_id.to_string()),
+        scope: None,
+        message: format!(
+            "\"{}\" decide {} \"{}\" has leading or trailing whitespace.",
+            node_name, label_role, label
+        ),
+    })
+}
+
 fn validate_decide_node_config(
     node: &WorkflowNode,
     config: &DecideConfig,
@@ -2955,7 +2975,14 @@ fn validate_decide_node_config(
         }
     }
 
-    if config.outcomes.is_empty() {
+    let branch_edges = outgoing
+        .iter()
+        .filter(|edge| edge.outcome == WorkflowEdgeOutcome::Branch)
+        .collect::<Vec<_>>();
+
+    let has_outcomes = !config.outcomes.is_empty();
+
+    if !has_outcomes {
         issues.push(ValidationIssue {
             severity: "error".to_string(),
             node_id: Some(node.id.clone()),
@@ -2965,79 +2992,95 @@ fn validate_decide_node_config(
                 node.name
             ),
         });
-        return;
-    }
-
-    let branch_labels = outgoing
-        .iter()
-        .filter(|edge| edge.outcome == WorkflowEdgeOutcome::Branch)
-        .filter_map(|edge| edge.label.as_deref())
-        .collect::<BTreeSet<_>>();
-    let mut seen_outcomes = BTreeSet::new();
-    for outcome in &config.outcomes {
-        if outcome.trim().is_empty() {
-            issues.push(ValidationIssue {
-                severity: "error".to_string(),
-                node_id: Some(node.id.clone()),
-                scope: None,
-                message: format!("\"{}\" decide node has an empty outcome label.", node.name),
-            });
-            continue;
+    } else {
+        let branch_labels = outgoing
+            .iter()
+            .filter(|edge| edge.outcome == WorkflowEdgeOutcome::Branch)
+            .filter_map(|edge| edge.label.as_deref())
+            .collect::<BTreeSet<_>>();
+        let mut seen_outcomes = BTreeSet::new();
+        for outcome in &config.outcomes {
+            if outcome.trim().is_empty() {
+                issues.push(ValidationIssue {
+                    severity: "error".to_string(),
+                    node_id: Some(node.id.clone()),
+                    scope: None,
+                    message: format!("\"{}\" decide node has an empty outcome label.", node.name),
+                });
+                continue;
+            }
+            // Declared outcomes must be unpadded: the runtime compares structured JSON
+            // outcomes untrimmed, but a mismatch yields Failed selection (success=false)
+            // and the caller returns before select_next_decision runs.
+            if let Some(issue) =
+                decide_padded_label_issue(&node.id, &node.name, outcome, "outcome")
+            {
+                issues.push(issue);
+                continue;
+            }
+            if !seen_outcomes.insert(outcome.clone()) {
+                issues.push(ValidationIssue {
+                    severity: "error".to_string(),
+                    node_id: Some(node.id.clone()),
+                    scope: None,
+                    message: format!(
+                        "\"{}\" decide node has duplicate outcome \"{}\".",
+                        node.name, outcome
+                    ),
+                });
+            }
+            if !branch_labels.contains(outcome.as_str()) {
+                issues.push(ValidationIssue {
+                    severity: "error".to_string(),
+                    node_id: Some(node.id.clone()),
+                    scope: None,
+                    message: format!(
+                        "\"{}\" decide outcome \"{}\" does not match an outgoing branch edge label.",
+                        node.name, outcome
+                    ),
+                });
+            }
         }
-        if !seen_outcomes.insert(outcome.clone()) {
+
+        if branch_edges.len() != config.outcomes.len() {
             issues.push(ValidationIssue {
                 severity: "error".to_string(),
                 node_id: Some(node.id.clone()),
                 scope: None,
                 message: format!(
-                    "\"{}\" decide node has duplicate outcome \"{}\".",
-                    node.name, outcome
-                ),
-            });
-        }
-        if !branch_labels.contains(outcome.as_str()) {
-            issues.push(ValidationIssue {
-                severity: "error".to_string(),
-                node_id: Some(node.id.clone()),
-                scope: None,
-                message: format!(
-                    "\"{}\" decide outcome \"{}\" does not match an outgoing branch edge label.",
-                    node.name, outcome
+                    "\"{}\" decide node must have one outgoing branch edge per outcome.",
+                    node.name
                 ),
             });
         }
     }
 
-    let branch_edges = outgoing
-        .iter()
-        .filter(|edge| edge.outcome == WorkflowEdgeOutcome::Branch)
-        .collect::<Vec<_>>();
-    if branch_edges.len() != config.outcomes.len() {
-        issues.push(ValidationIssue {
-            severity: "error".to_string(),
-            node_id: Some(node.id.clone()),
-            scope: None,
-            message: format!(
-                "\"{}\" decide node must have one outgoing branch edge per outcome.",
-                node.name
-            ),
-        });
-    }
-    for edge in branch_edges {
+    for edge in &branch_edges {
         if edge
             .label
             .as_deref()
             .is_none_or(|label| label.trim().is_empty())
         {
-            issues.push(ValidationIssue {
-                severity: "error".to_string(),
-                node_id: Some(node.id.clone()),
-                scope: None,
-                message: format!(
-                    "\"{}\" decide node branch edge \"{}\" requires a label matching an outcome.",
-                    node.name, edge.id
-                ),
-            });
+            if has_outcomes {
+                issues.push(ValidationIssue {
+                    severity: "error".to_string(),
+                    node_id: Some(node.id.clone()),
+                    scope: None,
+                    message: format!(
+                        "\"{}\" decide node branch edge \"{}\" requires a label matching an outcome.",
+                        node.name, edge.id
+                    ),
+                });
+            }
+        } else if let Some(label) = edge.label.as_deref() {
+            if let Some(issue) = decide_padded_label_issue(
+                &node.id,
+                &node.name,
+                label,
+                "node branch edge label",
+            ) {
+                issues.push(issue);
+            }
         }
     }
 }
@@ -6068,6 +6111,277 @@ args = ["--m22-unranked"]
             "expected outcome→edge mismatch error, got {:?}",
             result.issues
         );
+    }
+
+    fn validate_decide_workflow_at_document_boundary(workflow: WorkflowV3) -> ValidationResult {
+        let serialized = serde_json::to_value(&workflow).expect("serialize decide workflow");
+        let deserialized: WorkflowV3 =
+            serde_json::from_value(serialized).expect("strict deserialize decide workflow");
+        validate_workflow(deserialized)
+    }
+
+    fn decide_workflow_with_branch_labels(
+        outcomes: &[&str],
+        branch_labels: &[(&str, &str)],
+    ) -> WorkflowV3 {
+        let mut decide = node("decide", "Route", WorkflowNodeType::Decide);
+        decide.kind = NodeKind::Decide {
+            decide_config: DecideConfig {
+                inputs: Vec::new(),
+                prompt: "Pick a path".to_string(),
+                model: None,
+                outcomes: outcomes.iter().map(|label| (*label).to_string()).collect(),
+            },
+        };
+        let mut nodes = vec![decide];
+        let mut edges = Vec::new();
+        for (index, (edge_id, label)) in branch_labels.iter().enumerate() {
+            let target_id = format!("target_{index}");
+            let mut target = node(&target_id, "Target", WorkflowNodeType::Task);
+            target.agent = Some("claude".to_string());
+            target.prompt = "Done".to_string();
+            nodes.push(target);
+            edges.push(WorkflowEdge {
+                id: (*edge_id).to_string(),
+                from: "decide".to_string(),
+                to: target_id,
+                outcome: WorkflowEdgeOutcome::Branch,
+                label: Some((*label).to_string()),
+                branch_id: None,
+                condition: None,
+            });
+        }
+        workflow(nodes, edges, "decide")
+    }
+
+    fn has_decide_whitespace_validation_error(result: &ValidationResult) -> bool {
+        result.issues.iter().any(|issue| {
+            issue.severity == "error"
+                && issue.node_id.as_deref() == Some("decide")
+                && (issue.message.contains("whitespace") || issue.message.contains("padding"))
+        })
+    }
+
+    #[test]
+    fn validates_decide_rejects_identically_padded_outcome_and_branch_edge_labels() {
+        let workflow = decide_workflow_with_branch_labels(&[" yes "], &[("branch_yes", " yes ")]);
+        let result = validate_decide_workflow_at_document_boundary(workflow);
+
+        assert!(
+            has_decide_whitespace_validation_error(&result),
+            "expected whitespace-padding validation error, got {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn validates_decide_rejects_padded_outcome_labels_independently() {
+        let workflow = decide_workflow_with_branch_labels(&[" yes "], &[("branch_yes", "yes")]);
+        let result = validate_decide_workflow_at_document_boundary(workflow);
+
+        assert!(
+            has_decide_whitespace_validation_error(&result),
+            "expected padded-outcome whitespace error, got {:?}",
+            result.issues
+        );
+        assert!(
+            !result.issues.iter().any(|issue| {
+                issue.severity == "error"
+                    && issue
+                        .message
+                        .contains("does not match an outgoing branch edge label")
+            }),
+            "padded outcome should be refused for whitespace, not mismatch: {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn validates_decide_rejects_leading_padded_outcome_labels() {
+        let workflow = decide_workflow_with_branch_labels(&[" yes"], &[("branch_yes", "yes")]);
+        let result = validate_decide_workflow_at_document_boundary(workflow);
+
+        assert!(
+            has_decide_whitespace_validation_error(&result),
+            "expected leading-padded outcome whitespace error, got {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn validates_decide_rejects_trailing_padded_outcome_labels() {
+        let workflow = decide_workflow_with_branch_labels(&["yes "], &[("branch_yes", "yes")]);
+        let result = validate_decide_workflow_at_document_boundary(workflow);
+
+        assert!(
+            has_decide_whitespace_validation_error(&result),
+            "expected trailing-padded outcome whitespace error, got {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn validates_decide_rejects_padded_branch_edge_labels_independently() {
+        let workflow = decide_workflow_with_branch_labels(&["yes"], &[("branch_yes", " yes ")]);
+        let result = validate_decide_workflow_at_document_boundary(workflow);
+
+        assert!(
+            result.issues.iter().any(|issue| {
+                issue.severity == "error"
+                    && issue.node_id.as_deref() == Some("decide")
+                    && issue
+                        .message
+                        .contains("branch edge label")
+                    && issue.message.contains("whitespace")
+            }),
+            "expected padded branch-edge whitespace error, got {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn validates_decide_rejects_leading_padded_branch_edge_labels() {
+        let workflow = decide_workflow_with_branch_labels(&["yes"], &[("branch_yes", " yes")]);
+        let result = validate_decide_workflow_at_document_boundary(workflow);
+
+        assert!(
+            result.issues.iter().any(|issue| {
+                issue.severity == "error"
+                    && issue.node_id.as_deref() == Some("decide")
+                    && issue.message.contains("branch edge label")
+                    && issue.message.contains("whitespace")
+            }),
+            "expected leading-padded branch-edge whitespace error, got {:?}",
+            result.issues
+        );
+    }
+
+    #[test]
+    fn validates_decide_rejects_trailing_padded_branch_edge_labels() {
+        let workflow = decide_workflow_with_branch_labels(&["yes"], &[("branch_yes", "yes ")]);
+        let result = validate_decide_workflow_at_document_boundary(workflow);
+
+        assert!(
+            result.issues.iter().any(|issue| {
+                issue.severity == "error"
+                    && issue.node_id.as_deref() == Some("decide")
+                    && issue.message.contains("branch edge label")
+                    && issue.message.contains("whitespace")
+            }),
+            "expected trailing-padded branch-edge whitespace error, got {:?}",
+            result.issues
+        );
+    }
+
+    fn decide_validation_issues(result: &ValidationResult) -> Vec<(String, Option<String>, String)> {
+        result
+            .issues
+            .iter()
+            .map(|issue| {
+                (
+                    issue.severity.clone(),
+                    issue.node_id.clone(),
+                    issue.message.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn validates_decide_rejects_padded_branch_edge_when_outcomes_empty() {
+        let workflow = decide_workflow_with_branch_labels(&[], &[("branch_yes", " yes ")]);
+        let result = validate_decide_workflow_at_document_boundary(workflow);
+
+        let expected_issues = [
+            (
+                "error".to_string(),
+                Some("decide".to_string()),
+                "\"Route\" decide node requires at least one outcome.".to_string(),
+            ),
+            (
+                "error".to_string(),
+                Some("decide".to_string()),
+                "\"Route\" decide node branch edge label \" yes \" has leading or trailing whitespace."
+                    .to_string(),
+            ),
+            (
+                "warning".to_string(),
+                Some("target_0".to_string()),
+                "\"Target\" is a terminal node.".to_string(),
+            ),
+        ];
+        assert_eq!(decide_validation_issues(&result), expected_issues);
+    }
+
+    #[test]
+    fn validates_decide_whitespace_only_branch_edge_suppressed_when_outcomes_empty() {
+        let workflow = decide_workflow_with_branch_labels(&[], &[("branch_yes", "   ")]);
+        let result = validate_decide_workflow_at_document_boundary(workflow);
+
+        let expected_issues = [
+            (
+                "error".to_string(),
+                Some("decide".to_string()),
+                "\"Route\" decide node requires at least one outcome.".to_string(),
+            ),
+            (
+                "warning".to_string(),
+                Some("target_0".to_string()),
+                "\"Target\" is a terminal node.".to_string(),
+            ),
+        ];
+        assert_eq!(decide_validation_issues(&result), expected_issues);
+    }
+
+    #[test]
+    fn validates_decide_whitespace_only_branch_edge_is_missing_label_not_padding() {
+        let workflow = decide_workflow_with_branch_labels(&["yes"], &[("branch_yes", "   ")]);
+        let result = validate_decide_workflow_at_document_boundary(workflow);
+
+        let expected_issues = [
+            (
+                "error".to_string(),
+                Some("decide".to_string()),
+                "\"Route\" decide outcome \"yes\" does not match an outgoing branch edge label."
+                    .to_string(),
+            ),
+            (
+                "error".to_string(),
+                Some("decide".to_string()),
+                "\"Route\" decide node branch edge \"branch_yes\" requires a label matching an outcome."
+                    .to_string(),
+            ),
+            (
+                "warning".to_string(),
+                Some("target_0".to_string()),
+                "\"Target\" is a terminal node.".to_string(),
+            ),
+        ];
+        assert_eq!(decide_validation_issues(&result), expected_issues);
+    }
+
+    #[test]
+    fn validates_unpadded_decide_labels_unchanged_at_document_boundary() {
+        let workflow = decide_workflow_with_branch_labels(
+            &["yes", "no"],
+            &[("branch_yes", "yes"), ("branch_no", "no")],
+        );
+        let result = validate_decide_workflow_at_document_boundary(workflow);
+
+        let actual_issues = decide_validation_issues(&result);
+        let expected_issues = [
+            (
+                "warning".to_string(),
+                Some("target_0".to_string()),
+                "\"Target\" is a terminal node.".to_string(),
+            ),
+            (
+                "warning".to_string(),
+                Some("target_1".to_string()),
+                "\"Target\" is a terminal node.".to_string(),
+            ),
+        ];
+        assert_eq!(actual_issues, expected_issues);
     }
 
     #[test]

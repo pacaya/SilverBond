@@ -2,9 +2,11 @@
 id: ISSUE-260826-1648-02
 kind: issue
 category: bug
-status: ready-for-agent
+status: done
 origin: docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md
 terms: [Decide Outcome]
+claimed_by: implement-issue@Mac-mini-4.local
+claimed_at: 2026-08-31T02:56:28Z
 summary: Decide-node validation compares outcome labels to branch-edge labels untrimmed while the runtime trims, so a whitespace-padded label validates clean and then misses at runtime, reaching an arm that is otherwise unreachable
 ---
 
@@ -122,6 +124,27 @@ describing the padded-label route as something an author could rely on.
   hand-written prose whose per-row source citations are not machine-checked, so edits to the model
   module shift line references in rows this issue did not touch. That fragility is pre-existing and
   owned by no one here; add the new row and leave the rest.
+
+## Context Pack — generated at claim (2026-08-31T02:56:28Z)
+
+**PRD decisions relevant to this slice** (PRD-260826-0009-01, reached via this record's `origin:`):
+- User story 40: decide routing is documented in both stages, with the runtime's degrade-to-the-success-edge arm described as unreachable from a validated document — this issue removes the exception rather than the claim.
+- **No engine code changes** in that epic: `docs-truth` reads `src/` and writes `docs/`; behaviour found wrong is filed separately. This issue is that separate filing, so it is *not* bound by that constraint and may edit `src/model.rs`.
+- The validation catalog in `docs/workflow-schema.md` is **Tier P — hand-written, source cross-referenced**, not generated: each row cites the source location that owns it, and rows restate the emitted message. A new error means a hand-added row.
+- The generated node catalog lives strictly between `<!-- BEGIN GENERATED: … -->` markers; the validation catalog sits outside every generated block, so a hand-written row cannot trip the generator's freshness assertion.
+- Tier P is explicitly **not machine-pinned**: the 86 validation issues are assembled from string-producing branches scattered across `model.rs`, and per-row source citations go stale silently. Pre-existing and out of scope here.
+- Terminology follows `CONTEXT.md`, including its `_Avoid_` clauses; the docs must not restate or soften the unreachability claim.
+
+**Test seam & Testing Decisions:** observable at the document boundary — serialize a workflow, deserialize strictly with `serde_json::from_value::<WorkflowV3>()`, then `ensure_defaults` + `validate_workflow`, asserting on the resulting issue set (error severity + message text). The PRD's check 4 fixes this as the seam a reader's document actually meets; strict deserialization is used deliberately rather than `normalize_workflow_value`, because the v2→v3 migration fires unconditionally and would rescue malformed shapes. Saving never validates, so run-start validation is the only gate. Acceptance criterion 2 requires keying the assertion on the whitespace/padding wording, not on error-presence — three of the four padded shapes already error today. Criterion 6's observable is a row-shaped `rg` against the validation catalog; criterion 7 is `just test`, including the docs generator's committed-markdown assertion.
+
+**ADRs:** no `adrs:` frontmatter on this record; the parent PRD carries ADR-260815-2009-01 (v5 schema bump, delivered by `typed-contracts`), which does not govern this slice.
+
+**Terms:**
+- `Decide Outcome` [VO] — one label in a Decide Node's declared `outcomes` list, matched exactly against a branch edge's `label`; an outcome with no matching branch edge is a validation error, so the runtime's emit-`workflow_error`-and-fall-through-to-success arm is unreachable from a validated document. _Avoid_: bare "outcome" (that is Edge Outcome); describing the success fallthrough as behaviour an author can meet.
+- `Decide Node` [entity] — the node that asks an LLM to pick one of its declared Decide Outcomes and routes on the result, bypassing the task pipeline entirely (no orchestrator refinement, retries, session continuation, or agent defaults).
+
+**Full artifacts:** docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md · CONTEXT.md · docs/workflow-schema.md · docs/execution-model.md
+
 
 ## Triage Notes
 
@@ -242,3 +265,75 @@ than acted on:
   expected cost of a cold reader with no planning context, and the gate is worth that cost.
 
 Brief is immutable from this stamp. Promoting to `ready-for-agent`.
+
+## Code Review
+
+Review file: `issue-260826-1648-02-code-review-20260831-032547.md`
+
+Dual review (Claude + Codex, cross-verified, adjudicated inline) over the issue diff vs `c03d72d`, then four
+fix rounds with re-verification by both reviewers each round. 13 raised at first review (Claude 10, Codex 3),
+one merged, one duplication smell promoted, and six more surfaced by fix-round re-verification — 19 findings,
+all terminal.
+
+- M1 (MEDIUM): Brief's mandated confirmation of the structured-vs-free-text asymmetry is absent from the change — FIXED
+- M2 (MEDIUM): Empty `outcomes` list returns before the new branch-edge whitespace check — FIXED
+- M3 (MEDIUM): The two new whitespace guards are verbatim duplicates (promoted in-diff duplication smell) — FIXED
+- L1 (LOW): Preservation test asserts only that error-severity issues are empty — FIXED
+- L2 (LOW): Single-sided padding is not exercised at the seam — FIXED
+- L3 (LOW): Validation-catalog citation refresh is half-done — deferred
+- L4 (LOW): New branch-edge whitespace error identifies the edge by label, not `edge.id` — dismissed
+- L5 (LOW): Criterion-1 test cannot distinguish which of the two new checks fired — dismissed
+- L6 (LOW): Whitespace-only branch-edge label is refused without naming whitespace — dismissed
+- L7 (LOW): Editor trims decide outcomes but not branch-edge labels — deferred
+- L8 (LOW): Resumed runs are not re-validated — dismissed
+- L9 (LOW): New catalog row's source range includes the block's closing brace — dismissed
+- L10 (LOW): Field-reference tables do not mention the new whitespace invariant — dismissed
+- L11 (LOW): Fix round 1 left the validation catalog half-updated, two rows citing the same range — FIXED
+- L12 (LOW): The empty-outcomes regression does not pin the suppression invariant M2 put at risk — FIXED
+- L13 (LOW): Whitespace-only branch-edge labels are now reported twice — FIXED (same-site escalation: cluster {M2, L13} redesigned in round 2)
+- L14 (LOW): The empty-outcomes suppression policy is now expressed in two places — FIXED
+- L15 (LOW): The new projection helper was introduced without updating the older test that inlines it — FIXED
+- L16 (LOW): L14's binding shifted the source and re-staled both whitespace catalog rows — FIXED
+
+Smells: 3 advisory (all appended to `docs/issues/SMELLS-LEDGER.md`), 1 promoted into findings as M3.
+
+## Resolution
+
+**Commit:** `fix: reject whitespace-padded decide labels at validation (ISSUE-260826-1648-02)`
+
+**What landed.** `validate_decide_node_config` now refuses a decide node whose declared outcome labels or whose
+outgoing branch-edge labels carry leading or trailing whitespace, with an error-severity issue naming
+whitespace as the reason. Both sides of the outcome/branch-label correspondence carry the invariant
+independently. Routing is unchanged, so with padded labels refused at the document boundary the runtime's
+degrade-to-the-success-edge arm becomes genuinely unreachable from a validated document rather than
+approximately so. The validation catalog in `docs/workflow-schema.md` gains one row per new error.
+
+The brief's mandated confirmation is recorded in the source beside the outcome check: the structured-vs-free-text
+asymmetry in `select_decide_outcome` survives in code — the brief bans trimming anywhere in the runtime, so it
+must — but it is harmless, because a structured mismatch yields a failed selection whose caller returns before
+`select_next_decision` is reached. No follow-up record was filed on that account; the brief's "if it turns out
+to survive the fix, file it" branch is about the asymmetry remaining *harmful*, which it does not.
+
+**Route:** `cursor` on all four fix rounds and the initial implementation, chosen by `route-picker` each time —
+the work is localized to one Rust file (one validation function plus its unit tests) with the fix shape decided
+in the brief, no cross-module reasoning and no security-across-layers concern.
+
+**TDD:** red-green at the document boundary — serialize, deserialize strictly with
+`serde_json::from_value::<WorkflowV3>()`, then `ensure_defaults` + `validate_workflow`, asserting on the
+resulting issue set.
+
+**Review telemetry.** 19 findings — 3 MEDIUM, 16 LOW; 11 FIXED, 2 deferred, 6 dismissed. Fix rounds used: 4 of
+4. Round 2 was a redesign round under the same-site escalation rule (cluster {M2, L13}); both reviewers returned
+PASS on all six checkable properties it had to satisfy. Two findings were deferred rather than fixed: L3
+(citation staleness in catalog rows this issue did not touch, explicitly disclaimed by the brief) and L7 (the
+editor trims decide outcomes but not branch-edge labels — outside this brief's frontend boundary, and the one
+residual with a user-visible consequence; worth filing separately).
+
+**Suite:** `just test` green — Rust 461 + 6 + 17 passed, 0 failed, 1 ignored; frontend 131 passed across 14
+files. No pre-existing failures. Two tests in the Rust suite (`run_control_routes_return_typed_client_errors` in
+`tests/http_api.rs` and `runtime::tests::decide_abort_returns_promptly_and_kills_pane`) were observed failing
+under concurrent cargo invocations during review and passing in isolation; both passed in the authoritative run.
+Neither has a decide node in its fixture and this change touches no runtime code — recorded as latent
+load-sensitive flakes, not caused here.
+
+**Closed:** 2026-08-31 (UTC).
