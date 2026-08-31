@@ -57,7 +57,7 @@ Provides a host lifecycle abstraction used by both standalone CLI and Tauri:
 Defines the canonical workflow data model and validation logic:
 
 **Core enums:**
-- `WorkflowNodeType` — `Task`, `Approval`, `Split`, `Collector`
+- `WorkflowNodeType` — `Task`, `Approval`, `Split`, `Collector`, `Decide`, `ParallelBatch`, `Subflow`, `Call`, `Spawn`, `Send`, `Wait`, `Capture`, `Kill`, `RunAgent`
 - `ResponseFormat` — `Text`, `Json`
 - `WorkflowEdgeOutcome` — `Success`, `Reject`, `Branch`, `LoopContinue`, `LoopExit`
 - `SplitFailurePolicy` — `BestEffortContinue`, `FailFastCancel`, `DrainThenFail`

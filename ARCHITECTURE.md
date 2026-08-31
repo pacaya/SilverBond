@@ -294,6 +294,16 @@ Current first-class node types:
 - `approval`
 - `split`
 - `collector`
+- `decide`
+- `parallel_batch`
+- `subflow`
+- `call`
+- `spawn`
+- `send`
+- `wait`
+- `capture`
+- `kill`
+- `run_agent`
 
 Explicit `join` nodes are still planned.
 

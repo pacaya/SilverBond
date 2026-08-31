@@ -2,9 +2,11 @@
 id: ISSUE-260826-0240-01
 kind: issue
 category: bug
-status: ready-for-agent
+status: done
 origin: docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md
 summary: ARCHITECTURE.md states four "current first-class node types" where the engine has fourteen, and docs/backend.md names ten
+claimed_by: implement-issue@Mac-mini-4
+claimed_at: 2026-08-31T00:07:03Z
 ---
 
 ## Agent Brief
@@ -116,6 +118,30 @@ Nothing else in either document changes.
   version sweep.
 - **Any change to Rust source.** Both enums are correct as they stand; only the two documents are
   wrong.
+
+## Context Pack — generated at claim (2026-08-31T00:07:03Z)
+
+**PRD decisions relevant to this slice** (PRD-260826-0009-01, reached via this record's `origin:`):
+- Docs are written from the Rust source, not copied between documents; `src/model.rs` is the stated authority for node kinds.
+- Hand-maintained enumerations are the named failure mode — the PRD attributes the "4 of 14 kinds" defect to exactly this shape.
+- `ARCHITECTURE.md` and `docs/backend.md` are explicitly **out of scope** for that epic, and their disposal is delegated to this record (ISSUE-260826-0240-01) so the exclusion points at a real record.
+- Enumeration correctness is defined against serde's own derives: `NodeKind` is internally tagged (`tag = "type"`, `rename_all = "snake_case"`), so the wire tags are the variant identifiers mechanically lower-cased; `WorkflowNodeType` is a separate bare enum bridged by a `From` conversion.
+- No engine code changes; this class of work reads `src/` and writes docs only.
+- v4 is canonical and the v5 bump (ADR-260815-2009-01) is a forward reference only — do not touch the canonical-version statement here.
+
+**Test seam & Testing Decisions:** the seam this slice's AC echoes is the committed markdown itself, observed by section- and line-anchored `rg` searches (the `### Node types today` bullet list in `ARCHITECTURE.md`; the single-physical-line `WorkflowNodeType` entry under `**Core enums:**` in `docs/backend.md`). Membership is re-derived at implementation time from the two enum declaration blocks in the model module — deliberately unpinned, since a variant landing before the work does must be reflected. Related PRD Testing Decisions: the generated node catalog for `docs/workflow-schema.md` is guarded by a freshness + set-equality test against the serde-harvested variant lists; that machinery covers only the generated blocks and does **not** reach narrative prose in these two documents, which is why this correction is by hand. Preservation seam: `cargo test --locked` and `npm test` must pass unchanged (prose-only change).
+
+**ADRs:**
+- ADR-260815-2009-01 — Typed workflow contracts over a JSON-valued variable store (accepted); relevant only as the forward reference that pins the v4→v5 statement for a later epic — not to be acted on here.
+- (Record declares no `adrs:` frontmatter; the line above comes from the parent PRD's `adrs:` via `origin:`.)
+
+**Terms:** (record declares no `terms:` frontmatter; glossary lines below are the entries this slice's vocabulary touches)
+- `Workflow` — a versioned node/edge graph definition (schema `version: 4`; v2–v3 normalize forward at ingest), including its subflow catalog; bumps to v5 under ADR-260815-2009-01.
+- `Subflow` — a workflow invoked as a callable block from another workflow via a call frame.
+- `Collector` — the barrier node where parallel cursors join and branch results aggregate into a keyed `{inputs, summary}` object.
+- `Collector Barrier` — glossary `_Avoid_` list bans "join" as a noun; relevant because the `join`-nodes-are-planned sentence in the target section stays untouched.
+
+**Full artifacts:** docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md · docs/adr/INDEX.md · CONTEXT.md · docs/sources/workflow-schema-drift-260825.md (item X4)
 
 ## Triage Notes
 
@@ -267,3 +293,25 @@ Seven non-blocking notes. Three worth carrying for whoever claims this:
 
 Brief is immutable from this stamp. Promoting to `ready-for-agent`.
 
+
+## Code Review
+
+Review file: `issue-260826-0240-01-code-review-20260831-002900.md`
+
+- L1 (LOW): `NodeKind` is missing from the `**Core enums:**` list it belongs in — deferred (pre-existing, out of scope per "Nothing else in either document changes"; belongs to a separate record in the PRD-260826-0009-01 docs-truth family)
+
+Smells: 2 advisory (both borderline, both `ARCHITECTURE.md`, neither promoted — the Duplication smell's other cited sites are pre-existing code outside the issue diff). No graduation rows emitted for the diff's files.
+
+## Resolution
+
+**Commit:** `fix: correct the node-kind lists in ARCHITECTURE.md and docs/backend.md (ISSUE-260826-0240-01)`
+
+**Route:** `cursor` (`/cursor-developer`) — route-picker classified this as a well-scoped documentation-accuracy task with exact discovery commands supplied and mechanical edits to two markdown files; no cross-module reasoning, no ambiguity, no security surface.
+
+**TDD:** n/a (linear) — prose-only documentation correction; the acceptance seam is the committed markdown itself, observed by the brief's four section- and line-anchored `rg` observables, not a code seam.
+
+**Review telemetry:** dual review (Claude + Codex, cross-verified, adjudicated inline). Findings by severity: 0 CRITICAL, 0 HIGH, 0 MEDIUM, 1 LOW. Outcomes: 0 FIXED, 1 deferred, 0 dismissed. Fix rounds used: **0** of 4. Codex reported zero findings and zero smells; Claude's sole finding (L1 — `NodeKind` absent from `docs/backend.md`'s `**Core enums:**` list) was self-scoped as out of bounds, Codex returned DISAGREE on its defect framing, and the orchestrator adjudicated the split verdict by reading the code: the gap is real but pre-existing and outside "Nothing else in either document changes", so it is deferred to a separate record in the PRD-260826-0009-01 docs-truth family. 2 advisory smells recorded in `docs/issues/SMELLS-LEDGER.md`, neither promoted (the Duplication smell's other cited sites are pre-existing code outside the issue diff). Review file: `issue-260826-0240-01-code-review-20260831-002900.md`.
+
+**Suite:** `just test` — Rust `cargo test --locked` 473 passed / 0 failed / 1 ignored, fully green. Vitest 128 passed / 1 failed: `InspectorPanel.test.ts` → "prompts for an unlock secret and retries a privileged node preview" timed out at 5000ms (reported 6160ms) under full-suite load. **Pre-existing / environmental, not caused by this change:** the diff touches only two markdown files, the failing test is a Svelte component test that reads neither, and a file-scoped re-run passed all 17 tests with that test completing in 1064ms — well under the cap. Both reviewers independently observed the same file behave this way (one saw the full suite green in an unrestricted run; the other saw the same timeout in a constrained sandbox and the same isolation pass). The preservation criterion is satisfied on the Rust side outright and on the frontend side modulo this load-dependent flake, which is a candidate for its own record.
+
+**Closed:** 2026-08-31 (UTC)
