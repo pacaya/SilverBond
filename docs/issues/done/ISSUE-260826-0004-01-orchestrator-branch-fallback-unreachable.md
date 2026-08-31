@@ -2,8 +2,10 @@
 id: ISSUE-260826-0004-01
 kind: issue
 category: bug
-status: ready-for-agent
+status: done
 origin: docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md
+claimed_by: implement-issue@Mac-mini-4.local
+claimed_at: 2026-08-30T23:07:09Z
 summary: Delete the unreachable orchestrator branch-selection fallback; the silent first-edge default it exposed is split out to ISSUE-260830-1925-02
 ---
 
@@ -142,6 +144,48 @@ describes.
   Those are preserved historical audit records. They describe the tree as it stood when they were
   written and are not maintained against later changes. Do not edit them, even though they name the
   deleted symbol.
+
+## Context Pack — generated at claim (2026-08-30T23:07:09Z)
+
+**PRD decisions relevant to this slice** (PRD-260826-0009-01, the record's `origin:`; this issue carries no `prd:`/`adrs:`/`terms:` frontmatter):
+- "No engine code changes" — the docs-truth epic reads `src/`, writes `docs/`; behavior found wrong is documented as-is and filed separately, and this record is the named carrier of the unreachable orchestrator branch fallback plus the silent first-branch-edge default it causes.
+- Out of Scope explicitly excludes "the dead orchestrator fallback and the silent first-branch-edge default, filed as ISSUE-260826-0004-01 for separate triage" — so this issue is the sanctioned place for that engine change, and only that one.
+- Story 60: the real branch-routing default — an unmatched condition silently takes the first branch edge — must stay *recorded* in the docs so `condition-ast` designs against actual behavior rather than the unreachable orchestrator path the old doc described. This is why the AC pairs deletion of the symbol name with preservation of the default's description.
+- `docs/execution-model.md` is Tier C (conceptual prose, hand-written, not generated) and is rewritten around mechanism; editing that passage does not touch any generated marker block, so no regeneration is owed.
+- Decide-node routing is documented in both stages, with the runtime's degrade arm unreachable from a validated document (story 40) — the live, validated LLM-routing mechanism this dead helper duplicates weakly.
+- Terminology follows `CONTEXT.md`, honouring each entry's `_Avoid_` list, when rewording the execution-model passage.
+
+**Test seam & Testing Decisions:** observable at the engine crate's runtime-module `#[cfg(test)]` block — the routing function under test is private to that module, so the new pin (`fn .*unmatched_branch`, naming `ISSUE-260830-1925-02` in a comment) lives beside the existing routing tests, and both observables scope `src/` not `tests/`. Doc-side observables are `rg` patterns over `docs/execution-model.md`: absence of the deleted symbol paired with a preservation pattern for the silent-first-edge sentence (word order tolerant, so an honest reword stays green). The PRD's Testing Decisions note that Tier C prose is not machine-checkable at all — a mechanism paragraph cannot be asserted against `runtime.rs` — which is why the doc criterion is expressed as grep observables rather than a test. The PRD's freshness/coverage checks (`tests/docs_catalog.rs`, `SB_REGEN_DOCS=1`) gate only the generated node catalog in `docs/workflow-schema.md` and are untouched here. Preservation gates: the refinement half of the `runAs`-threading orchestrator test keeps its assertions, and `cargo test --locked` plus `npm test` pass.
+
+**ADRs:**
+- ADR-260815-2009-04 — Model/CLI routing via allow-listed named profiles · accepted. Cited by the brief's Out of scope: it records that this initiative makes exactly one driver-seam change, which is not `branchChoice`, so that capability field, its registry copy, its `/api/capabilities` serialization, and its `docs/agent-drivers.md` row all stay.
+- ADR-260815-2009-01 — Typed workflow contracts over a JSON-valued variable store · accepted. The parent PRD's ADR; owns the v4→v5 bump delivered by `typed-contracts`. Neighbor context only — no bearing on this deletion.
+
+**Terms** (no `terms:` frontmatter on the record; nearest glossary entries for the vocabulary the brief uses):
+- `Condition` — the engine's single post-execution deterministic branching form (edge and loop conditions): one flat `{field, operator, value}` leaf, evaluated by the engine and never by an LLM. _Avoid_: expression, rule.
+- `Skip Condition` — a node's pre-execution guard, a separate form; _Avoid_ using bare "condition" for it.
+- `Cursor` — an independent execution pointer inside a run, carrying its own variable scope and call stack.
+
+**Full artifacts:** docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md · docs/adr/INDEX.md · CONTEXT.md
+
+## Code Review
+
+Review file: `issue-260826-0004-01-code-review-20260830-233849.md` (Claude + Codex, cross-verified, adjudicated inline; round 1)
+
+- M1 (MEDIUM): Pinning test cannot distinguish "defaulted to first edge" from "first edge's condition matched" — FIXED
+- M2 (MEDIUM): Two hand-written 14-field `NodeResult` literals in the new test, where a helper already exists — FIXED (promoted in-diff duplication smell; split re-verify verdict adjudicated against the code)
+- L1 (LOW): Dead `_workflow` parameter left in place instead of removed — FIXED
+- L2 (LOW): Second half of the test passes a cursor id that belongs to a different checkpoint — FIXED
+- L3 (LOW): `docs/agent-drivers.md:3` still lists "branch choice" as a live lightweight classifier call — deferred (pre-existing doc drift, owned by the docs-truth PRD)
+- L4 (LOW): No test variant with `use_orchestrator: true` — dismissed (the flag no longer reaches this function)
+- L5 (LOW): Test does not assert the emitted `branch_decision` event — dismissed (outside the criterion's seam; owned by ISSUE-260830-1925-02)
+- L6 (LOW): New test line is not rustfmt-clean — dismissed (no formatting gate in this repo)
+- L7 (LOW): Preserved audit snapshot still names the deleted symbol — dismissed (explicitly out of scope per the brief)
+
+Smells: 3 observed, 1 promoted to finding M2, 2 remaining advisory. Codex contributed zero correctness findings and independently confirmed the deletion is a true routing no-op.
+
+Outcome: ACCEPTED after 1 fix round (cap 4). All four routed findings FIXED and re-verified by both live reviewers; no new findings, no regressions. Bit-identity re-confirmed mechanically after the fixes — every changed line outside the `#[cfg(test)]` region is a deletion, with zero added production lines.
+
 
 ## Triage Notes
 
@@ -600,3 +644,24 @@ and say what this record claims, but they are one `git clean` from disappearing.
 
 Brief is immutable from this stamp. Promoting to `ready-for-agent`.
 
+## Resolution
+
+**Commit:** `fix: delete the unreachable orchestrator branch-selection fallback (ISSUE-260826-0004-01)`
+
+**Route:** `cursor` for both the implementation and the single fix round — chosen by `route-picker` on the grounds that this is localized dead-code deletion in one file with named, concrete remedies and no cross-module, security, or architecture dimension. Correct call: the whole change landed in `src/runtime.rs` plus a one-line documentation edit.
+
+**TDD:** `n/a (linear)`. The trigger rule routes behavior-changing work with a named seam to red-green; this change is specified as bit-identical, and acceptance criterion 4's new test is a *characterization* test — green before and after — so there is no red state to write. The test was nonetheless the review's main subject: as first written it could not go red under the failure it characterized, which the review caught and the fix round corrected.
+
+**Review telemetry:** 9 findings — 2 MEDIUM, 7 LOW; 0 CRITICAL, 0 HIGH. Disposition: **4 FIXED** (M1, M2, L1, L2), **1 deferred** (L3), **4 dismissed** (L4-L7). **1 fix round used** of a cap of 4. Reviewers: Claude + Codex, cross-verified and adjudicated inline; Codex contributed zero correctness findings and one smell, so every finding was Claude-originated. Three smells observed, one promoted to finding M2 under the in-diff duplication rule, two left advisory; all three appended to `docs/issues/SMELLS-LEDGER.md`. Review file: `issue-260826-0004-01-code-review-20260830-233849.md`.
+
+**The change is a true no-op, and this was established rather than assumed.** Both reviewers independently derived that the deleted guard was unreachable: the branch-routing block is entered only when `branch_edges` is non-empty, `chosen` is seeded from `branch_edges.first()`, and the condition scan's `.or(chosen)` preserves that seed, so `chosen.is_none()` was always false. After the fix round the Claude reviewer confirmed it mechanically — every changed line outside the `#[cfg(test)]` region is a deletion, with zero added production lines.
+
+**One split verdict, adjudicated by the orchestrator.** On re-verification Codex returned STILL_BROKEN for M2 because `mock_node_result` supplies `prompt: "test"` where the replaced literals had `prompt: ""`. Resolved as FIXED against the code: `select_next_decision` never reads `result.prompt`, no assertion inspects it, and M2's defect was duplication — delegating to a helper necessarily inherits its defaults, so demanding field-for-field equality with the old literal would forbid the helper outright. Codex accepted the adjudication before shutdown. Reasoning recorded in full in the review file.
+
+**Suite:** green. The first full run reported one failure — `run_control_routes_return_typed_client_errors` (`tests/http_api.rs`) timing out against `wait_for_run`'s 5-second deadline. Judged not diff-attributable and confirmed empirically: the workflow it waits on is a single `approval` node with `"edges": []`, and the branch-routing block this change touched runs only for nodes with outgoing branch edges, so the changed path is unreachable from that test. Two subsequent full runs of `cargo test --locked` passed 450 + 6 + 17 with 0 failures, including that test under the same parallel load; `npm test` passed 129/129. Pre-existing timing sensitivity, not a regression — the test needs 4.8 s in isolation against a 5 s deadline.
+
+**Deferred out of this slice:** L3 — `docs/agent-drivers.md:3` still lists "branch choice" among live lightweight classifier calls. The sentence is inaccurate, but it was already inaccurate before this change (the classifier was unreachable, not absent), so this is pre-existing documentation drift rather than a regression introduced here. The acceptance criteria name only `docs/execution-model.md`, and doc-accuracy sweeps belong to the parent docs-truth PRD (`PRD-260826-0009-01`). Recorded so that sweep can pick it up rather than re-discover it.
+
+**One observation for the record, changing nothing here:** the brief's Out-of-scope prose describes `ISSUE-260830-1925-02` as `ready-for-human` with `condition-ast` its likely owner. That record is now `done` (commit `9f7e9c5`), with the branch-edge default decision carried into `typed-contracts`. The operative instruction — leave the silent first-edge default exactly as it is — is unaffected, and acceptance criterion 4's comment target still resolves. Flagged at the claim-time tripwire by the cold reader as a class-7 currency question, which that tripwire excludes by design.
+
+**Closed:** 2026-08-30 (UTC).

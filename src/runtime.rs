@@ -4620,7 +4620,6 @@ async fn apply_join_result(
 
     let decision = select_next_decision(
         ctx,
-        active_workflow,
         &graph,
         checkpoint,
         &task_result.cursor_id,
@@ -4845,7 +4844,6 @@ async fn complete_subflow_if_at_exit(
 
     let decision = select_next_decision(
         ctx,
-        parent_workflow,
         &parent_graph,
         checkpoint,
         cursor_id,
@@ -6356,7 +6354,6 @@ async fn record_transition_for_cursor(
 
 async fn select_next_decision(
     ctx: &RuntimeContext,
-    workflow: &WorkflowV3,
     graph: &WorkflowGraph<'_>,
     checkpoint: &mut RuntimeCheckpoint,
     cursor_id: &str,
@@ -6537,31 +6534,6 @@ async fn select_next_decision(
                 })
                 .map(|edge| (*edge).clone())
                 .or(chosen);
-        }
-        if chosen.is_none() && workflow.use_orchestrator {
-            let invocation = ctx
-                .run_invocation
-                .clone()
-                .context("tmux invocation missing for orchestrator branch")?;
-            let orchestration = run_orchestrator_branch(
-                &workflow.goal,
-                node,
-                &result.output,
-                &branch_edges,
-                &scoped_workflow_cwd(workflow, &checkpoint.cwd),
-                invocation,
-            )
-            .await?;
-            let chosen_id = orchestration
-                .output
-                .trim()
-                .trim_matches('"')
-                .trim_matches('\'');
-            chosen = branch_edges
-                .iter()
-                .find(|edge| edge.branch_id.as_deref() == Some(chosen_id) || edge.id == chosen_id)
-                .map(|edge| (*edge).clone())
-                .or_else(|| branch_edges.first().copied().map(|edge| edge.clone()));
         }
         if let Some(edge) = chosen {
             emit_event(
@@ -7434,39 +7406,6 @@ async fn run_orchestrator_refinement(
         .run_invocation
         .clone()
         .context("tmux invocation missing for orchestrator refinement")?;
-    tokio::task::spawn_blocking(move || {
-        crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None, inv, None, None)
-    })
-    .await
-    .context("join error in orchestrator")?
-}
-
-async fn run_orchestrator_branch(
-    goal: &str,
-    node: &WorkflowNode,
-    output: &str,
-    branches: &[&WorkflowEdge],
-    cwd: &str,
-    inv: TmuxInvocation,
-) -> anyhow::Result<NodeResult> {
-    let branch_list = branches
-        .iter()
-        .map(|edge| {
-            format!(
-                "- \"{}\": {}",
-                edge.branch_id.clone().unwrap_or_else(|| edge.id.clone()),
-                edge.label.clone().unwrap_or_else(|| edge.id.clone())
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let prompt = format!(
-        "You are an AI orchestrator deciding which branch a workflow should take.\n\nWORKFLOW GOAL: {goal}\nSTEP JUST COMPLETED: \"{}\"\nOUTPUT OF THAT STEP:\n{}\n\nAVAILABLE BRANCHES:\n{}\n\nBased on the output and the workflow goal, choose the most appropriate branch.\nRespond with ONLY the branch id string (e.g. branch_a). Nothing else.",
-        node.name, output, branch_list
-    );
-    let agent = DEFAULT_AGENT.to_string();
-    let owned_prompt = prompt.clone();
-    let owned_cwd = cwd.to_string();
     tokio::task::spawn_blocking(move || {
         crate::tmux_exec::run_tmux_oneshot(&agent, &owned_prompt, &owned_cwd, None, inv, None, None)
     })
@@ -9006,15 +8945,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn fake_run_as_invocation(temp: &TempDir, stem: &str) -> (TmuxInvocation, PathBuf) {
-        let (run_as, log) = fake_run_as_config(temp, stem);
-        let inv = crate::tmux_exec::build_tmux_invocation(&run_as, stem);
-        let _ = fs::remove_file(&log);
-
-        (inv, log)
-    }
-
-    #[cfg(unix)]
     fn fake_tmux_kill_invocation(temp: &TempDir) -> (TmuxInvocation, PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -10082,7 +10012,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn run_as_orchestrator_oneshots_use_invocation_prefix_and_socket() {
+    async fn run_as_orchestrator_refinement_uses_invocation_prefix_and_socket() {
         let temp = TempDir::new().unwrap();
 
         let refinement_socket = "silverbond-run_orchestrator_refinement";
@@ -10131,31 +10061,6 @@ mod tests {
         )
         .await;
         assert_recorded_run_as_tmux_args(&refinement_log, refinement_socket);
-
-        let branch_socket = "silverbond-orchestrator-branch";
-        let (branch_inv, branch_log) = fake_run_as_invocation(&temp, "orchestrator-branch");
-        let node = task_node("task", "Task", "prompt");
-        let branch_edge = WorkflowEdge {
-            id: "edge_branch".to_string(),
-            from: "task".to_string(),
-            to: "next".to_string(),
-            outcome: WorkflowEdgeOutcome::Branch,
-            label: Some("Branch A".to_string()),
-            branch_id: Some("branch_a".to_string()),
-            condition: None,
-        };
-        let branch_refs = [&branch_edge];
-        let branch = run_orchestrator_branch(
-            "goal",
-            &node,
-            "task output",
-            &branch_refs,
-            &temp.path().to_string_lossy(),
-            branch_inv,
-        )
-        .await;
-        assert!(branch.is_err());
-        assert_recorded_run_as_tmux_args(&branch_log, branch_socket);
     }
 
     #[cfg(unix)]
@@ -14532,6 +14437,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unmatched_branch_conditions_route_to_first_branch_edge() {
+        // ISSUE-260830-1925-02: changing this silent first-edge default is out of scope here.
+        let temp = TempDir::new().unwrap();
+        let db = Database::new(temp.path().join("silverbond.db"));
+        db.init().await.unwrap();
+        let ctx = RuntimeContext::with_runner(db.clone(), Arc::new(EchoRunner));
+
+        let workflow = workflow_from_parts(
+            "router",
+            vec![
+                task_node("router", "Router", "prompt"),
+                task_node("first_target", "First", "first"),
+                task_node("second_target", "Second", "second"),
+            ],
+            vec![
+                WorkflowEdge {
+                    id: "edge_first".to_string(),
+                    from: "router".to_string(),
+                    to: "first_target".to_string(),
+                    outcome: WorkflowEdgeOutcome::Branch,
+                    label: Some("First".to_string()),
+                    branch_id: Some("first".to_string()),
+                    condition: Some(StructuredCondition {
+                        field: "status".to_string(),
+                        operator: "==".to_string(),
+                        value: "match_first".to_string(),
+                    }),
+                },
+                WorkflowEdge {
+                    id: "edge_second".to_string(),
+                    from: "router".to_string(),
+                    to: "second_target".to_string(),
+                    outcome: WorkflowEdgeOutcome::Branch,
+                    label: Some("Second".to_string()),
+                    branch_id: Some("second".to_string()),
+                    condition: Some(StructuredCondition {
+                        field: "status".to_string(),
+                        operator: "==".to_string(),
+                        value: "match_second".to_string(),
+                    }),
+                },
+            ],
+        );
+        let mut checkpoint =
+            build_initial_checkpoint(&workflow, "run_branch", BTreeMap::new(), None);
+        let graph = workflow.graph();
+        let node = workflow.nodes[0].clone();
+        let cursor_id = checkpoint.active_cursors[0].cursor_id.clone();
+
+        let unmatched_result = NodeResult {
+            output: "no match".to_string(),
+            duration: "0".to_string(),
+            agent: "llm".to_string(),
+            parsed_output: Some(json!({"status": "unmatched"})),
+            ..mock_node_result("")
+        };
+        let unmatched_decision = select_next_decision(
+            &ctx,
+            &graph,
+            &mut checkpoint,
+            &cursor_id,
+            &node,
+            &unmatched_result,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unmatched_decision.control_type, "branch");
+        assert_eq!(
+            unmatched_decision.next_edge.as_ref().map(|edge| edge.id.as_str()),
+            Some("edge_first")
+        );
+
+        let match_second_result = NodeResult {
+            output: "matched second".to_string(),
+            duration: "0".to_string(),
+            agent: "llm".to_string(),
+            parsed_output: Some(json!({"status": "match_second"})),
+            ..mock_node_result("")
+        };
+        let match_second_decision = select_next_decision(
+            &ctx,
+            &graph,
+            &mut checkpoint,
+            &cursor_id,
+            &node,
+            &match_second_result,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(match_second_decision.control_type, "branch");
+        assert_eq!(
+            match_second_decision
+                .next_edge
+                .as_ref()
+                .map(|edge| edge.id.as_str()),
+            Some("edge_second")
+        );
+
+        let mut checkpoint =
+            build_initial_checkpoint(&workflow, "run_branch_no_parse", BTreeMap::new(), None);
+        let cursor_id = checkpoint.active_cursors[0].cursor_id.clone();
+        let no_parse_result = NodeResult {
+            output: "raw only".to_string(),
+            duration: "0".to_string(),
+            agent: "llm".to_string(),
+            ..mock_node_result("")
+        };
+        let no_parse_decision = select_next_decision(
+            &ctx,
+            &graph,
+            &mut checkpoint,
+            &cursor_id,
+            &node,
+            &no_parse_result,
+            1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(no_parse_decision.control_type, "branch");
+        assert_eq!(
+            no_parse_decision
+                .next_edge
+                .as_ref()
+                .map(|edge| edge.id.as_str()),
+            Some("edge_first")
+        );
+    }
+
+    #[tokio::test]
     async fn decide_missing_branch_edge_degrades_instead_of_bailing() {
         let temp = TempDir::new().unwrap();
         let db = Database::new(temp.path().join("silverbond.db"));
@@ -14578,7 +14614,6 @@ mod tests {
 
         let decision = select_next_decision(
             &ctx,
-            &workflow,
             &graph,
             &mut checkpoint,
             &cursor_id,
