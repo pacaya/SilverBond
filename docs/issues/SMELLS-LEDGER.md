@@ -132,3 +132,6 @@ One row per unique key (`file:line` + smell name). Columns:
 | `ui/src/test/fixtures/decideBranchWorkflow.ts:49` + Speculative Generality | 1 | 2026-09-01 | open |
 | `ui/src/features/editor/EdgeInspector.svelte:46` + Divergent Change | 1 | 2026-09-01 | open |
 | `ui/src/lib/stores/workflowStore.test.ts:230` + Mysterious Name | 1 | 2026-09-01 | open |
+| `tests/docs_catalog.rs:2108` + Shotgun Surgery | 1 | 2026-09-01 | open |
+| `docs/workflow-schema.md:1429-1444` + Duplicated Code | 1 | 2026-09-01 | open |
+| `docs/workflow-schema.md:1367` + Divergent Change | 1 | 2026-09-01 | open |

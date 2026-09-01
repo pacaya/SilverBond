@@ -2105,7 +2105,7 @@ mod workflow_schema_citations {
         let mentions = source_mentions(&markdown);
         assert_eq!(
             mentions.len(),
-            303,
+            307,
             "source mention count changed; update discovery expectations if intentional"
         );
         let unclaimed = discover_citation_candidates(&markdown)

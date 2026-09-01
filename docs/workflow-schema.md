@@ -1426,6 +1426,21 @@ object deserializes to `WorkflowCanvasViewport::default()` via the parent `#[ser
 *Source: `WorkflowCanvasViewport` (`WorkflowCanvasViewport`, `src/model.rs`), `WorkflowCanvasUi`
 (`WorkflowCanvasUi::viewport`, `src/model.rs`).*
 
+### UI per-node canvas state
+
+`ui.canvas.nodes` (`WorkflowCanvasUi::nodes`, `src/model.rs`) is a map keyed by **node id**
+to per-node canvas position (`WorkflowCanvasNodeState`, `src/model.rs`). Keys are intended to
+match `nodes[].id` in the same workflow body, but that correspondence is not validated — an
+entry whose key no longer names a node in `nodes[]` is neither rejected nor pruned and
+round-trips unchanged. The map is optional: it defaults to empty via `#[serde(default)]` and is
+**skipped on serialize when empty**.
+
+Each value has two required sub-fields (`x`, `y`) with no per-field serde defaults. A **partial**
+value object (for example only `x`) fails deserialization.
+
+*Source: `WorkflowCanvasNodeState` (`WorkflowCanvasNodeState`, `src/model.rs`), `WorkflowCanvasUi`
+(`WorkflowCanvasUi::nodes`, `src/model.rs`).*
+
 ## Templates and agent config
 
 ### Template tokens
