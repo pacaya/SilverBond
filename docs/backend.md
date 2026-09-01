@@ -58,6 +58,7 @@ Defines the canonical workflow data model and validation logic:
 
 **Core enums:**
 - `WorkflowNodeType` — `Task`, `Approval`, `Split`, `Collector`, `Decide`, `ParallelBatch`, `Subflow`, `Call`, `Spawn`, `Send`, `Wait`, `Capture`, `Kill`, `RunAgent`
+- `NodeKind` — internally tagged enum (`type` tag) carrying per-kind configuration where the kind has one, serializing as a node's `kind` object in canonical v4 documents, with `WorkflowNodeType` as the plain discriminant
 - `ResponseFormat` — `Text`, `Json`
 - `WorkflowEdgeOutcome` — `Success`, `Reject`, `Branch`, `LoopContinue`, `LoopExit`
 - `SplitFailurePolicy` — `BestEffortContinue`, `FailFastCancel`, `DrainThenFail`
