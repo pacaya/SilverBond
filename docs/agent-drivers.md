@@ -1,6 +1,6 @@
 # Agent Drivers
 
-SilverBond executes workflow tasks by launching local agent CLIs inside **tmux panes**. Every agent invocation — full worker tasks and lightweight classifier calls (orchestrator prompt refinement, branch choice, loop verdicts) alike — runs through the same tmux-based path. The driver layer (`driver.rs`) provides a uniform abstraction over different agent implementations; the runtime (`tmux_exec.rs`) owns pane lifecycle, readiness detection, and output capture.
+SilverBond executes workflow tasks by launching local agent CLIs inside **tmux panes**. Every agent invocation — full worker tasks and lightweight classifier calls (orchestrator prompt refinement, loop verdicts) alike — runs through the same tmux-based path. The driver layer (`driver.rs`) provides a uniform abstraction over different agent implementations; the runtime (`tmux_exec.rs`) owns pane lifecycle, readiness detection, and output capture.
 
 There are only two execution modes:
 

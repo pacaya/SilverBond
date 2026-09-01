@@ -136,7 +136,7 @@ Validate a workflow and return issues with graph analysis.
 
 ### `POST /api/test-node`
 
-Preview a task node's resolved prompt without executing it.
+Resolve a task node's prompt template against a mock context and **execute it once**, returning the resolved prompt alongside the agent's output, parsed output, and routing preview. This is not a dry run: `run_node_preview` launches the node's agent in a throwaway tmux pane via `run_tmux_oneshot` (`src/runtime.rs:1749`, `:1794`), under the same `runAs` identity authorization as a real run (`authorize_and_prepare_node_preview_security`, `src/api.rs:697`).
 
 **Request body:**
 ```json

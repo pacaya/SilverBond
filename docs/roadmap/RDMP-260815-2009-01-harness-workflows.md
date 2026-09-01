@@ -65,7 +65,16 @@ The user's agent harness (issue-dev, implement-issue, and kin) lives as chat-ski
 
 ## docs-truth: Documentation from the Rust truth
 
-Status: active (PRD-260826-0009-01)
+Status: complete (PRD-260826-0009-01) — all declared issues and their follow-on fix rounds closed.
+Residuals filed 2026-09-01 and owned outside this epic: ISSUE-260901-0216-01 (citation drift in
+the schema document's hand-written sections — positional citations become symbolic, per a maintainer
+decision recorded on the record), ISSUE-260901-0216-04 (the
+per-node canvas state map undocumented), ISSUE-260901-0216-06 (the tagged node-kind enum missing
+from the backend module reference), ISSUE-260901-0216-05 (the CI job this epic added has still
+never run). ISSUE-260901-0216-02 is fallout from this epic's validation change.
+ISSUE-260901-0216-03 preserves three second-hand sightings of intermittent test failures and sits
+at needs-triage — its first diagnosis was falsified at the readiness gate and no mechanism has
+been reproduced.
 
 Rewrite `docs/workflow-schema.md` and `docs/execution-model.md` from the Rust source: all 14 node kinds, v4 tagged shapes, edges with conditions, subflows, variables, the tmux node family, and run/checkpoint semantics. No engine code changes. This epic establishes the baseline, not a frozen snapshot: every later schema-changing epic owns updating these two documents, and its `CONTEXT.md` terms, for its delta — the terms it owns are those its ADRs name (`grep '(planned' CONTEXT.md` for the outstanding set). Sharpest exclusion: no schema changes are designed here — this documents what exists so later epics diff against truth.
 

@@ -671,3 +671,27 @@ were both wrong in opposite directions: the docs lagged it by two epochs, the gl
 one initiative. The glossary session closed its half by making every unmarked definition true of
 HEAD and flagging the rest, so this epic inherits one authority rather than two. Each later
 schema-changing epic owns the terms its ADR names, per RDMP-260815-2009-01's `docs-truth` entry.
+
+## Post-Epic Corrections
+
+Added 2026-09-01 at epic close. The body above is preserved as written — it records the state of
+the repo when this PRD was authored, and its Problem Statement is deliberately a "before" framing.
+These are the passages a later reader would otherwise take as present tense and be misled by.
+
+- **`## Out of Scope`, on other documents under-reporting node kinds.** The claim that
+  `ARCHITECTURE.md` and `docs/backend.md` are "left standing deliberately" at nine and ten node
+  kinds no longer holds. `ISSUE-260826-0240-01` — named in that same paragraph — brought both to
+  all fourteen. The exclusion was overturned during the epic, not carried.
+- **`## Implementation Decisions` and `## Out of Scope`, on the orchestrator branch fallback.** The
+  statement that `ISSUE-260826-0004-01` "already carries" the unreachable fallback and the silent
+  first-branch-edge default it causes is doubly superseded: that record deleted the fallback, and
+  the silent default was separated into `ISSUE-260830-1925-02` and reassigned to the
+  `typed-contracts` epic of RDMP-260815-2009-01. The line range cited alongside the claim now
+  addresses different code.
+- **`## Problem Statement` and `## Testing Decisions`, on the absence of CI.** Both state in the
+  present tense that no CI workflow runs the Rust suite. `ISSUE-260826-0637-01` added one. The
+  test count quoted beside that claim has also moved; derive the current figure by running the
+  suite rather than reading it here.
+
+Residual work this epic did not close is filed as `ISSUE-260901-0216-01` through `-06` and is
+tracked on the roadmap's `docs-truth` entry, not here.

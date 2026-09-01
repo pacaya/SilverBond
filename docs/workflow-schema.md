@@ -1093,7 +1093,7 @@ default deserialize the same.
 #### task
 
 The only in-`kind` payload is `agentConfig` (agent overrides). That object is documented in
-**Templates and agent config** (ISSUE-260826-0637-06).
+**Templates and agent config**.
 
 *Source: `NodeKind::Task` (`src/model.rs:696-703`).*
 
@@ -1259,7 +1259,7 @@ is skipped on serialize when equal to `RunAgentConfig::default()`.
 | `readyStableSeconds` | number or absent | No | absent | Runtime uses `DEFAULT_READY_STABLE_SECONDS` (`2.0`) when unset (`src/tmux_exec.rs:1059-1061`). |
 | `until` | string or absent | No | absent | Marker string for ready/until waits. |
 | `killAfter` | boolean | No | `true` | Tear down the pane after the agent exits. |
-| `agentConfig` | object or absent | No | absent | Agent overrides alongside `runAgentConfig`; documented in **Templates and agent config** (ISSUE-260826-0637-06). Sibling payload of the variant, not a field of `RunAgentConfig`. |
+| `agentConfig` | object or absent | No | absent | Agent overrides alongside `runAgentConfig`; documented in **Templates and agent config**. Sibling payload of the variant, not a field of `RunAgentConfig`. |
 
 *Source: `RunAgentConfig` (`src/model.rs:584-626`), `NodeKind::RunAgent` (`src/model.rs:743-752`).*
 
