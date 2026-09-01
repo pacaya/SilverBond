@@ -5,6 +5,7 @@
     WorkflowDocument,
     WorkflowEdge,
   } from "@/lib/types/workflow";
+  import { normalizeBranchEdgeLabel } from "@/lib/utils/branchEdgeLabel";
   import ConditionBuilder from "./ConditionBuilder.svelte";
 
   let {
@@ -35,6 +36,63 @@
       if (found) mutate(found);
     });
   }
+
+  let liveEdge = $derived(
+    activeWorkflow.edges.find((item) => item.id === edge.id) ?? edge,
+  );
+
+  let labelDraft = $state<string | null>(null);
+  let labelFocused = $state(false);
+  let draftEdgeId = $state<string | null>(null);
+
+  function draftMatchesStore(draft: string): boolean {
+    const committed = liveEdge.outcome === "branch"
+      ? normalizeBranchEdgeLabel(draft)
+      : (draft || null);
+    return committed === liveEdge.label;
+  }
+
+  let labelDisplay = $derived.by(() => {
+    if (
+      labelDraft !== null
+      && labelFocused
+      && edge.id === draftEdgeId
+      && draftMatchesStore(labelDraft)
+    ) {
+      return labelDraft;
+    }
+    return liveEdge.label ?? "";
+  });
+
+  $effect(() => {
+    if (labelDraft === null) return;
+    if (
+      !labelFocused
+      || edge.id !== draftEdgeId
+      || !draftMatchesStore(labelDraft)
+    ) {
+      labelDraft = null;
+      draftEdgeId = null;
+    }
+  });
+
+  function onLabelFocus() {
+    labelFocused = true;
+    draftEdgeId = edge.id;
+    labelDraft = liveEdge.label ?? "";
+  }
+
+  function onLabelInput(event: Event) {
+    const raw = (event.target as HTMLInputElement).value;
+    labelDraft = raw;
+    store.setEdgeLabel(edge.id, raw);
+  }
+
+  function onLabelBlur() {
+    labelFocused = false;
+    labelDraft = null;
+    draftEdgeId = null;
+  }
 </script>
 
 <div class="inspector">
@@ -55,9 +113,10 @@
         <span>Outcome</span>
         <select
           value={edge.outcome}
-          onchange={(e) => updateSelectedEdge((found) => {
-            found.outcome = (e.target as HTMLSelectElement).value as WorkflowEdge["outcome"];
-          })}
+          onchange={(e) => store.setEdgeOutcome(
+            edge.id,
+            (e.target as HTMLSelectElement).value as WorkflowEdge["outcome"],
+          )}
         >
           {#each capabilities.supportedEdgeOutcomes as outcome (outcome)}
             <option value={outcome}>{outcome}</option>
@@ -75,10 +134,10 @@
     <label class="field">
       <span>Label</span>
       <input
-        value={edge.label ?? ""}
-        oninput={(e) => updateSelectedEdge((found) => {
-          found.label = (e.target as HTMLInputElement).value || null;
-        })}
+        value={labelDisplay}
+        onfocus={onLabelFocus}
+        oninput={onLabelInput}
+        onblur={onLabelBlur}
       />
     </label>
     <label class="field">

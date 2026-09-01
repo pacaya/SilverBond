@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { store } from "@/lib/stores/workflowStore.svelte";
+import { branchEdge, buildDecideBranchWorkflow } from "@/test/fixtures/decideBranchWorkflow";
 import type {
   NodeKind,
   WorkflowDocument,
@@ -224,6 +225,53 @@ describe("workflowStore", () => {
 
     store.redo();
     expect(store.workflow!.name).toBe("second");
+  });
+
+  it("refuses forward branch transition when normalized label collides with sibling", () => {
+    store.setWorkflow(
+      buildDecideBranchWorkflow({
+        edges: [
+          branchEdge({ id: "branch_yes", label: "yes" }),
+          branchEdge({ id: "branch_maybe", outcome: "success", label: " yes " }),
+        ],
+      }),
+    );
+
+    store.setEdgeOutcome("branch_maybe", "branch");
+
+    const edge = store.workflow!.edges.find((item) => item.id === "branch_maybe")!;
+    expect(edge.outcome).toBe("branch");
+    expect(edge.label).toBe("yes");
+  });
+
+  it("normalizes forward branch transition when no sibling collision", () => {
+    store.setWorkflow(
+      buildDecideBranchWorkflow({
+        edges: [
+          branchEdge({ id: "branch_yes", label: "yes" }),
+          branchEdge({ id: "branch_maybe", outcome: "success", label: " maybe " }),
+        ],
+      }),
+    );
+
+    store.setEdgeOutcome("branch_maybe", "branch");
+
+    const edge = store.workflow!.edges.find((item) => item.id === "branch_maybe")!;
+    expect(edge.label).toBe("maybe");
+  });
+
+  it("preserves label on reverse transition away from branch", () => {
+    store.setWorkflow(
+      buildDecideBranchWorkflow({
+        edges: [branchEdge({ label: " yes " })],
+      }),
+    );
+
+    store.setEdgeOutcome("branch_yes", "success");
+
+    const edge = store.workflow!.edges.find((item) => item.id === "branch_yes")!;
+    expect(edge.outcome).toBe("success");
+    expect(edge.label).toBe(" yes ");
   });
 
   it("stores compounds created inside a drilled subflow in the root catalog", () => {

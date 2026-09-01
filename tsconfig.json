@@ -20,6 +20,6 @@
     },
     "types": ["vitest/globals", "@testing-library/jest-dom"]
   },
-  "include": ["ui/src/**/*.ts", "ui/src/**/*.svelte", "ui/vite.config.ts", "playwright.config.ts"],
+  "include": ["ui/src/**/*.ts", "ui/src/**/*.svelte", "ui/e2e/**/*.ts", "ui/vite.config.ts", "playwright.config.ts"],
   "exclude": ["node_modules"]
 }

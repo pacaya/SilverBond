@@ -124,3 +124,11 @@ One row per unique key (`file:line` + smell name). Columns:
 | `tests/docs_catalog.rs:1290` + Feature Envy | 1 | 2026-09-01 | open |
 | `tests/docs_catalog.rs:1379` + Speculative Generality | 1 | 2026-09-01 | open |
 | `docs/workflow-schema.md:1106` + Mysterious Name | 1 | 2026-09-01 | open |
+| `ui/src/lib/stores/workflowStore.svelte.ts:802` + Mysterious Name | 1 | 2026-09-01 | open |
+| `ui/src/lib/utils/branchEdgeLabel.ts:1` + Speculative Generality | 1 | 2026-09-01 | open |
+| `ui/src/features/editor/EdgeInspector.svelte:79` + Divergent Change | 1 | 2026-09-01 | open |
+| `ui/src/features/editor/EdgeInspector.test.ts:94` + Mysterious Name | 1 | 2026-09-01 | open |
+| `ui/src/features/editor/EdgeInspector.test.ts:90` + Mysterious Name | 1 | 2026-09-01 | open |
+| `ui/src/test/fixtures/decideBranchWorkflow.ts:49` + Speculative Generality | 1 | 2026-09-01 | open |
+| `ui/src/features/editor/EdgeInspector.svelte:46` + Divergent Change | 1 | 2026-09-01 | open |
+| `ui/src/lib/stores/workflowStore.test.ts:230` + Mysterious Name | 1 | 2026-09-01 | open |

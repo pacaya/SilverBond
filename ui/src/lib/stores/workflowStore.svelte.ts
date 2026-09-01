@@ -20,6 +20,7 @@ import type {
 } from "@/lib/types/workflow";
 import { defaultNodeKind, defaultNodeName } from "@/lib/stores/nodeMetadata";
 import { formatTokens } from "@/lib/utils/format";
+import { normalizeBranchEdgeLabel } from "@/lib/utils/branchEdgeLabel";
 
 type Selection =
   | { kind: "workflow"; id: null }
@@ -796,6 +797,27 @@ class WorkflowStore {
     wf.edges = wf.edges.filter((e) => e.id !== edgeId);
     this.dirty = true;
     this.selection = { kind: "workflow", id: null };
+  }
+
+  setEdgeLabel(edgeId: string, rawLabel: string) {
+    this.updateWorkflow((wf) => {
+      const edge = wf.edges.find((item) => item.id === edgeId);
+      if (!edge) return;
+      edge.label = edge.outcome === "branch"
+        ? normalizeBranchEdgeLabel(rawLabel)
+        : (rawLabel || null);
+    });
+  }
+
+  setEdgeOutcome(edgeId: string, outcome: WorkflowEdge["outcome"]) {
+    this.updateWorkflow((wf) => {
+      const edge = wf.edges.find((item) => item.id === edgeId);
+      if (!edge) return;
+      edge.outcome = outcome;
+      if (outcome === "branch" && edge.label != null) {
+        edge.label = normalizeBranchEdgeLabel(edge.label);
+      }
+    });
   }
 
   setNodePosition(nodeId: string, position: { x: number; y: number }) {
