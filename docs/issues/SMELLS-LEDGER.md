@@ -118,3 +118,9 @@ One row per unique key (`file:line` + smell name). Columns:
 | `templates/research-and-summarize.json:30` + Mysterious Name | 1 | 2026-08-31 | open |
 | `tests/bundled_templates.rs:53` + Primitive Obsession | 1 | 2026-08-31 | open |
 | `tests/docs_catalog.rs:582` + Duplicated Code | 1 | 2026-08-31 | open |
+| `tests/docs_catalog.rs:846` + Duplicated Code | 1 | 2026-09-01 | open |
+| `tests/docs_catalog.rs:1130` + Divergent Change | 1 | 2026-09-01 | open |
+| `tests/docs_catalog.rs:812` + Repeated Switches | 1 | 2026-09-01 | open |
+| `tests/docs_catalog.rs:1290` + Feature Envy | 1 | 2026-09-01 | open |
+| `tests/docs_catalog.rs:1379` + Speculative Generality | 1 | 2026-09-01 | open |
+| `docs/workflow-schema.md:1106` + Mysterious Name | 1 | 2026-09-01 | open |

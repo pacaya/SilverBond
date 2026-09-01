@@ -2,8 +2,10 @@
 id: ISSUE-260901-0216-01
 kind: issue
 category: bug
-status: ready-for-agent
+status: done
 prd: PRD-260826-0009-01
+claimed_by: implement-issue@macmini
+claimed_at: 2026-09-01T04:06:18Z
 summary: Source citations in the workflow-schema document's hand-written sections drift silently when Rust line numbers shift; correct the drifted ones and add a freshness guard that fails when a citation no longer points at what it claims
 ---
 
@@ -158,6 +160,75 @@ the guard.
 - Any change to validation behavior, to messages, or to the English condition text of catalog rows.
 - Renaming Rust symbols to make them easier to cite. Citations adapt to the code, not the reverse.
 
+## Context Pack — generated at claim (2026-09-01T04:06:18Z)
+
+**PRD decisions relevant to this slice** (PRD-260826-0009-01):
+- Tier P content is hand-written but source-cross-referenced: "Each entry cites the source location that owns it, so a reader can verify in one jump" — the citations this record makes symbolic are that tier's contract.
+- Tier P is explicitly **not machine-pinned**; the PRD's "Honest limits" names the validation catalog, template-token list, event vocabulary, and condition operator set as hand-written. This record closes part of that gap.
+- No engine code changes: the epic reads `src/`, writes `docs/`, and adds a generator plus freshness check; nothing under `src/` is edited. Matches this record's "renaming Rust symbols to make them easier to cite" exclusion.
+- The generator/checker home is `tests/docs_catalog.rs`, an integration test compiling against the public API — the same target this record's guard joins.
+- `cargo test` stays side-effect-free: the checker regenerates in memory and compares against committed markdown, never writing tracked files during a compare run (writes only under `SB_REGEN_DOCS=1`).
+- Freshness pattern to follow: derive from the Rust tree, diff against the committed document, fail on difference (mirrors `.githooks/pre-commit` / `frontend-freshness.yml`).
+- The freshness check gates generated blocks only and is not a general documentation linter — this record extends enforcement to hand-written citations in `docs/workflow-schema.md` alone.
+- `docs/workflow-schema.md` states `src/model.rs` is the authority, which parts are generated, and how to regenerate them.
+
+**Test seam & Testing Decisions:** observable at the `tests/docs_catalog.rs` integration-test target run under `cargo test --locked`; the PRD's Testing Decisions put the primary guarantee in "generation plus a freshness check, not an assertion", require compare runs to be side-effect-free, and order checks by decreasing strength — this record adds a citation-resolution check in that same target, with fixtures that perturb a copy of the document (never the committed one) and assert the failure output names the perturbed symbol/discriminant text, not just an exit status.
+
+**ADRs:**
+- None on this record's frontmatter (no `adrs:` field). Parent PRD carries ADR-260815-2009-01 — "Typed workflow contracts over a JSON-valued variable store · accepted" — a forward v5 reference only; no bearing on this slice.
+
+**Terms:**
+- None on this record's frontmatter (no `terms:` field); glossary tier not applicable to this slice.
+
+**Full artifacts:** docs/prd/PRD-260826-0009-01-docs-from-rust-truth.md · docs/adr/INDEX.md · CONTEXT.md
+
+## Code Review
+
+Review file: `issue-260901-0216-01-code-review-20260901-050856.md`
+
+Dual review (Claude + Codex), cross-verified and adjudicated inline, then **4 fix rounds (cap 4)**.
+**ACCEPTED: 30 findings, all FIXED — 0 deferred, 0 dismissed.** 19 raised at review, 6 at round-1
+verification, 5 at round-2, 2 at round-3, none at round-4; both reviewers filed empty final reports and
+stated the work is fit to commit.
+
+- C1 (CRITICAL): Validation-catalog Source-column citations (~152 table rows) silently skipped — FIXED (r1)
+- C2 (CRITICAL): Parsed `` `Symbol` (`file`) `` citations parsed then discarded (~65) — FIXED (r1)
+- C3 (CRITICAL): Unparseable citations treated as prose; surplus grammar tokens dropped — FIXED (r1)
+- C4 (CRITICAL): The conversion cemented the drift the record exists to remove — FIXED (r1)
+- H1 (HIGH): The hand-rolled Rust index unsound and incomplete — FIXED (r1)
+- H2 (HIGH): "Reports only what is broken" discharged with vacuous absent-assertions — FIXED (r1)
+- H3 (HIGH): `docs/workflow-schema.md:73` cited the wrong file and dropped a documented wire key — FIXED (r1)
+- M1 (MEDIUM): Tautological and over-generic discriminants — FIXED (r1 guard + catalog, r2 residual)
+- M2 (MEDIUM): Symbol inference could borrow an unrelated earlier code span — FIXED (r1)
+- M3 (MEDIUM): The symbol-less fixture asserted on a citation the guard never saw — FIXED (r1)
+- M4 (MEDIUM): Field-level precision dropped where the guard supports it — FIXED (r1)
+- M5 (MEDIUM): Duplicated tokenisation between the two paren-body scanners — FIXED (r1) (promoted in-diff duplication smell)
+- M6 (MEDIUM): Duplicated item parsing between impl-method and top-level indexing — FIXED (r1) (promoted in-diff duplication smell)
+- L1 (LOW): Fixture asserted a line-wrap-dependent literal — FIXED (r2)
+- L2 (LOW): A missing cited file reported as an unresolved symbol — FIXED (r1)
+- L3 (LOW): Whole cited file re-joined into a String per citation — FIXED (r1)
+- L4 (LOW): `parse_in_citation` accepted arbitrary prose between symbol and file — FIXED (r1)
+- L5 (LOW): Trailing periods dropped from two table cells — FIXED (r1)
+- L6 (LOW): Enum brace-column fallback wrong by construction — FIXED (r1); struct resume-position sub-claim dismissed (no incorrect result in this tree)
+- M7 (MEDIUM): Externally-symbolled citations got an unlocatable, shared `raw` — FIXED (r2)
+- L7 (LOW): Unclaimed mention reported with only the bare file token — FIXED (r2)
+- L8 (LOW): Table-cell splitting ignored escaped pipes — FIXED (r2)
+- L9 (LOW): Prose whitelist keyed to a hard-coded English sentence — FIXED (r2)
+- H4 (HIGH): The document-wide perturbation fixture made the suite ~30x slower — FIXED (r3)
+- M8 (MEDIUM): Reported line numbers wrong for almost every citation — FIXED (r3)
+- L11 (LOW): Prose fixture pinned an incidental total mention count — FIXED (r3)
+- L12 (LOW): Multi-symbol fixture half still used a literal replace — FIXED (r3)
+- L10 (LOW): Rendered slice and reported column disagreed — FIXED (r4; partially fixed r3)
+- M9 (MEDIUM): Source-cache mutex held across the whole sweep, serializing fixtures — FIXED (r4)
+- L13 (LOW): Line numbers recomputed by a linear scan per citation — FIXED (r4)
+
+**Same-site escalation invoked once:** round 3 was briefed as a redesign of the locatability mechanism
+rather than five patches, after round 2's new findings landed in the code round 2 had just written.
+
+Smells: 6 advisory, all newly appended to `docs/issues/SMELLS-LEDGER.md`; 2 Duplication smells promoted
+into the findings track as M5 and M6 under the in-diff promotion rule, both FIXED. Graduation advisory:
+none emitted.
+
 ## Triage Notes
 
 Filed 2026-09-01 during a completeness audit of the `docs-truth` epic (PRD-260826-0009-01), from a
@@ -281,3 +352,49 @@ already position-free and needs only a symbol where it lacks one.
 
 The scale snapshot was sitting under this section rather than under `## Triage Notes`, where the
 authoring rules place it; moved.
+
+## Resolution
+
+**Commit:** `fix: replace positional source citations with symbolic ones and guard them (ISSUE-260901-0216-01)`
+
+**Route:** `cursor` for the implementation (route-picker: well-specified single-file test implementation
+with immutable acceptance criteria). Fix rounds routed per round: `codex` for round 1 (4 CRITICAL findings
+spanning deep cross-module reasoning over `src/model.rs` and `src/runtime.rs` plus a hand-rolled parser
+rework), then `cursor` for rounds 2-4 (single-file, named remedies, no open architectural decisions).
+
+**TDD:** red-green at `tests/docs_catalog.rs` — behaviour-changing work whose acceptance criteria name a
+seam.
+
+**Review telemetry:** 30 findings — 4 CRITICAL, 4 HIGH, 9 MEDIUM, 13 LOW. All 30 **FIXED**; 0 deferred,
+0 dismissed. Two sub-claims dismissed within findings (L6's struct resume position; H1's
+`NodeKind::agent_config`, which is a real method at `src/model.rs:779`). **4 fix rounds used of 4.**
+Findings by round raised: 19 at review, 6 / 5 / 2 at rounds 1-3 verification, 0 at round 4. Cross-verify:
+Claude AGREEd with all 8 Codex findings; Codex AGREEd with 21 of 25 Claude findings, DISAGREEd with 3,
+UNCERTAIN on 1 — all four adjudicated by the orchestrator against the code, with two DISAGREEs upheld as
+keeps (both later verified genuinely fixed) and one UNCERTAIN upheld (the `strip_markdown_json_fence`
+co-citation is legitimate).
+
+**What review caught that the suite did not:** the implementation arrived with `cargo test --locked`
+green and every acceptance grep returning the expected result, while the guard resolved **76 of 303**
+source mentions and silently skipped the rest — including the whole validation catalog, the very rows
+whose drift motivated this record. Separately, ~12 citations had been converted by translating each stale
+line range into whatever symbol now occupied it, freezing the drift this record exists to remove into a
+form the guard would have blessed permanently. Both were found by perturbation, not by the suite.
+
+**Final state:** discovery sees 302 of 303 source mentions, the single prose exception classified
+structurally and pinned by a fixture; all 100 validation-catalog rows carry a distinct
+owning-symbol/discriminant identity; unparseable, unresolved, symbol-less, missing-file and
+out-of-extent each report a diagnostic the others never emit; and every load-bearing property is carried
+by a fixture a reviewer watched fail after deliberately breaking the code behind it.
+
+**Suite:** `just test` green — Rust 461 + 8 + 31 + 17 passed, 0 failed, 1 ignored; frontend 131 passed
+across 14 files. Full suite 28-38s wall (from 96s before the round-3/4 optimisation);
+`cargo test --locked --test docs_catalog` 0.39-1.09s for 31 tests, against 0.67s for 13 tests before this
+work. Two known environment-timing flakes in `tests/http_api.rs`
+(`run_stream_requires_matching_stream_token`, `run_control_routes_return_typed_client_errors`) failed once
+and passed on retry; both are pre-existing and untouched by this change. One intermittent failure of
+`citation_reported_lines_match_committed_file` during a suite run was traced to a reviewer's concurrent
+break-the-code experiment — its `left: 57 right: 31` is the exact signature of that reverted table anchor
+— and the target passed 3/3 on a quiet tree afterwards.
+
+**Closed:** 2026-09-01 (UTC).
