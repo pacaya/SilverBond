@@ -7,3 +7,4 @@
 - ADR-260815-2009-03 · Script input indirection: no templating into source, exit-code-only success · accepted
 - ADR-260815-2009-04 · Model/CLI routing via allow-listed named profiles · accepted
 - ADR-260815-2009-05 · Cursor-local variable writes; cross-branch data only through collectors · accepted
+- ADR-260902-0312-01 · Test tiers: tests assert behavior, never elapsed time · accepted

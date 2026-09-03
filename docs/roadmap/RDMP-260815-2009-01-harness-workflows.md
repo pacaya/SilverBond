@@ -70,11 +70,12 @@ Residuals filed 2026-09-01 and owned outside this epic: ISSUE-260901-0216-01 (ci
 the schema document's hand-written sections — positional citations become symbolic, per a maintainer
 decision recorded on the record), ISSUE-260901-0216-04 (the
 per-node canvas state map undocumented), ISSUE-260901-0216-06 (the tagged node-kind enum missing
-from the backend module reference), ISSUE-260901-0216-05 (the CI job this epic added has still
-never run). ISSUE-260901-0216-02 is fallout from this epic's validation change.
-ISSUE-260901-0216-03 preserves three second-hand sightings of intermittent test failures and sits
-at needs-triage — its first diagnosis was falsified at the readiness gate and no mechanism has
-been reproduced.
+from the backend module reference), ISSUE-260901-0216-05 (the CI job this epic added has since
+been pushed and has almost certainly run; what is owed is reading its result). ISSUE-260901-0216-02 is fallout from this epic's validation change.
+ISSUE-260901-0216-03 is closed: the intermittent test failures were reproduced twice under CPU
+load and traced to fixed wall-clock deadlines plus a test seam sitting below the process boundary.
+Remediation is epic-scale and moved to PRD-260902-0301-01, which is engineering infrastructure and
+sits outside this initiative.
 
 Rewrite `docs/workflow-schema.md` and `docs/execution-model.md` from the Rust source: all 14 node kinds, v4 tagged shapes, edges with conditions, subflows, variables, the tmux node family, and run/checkpoint semantics. No engine code changes. This epic establishes the baseline, not a frozen snapshot: every later schema-changing epic owns updating these two documents, and its `CONTEXT.md` terms, for its delta — the terms it owns are those its ADRs name (`grep '(planned' CONTEXT.md` for the outstanding set). Sharpest exclusion: no schema changes are designed here — this documents what exists so later epics diff against truth.
 
