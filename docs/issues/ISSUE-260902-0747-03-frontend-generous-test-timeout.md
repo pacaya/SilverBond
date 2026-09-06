@@ -8,23 +8,6 @@ prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01]
 ---
 
-## Scope note
-
-Amended 2026-09-05. This record stays what it is: a small configuration patch raising the outer
-Vitest per-test timeout, with its existing justification intact.
-
-**It is not a determinism claim, and must not be written as one.** Testing Library's
-`asyncUtilTimeout` is a separate deadline defaulting to 1000ms, consumed by `waitFor` and the
-`findBy*` queries, and `ui/src/test/setup.ts` does not override it — so raising the Vitest timeout
-leaves the convergence-wait budgets in the same test untouched
-(`ui/src/features/editor/InspectorPanel.test.ts:145`, `:150`). Reconciling that nested wait policy is
-`ISSUE-260905-2136-04` and is deliberately not in this patch.
-
-Two consequences for the wording of this record: state that it buys resilience headroom rather than
-determinism, and drop any claim that the frontend suite is uniformly deterministic under fake timers.
-It is not — the pane-stream timing-policy tests use fake timers; this InspectorPanel test uses real
-Testing Library waits.
-
 ## Agent Brief
 
 **Category:** bug
@@ -38,7 +21,9 @@ The vitest configuration sets no `testTimeout`, so every frontend test runs agai
 default of the installed vitest version. That default is the cap recorded frontend load failures have
 exceeded. The suite is not uniformly fast under contention, and a test that passes comfortably on an
 idle machine can exceed the implicit default when the machine is loaded — a false red about the
-runner rather than about the code, which is the defect `PRD-260902-0301-01` exists to remove.
+runner rather than about the code. This buys resilience headroom, not determinism: a larger budget
+makes a loaded machine less likely to close the margin, and changes nothing about what a test
+observes.
 
 The suite carries per-test timeout overrides, added ad hoc when a test was observed to exceed the
 implicit default. State no count for them and do not assume there is more than one — derive the set
@@ -92,6 +77,9 @@ existing deterministic timing-policy tests. It must not.
 **Key interfaces:**
 - The `test` block of the vitest configuration — the `testTimeout` field, alongside the existing
   `environment`, `setupFiles`, `css` and `exclude` settings.
+- `hookTimeout` in the same block. It defaults to 10000 ms, so once `testTimeout` exceeds that the
+  hook budget becomes the tighter ceiling and a test with a slow `beforeEach` fails below the floor
+  this record establishes. Raise it to at least the same value, so one number governs.
 - Every per-test timeout override in the frontend suite, as the reconciliation set.
 
 **Acceptance criteria:**
@@ -114,13 +102,18 @@ existing deterministic timing-policy tests. It must not.
       at `just test-ui`.
 
 **Out of scope:**
-- Any restructuring of the frontend tests. The frontend already asserts timing policy
-  deterministically under fake timers; `PRD-260902-0301-01` § Out of Scope keeps its tests
-  unreorganized by this epic.
+- Any restructuring of the frontend tests. `PRD-260902-0301-01` § Out of Scope keeps them
+  unreorganized by this epic. The suite is not uniformly under fake timers — the pane-stream client
+  and validation suites use them, `InspectorPanel.test.ts` uses real Testing Library waits — so do not
+  treat "the frontend is already deterministic" as a premise for any decision here.
 - Adding new per-test timeout overrides. Reconciling the existing ones is in scope; minting more is
   not — a test that needs its own budget after this change is evidence for a different record.
 - The Rust suite's tiers and timing rules, which are `ISSUE-260902-0747-01` and its siblings.
 - Playwright e2e tests.
+- Testing Library's `asyncUtilTimeout`, the separate 1000 ms budget consumed by `waitFor` and the
+  `findBy*` queries and not overridden in `ui/src/test/setup.ts`. Raising `testTimeout` does not move
+  it, so a convergence wait inside a test keeps its own deadline. Reconciling that nested policy is
+  `ISSUE-260905-2136-04`.
 
 ## Triage Notes
 
@@ -178,7 +171,7 @@ Every gap `fine` or an explicit delegation; class 6 does not fire; 52 class-7 su
 The round-1 class-1 defect is discharged: the >10790 ms floor and its source are now carried by `PRD-260902-0301-01` § Implementation Decisions, so the brief's citation resolves.
 
 Non-blocking notes, recorded rather than acted on:
-- "Two lower observations exist" is not exhaustive — the same source line records a third, 7.3s at a 20s budget. It sits below the floor and changes nothing.
+- "Lower observations exist" is not exhaustive — the same source line records a third, 7.3s at a 20s budget. It sits below the floor and changes nothing.
 - The two-suite fake-timer preservation set is correct but uncited; a reader running `rg -l useFakeTimers` finds three files and cannot see why `AppShell.runActions` is excluded. `ISSUE-260901-0216-03` § Timing-site audit is the authority.
 - `hookTimeout` stays at its 10000 ms default by design and becomes the tighter budget once `testTimeout` exceeds it.
 

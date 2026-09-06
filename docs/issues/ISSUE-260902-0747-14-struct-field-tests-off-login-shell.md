@@ -22,8 +22,8 @@ and are not meant to be read against today's tree.
 **Provenance.** This record was split out of `ISSUE-260902-0747-04` by maintainer decision
 2026-09-02, on the gate's class 6 prong (b): its batch shares no test function with either batch that
 remains there, is green or red on its own, and its acceptance is two `rg` commands plus one
-default-command report. `-04` keeps the socket-isolation and honest-absence batches, which do share
-their test functions with each other.
+default-command report. `-04` keeps the socket-isolation batch; the honest-absence
+work is its own record.
 
 **Current behavior:**
 Some tests assert nothing but pure fields of the constructed tmux invocation — the socket, the command
@@ -56,8 +56,11 @@ interactive login shell remains the accepted production behavior; the defect is 
 went through that path, not that the path is wrong.
 
 **Key interfaces:**
-- The resolving and non-resolving tmux invocation constructors — no signature change on either. The
-  moving tests change which one they call, nothing more.
+- The resolving and non-resolving tmux invocation constructors — no signature change on either.
+- The Integration Tier marker on the five moving tests. `ISSUE-260902-0747-01` installs it, correctly:
+  at its baseline these tests spawn a process, and it refuses to leave a rule-failing test unmarked on
+  the promise of a later record. This record is that later record, and removing the marker is the act
+  that puts them in the gate. Nothing else about them changes: same fields, same expected values.
 
 **Acceptance criteria:**
 - [ ] `rg -n 'build_tmux_invocation\(' src/tmux_exec.rs` returns only the resolving constructor's own
@@ -65,19 +68,28 @@ went through that path, not that the path is wrong.
 - [ ] `rg -n 'build_tmux_invocation\(' src/api.rs` returns only the production node-preview call site.
       A test call site is present before this change.
 - [ ] Every moved test asserts the same fields with the same expected values as before. This record
-      changes which constructor a test calls; it changes no assertion. Any test that cannot move
-      without weakening an assertion is left where it is and named, with the reason.
+      changes which constructor a test calls and removes the marker that change earns; it changes no
+      assertion. Any test that cannot move without weakening an assertion is left where it is and
+      named, with the reason.
+- [ ] No moved test carries the Integration Tier marker after this change, and each carried it before.
 - [ ] The moved tests are executed by the default command after this change and were not before it.
       Read this from what the command reports it executed, not from `cargo test -- --list`, which
-      enumerates `#[ignore]`d tests and so cannot witness an exclusion.
-- [ ] The full Rust suite is green before and after this change, with the same set of passing tests.
+      enumerates `#[ignore]`d tests and so cannot distinguish a test it executed from one it listed
+      and skipped.
+- [ ] Both tier commands are run, and the union of what they execute holds the same set of passing
+      tests before and after this change. Name them explicitly — the default command for the Logic Tier
+      and the opt-in switch for the Integration Tier, both introduced by `ISSUE-260902-0747-01` — since
+      after the split no single command runs every Rust test. The five moved tests migrate from the
+      second command's set to the first's; this criterion asserts nothing was dropped in that move.
+      It does **not** assert a green gate: the gate is expected red between `ISSUE-260902-0747-01` and
+      `ISSUE-260902-0747-11`, so compare passing sets, not exit codes.
 
 **Out of scope:**
 - Any change to production tmux binary resolution. `ADR-260622-0208-01` is respected, not revisited.
 - The real-tmux guard tests, their socket isolation, and the honest-absence encoding —
   `ISSUE-260902-0747-04`.
-- Consolidating fake-process fixtures — `ISSUE-260902-0747-02`. These tests drive neither a fake nor
-  the real binary after this change; they construct a struct.
+- Consolidating fake-process fixtures — `ISSUE-260902-0747-02`, deferred. These tests drive neither a
+  fake nor the real binary after this change; they construct a struct, so nothing here waits on it.
 
 ## Triage Notes
 

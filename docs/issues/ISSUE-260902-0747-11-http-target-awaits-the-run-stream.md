@@ -84,10 +84,12 @@ rg -n 'RuntimeContext::new|"agent": "echo"|kind.*task' tests/http_api.rs
 No **Logic Tier** test in the HTTP target waits on the clock to observe a run, **and none of them
 spawns a process.** The qualifier is load-bearing and is not a hedge: membership is per test, and
 `test_node_accepts_v3_task_node` stays in this file as an Integration Tier test that spawns by design.
-A criterion or a claim phrased over "the target" rather than over its Logic Tier members is wrong —
-the PRD says so in terms — and this record's earlier draft was phrased that way in three places. Each awaits the run's event stream — a happens-before edge that cannot be starved into a
-false failure — the polling helper and the unconditional sleeps are both gone, and no run started by
-this target reaches the node runner at all.
+A criterion or a claim phrased over "the target" rather than over its Logic Tier members is wrong;
+`PRD-260902-0301-01` § Implementation Decisions says so in terms.
+
+Each Logic Tier member awaits the run's event stream — a happens-before edge that cannot be starved
+into a false failure. The polling helper and the unconditional sleeps are both gone, and no run
+started by this target reaches the node runner at all.
 
 *The fixture stops executing tasks.* These tests need a run in a terminal state and its stream token;
 they do not need a task to execute. An approval-only workflow — a single `approval` node with no
@@ -125,8 +127,13 @@ the earlier checkpoint.
 So: for each converted assertion, name the event you await and confirm it is emitted after the state
 you read. Where no such event exists, keep the persisted-state assertion and await a terminal event
 that does carry the ordering, rather than weakening the assertion to "two notifications arrived".
-Reported 2026-09-05; the general form of this problem belongs to `ISSUE-260902-0747-05` (deferred). The run creation-and-approval test moves to the router helper that returns the database
-handle, so it has something to await instead of a sleep.
+The general form of this problem belongs to `ISSUE-260902-0747-05`, which is deferred; handle it
+per-assertion here.
+
+`creates_and_approves_runs` replaces both of its sleeps with awaits on the run stream. It does **not**
+move to the router helper that returns the database handle: it asserts on endpoint responses
+(`/api/interrupted-runs`, `/api/logs`), not on persisted state, so it needs no handle, and taking one
+would reintroduce the polling shape this record deletes.
 
 *Deletion, not softening.* The polling helper is removed rather than given a longer deadline.
 Raising a deadline is rejected on evidence and no stopgap is taken. A test that still needs a failure
@@ -139,12 +146,11 @@ re-introducing it under a longer bound does not satisfy this record.
 
 *Tier.* The HTTP endpoint tests are **Logic Tier** tests: the unit is a use case reached
 at its API boundary, the per-test temporary-directory store is controlled data, and after this change
-no clock **ends a wait**. That is the tier's criterion, and it is the accurate claim. Clocks are still
-read on this path — `start_run` mints a time-ordered run id (`src/runtime.rs:1408`) and checkpoint
-persistence stamps `now_iso()` (`src/runtime.rs:7014`) — and both are permitted: a stamp written as
-data gates no control flow, and the run id is not load-bearing identity under the narrowed rule
-(`ADR-260902-0312-01`, amended 2026-09-05). Do not restate this as "no clock is read"; that was the
-earlier wording and it was false. They are in the gate, and they were never taken out of it: `ISSUE-260902-0747-01`
+no clock **ends a wait** — which is the tier's criterion. Clocks are still read on this path:
+`start_run` mints a time-ordered run id (`src/runtime.rs:1408`) and checkpoint persistence stamps
+`now_iso()` (`src/runtime.rs:7014`). Both are permitted — a stamp written as data gates no control
+flow, and the run id is not load-bearing identity under `ADR-260902-0312-01`. The claim this record
+makes is about waits, not about clock reads. They are in the gate, and they were never taken out of it: `ISSUE-260902-0747-01`
 leaves **the reproduction's tests** unmarked as its one named exception, because marking them would
 have carried the reproduced failure out of the gate. The exception is over tests, not over the target
 — `-01` is explicit about that, and it marks `test_node_accepts_v3_task_node` in this same file by the
@@ -176,28 +182,29 @@ not depend on the build-profile timeout shims; their production budgets would ap
       terminal state, and still receives the run's earlier events. This is the property that makes
       the conversion race-free, and it is asserted rather than assumed. Observable at the run stream
       endpoint.
-- [ ] **No run started by this target reaches the node runner.** A test that starts a run and drives
-      it to a terminal state does so through a node kind the runtime does not dispatch to a runner, so
-      no pane is created. Witness it with a control that is **produced mechanically from the tree**,
-      not by an ambient environment change an operator has to remember to make: point the target's tmux
-      binary resolution at a path that does not exist, or otherwise make a spawn attempt fail loudly,
-      as a committed variant of the test configuration. The target's Logic Tier members pass under it.
+- [ ] **No run started by this target reaches the node runner.** Every test that starts a run drives it
+      to a terminal state through a node kind the runtime does not dispatch to a runner, so no pane is
+      created.
 
-      **Order the two halves, or the control proves nothing.** Replacing the tolerant terminal helper
-      comes *first*: today the shared fixture accepts `Completed`, `Failed` **or** `Aborted`, so a
-      broken tmux path terminalizes the run instantly and the members already pass under this control
-      before any of this record's work is done. Stated as "they do not pass before this change" the
-      claim is simply false, and the control cannot tell the two states apart. Once the helper asserts
-      the state it actually wants, the control separates them: before the conversion the members fail
-      under it, after the conversion they pass.
+      Witness this **structurally, from the fixture**, not by breaking tmux resolution. Assert that
+      every workflow the target builds contains no runner-kind node — `is_runner_node_kind`
+      (`src/runtime.rs`) is the predicate, and the assertion runs over the fixtures the target
+      actually constructs. A fixture that grows a runner-kind node fails the assertion, which is the
+      red this criterion needs.
 
-      **The control also carries its own acted-on witness**, in the same run and through the same
-      seam: the same committed variant makes `test_node_accepts_v3_task_node` fail, loudly and by a
-      signal naming the unresolvable binary. Without that half, a variant wired to neither resolution
-      path — the run path takes its invocation from the runtime context, the preview path resolves
-      independently — produces exactly the green this criterion would otherwise accept. Scope the
-      *passing* assertion to the Logic Tier members and the *failing* assertion to that one test;
-      asserting the whole target passes is wrong and would stay red however much work was done.
+      **Do not witness it by pointing tmux resolution at a bad path.** The two paths in this target
+      do not share a resolution seam: a run built by `RuntimeContext::new` carries
+      `run_invocation: None`, no workflow here sets `runAs`, so the invocation is the hardcoded
+      literal in `run_scoped_tmux_invocation` and `resolve_tmux_bin` is never reached; the preview
+      endpoint calls `build_tmux_invocation` directly. One control therefore cannot redden both, and
+      `resolve_tmux_bin` swallows a resolution failure back to the literal `"tmux"` anyway, so the
+      signal would not name the configured path. Adding a knob that joins the two paths is **not
+      authorized here** — this record adds no new production surface.
+
+      **Order the two halves.** Replacing the tolerant terminal helper comes *first*: the shared
+      fixture today accepts `Completed`, `Failed` **or** `Aborted`, so a run that dies for any reason
+      reads as terminal and the structural assertion is the only thing that can distinguish a
+      converted fixture from a broken one.
 - [ ] The HTTP endpoint tests **that this record converts** are executed by the default command and
       carry no Integration Tier marker, **because they satisfy the tier rule on both halves** — no
       clock wait and no spawned process. `test_node_accepts_v3_task_node` is excluded by name: it

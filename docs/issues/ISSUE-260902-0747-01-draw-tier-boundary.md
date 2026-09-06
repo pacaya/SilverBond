@@ -63,11 +63,9 @@ silently in the gate. `ISSUE-260902-0747-10` is what keeps that default honest.
 *Mark against today's tree.* Assign each test by what it isolates **as it is written now**. Do not leave
 a test unmarked on the grounds that some later record will make it deterministic.
 
-Expect the Integration Tier to be **large, and to stay large**. The epic was narrowed on 2026-09-05 and
-the seam work that would have promoted these tests is deferred (`ISSUE-260902-0747-05` through `-08`,
-`-02`, `-09`, `-12`, `-13`). What they would have repaired is retained debt under `ADR-260902-0312-01`
-§ Retained debt. A large Integration Tier is the expected outcome here, not a defect and not a
-trajectory to anticipate.
+Expect the Integration Tier to be **large, and to stay large**. No slice in this epic promotes tests out
+of it; what would have is retained debt under `ADR-260902-0312-01` § Retained debt. A large Integration
+Tier is the correct outcome here, not a defect and not a trajectory to anticipate.
 
 *Three test sets this slice owns.* Each is a marking, not a seam change:
 
@@ -90,12 +88,11 @@ trajectory to anticipate.
 and that a large valid workflow produces no error issues. The second is clock-free logic and is Logic
 Tier by the ordinary rule — separate it into its own test that stays in the gate.
 
-The timing half has nowhere built to go. The **Performance Check** category is defined in
-`ADR-260902-0312-01` but is **not built** by the narrowed epic (`PRD-260902-0301-01` § Out of Scope), so
-this record adds no third selector and no third marker. Leave the timing assertion in place marked
-`#[ignore]`, with a comment naming `ISSUE-260905-2136-05` as the record that owns deciding its fate.
-Do not mark it Integration Tier — that would make a tier mean "non-gating" rather than a statement about
-what a test isolates.
+**Delete the timing assertion.** The `BUDGET` constant and the `elapsed < BUDGET` assertion go; the
+correctness half stays in the gate. This record adds no third selector and no third marker, and leaves
+no `#[ignore]`d remnant. Do not mark the timing half Integration Tier — its subject is elapsed time, not
+infrastructure — and do not leave it unmarked, which would put an elapsed-time assertion in the Logic
+Tier and make the tier rule false on the tree it governs.
 
 *One exception, named and temporary.* Membership is per test, so this exception is over tests, not over
 the target. In `tests/http_api.rs`, the tests whose Logic Tier violations `ISSUE-260902-0747-11` repairs
@@ -118,9 +115,9 @@ closing record. No second exception is authorized: a test that appears to need o
 maintainer, not a judgment call for the implementer. Expect the gate to stay red between this issue and
 `-11`; that is the correct signal.
 
-*Selector.* The mechanism is the implementer's finding, subject to five constraints. The first three are
+*Selector.* The mechanism is the implementer's finding, subject to five constraints. The first four are
 from `PRD-260902-0301-01` § Implementation Decisions ("The selector is a constraint here, not a
-mechanism") and restated in `ADR-260902-0312-01`; the last two are this record's:
+mechanism") and restated in `ADR-260902-0312-01`; the last is this record's:
 
 - A bare `cargo test` runs the Logic Tier and nothing else. The gating command is the habitual one.
 - The exclusion operates **per test, not per target**. It must reach an individual Integration Tier test
@@ -143,9 +140,10 @@ without `cfg(test)` and those shims silently resolve to their production budgets
 
 *Commands.* `test-rust` keeps invoking the default command and becomes the Logic Tier gate with no edit
 to its body. A sibling recipe `test-integration` runs the Integration Tier via the opt-in switch.
-`test-under-load` is already tracked (committed 2026-09-05); this record **owns, verifies and hardens
-it** — it does not create it. Its body needs no change for the tier split, because narrowing the default
-narrows what it measures; it does need the argument hardening in the criteria below.
+`test-under-load` is tracked; this record **owns and verifies it** rather than creating it. Its body
+needs no change for the tier split, because narrowing the default narrows what it measures. It does need
+one hardening: it accepts a non-positive repetition count and reports success, which is a green
+acceptance run that measured nothing.
 
 *CI.* The Rust workflow carries two jobs: a **gating** job running the Logic Tier via the default
 command, and a **separate, non-gating** job running the Integration Tier via the switch, so a red
@@ -203,22 +201,29 @@ the tier and timing rules — a pointer, not a copy.
       red at baseline; the second half is the acted-on witness that a selector excluding everything
       cannot satisfy. `cargo test -- --list` is not an acceptable observable — it enumerates
       `#[ignore]`d tests and cannot distinguish "excluded" from "listed but skipped".
-- [ ] `validate_workflow_many_calls_against_large_subflow_within_budget` (`src/model.rs:6631`) is split:
-      a test asserting only that a large valid workflow produces no error issues is executed by the
-      default command, and a test carrying only the fifteen-second budget assertion is `#[ignore]`d and
-      executed by neither the default command nor the Integration Tier switch. That test's comment names
-      `ISSUE-260905-2136-05`. Before this change one test carries both assertions and the default
-      command executes it.
+- [ ] `validate_workflow_many_calls_against_large_subflow_within_budget` (`src/model.rs:6631`) is split
+      and its timing half deleted: a test asserting only that a large valid workflow produces no error
+      issues is executed by the default command, and `rg -n 'BUDGET|elapsed' src/model.rs` returns no
+      duration budget or elapsed-time assertion in that test's module. Before this change one test
+      carries both assertions and the default command executes it, and `BUDGET` is present at
+      `src/model.rs:6636`.
+- [ ] No `#[ignore]`d test remains in the tree other than the docs-regeneration maintenance writer.
+      `rg -n -B2 '#\[ignore' src/ tests/` returns exactly one site, `tests/docs_catalog.rs`. Before this
+      change the same command returns that one site, so this criterion is a preservation guard against
+      the split leaving a remnant, not a change witness.
 - [ ] The application-host startup test, the self-exec child fixtures, and
       `writer_progresses_while_a_read_connection_is_checked_out` each carry a recorded tier decision.
       The self-exec pair passes when the Integration Tier is run through its switch — the `--exact`
       re-invocation still resolves the child — which is the case that falsifies a selector excluding
       marked tests from the child's own invocation.
 - [ ] The default command does not execute the pane-stream FIFO tests, the storage permission and
-      migration tests, or the process-group termination test — the Integration Tier module behaviors
-      named in `PRD-260902-0301-01` § Testing Decisions, "Modules tested, by tier". It does execute the
-      generated-catalog staleness check, the shipped-template validation, the HTTP endpoint round-trips,
-      and the storage tests that assert this repository's own persistence logic against a per-test store.
+      migration tests, or the process-group termination test — the groups the selector must reach per
+      `PRD-260902-0301-01` § Implementation Decisions, "The selector is a constraint here, not a
+      mechanism", and `ADR-260902-0312-01` § "The selector is left to the implementation". It does
+      execute the generated-catalog staleness check, the shipped-template validation, and the storage
+      tests that assert this repository's own persistence logic against a per-test store. For
+      `tests/http_api.rs` state the outcome **per test**, not as a group: the tests the exception covers
+      are executed, and `test_node_accepts_v3_task_node` is not.
 - [ ] `rg -n 'Logic Tier' docs/testing.md` returns the tier section introduced by this change; no
       matches before it.
 - [ ] `rg -n 'ADR-260902-0312-01' CLAUDE.md` returns the pointer introduced by this change; no matches
@@ -229,14 +234,23 @@ the tier and timing rules — a pointer, not a copy.
 - [ ] `rg -n '^test-integration' justfile` returns the recipe introduced by this change; no matches
       before it.
 - [ ] `git show HEAD:justfile | rg -n '^test-under-load'` returns the recipe. This is a **precondition to
-      verify, not work to do** — it has been tracked since 2026-09-05. If it does not hold, stop and
-      report rather than re-adding the recipe.
-- [ ] The recipe rejects a non-positive repetition count instead of reporting success. `just
-      test-under-load 0` exits non-zero after this change; before it the loop body never runs and the
-      recipe reports zero failures.
+      verify, not work to do**. If it does not hold, stop and report rather than re-adding the recipe.
+- [ ] The recipe rejects a non-positive repetition count, identified by a diagnostic unique to that
+      rejection rather than by exit status. `just test-under-load 0` prints a message naming the
+      invalid argument and its value on stderr, and runs no test; `rg` for that message's fixed text
+      returns only the recipe. Exit status alone does not discharge this criterion — the recipe runs the
+      suite, which is expected red between this issue and `ISSUE-260902-0747-11`, so a non-zero exit is
+      the ordinary state and cannot distinguish a rejected argument from a failing test.
+
+      Derive the pre-change behavior on the machine you are running, rather than assuming it: `seq 1 0`
+      returns nothing under GNU coreutils and counts **down** under the BSD `seq` on darwin, so the
+      unhardened recipe silently runs the suite zero times on one platform and twice on the other.
+      Neither is a rejection, and the criterion is satisfied only when both platforms reject.
 - [ ] The recipe **verifies the load it claims to apply**: after starting its workers it confirms each
       is alive, exits non-zero if fewer are running than were requested, and reports the count actually
-      established alongside the count requested.
+      established alongside the count requested. This is a **precondition to verify, not work to do** —
+      `git show HEAD:justfile | rg -n 'only \$alive are running'` returns the check. If it does not hold,
+      stop and report rather than reimplementing it.
 - [ ] Running the Integration Tier through the opt-in switch does not execute the docs-regeneration
       maintenance writer, and the `regen-docs` recipe still regenerates the catalog blocks without the
       switch.
@@ -252,8 +266,9 @@ the tier and timing rules — a pointer, not a copy.
   `just test-under-load` is expected to stay red after this issue lands. Regression acceptance for that
   failure binds to `ISSUE-260902-0747-11`; the epic's **closing** acceptance binds to
   `ISSUE-260902-0747-10`.
-- **Building the Performance Check.** No third selector, no third marker, one `#[ignore]`d assertion.
-  Owned by `ISSUE-260905-2136-05`.
+- **Building the Performance Check.** No third selector and no third marker. The one assertion that
+  would have been its member is deleted here rather than parked; whether SilverBond wants a
+  performance-testing practice at all is `ISSUE-260905-2136-05`.
 - The mechanical enforcement check for the tier rule — `ISSUE-260902-0747-10`, sequenced last because
   the tier assignments must settle before a check can read them.
 - Rewriting the testing document's stale claims about the HTTP suite's transport and its test-case

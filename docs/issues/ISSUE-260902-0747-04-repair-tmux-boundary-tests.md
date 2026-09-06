@@ -3,7 +3,7 @@ id: ISSUE-260902-0747-04
 kind: issue
 category: bug
 status: needs-info
-summary: Every external-dependency guard in the Rust suite reports a pass when its dependency is absent, and the real-tmux guard tests additionally run on the user's default socket where they can collide with a developer's live sessions
+summary: The real-tmux guard tests create long-lived sessions on the user's default socket, where they can collide with a developer's live sessions and leave residue on a shared runner
 prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01, ADR-260622-0208-01]
 terms: [Integration Tier]
@@ -13,7 +13,7 @@ blocked_by: [ISSUE-260902-0747-01]
 ## Agent Brief
 
 **Category:** bug
-**Summary:** Isolate the real-tmux guard tests on a dedicated socket, and stop a missing external dependency reading as success anywhere in the Rust suite.
+**Summary:** Run the real-tmux guard tests against a socket dedicated to the test run, and assert they leave nothing on it.
 
 > The record's filename says "tmux boundary" for historical reasons. Its scope is wider: **every**
 > guard in the Rust suite that returns early when an external dependency is absent, wherever it lives.
@@ -22,81 +22,34 @@ blocked_by: [ISSUE-260902-0747-01]
 against the tree **after** the tier selector exists. The tier assertions in the acceptance criteria
 are unobservable before that and are not meant to be read against today's tree.
 
-**Scope note.** The vacuous-skip half of this record covers every external-dependency guard in the
-suite, not only tmux's. That scope is authorized upstream by `PRD-260902-0301-01`
-§ Implementation Decisions, "a missing external dependency must not read as success", which states
-the constraint over the genus precisely because the encoding is one decision rather than one per
-dependency. This record names no count of the guards; derive the set yourself with the discovery
-command below and read each hit.
-
-**Bounded 2026-09-05.** Deriving the set stays as written — a runnable predicate outlives any list.
-What is bounded is the *work per hit*: choose the encoding once, then apply it mechanically to every
-hit. A guard that resists the shared encoding — because deciding whether its dependency is "expected"
-needs a judgement this slice has no basis to make — is **recorded on this record and left alone**,
-not resolved here. The slice is done when every hit either carries the encoding or carries a one-line
-note saying why it could not.
-
-This keeps a suite-wide sweep from becoming a suite-wide redesign. The epic was narrowed on
-2026-09-05 to the reproduced failure plus the tier rule; this record stayed in scope because a test
-that reports green without running defeats the rule, not because the sweep is cheap.
-
 **Current behavior:**
-Three defects, two of them at the tmux boundary.
+The guard tests are unisolated. Several tests construct this repository's `SessionGuard` and
+`PaneGuard` and assert its RAII cleanup policy — which guard kills what on drop, and what `disarm`
+suppresses — by creating real, long-lived tmux sessions. They create them on the **user's default
+socket**, so they can collide with a developer's live sessions and leave long-sleeping session residue
+on a shared runner. Nothing pins a socket: each tmux command runs against whatever socket the
+environment supplies.
 
-*The guard tests are unisolated and vacuously green.* Several tests construct this repository's
-`SessionGuard` and `PaneGuard` and assert its RAII cleanup policy — which guard kills what on drop,
-and what `disarm` suppresses — by creating real, long-lived tmux sessions. They create them on the
-**user's default socket**, so they can collide with a developer's live sessions and leave long-sleeping
-session residue on a shared runner. Each begins by consulting an availability probe and returning
-early when it is false, so a skipped test is reported as a pass. The probe itself is weaker than it
-looks: it asks whether a `list-sessions` invocation *ran*, not whether it succeeded — the sibling
-session-existence helper has to add an explicit exit-code check, which is the tell — so
-it amounts to "is the tmux binary spawnable", and only an absent binary takes the early return.
-
-*The same vacuous-skip defect sits on guards that are not tmux's.* Further tests in the suite return
-early when a dependency is missing and are therefore reported as passing on any machine lacking it.
-One guards an interactive-shell dependency through a shell-availability probe, in the same module as
-the tmux guards; it is a single guard, not a family. Another, in the HTTP module, guards a pane-stream
-FIFO test on a combination of root privileges, `sudo`, and a system account; it prints a diagnostic line before returning, which is
-better than silence but still reports a pass. They are the same defect as the tmux guards', and they
-are in scope here because the encoding decision below is **one** decision, not one per dependency.
-
-Discovery command for the genus — an early return whose condition tests for an external dependency.
-It over-returns slightly, so read each hit rather than treating the set as closed:
-
-```
-rg -n -B4 '^\s+return;\s*$' src/ | rg 'available\(\)|geteuid|is_ok_and'
-```
+These same tests also report a pass when tmux is absent. That defect belongs to
+`ISSUE-260902-0747-15` and is untouched here; this record changes only which socket they address.
 
 **Desired behavior:**
 
-*Guard tests, isolated.* The guard tests run against a tmux socket dedicated to the test run
-rather than the user's default, so they cannot see or disturb a developer's live sessions and leave
-nothing behind on a shared runner. They obtain it through a single named helper —
-`guard_test_socket` — rather than each test naming a socket itself, and every tmux command they issue
-goes through it. Session residue is cleaned up on the way out even when an assertion fails.
+*Guard tests, isolated.* Each guard test runs against its own tmux socket rather than the user's
+default, so it cannot see or disturb a developer's live sessions and leaves nothing behind on a shared
+runner. Tests obtain the socket through a single named helper — `guard_test_socket` — rather than each
+naming one itself, and every tmux command they issue goes through it. Session residue is cleaned up on
+the way out even when an assertion fails.
+
+**Per test, not per run.** A single run-scoped socket is the obvious shape and it does not work: the
+residue assertion has to enumerate that socket, libtest runs these tests in parallel by default, and
+each holds a live `sleep 600` session, so a run-scoped enumeration races its siblings. Per-test
+sockets make the enumeration a local fact.
 
 Residue is asserted on the **dedicated socket only**. Asserting that the user's default socket is
 untouched was considered and dropped: the honest version of that check would have to enumerate a
 developer's live sessions, and the property it protects — the guard tests never address the default
 socket — is already carried by every tmux command going through the one helper.
-
-*Absence never reads as success — for every guarded dependency, not only tmux.* One encoding is
-chosen and applied to every guard the discovery command returns — the tmux guards, the
-interactive-shell guard, and the privilege-guarded FIFO test among them. Applying different encodings per dependency is the outcome to avoid;
-the point of doing them together is that a reader learns the convention once.
-
-Rust's default harness has no dynamic skipped outcome, so "skip loudly" is not directly expressible.
-The honest encoding is the implementer's choice among a static opt-in, a hard failure where the
-dependency is expected, or a reporter that surfaces the condition
-(`ADR-260902-0312-01` § Consequences, "A test that needs a real external dependency gets an isolated
-one, and its absence never reads as success" — the ADR says *dependency*, and the genus matters here:
-root plus `sudo` plus a system account is not a binary). Whichever is chosen, two bounds hold **for every guarded dependency, not only tmux**: a run on a
-machine missing that dependency must not be indistinguishable from a run where the guarded tests were
-exercised and passed; and if the encoding is a failure, its message must name the missing dependency
-specifically, so the condition is distinguishable from a genuine regression in the contract under
-test. If the probe is kept in any
-form, it checks the exit code and not merely that a process ran.
 
 *Tier.* Every guard test is Integration Tier — they spawn processes and touch shared mutable OS
 state. They are **kept and repaired, not deleted**: they assert SilverBond's own cleanup contract, not
@@ -106,61 +59,43 @@ paragraph).
 
 **Key interfaces:**
 - `guard_test_socket` — the new helper pinning the dedicated socket for the guard tests.
-- The availability probe — either removed, or corrected to check the exit code and to make absence
-  observable.
 
 **Acceptance criteria:**
 - [ ] `rg -n 'guard_test_socket' src/tmux_exec.rs` returns the helper and its call sites introduced by
       this change; no matches before it.
-- [ ] `rg -n 'if !tmux_available\(\)' src/tmux_exec.rs` returns no matches; it returns the early-return
-      guard at each guard test before this change.
-- [ ] With the Integration Tier switch on and tmux absent from `PATH`, the guard tests do not report
-      as passed, and the reported outcome names the missing tmux dependency — a signal the passing
-      path never emits. With tmux present they run and pass. Observable at the Integration Tier
-      command introduced by `ISSUE-260902-0747-01`.
-- [ ] The same holds for every other guarded dependency in the suite: with the interactive shell
-      absent, and separately with the privilege/`sudo`/system-account combination unavailable, the
-      guarded tests **do not report as passed**, and the outcome **names the missing dependency on the
-      non-pass path**. Both halves are required and neither alone suffices. A message is not enough on
-      its own: the privilege-guarded FIFO test already prints a line naming its missing dependency on
-      the very path where it reports a pass, so a criterion satisfied by a message is green before the
-      change. A non-pass outcome is not enough on its own either: deleting the guards satisfies it —
-      the unguarded body panics on the absent dependency — while building none of the honest encoding
-      and producing a failure indistinguishable from a real regression. The acted-on complement: with
-      each dependency **present**, the same tests run and pass. The discovery command in Current
-      behavior returns no guard that reports a pass on absence after this change.
+- [ ] Every tmux command the guard tests issue goes through the helper. `rg -n 'tmux' src/tmux_exec.rs`
+      over the guard tests' bodies returns no invocation that names a socket itself or omits one.
+- [ ] Residue on the dedicated socket is asserted by an automated fixture carrying a **positive
+      control**: the same residue check, run against a copy of the guard-test fixture differing in
+      exactly one dimension — a session deliberately left un-dropped — reports residue, while the real
+      run reports none. Without the control the criterion is vacuously green, because a socket that was
+      never created holds no sessions and a run that never happened leaves no residue.
 
-      For the privilege guard specifically, "present" means root plus `sudo` plus the system account,
-      which the CI job does not provide. Satisfy the complement for it wherever that combination is
-      actually available and say where; do not silently treat the complement as discharged by the two
-      dependencies CI does install.
-- [ ] All guarded dependencies use the **same** encoding. A reader can state the convention after
-      reading one of them.
-- [ ] Residue on the dedicated socket is asserted by an automated fixture, and that fixture carries a
-      **positive control**: the same residue check, run against a copy of the guard-test fixture
-      differing in exactly one dimension — a session deliberately left un-dropped — reports residue,
-      while the real run reports none. Without the control the criterion is vacuously green, because a
-      socket that was never created holds no sessions and a run that never happened leaves no residue.
-      The check enumerates sessions on the dedicated socket by name after the run, so it distinguishes
-      "cleaned up" from "never ran".
-- [ ] The guard tests are not executed by the default command after this change. Read this from what
-      the command reports it executed, not from `cargo test -- --list`, which enumerates `#[ignore]`d
-      tests and so cannot witness an exclusion.
+      **Name the seam and bound the race.** The check enumerates sessions on the dedicated socket by
+      name, so it distinguishes "cleaned up" from "never ran". Rust's default harness has no after-all
+      hook, so the enumeration cannot run once for the whole batch: give each guard test its own socket
+      and run the check as that test's own last act, inside the same test function. A single
+      run-scoped socket would put the enumeration in a race with the other guard tests' live
+      `sleep 600` sessions under libtest's default parallelism, and a check that races is not a check.
+      If a per-test socket turns out not to be reachable, say so and stop rather than widening the
+      window.
+- [ ] Session residue is cleaned up on the way out even when an assertion fails. The control above
+      covers the leak direction; this criterion is its complement, witnessed by a variant whose
+      assertion fails before the drop and which still leaves the socket empty.
 
 **Out of scope:**
 - Any change to production tmux binary resolution. `ADR-260622-0208-01` is respected, not revisited.
 - Deleting the guard tests, or moving them upstream to the `tmux-tools` repository. They assert an
   owned contract.
-- The process-group termination test, which is explicitly irreducible and stays as written in the
-  Integration Tier. It is unguarded — it needs no absent-dependency encoding.
-- Changing what any guarded test asserts. This issue changes how absence is reported, not the
-  contract under test.
-- Taking the struct-field tests off the login-shell path — `ISSUE-260902-0747-14`. That batch shares
-  no test function with either batch here, so it was split out by maintainer decision 2026-09-02 on
-  the gate's class 6 prong (b); the no-split decision recorded below stands for the two batches that
-  remain, which do share their four test functions.
-- Consolidating fake-process fixtures — `ISSUE-260902-0747-02`. These tests drive the real binary, not
-  a fake.
+- The process-group termination test, which is irreducible and stays as written in the Integration
+  Tier.
+- Changing what any guard test asserts. This issue changes where their sessions live, not the contract
+  under test.
+- The absent-dependency encoding — `ISSUE-260902-0747-15`. This record leaves every availability probe
+  exactly as it is; a guard that reports a pass on absence still does so after this change.
+- Taking the struct-field tests off the login-shell path — `ISSUE-260902-0747-14`.
+- Consolidating fake-process fixtures — `ISSUE-260902-0747-02`, deferred. These tests drive the real
+  binary, not a fake.
 - The `tmux-tools` tokio unification, tracked by `ISSUE-260902-0445-01` and sequenced after this epic.
 
 ## Triage Notes
@@ -273,3 +208,24 @@ matters where the guard is a privilege combination.
 
 Full round report: `docs/prd/adversary-reports/PRD-260902-0301-01-readiness-gate-260902-briefs-round3.md`.
 Awaiting re-gate.
+
+### Split at round 4 — 2026-09-05
+
+**Readiness gate (cold-reader): FAIL** (round 4)
+
+Class 6 fired on both prongs. Prong (a): the acceptance criteria required a hard failure for the
+root-plus-`sudo`-plus-system-account combination, which no GitHub-hosted runner provides, so the record
+minted an ops decision no artifact authorized. Prong (b): the socket-isolation batch is four RAII guard
+tests in `src/tmux_exec.rs`; the honest-absence work additionally reaches the interactive-shell guard
+and the privilege-guarded FIFO test in `src/api.rs`, sharing no test function with the socket batch —
+the same shape on which `ISSUE-260902-0747-14` was split out at round 3.
+
+The honest-absence half is now `ISSUE-260902-0747-15`, which also carries the maintainer's rule for
+what counts as an *expected* dependency. This record keeps socket isolation only.
+
+Also repaired this round: the residue criterion named no observation seam (round 1 finding, unrepaired
+through round 3) and its enumeration raced sibling tests under a run-scoped socket — both closed by
+moving to per-test sockets and running the check inside each test. AC7 was removed as already satisfied
+at its own baseline: it duplicated `ISSUE-260902-0747-01`'s exclusion criterion and could not go red on
+this record's work. Load-bearing counts in Current behavior were replaced by the discovery command,
+which moved to `-15` with the work it describes.

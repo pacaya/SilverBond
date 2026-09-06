@@ -4,7 +4,7 @@ scale: epic
 stakes: internal
 terms: [Run, Runtime Event, Workflow, Logic Tier, Integration Tier, Performance Check, Port, Double]
 adrs: [ADR-260902-0312-01, ADR-260622-0208-01]
-issues: [ISSUE-260902-0747-01, ISSUE-260902-0747-03, ISSUE-260902-0747-04, ISSUE-260902-0747-10, ISSUE-260902-0747-11, ISSUE-260902-0747-14]
+issues: [ISSUE-260902-0747-01, ISSUE-260902-0747-03, ISSUE-260902-0747-04, ISSUE-260902-0747-10, ISSUE-260902-0747-11, ISSUE-260902-0747-14, ISSUE-260902-0747-15]
 source: grilling 2026-09-02 (conversation-entered); diagnostic evidence ISSUE-260901-0216-03
 ---
 
@@ -769,8 +769,10 @@ invoked an unbounded integration deadline would not have solved the stated probl
 - **Building the Performance Check.** The category stays defined in `ADR-260902-0312-01`; its
   selector switch is not built here. A third category with no scheduled run and no named owner rots,
   which is the same argument this epic uses to refuse hiding the Integration Tier from CI. The
-  large-workflow test's clock-free correctness half is separated out and stays in the gate; the
-  timing assertion waits for an owner.
+  large-workflow test's clock-free correctness half is separated out and stays in the gate, and its
+  timing assertion is deleted rather than parked — an unmarked elapsed-time assertion would be a Logic
+  Tier violation, and an `#[ignore]`d one would not run. Whether this repository wants a
+  performance-testing practice at all is `ISSUE-260905-2136-05`.
 - **Latent flakes found after the plan was written.** The unlock throttle's production clock
   (`ISSUE-260905-2136-01`), ambient registry configuration in driver tests
   (`ISSUE-260905-2136-02`), pane-stream sequencing sleeps (`ISSUE-260905-2136-03`) and the
@@ -836,8 +838,9 @@ during the audit". `run_cursor_task` holds a retry sleep
 of `retry_delay` seconds defaulting to **2**, which no current test reaches: the retry loop's
 attempt count comes from `retry_count`, and no runtime test sets it, so the loop breaks before the
 sleep. The latent cost appears the moment a test sets `retry_count` while leaving `retry_delay`
-unset — setting a delay is what would *avoid* the default, not what triggers it. And `creates_and_approves_runs` uses two unconditional sleeps only because
-its router helper discards the database handle, leaving it nothing to await.
+unset — setting a delay is what would *avoid* the default, not what triggers it. And `creates_and_approves_runs` uses two unconditional sleeps
+only because nothing in the target awaits the run stream; the stream is what it should await, not a
+database handle, which would reintroduce polling in a new place.
 
 `ISSUE-260901-0216-05` — reading the result of the CI job's run on the pushed branch — is not blocked by
 this epic and does not block it, but the two interact. The first CI run has an elevated chance of

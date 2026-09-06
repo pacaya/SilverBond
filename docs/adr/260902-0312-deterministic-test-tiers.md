@@ -258,9 +258,10 @@ a permitted exception, and may not be cited as precedent for writing a new one.
   `ISSUE-260905-2136-03`.
 - **Production clock reached from tests that contain no timing construct.** The unlock throttle's
   five-second window (`src/app.rs:129`, `:150`). Owner: `ISSUE-260905-2136-01`. This is the known
-  counterexample to mechanical enforcement: § Enforcement is scoped, or advisory anticipated that a
-  check conditioned on the tier boundary cannot see every violation, and this is the property that
-  defeats it. The checker ships against test sources; call-path isolation stays a review obligation.
+  counterexample to mechanical enforcement, and it is a limit on the check's **coverage**, not on tier
+  decidability — § Enforcement is scoped, or advisory governs the latter and its advisory branch is not
+  triggered by this. The checker ships against test sources; call-path isolation stays a review
+  obligation stated alongside it.
 - **Ambient configuration reaching driver capability tests** through a process-global registry cache
   (`src/driver.rs:727`, `:1837`). Owner: `ISSUE-260905-2136-02`. Same class as the item above —
   isolation broken below the test body, invisible to a source scan.
@@ -279,9 +280,9 @@ The Performance Check stays defined above and is **not built in this pass**. Its
 switch is apparatus the narrowed epic does not need, and a category with no scheduled run and no
 named owner is a test that rots — the same argument this decision uses to refuse hiding the
 Integration Tier from CI. Where the large-workflow test asserts a clock-free correctness property,
-that property is separated out and stays in the gate; the timing assertion is left `#[ignore]`d and
-waits for someone willing to own running it. Owner for that decision: `ISSUE-260905-2136-05`, which
-records the three live options including deleting the assertion outright. An ignored test does not
-run and will rot — that is the cost of not building the category, and it is named rather than hidden.
+that property is separated out and stays in the gate; the timing assertion is **deleted** rather than
+parked, because an unrun test is not a guard and an unmarked one would put an elapsed-time assertion in
+the Logic Tier. `ISSUE-260902-0747-01` performs the deletion. Whether this repository wants a
+performance-testing practice at all is left open at `ISSUE-260905-2136-05`.
 
 Delivery is tracked by `PRD-260902-0301-01`.

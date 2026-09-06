@@ -7,7 +7,7 @@ summary: The tier rule survives only as prose, so a hurried afternoon can put a 
 prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01]
 terms: [Logic Tier, Integration Tier]
-blocked_by: [ISSUE-260902-0747-01, ISSUE-260902-0747-04, ISSUE-260902-0747-11, ISSUE-260902-0747-14]
+blocked_by: [ISSUE-260902-0747-01, ISSUE-260902-0747-04, ISSUE-260902-0747-11, ISSUE-260902-0747-14, ISSUE-260902-0747-15]
 ---
 
 ## Agent Brief
@@ -27,19 +27,13 @@ before review rather than after.
 *Scoped to the tier, never repository-wide.* A repository-wide search for durations would flag exactly
 the load-bearing sites this epic exists to protect — the Integration Tier's deliberate temporal
 assertions. The check is therefore conditioned on the tier boundary: it inspects Logic Tier tests and
-ignores everything else. An earlier draft of this record claimed the scoping did most of the
-work by itself, on the ground that the scripted-delay fixtures "sleep, so they are Integration Tier,
-so a tier-scoped check never sees them". That was a true statement of an interim state mistaken for a
-permanent one. `ISSUE-260902-0747-01` does mark them Integration Tier — they sleep to sequence work
-and they end a poll at a wall-clock deadline, two of its forbidden forms — but that is where they sit
-*before* the seam work, not where they end up. `ISSUE-260902-0747-13` removes the terminal-run deadline wait these tests actually end at,
-`ISSUE-260902-0747-05` removes the progress-wait helpers a few of them additionally hold, and
-`ISSUE-260902-0747-12` removes the scripted sleep; together those return them to the Logic Tier, which
-is where `PRD-260902-0301-01` § Testing Decisions places the workflow decision logic they test. This
-record is blocked by both, so by the time it runs they are Logic Tier tests the check **does** see —
-and must not flag, because by then they neither sleep nor wait on a deadline. Scoping therefore does
-*not* do this work by itself, and a check written on the assumption that it does would miss the
-largest group of tests in the tier.
+ignores everything else.
+
+Scoping is not, however, a substitute for the check's own coverage. The scripted-delay fixtures sleep
+and end a poll at a wall-clock deadline, so `ISSUE-260902-0747-01` marks them Integration Tier and the
+check does not see them — and no record in this epic promotes them back. They are retained debt
+(`ADR-260902-0312-01` § Retained debt). Do not design the check's scope around a population that will
+move; nothing moves here.
 
 *What it forbids, in the Logic Tier only:* sleeping to sequence work, asserting on elapsed time,
 ending a polling or convergence wait at a wall-clock deadline, and — because the PRD's accepted cost
@@ -57,17 +51,23 @@ reproduced failure took, so a check that omits it does not cover the defect it e
 bound that fires only on a hang — wrapping an await a happens-before edge ends on the passing path —
 is permitted and must not be flagged; `PRD-260902-0301-01` § Testing Decisions draws that line.
 Reading the clock to stamp a record is permitted and must not be flagged — a timestamp written as data
-gates no control flow. Deriving identity from the clock is not covered by that allowance, but whether
-the check can distinguish the two is a judgment for the implementer; if it cannot, forbid the two
-clear cases and say so rather than producing false positives on the third.
+gates no control flow. Deriving identity from the clock is constrained only where that identity is
+load-bearing (`ADR-260902-0312-01`), which a source scan cannot determine — so the check does not
+hunt clock-derived identity at all, and says so. It must still flag every form listed above; none of
+them may be dropped for being hard to recognise.
 
 *The escape hatch is the honest outcome, not a failure.* If the tier boundary does not turn out to be
 mechanically obvious — if the check cannot tell a Logic Tier test from an Integration Tier one without
 guessing — then **ship the rule advisory rather than ship a gate that cries wolf**
 (`PRD-260902-0301-01` § Implementation Decisions, "One mechanical check"; `ADR-260902-0312-01`
 § Consequences, "Enforcement is scoped, or advisory"). Advisory means the rule is stated where a
-developer writing a test will read it and, where cheap, reported without failing the build. Taking
-this branch is a legitimate completion of this issue; record which branch was taken and why.
+developer writing a test will read it and, where cheap, reported without failing the build. Taking this branch is a **finding to be confirmed, not an implementer's
+preference**: state the specific property that defeated the check and stop for maintainer
+confirmation before shipping advisory (`PRD-260902-0301-01` § Implementation Decisions;
+`ADR-260902-0312-01` § Consequences). The branch condition is **tier decidability** — whether the
+check can decide any test's tier from the tree alone with no per-test human judgement. It is not
+violation coverage: a check that decides tiers cleanly but cannot see every violation is the gating
+branch with a stated limit, not the advisory branch.
 
 *No false reds.* Whichever branch is taken, the check must not fail on the suite as it stands when this
 issue completes. A check that flags existing, decided Integration Tier assertions is wrong and must be
@@ -80,35 +80,34 @@ narrowed, never satisfied by weakening those assertions.
 - The testing document's tier section, which gains the statement of what is checked and what is left to
   review.
 
-**Baseline:** this slice is the join node **of the narrowed epic** — blocked by `-01`, `-04`, `-11`
-and `-14`, the remaining slices that change Rust test code or move a test between tiers — so every
+**Baseline:** this slice is the join node **of the narrowed epic** — blocked by `-01`, `-04`, `-11`,
+`-14` and `-15`, the remaining slices that change Rust test code or move a test between tiers — so every
 criterion below is read against the tree after those four have landed.
 
-Amended 2026-09-05. This record was originally blocked by all thirteen siblings, on the premise that
-the check could only run once every violation was repaired. Eight of those slices were deferred, so
-that premise is gone and it is not restored by waiting: **the check enforces the Logic Tier, not a
-clean suite.** Known violations that remain live in the Integration Tier as retained debt
-(`ADR-260902-0312-01` § Retained debt) and are outside what this check examines. A criterion below
-that reads as "the suite is clean" is to be read as "the Logic Tier is clean".
+**The check enforces the Logic Tier as it stands, not a clean suite.** It runs once the tier
+assignments settle, not once every violation is repaired. Two known violations sit in **Logic Tier** tests whose dependence lives in
+production code the test body never names — the unlock throttle's five-second window
+(`ISSUE-260905-2136-01`) and ambient registry configuration in driver tests (`ISSUE-260905-2136-02`).
+A source scan cannot see either. They are filed, they are not repaired by this epic, and a criterion
+below that reads as "the Logic Tier is clean" means clean **of the forms this check inspects** — not
+free of every isolation defect. Do not widen the check to chase them; do not claim they are absent.
 
 **The check knows two categories.** The **Performance Check** is defined in `ADR-260902-0312-01` but
 is **not built in this pass** (`PRD-260902-0301-01` § Out of Scope), so no member exists for the check
 to misclassify and no third selector is read. If that category is ever built, teaching the check about
 it is that work's problem, not this record's.
 
-**How the controls are produced.** Every criterion below that calls for a "mechanically produced"
-working copy differing from the tree in one dimension is discharged instead by a **fixture suite**: a
-directory of small, checked-in source examples, each a minimal test file exercising exactly one
-accepted or rejected shape, with the expected verdict recorded beside it. The check runs over the
-fixture directory as part of its own test.
+**How the controls are produced.** Every control below is a working copy of the tree under test,
+produced **mechanically** from it and differing in exactly one dimension. A hand-authored fixture file
+does not satisfy a control: the check must be shown to catch a violation written the way this suite
+actually writes one — a helper-wrapped `tokio::time::sleep`, a `with_delay` integer, a
+`std::thread::sleep` — and a minimal example tuned to the check's own literal proves nothing about
+that.
 
-This is a deliberate simplification, taken 2026-09-05. Mutating a copy of the whole repository per
-control was specified when this record was the join node behind thirteen slices; it is expensive to
-build, slow to run, and no more convincing than a fixture whose expected verdict is written down. The
-guarantee that matters is unchanged and is retained in full: **a clean result counts as evidence only
-when the same invocation also reports the paired violation.** A check that examines nothing must not
-be able to discharge a criterion by silence. Keep every paired-run requirement below; change only how
-the input is produced.
+Each control is run in the same invocation as the clean case it is paired with, and the report must
+name the violation while staying silent on the clean case. A run producing no output at all discharges
+nothing: a check that examines nothing would otherwise satisfy every clean-run criterion here by
+silence.
 
 **Acceptance criteria:**
 - [ ] Either a check exists and is invoked from a recipe, or the record states that the boundary was
@@ -126,34 +125,44 @@ the input is produced.
 - [ ] A third control covers the third forbidden form: the same tree with one Logic Tier test given a
       loop that reads a resource until it changes and gives up at a wall-clock deadline, on which the
       check reports a violation naming that test.
-- [ ] Three controls cover the permitted cases and must all come back clean: the same tree with one
-      Logic Tier test reading the clock to stamp a record; the same tree with one Logic Tier test whose
-      await is wrapped in a hang-only bound of the shape
-      `pane_stream_pump_honors_explicit_drain_with_receiver_alive` uses; and the same tree with one
-      **Performance Check** member asserting elapsed time. A check that flags any of them is wrong and
-      is narrowed, not accepted — the hang-only bound is the hardest of the three and is why the
+- [ ] Two controls cover the permitted cases and must both come back clean: the same tree with one
+      Logic Tier test reading the clock to stamp a record; and the same tree with one Logic Tier test
+      whose await is wrapped in a hang-only bound of the shape
+      `pane_stream_pump_honors_explicit_drain_with_receiver_alive` uses. A check that flags either is
+      wrong and is narrowed, not accepted — the hang-only bound is the harder of the two and is why the
       forbidden third form is stated as a termination condition rather than as the presence of a
       timeout.
 
-      **Each clean result is only evidence if the check was live when it was produced.** A check that
-      reports nothing satisfies every clean-run criterion in this record vacuously. So each of these
-      three controls is run in the same invocation as one of the violating controls above, and the
-      report must name the violation *and* stay silent on the permitted case. A run producing no
-      output at all discharges none of them.
+      **Each control carries its own witness.** Build each as a two-dimension variant of the tree: the
+      permitted shape *and*, in a different Logic Tier test, one forbidden shape. The check must report
+      the forbidden one by name and stay silent on the permitted one, in the same run. Do not discharge
+      this against another criterion's control — a permitted case whose only witness is elsewhere is
+      not itself falsifying.
 - [ ] No existing Integration Tier assertion was weakened to satisfy the check, and the check reports
-      no violation against any of them — demonstrated the same way: the run that reports clean on the
-      Integration Tier also reports the violation on a paired dirty variant, so silence is
-      distinguishable from a check that examined nothing.
+      no violation against any of them.
+
+      **Witness this by moving the boundary, not by dirtying an Integration Tier test.** A forbidden
+      shape inserted into an Integration Tier test is silent by design — the check ignores that tier —
+      so such a pairing proves nothing. Build the control by taking one Integration Tier test that
+      already contains a forbidden shape and removing only its tier marker: the check must then report
+      it by name, and must fall silent again when the marker is restored. That varies exactly the
+      dimension the check keys on, and it is this criterion's own witness.
 - [ ] **`just test-under-load` passes over the final gate population.** This record is the join node:
       it is blocked by every slice that changes Rust test code or moves a test between tiers, so it is
       the first point at which the default command's contents are settled. `ISSUE-260902-0747-11` runs
       the same recipe when it removes the reproduced failure, and that criterion stays — but `-11` is
-      blocked only by `-01`, so `-04` and `-14` still move tests into the gate after it passes. Without
-      this criterion no record runs the epic's acceptance against the population the epic actually
-      ships. (Before 2026-09-05 this read "seven later slices"; those eight are deferred and the point
-      now rests on two.) Run the Integration Tier once as well, so a test promoted out of the gate is
+      blocked only by `-01`, so `-14` still moves tests into the gate after it passes, and `-04` moves
+      guard tests out of it. Without this criterion no record runs the epic's acceptance against the
+      population the epic actually ships. Run the Integration Tier once as well, so a test moved out of the gate is
       still known to pass somewhere. Both branches of this record owe this criterion — it is about the
       suite, not about the check.
+
+      **Its pass condition is not a green run.** After the honest-absence work, a guard whose
+      dependency is genuinely absent does not report a pass, and the root-plus-`sudo`-plus-system-account
+      combination is available on no CI runner and few developer machines. Satisfy this criterion by
+      recording, per non-passing test, which dependency was missing — read from the diagnostic that work
+      requires each guard to emit. A run that is non-green *only* for named absent dependencies
+      satisfies it; any other failure does not.
 
       **State the acceptance's limit alongside the result.** The reproduced failure is intermittent —
       the reproduction measured two red runs and one green — so a passing sample is not proof of a fix
@@ -190,10 +199,10 @@ the input is produced.
 - [ ] **The glossary stops calling this practice planned, for the terms this epic makes real.**
       After this change, `grep '(planned' CONTEXT.md` returns no `_(planned — ADR-260902-0312-01)_`
       entry for **Logic Tier**, **Integration Tier**, **Port** or **Double**, and returns every one of
-      them before it. **Performance Check keeps its planned marker**: the narrowed epic defines the
-      category but does not build it (`PRD-260902-0301-01` § Out of Scope), and removing the marker
-      would assert a practice that is not in force. Amended 2026-09-05; before that this criterion
-      covered every term the ADR names. `CONTEXT.md` states that the marker comes off in the epic that makes
+      them before it. **Performance Check keeps its planned marker**: the category is defined but not
+      built, and removing the marker would assert a practice that is not in force.
+
+      `CONTEXT.md` states that the marker comes off in the epic that makes
       a practice real and that the epic owns the terms its ADR names, so the removal belongs to the
       slice at which the practice actually comes into force — this one, the join node behind every
       slice that changes Rust test code. Removing a marker is not editing a definition: if an entry's
