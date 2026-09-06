@@ -3,7 +3,7 @@ id: ISSUE-260902-0747-01
 kind: issue
 category: enhancement
 status: needs-info
-summary: The default Rust test command runs process-spawning and clock-bound tests alongside deterministic ones, so a red result cannot be trusted; introduce the tier selector, mark every Integration Tier test explicitly with Logic Tier as the unmarked default, commit the acceptance recipe, and split CI into a gating logic job and a non-gating integration job
+summary: The default Rust test command runs process-spawning and clock-bound tests alongside deterministic ones, so a red result cannot be trusted; introduce the tier selector, mark every Integration Tier test explicitly with Logic Tier as the unmarked default, harden the acceptance recipe, and split CI into a gating logic job and a non-gating integration job
 prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01]
 terms: [Logic Tier, Integration Tier]
@@ -12,302 +12,252 @@ terms: [Logic Tier, Integration Tier]
 ## Agent Brief
 
 **Category:** enhancement
-**Summary:** Make the Logic Tier / Integration Tier split real: a selector that the default `cargo test` honours, an explicit marker on every Integration Tier test, two CI jobs, the acceptance recipe in version control, and the tier rule written down.
+**Summary:** Make the Logic Tier / Integration Tier split real: a selector the default `cargo test` honours, an explicit marker on every Integration Tier test, two CI jobs, and the tier rule written down.
 
 **Current behavior:**
-The Rust suite is one undifferentiated set. A bare `cargo test` — which is what the `test-rust`
-recipe and the Rust CI workflow both invoke — runs deterministic decision-logic tests in the same
-pass as tests that fork real shell scripts, open real FIFOs, create real tmux sessions on the user's
-default socket, and wait out fixed wall-clock deadlines. A red run therefore does not distinguish a
-logic regression from a loaded machine, which is the defect `PRD-260902-0301-01` exists to remove.
-Nothing in the tree names a tier, and no mechanism selects one. The testing document describes a
-single "Rust integration tests" layer and `CLAUDE.md` says nothing about timing rules in tests.
+The Rust suite is one undifferentiated set. A bare `cargo test` — what the `test-rust` recipe and the
+Rust CI workflow both invoke — runs deterministic decision-logic tests in the same pass as tests that
+fork real shell scripts, open real FIFOs, create real tmux sessions on the user's default socket, and
+wait out fixed wall-clock deadlines. A red run does not distinguish a logic regression from a loaded
+machine. Nothing in the tree names a tier and no mechanism selects one. `docs/testing.md` describes a
+single "Rust integration tests" layer; `CLAUDE.md` says nothing about timing rules in tests.
 
-The epic's acceptance recipe — `just test-under-load`, which runs the default command repeatedly
-under generated CPU contention — is this record's to own, because two sibling records close on running
-it (`ISSUE-260902-0747-11` as regression acceptance, `ISSUE-260902-0747-10` as the epic's closing
-criterion). Ownership is the durable fact and belongs here; whether the file happened to be committed
-on a given day is not, and earlier drafts of this brief carried that state as if it were a
-requirement.
+This record owns `just test-under-load`, the epic's acceptance seam: `ISSUE-260902-0747-11` runs it as
+regression acceptance and `ISSUE-260902-0747-10` closes on it.
 
-**Baseline:** this slice has no blockers, so every criterion below is read against the tree at the tip of the branch this epic lands on (`feature/tmux-panes`)
-as it stands — not against `main`, which is behind the tree this epic is written for. Later slices in this epic are read against the tree after *their* blockers land, which
-is why their pre-change halves look already-satisfied from here.
+**Baseline:** no blockers. Read every criterion against the tip of `feature/tmux-panes`, not `main`.
 
 **Desired behavior:**
-The two tiers minted by `ADR-260902-0312-01` are enforced mechanically, the third non-gating category
-exists alongside them, and the command a maintainer habitually types is the gating one.
+The two tiers minted by `ADR-260902-0312-01` are enforced mechanically, and the command a maintainer
+habitually types is the gating one.
 
 *Tier assignment.* Membership is decided by **what a test isolates, never by where its file lives**
-(`ADR-260902-0312-01`, § "Tier membership is decided by what a test isolates"). A Logic Tier test
-drives its unit through that unit's own public contract with every port either replaced by a fake or
-supplied with **controlled data**, and asserts on no elapsed time. An Integration Tier test exercises
-a chain of behavior end-to-end against **real infrastructure**; what it isolates is the external
-world.
+(`ADR-260902-0312-01` § "Tier membership is decided by what a test isolates"). A Logic Tier test drives
+its unit through that unit's own public contract with every port either replaced by a fake or supplied
+with **controlled data**, and asserts on no elapsed time. An Integration Tier test exercises a chain of
+behavior end-to-end against **real infrastructure**; what it isolates is the external world.
 
-Two consequences of that rule decide cases this issue will actually meet, and both are the ADR's, not
-this record's:
+Two consequences of that rule decide cases this issue will meet:
 
-- **Controlled data counts as isolation.** A dependency the test fully owns and constructs for itself
-  — a temporary-directory database, a committed file read read-only — is Logic Tier even though no
-  fake replaces it. A temporary-directory database round-trip is therefore *not* by itself an
-  Integration Tier marker.
+- **Controlled data counts as isolation.** A dependency the test fully owns and constructs for itself —
+  a temporary-directory database, a committed file read read-only — is Logic Tier even though no fake
+  replaces it. A temp-dir database round-trip is *not* by itself an Integration Tier marker.
 - **Storage splits per test, not as a module.** Within the storage module, Integration Tier is the
   subset whose subject genuinely is the real engine or the real filesystem — the migration-on-init
   behaviors and the file- and write-ahead-log permission assertion. The rest assert this repository's
   own persistence logic against a store they fully own and are Logic Tier
   (`PRD-260902-0301-01` § Testing Decisions, "Storage splits per test, not as a module").
 
-*The classification input.* The per-site timing classification is contractual and is not re-derived:
-it is the table keyed by owning function under `### Timing-site audit` in `ISSUE-260901-0216-03`,
-which marks each timing construct A (raisable headroom), B (poll tick) or C (load-bearing for an
-assertion). Consult it before assigning any test that touches the clock at all. It records
-two mechanical hazards that a pattern sweep will get wrong: one cleanup-timeout constant is used with
-**opposite polarity** at two sites, and the scripted-delay fixtures encode concurrency orderings as
-bare integers that no duration pattern matches.
+*The classification input.* The per-site timing classification is contractual and is not re-derived: it
+is the table keyed by owning function under `### Timing-site audit` in `ISSUE-260901-0216-03`, marking
+each timing construct A (raisable headroom), B (poll tick) or C (load-bearing for an assertion). Consult
+it before assigning any test that touches the clock. It records two hazards a pattern sweep gets wrong:
+one cleanup-timeout constant is used with **opposite polarity** at two sites, and the scripted-delay
+fixtures encode concurrency orderings as bare integers that no duration pattern matches.
 
 *Marking is explicit for the Integration Tier only.* Every Integration Tier test carries an explicit
-marker at the test. The Logic Tier is the **unmarked default**: a test with no marker is Logic Tier
-and is in the gate. This is a deliberate choice of the smaller annotation surface over annotating
-every test in the repository, and it has a known cost — a newly added test that spawns a process and
-carries no marker lands silently in the gate. `ISSUE-260902-0747-10` is what keeps that default
-honest, and is sequenced last for exactly this reason.
+marker at the test. The Logic Tier is the **unmarked default**: a test with no marker is Logic Tier and
+is in the gate. Known cost: a newly added test that spawns a process and carries no marker lands
+silently in the gate. `ISSUE-260902-0747-10` is what keeps that default honest.
 
-*Mark against today's tree, not the end state.* Assign each test by what it isolates **as it is
-written now**. The sibling seam issues (`ISSUE-260902-0747-05` through `-08`) each promote a batch of
-tests into the Logic Tier as they remove the process or the clock wait; this issue must not
-anticipate those promotions, and must not leave a test unmarked on the grounds that a later issue
-will make it deterministic. Expect the Integration Tier to be large at this point and to shrink as
-those issues land — that is the intended trajectory, not a defect in this one.
+*Mark against today's tree.* Assign each test by what it isolates **as it is written now**. Do not leave
+a test unmarked on the grounds that some later record will make it deterministic.
 
-*Three test sets this slice owns that earlier drafts of the epic left unassigned.* Each is a marking,
-not a seam change, and each is here because the rule reaches it while no prose inventory named it:
+Expect the Integration Tier to be **large, and to stay large**. The epic was narrowed on 2026-09-05 and
+the seam work that would have promoted these tests is deferred (`ISSUE-260902-0747-05` through `-08`,
+`-02`, `-09`, `-12`, `-13`). What they would have repaired is retained debt under `ADR-260902-0312-01`
+§ Retained debt. A large Integration Tier is the expected outcome here, not a defect and not a
+trajectory to anticipate.
+
+*Three test sets this slice owns.* Each is a marking, not a seam change:
 
 - **The application-host startup test.** `starts_host_on_ephemeral_port_and_serves_health`
   (`src/host.rs:129`) binds a real `TcpListener` (`:33`) and gates on `wait_for_health` (`:80-95`), a
-  convergence wait that fails at a deadline. It fails both halves of the Logic Tier rule and is
-  Integration Tier.
-- **The self-exec child fixtures** (`src/model.rs:5221`, `:5301`) fork the test binary itself and are
+  convergence wait that fails at a deadline. It fails both halves of the Logic Tier rule: Integration
+  Tier.
+- **The self-exec child fixtures** (`src/model.rs:5221`, `:5301`) fork the test binary itself:
   Integration Tier. **Cost this hazard rather than discovering it:** the child re-invokes the binary
-  with `--exact <test name>`, so a selector that excludes the marked parent makes the parent's
-  assertion about the child's output unsatisfiable. Whatever selector you choose has to keep that pair
-  working when the Integration Tier is run, and the pair is the case to test the selector against.
-- **`writer_progresses_while_a_read_connection_is_checked_out`** (`src/storage.rs:2107`), whose
-  subject is the real connection pool's concurrency behavior and which bounds its passing path with a
-  250ms timeout. `PRD-260902-0301-01` assigns it to this slice by name. Decide it against the rule —
-  its subject is arguably the real engine, which the storage paragraph above marks Integration Tier,
-  while a 250ms bound on the passing path is a forbidden mechanism either way — and record which
-  reading you applied.
+  with `--exact <test name>`, so a selector that excludes the marked parent makes the parent's assertion
+  about the child's output unsatisfiable. Whatever selector you choose must keep that pair working when
+  the Integration Tier is run; test the selector against this pair.
+- **`writer_progresses_while_a_read_connection_is_checked_out`** (`src/storage.rs:2107`), whose subject
+  is the real connection pool's concurrency behavior and which bounds its passing path with a 250ms
+  timeout. Decide it against the rule — its subject is arguably the real engine, and a 250ms bound on
+  the passing path is a forbidden mechanism either way — and record which reading you applied.
 
-*A third category exists, and one test goes in it.* Beyond the two tiers there is a **Performance
-Check**: the non-gating category for a test whose subject genuinely is elapsed time, marked at the
-test and added back by its own opt-in switch alongside the Integration Tier's
-(`ADR-260902-0312-01`, § "A third, non-gating category holds performance assertions").
-`validate_workflow_many_calls_against_large_subflow_within_budget` (`src/model.rs:6631`) is its
-member: it asserts a fifteen-second validation budget but isolates nothing external, so neither
-correctness tier fits it. Do not mark it Integration Tier — that would make a tier mean "non-gating"
-rather than a statement about what a test isolates.
-
-**Split that test before marking it.** It asserts two properties: that validation finishes inside the
-budget, and that a large valid workflow produces no error issues. The second is clock-free logic and
-is Logic Tier by the ordinary rule. Separate it into its own test that stays in the gate. Relocating the test whole would carry a
-correctness property out of the gate as a passenger.
+*Split the large-workflow test.* `validate_workflow_many_calls_against_large_subflow_within_budget`
+(`src/model.rs:6631`) asserts two properties: that validation finishes inside a fifteen-second budget,
+and that a large valid workflow produces no error issues. The second is clock-free logic and is Logic
+Tier by the ordinary rule — separate it into its own test that stays in the gate.
 
 The timing half has nowhere built to go. The **Performance Check** category is defined in
-`ADR-260902-0312-01` but is not built by the narrowed epic (`PRD-260902-0301-01` § Out of Scope), so
-this record does **not** add a third selector for one test. Leave the timing assertion in place marked
-`#[ignore]`, carrying a comment naming `ISSUE-260905-2136-05` as the record that owns deciding its
-fate. This is honest rather than good: an ignored test does not run and will rot, which is exactly why
-that record exists and why the category is not being built on spec.
+`ADR-260902-0312-01` but is **not built** by the narrowed epic (`PRD-260902-0301-01` § Out of Scope), so
+this record adds no third selector and no third marker. Leave the timing assertion in place marked
+`#[ignore]`, with a comment naming `ISSUE-260905-2136-05` as the record that owns deciding its fate.
+Do not mark it Integration Tier — that would make a tier mean "non-gating" rather than a statement about
+what a test isolates.
 
-*One exception, named and temporary.* Membership is per test, so this exception is over tests, not
-over the target. In the out-of-crate HTTP target (`tests/http_api.rs`), the tests whose Logic Tier
-violations `ISSUE-260902-0747-11` repairs stay **unmarked and in the gate** even though they still
-wait on a clock — and, be clear about the size of this, even though the run-creating ones still
-**spawn real tmux sessions**. Derive that set yourself by applying the Logic Tier rule to each test in
-the target and intersecting with what `-11` scopes; do not take it from a category label such as "the
-run-stream tests", which excludes one of the three tests the reproduction names. The target builds
-its state with the runtime's production constructor, so a run whose node is a task reaches
-`tmux new-session`; `ISSUE-260902-0747-11` converts the fixture to an approval-only workflow that
-never reaches the runner. Until it does, this exception holds inside the gate tests that violate both
-halves of the tier rule, not just the clock half. One test in the same target is **not** covered by
-it: the preview endpoint's task test (`test_node_accepts_v3_task_node`, `tests/http_api.rs:889`) is
-Integration Tier by the ordinary rule, because it genuinely requires task execution and no runner
-port stands on that path. Marking it is not a second exception — it is the rule working. The rule is being honored in spirit rather than to the letter, deliberately. The reproduced
-failure this epic exists to fix lives in that target, and marking it Integration Tier would carry that
-failure out of the gate at this issue — letting the epic satisfy its acceptance by relocating the
-defect instead of fixing it, which `PRD-260902-0301-01` § Implementation Decisions forbids in the
-paragraph beginning "One temporary exception to the marking rule". The exception is **temporary and
-expires at `ISSUE-260902-0747-11`**, which removes the target's clock waits and thereby makes it a
-logic-tier member on the letter too; from that point no exception exists, and
-`ISSUE-260902-0747-10` checks that none does. Record it as a single greppable entry — one target, one
-reason, one closing record — not as a general escape hatch: no second exception is authorized here,
-and a test that needs one is a question for the maintainer, not a judgment call for the implementer.
-Expect the gate to stay red between this issue and `-11`. That is the correct signal, not a defect.
+*One exception, named and temporary.* Membership is per test, so this exception is over tests, not over
+the target. In `tests/http_api.rs`, the tests whose Logic Tier violations `ISSUE-260902-0747-11` repairs
+stay **unmarked and in the gate** even though they still wait on a clock and the run-creating ones still
+**spawn real tmux sessions**. Derive that set by applying the Logic Tier rule to each test in the target
+and intersecting with what `-11` scopes; do not take it from a category label such as "the run-stream
+tests", which excludes one of the three tests the reproduction names.
 
-*Selector.* The mechanism is the implementer's finding, subject to five constraints. The first four
-are from `PRD-260902-0301-01` § Implementation Decisions ("The selector is a constraint here, not a
-mechanism") and are restated in `ADR-260902-0312-01`; the fifth is this record's:
+The exception exists because the reproduced failure lives in that target, and marking it Integration
+Tier would carry that failure out of the gate — satisfying the epic's acceptance by relocating the
+defect (`PRD-260902-0301-01` § Implementation Decisions, "One temporary exception to the marking rule").
 
-- A bare `cargo test` runs the Logic Tier and nothing else. The gating command must be the habitual
-  one, not a new command a developer has to remember.
-- The exclusion operates **per test, not per target**. It must reach an individual Integration Tier
-  test living inside the library harness — the pane-stream FIFO tests, the storage permission and
-  migration tests, the process-group termination test and the tmux guard tests — and it must exclude
-  no Logic Tier test, including out-of-crate targets. Target-level `required-features` alone does not
-  satisfy this, because it cannot exclude individual tests inside the library harness.
-- Exactly one opt-in switch adds the Integration Tier back, for the non-gating CI job and for local
-  use.
-- The Performance Check has its **own** opt-in switch, separate from the Integration Tier's, so that
-  running one does not run the other. The default command runs neither. This is the third category the
-  selector has to express, and it is why a two-valued marker is not enough.
+One test in the same target is **not** covered: the preview endpoint's task test
+(`test_node_accepts_v3_task_node`, `tests/http_api.rs:889`) is Integration Tier by the ordinary rule,
+because it genuinely requires task execution and no runner port stands on that path.
+
+The exception **expires at `ISSUE-260902-0747-11`**; from that point none exists and
+`ISSUE-260902-0747-10` checks that none does. Record it as a single greppable entry — one reason, one
+closing record. No second exception is authorized: a test that appears to need one is a question for the
+maintainer, not a judgment call for the implementer. Expect the gate to stay red between this issue and
+`-11`; that is the correct signal.
+
+*Selector.* The mechanism is the implementer's finding, subject to five constraints. The first three are
+from `PRD-260902-0301-01` § Implementation Decisions ("The selector is a constraint here, not a
+mechanism") and restated in `ADR-260902-0312-01`; the last two are this record's:
+
+- A bare `cargo test` runs the Logic Tier and nothing else. The gating command is the habitual one.
+- The exclusion operates **per test, not per target**. It must reach an individual Integration Tier test
+  living inside the library harness — the pane-stream FIFO tests, the storage permission and migration
+  tests, the process-group termination test, the tmux guard tests — and must exclude no Logic Tier test,
+  including out-of-crate targets. Target-level `required-features` alone does not satisfy this.
+- Exactly one opt-in switch adds the Integration Tier back, for the non-gating CI job and local use.
 - The switch must not collide with the `#[ignore]`-gated docs-regeneration maintenance writer, which
-  already claims `#[ignore]` for a non-tier purpose. Running the Integration Tier must not run the
-  docs writer, and running the docs writer must not require running the Integration Tier.
-- **The selector must not be `#[ignore]`-shaped.** `cargo test -- --list` enumerates `#[ignore]`d
-  tests alongside the rest, so an `#[ignore]`-based tier marker would leave tier membership invisible
-  to the listing and would make every listing-based check in this epic unfalsifiable. Excluded tests
-  must be genuinely not executed by the default command, and the exclusion must be observable in what
-  that command reports it ran.
+  already claims `#[ignore]` for a non-tier purpose. Running the Integration Tier must not run the docs
+  writer, and running the docs writer must not require running the Integration Tier.
+- **The selector must not be `#[ignore]`-shaped.** `cargo test -- --list` enumerates `#[ignore]`d tests
+  alongside the rest, so an `#[ignore]`-based tier marker would leave tier membership invisible to the
+  listing and make every listing-based check in this epic unfalsifiable. Excluded tests must be
+  genuinely not executed by the default command, and the exclusion must be observable in what that
+  command reports it ran.
 
-*Location constraint (a consequence of location, not a tier assignment).* An out-of-crate target must
-not depend on the `cfg!(test)` build-profile timeout shims, because an integration target compiles
-the library without `cfg(test)` and those shims silently resolve to their production budgets across
-that boundary.
+*Location constraint (a consequence of location, not a tier assignment).* An out-of-crate target must not
+depend on the `cfg!(test)` build-profile timeout shims: an integration target compiles the library
+without `cfg(test)` and those shims silently resolve to their production budgets across that boundary.
 
-*Commands.* The `test-rust` recipe keeps invoking the default command and therefore becomes the Logic
-Tier gate with no edit to its body. A sibling recipe named `test-integration` runs the Integration
-Tier via the opt-in switch. The `test-under-load` recipe — which runs the default command repeatedly
-under generated CPU contention and fails if any repetition fails — is the epic's acceptance seam, run
-by `ISSUE-260902-0747-11` as regression acceptance and by `ISSUE-260902-0747-10` as the epic's closing
-criterion. It is already tracked (committed 2026-09-05); this record **owns it, verifies it and hardens
-it**, and does not create it. Its body needs no change for the tier split, because narrowing the
-default narrows what it measures. It does need the argument hardening in the acceptance criteria
-below: the recipe currently checks its load workers once at startup and accepts a zero-repetition
-invocation as a zero-failure success.
+*Commands.* `test-rust` keeps invoking the default command and becomes the Logic Tier gate with no edit
+to its body. A sibling recipe `test-integration` runs the Integration Tier via the opt-in switch.
+`test-under-load` is already tracked (committed 2026-09-05); this record **owns, verifies and hardens
+it** — it does not create it. Its body needs no change for the tier split, because narrowing the default
+narrows what it measures; it does need the argument hardening in the criteria below.
 
 *CI.* The Rust workflow carries two jobs: a **gating** job running the Logic Tier via the default
 command, and a **separate, non-gating** job running the Integration Tier via the switch, so a red
 integration result and a red logic result are distinguishable at a glance and can carry different
 timeouts and retry policies. Hiding the Integration Tier from CI is rejected — unrun tests rot.
 
-*Documentation.* The testing document gains a section naming both tiers, stating the membership rule,
-and giving the command for each. `CLAUDE.md` gains a thin pointer to `ADR-260902-0312-01` as the
-source of the tier and timing rules — a pointer, not a copy of the rules.
+*Documentation.* `docs/testing.md` gains a section naming both tiers, stating the membership rule, and
+giving the command for each. `CLAUDE.md` gains a thin pointer to `ADR-260902-0312-01` as the source of
+the tier and timing rules — a pointer, not a copy.
 
 **Key interfaces:**
 - The tier marker as it appears **at an Integration Tier test** — the single form every such test
-  carries, and the thing a reader checks to know a test's tier.
-- The tier selector — the mechanism both the default command and the opt-in switch resolve through.
-  It consumes the marker; it is not itself readable at the test.
-- The `test-rust`, `test-integration` and `test-under-load` recipes, and the Rust CI workflow's job
-  list.
+  carries, and what a reader checks to know a test's tier.
+- The tier selector — the mechanism both the default command and the opt-in switch resolve through. It
+  consumes the marker; it is not itself readable at the test.
+- The `test-rust`, `test-integration` and `test-under-load` recipes, and the Rust CI workflow's job list.
 - The testing document's tier section, and the `CLAUDE.md` pointer.
 
 **Acceptance criteria:**
-- [ ] Marker membership is decided by `ADR-260902-0312-01`'s tier rule — **what a test isolates** —
-      and not by a list of mechanisms. Every test that fails the Logic Tier rule carries the
-      Integration Tier marker, except the Performance Check member and the tests covered by the named
-      exception below; no test that satisfies the rule carries either marker.
-      Two sufficient conditions for marking, neither of which subsumes the other:
+- [ ] Marker membership is decided by `ADR-260902-0312-01`'s tier rule — **what a test isolates** — not
+      by a list of mechanisms. Every test that fails the Logic Tier rule carries the Integration Tier
+      marker, except the tests covered by the named exception; no test that satisfies the rule carries
+      it. Two sufficient conditions for marking, neither subsuming the other:
       - *Forbidden mechanisms.* Spawning a process, opening a FIFO, creating a tmux session, joining a
         process group, binding a socket, writing or chmod-ing an executable fixture, sleeping to
         sequence work, asserting on elapsed time, or ending a polling or convergence wait at a
         wall-clock deadline.
       - *Real-infrastructure subject.* A test whose subject genuinely **is** the external world, even
-        when it exhibits none of those mechanisms — the database and WAL-sidecar permission assertion
-        and the migration-on-`init` behaviors are the worked examples, and `PRD-260902-0301-01`
-        § Testing Decisions requires them marked. Their mechanism is an ordinary temp-dir database and
-        a filesystem-mode read; a mechanism list alone would leave them unmarked and contradict the
-        criterion below.
+        with none of those mechanisms — the database and WAL-sidecar permission assertion and the
+        migration-on-`init` behaviors are the worked examples, required marked by
+        `PRD-260902-0301-01` § Testing Decisions.
       A bound that fires only on a hang, wrapping an await that a happens-before edge ends on the
-      passing path, is **not** a forbidden mechanism and does not by itself earn the marker:
+      passing path, is **not** a forbidden mechanism and does not earn the marker:
       `pane_stream_pump_honors_explicit_drain_with_receiver_alive` (`src/api.rs:5220`) is the named
-      example of a Logic Tier test that keeps such a guard, and marking it would contradict the PRD
-      holding that test's family up as the tier's template. The marker is a single greppable form, so
-      the marked set can be compared against the mechanism sweep **as one audit input among two** —
-      a divergence is a question to answer against the rule, not automatically a defect. Before this
+      example of a Logic Tier test that keeps such a guard. The marker is a single greppable form, so
+      the marked set can be compared against the mechanism sweep as one audit input among two — a
+      divergence is a question to answer against the rule, not automatically a defect. Before this
       change no marker exists and the comparison has an empty left side.
 - [ ] The tests covered by the exception carry **no** Integration Tier marker and are executed by the
       default command, even though at this issue's completion they still wait on a clock **and the
-      run-creating ones still spawn real tmux sessions**. State which tests those are by derivation,
-      not by target and not by category label: apply the Logic Tier rule to each test in
-      `tests/http_api.rs`, and record the set you derived together with the derivation you used.
-      A criterion phrased as "the HTTP target carries no Integration Tier marker" is wrong — membership
-      is per test, and `test_node_accepts_v3_task_node` in that same target is correctly marked
-      Integration Tier. The exception is recorded in one greppable place naming the tests, the reason,
-      and `ISSUE-260902-0747-11` as the record that closes it; the record of the exception is the only
-      thing that distinguishes it from an oversight, so an unmarked rule-failing test with no such
-      entry does not satisfy this criterion. **Pin the entry's form**: choose one stable token that
-      `rg` finds and that appears nowhere else, and state it in this record. `ISSUE-260902-0747-10`
-      builds a control that reintroduces an exception entry to prove its check treats one as a
-      violation, and it can only do that against a form this record fixed. It is the only **decided exception** this epic authorizes:
-      a test may sit outside the mechanism sweep and still be correctly marked under the
-      real-infrastructure condition above — that is the rule working, not an exception to it.
-- [ ] The default command excludes the Integration Tier and the switch adds it back, demonstrated in
-      one run through the same seam: the default command's own report of what it executed does
-      **not** include `session_guard_kills_session_on_drop_without_disarm`, and the same report taken
-      with the opt-in switch **does**. Before this change the default command executes it, so the
-      first half is red at baseline; the second half is the acted-on witness that a selector which
-      excludes everything cannot satisfy. `cargo test -- --list` is not an acceptable observable here
-      — it enumerates `#[ignore]`d tests and so cannot distinguish "excluded" from "listed but
-      skipped".
-- [ ] `validate_workflow_many_calls_against_large_subflow_within_budget` (`src/model.rs:6631`) is
-      split: a test asserting only that a large valid workflow produces no error issues is executed by
-      the default command, and a test carrying only the fifteen-second budget assertion is not. The
-      budget assertion is executed by the Performance Check switch and by neither the default command
-      nor the Integration Tier switch. Before this change one test carries both assertions and the
-      default command executes it, so the split's second half is red at baseline.
+      run-creating ones still spawn real tmux sessions**. State which tests those are by derivation:
+      apply the Logic Tier rule to each test in `tests/http_api.rs`, and record the set together with
+      the derivation used. A criterion phrased as "the HTTP target carries no Integration Tier marker"
+      is wrong — membership is per test, and `test_node_accepts_v3_task_node` in that same target is
+      correctly marked. The exception is recorded in one greppable place naming the tests, the reason,
+      and `ISSUE-260902-0747-11` as the record that closes it; an unmarked rule-failing test with no
+      such entry does not satisfy this criterion. **Pin the entry's form**: choose one stable token that
+      `rg` finds and that appears nowhere else, and state it in this record — `ISSUE-260902-0747-10`
+      builds a control that reintroduces an exception entry, and can only do so against a form this
+      record fixed.
+- [ ] The default command excludes the Integration Tier and the switch adds it back, demonstrated in one
+      run through the same seam: the default command's own report of what it executed does **not**
+      include `session_guard_kills_session_on_drop_without_disarm`, and the same report taken with the
+      opt-in switch **does**. Before this change the default command executes it, so the first half is
+      red at baseline; the second half is the acted-on witness that a selector excluding everything
+      cannot satisfy. `cargo test -- --list` is not an acceptable observable — it enumerates
+      `#[ignore]`d tests and cannot distinguish "excluded" from "listed but skipped".
+- [ ] `validate_workflow_many_calls_against_large_subflow_within_budget` (`src/model.rs:6631`) is split:
+      a test asserting only that a large valid workflow produces no error issues is executed by the
+      default command, and a test carrying only the fifteen-second budget assertion is `#[ignore]`d and
+      executed by neither the default command nor the Integration Tier switch. That test's comment names
+      `ISSUE-260905-2136-05`. Before this change one test carries both assertions and the default
+      command executes it.
 - [ ] The application-host startup test, the self-exec child fixtures, and
       `writer_progresses_while_a_read_connection_is_checked_out` each carry a recorded tier decision.
       The self-exec pair passes when the Integration Tier is run through its switch — the `--exact`
-      re-invocation still resolves the child — which is the case that falsifies a selector that
-      excludes marked tests from the child's own invocation.
+      re-invocation still resolves the child — which is the case that falsifies a selector excluding
+      marked tests from the child's own invocation.
 - [ ] The default command does not execute the pane-stream FIFO tests, the storage permission and
       migration tests, or the process-group termination test — the Integration Tier module behaviors
-      named in `PRD-260902-0301-01` § Testing Decisions, "Modules tested, by tier", which names
-      behaviors rather than individual test functions. It does execute the generated-catalog
-      staleness check, the shipped-template validation, the HTTP endpoint round-trips, and the
-      storage tests that assert this repository's own persistence logic against a per-test store.
+      named in `PRD-260902-0301-01` § Testing Decisions, "Modules tested, by tier". It does execute the
+      generated-catalog staleness check, the shipped-template validation, the HTTP endpoint round-trips,
+      and the storage tests that assert this repository's own persistence logic against a per-test store.
 - [ ] `rg -n 'Logic Tier' docs/testing.md` returns the tier section introduced by this change; no
       matches before it.
-- [ ] `rg -n 'ADR-260902-0312-01' CLAUDE.md` returns the pointer introduced by this change; no
-      matches before it.
-- [ ] `rg -n 'integration' .github/workflows/rust-tests.yml` returns the second job introduced by
-      this change; no matches before it. The integration job is not required for the workflow to
-      report success.
+- [ ] `rg -n 'ADR-260902-0312-01' CLAUDE.md` returns the pointer introduced by this change; no matches
+      before it.
+- [ ] `rg -n 'integration' .github/workflows/rust-tests.yml` returns the second job introduced by this
+      change; no matches before it. The integration job is not required for the workflow to report
+      success.
 - [ ] `rg -n '^test-integration' justfile` returns the recipe introduced by this change; no matches
       before it.
-- [ ] `git show HEAD:justfile | rg -n '^test-under-load'` returns the recipe. This is a **precondition
-      to verify, not work to do** — it has been tracked since 2026-09-05. If it does not hold, stop and
+- [ ] `git show HEAD:justfile | rg -n '^test-under-load'` returns the recipe. This is a **precondition to
+      verify, not work to do** — it has been tracked since 2026-09-05. If it does not hold, stop and
       report rather than re-adding the recipe.
 - [ ] The recipe rejects a non-positive repetition count instead of reporting success. `just
-      test-under-load 0` exits non-zero after this change; before it, the loop body never runs and the
-      recipe reports zero failures, which is a passing acceptance run that measured nothing.
-- [ ] The committed recipe **verifies the load it claims to apply**: after starting its workers it
-      confirms each is alive and exits non-zero if fewer are running than were requested, and it
-      reports the count it actually established alongside the count requested. A recipe that records a
-      pid without checking it can print "N busy processes" while providing no load at all, which would
-      make every acceptance run that cites it worthless. This is a property of the recipe being
-      committed, not of the tier boundary, and it is here only because this record is what commits it.
+      test-under-load 0` exits non-zero after this change; before it the loop body never runs and the
+      recipe reports zero failures.
+- [ ] The recipe **verifies the load it claims to apply**: after starting its workers it confirms each
+      is alive, exits non-zero if fewer are running than were requested, and reports the count actually
+      established alongside the count requested.
 - [ ] Running the Integration Tier through the opt-in switch does not execute the docs-regeneration
-      maintenance writer, and the `regen-docs` recipe still regenerates the catalog blocks without
-      the switch.
+      maintenance writer, and the `regen-docs` recipe still regenerates the catalog blocks without the
+      switch.
 - [ ] No out-of-crate test target reads a `cfg!(test)`-shimmed timeout helper.
 
 **Out of scope:**
-- Cutting any seam, removing any wall-clock wait, or promoting any test into the Logic Tier. Those
-  are `ISSUE-260902-0747-05` through `-08`; this issue only records where each test stands today.
-- **Making the gate green.** This issue draws the boundary; it does not fix the reproduced failure.
-  That failure is in the HTTP target, which is Logic Tier and therefore inside the gate, so
-  `just test-under-load` is expected to stay red after this issue lands. Regression acceptance for
-  that failure binds to `ISSUE-260902-0747-11`; the epic's **closing** acceptance binds to
-  `ISSUE-260902-0747-10`, the join node behind every slice that moves a test between tiers.
-- The mechanical enforcement check for the tier rule — `ISSUE-260902-0747-10`, deliberately last
-  because the boundary keeps moving until the promotions land.
+- Cutting any seam, removing any wall-clock wait, or promoting any test into the Logic Tier. This issue
+  records where each test stands today. The seam work is deferred (`ISSUE-260902-0747-02`, `-05`
+  through `-09`, `-12`, `-13`) and its subject is retained debt under `ADR-260902-0312-01`
+  § Retained debt.
+- **Making the gate green.** This issue draws the boundary; it does not fix the reproduced failure. That
+  failure is in the HTTP target, which is Logic Tier and therefore inside the gate, so
+  `just test-under-load` is expected to stay red after this issue lands. Regression acceptance for that
+  failure binds to `ISSUE-260902-0747-11`; the epic's **closing** acceptance binds to
+  `ISSUE-260902-0747-10`.
+- **Building the Performance Check.** No third selector, no third marker, one `#[ignore]`d assertion.
+  Owned by `ISSUE-260905-2136-05`.
+- The mechanical enforcement check for the tier rule — `ISSUE-260902-0747-10`, sequenced last because
+  the tier assignments must settle before a check can read them.
 - Rewriting the testing document's stale claims about the HTTP suite's transport and its test-case
-  inventory. That is documentation drift owned by the docs-truth family; this issue adds only the
-  tier section it owns.
+  inventory. Documentation drift owned by the docs-truth family; this issue adds only the tier section.
 - The frontend suite, which is `ISSUE-260902-0747-03`.
 
 ## Triage Notes
@@ -315,6 +265,15 @@ source of the tier and timing rules — a pointer, not a copy of the rules.
 Minted 2026-09-02 from `PRD-260902-0301-01`, first of ten slices; breakdown approved by the
 maintainer the same day. This is the epic's spine: every other slice's promotions are expressed
 against the boundary this one draws.
+
+**Amended 2026-09-05.** The epic was narrowed to the reproduced failure plus the forward-facing tier
+rule, and eight slices were deferred. Read the sentence above as history: the promotions it refers to
+are now retained debt (`ADR-260902-0312-01` § Retained debt), and the boundary this record draws is
+where the suite stays rather than a waypoint. The Agent Brief above was rewritten the same day — its
+prior version carried the working tree's state as a requirement, argued cases already decided, and
+specified a Performance Check selector the narrowed epic does not build. Gate-round findings below are
+left as they were recorded; several of the defects they raise were repaired by that rewrite rather
+than by the round they belong to.
 
 **The epic's acceptance does not land here.** HTTP endpoint tests are Logic Tier, so the reproduced
 failure stays inside the gate and has to be fixed rather than relocated. A red gate after this issue
