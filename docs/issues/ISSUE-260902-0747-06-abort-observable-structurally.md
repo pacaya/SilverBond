@@ -2,13 +2,31 @@
 id: ISSUE-260902-0747-06
 kind: issue
 category: enhancement
-status: needs-info
+status: needs-triage
 summary: Abort is only checked at the top of the supervisor's loop so worst-case latency is a full poll tick, and the abort path carries elapsed-time promptness assertions against fixed wall-clock bounds that a loaded machine closes
-prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01]
 terms: [Run, Logic Tier, Integration Tier]
-blocked_by: [ISSUE-260902-0747-01]
+blocked_by: [PRD-260902-0301-01]
 ---
+
+## Deferral note
+
+Deferred 2026-09-05, out of `PRD-260902-0301-01`'s delivery scope and into the backlog, following the
+maintainer's decision to narrow that epic to the reproduced failure plus the forward-facing tier rule.
+The narrowed epic delivers `-01`, `-11`, `-04`, `-03`, `-14` and a scoped `-10`; this record is good
+work that is not that task.
+
+Deferring it does not retire the problem it describes. It is retained debt under
+`docs/adr/260902-0312-deterministic-test-tiers.md` § Retained debt: the tests it would have repaired
+stay in the Integration Tier, stay in the non-gating job, and must not be described as fixed.
+
+**Do not implement this brief as written without re-triage.** It was authored against the pre-narrowing
+ADR and PRD, and its `blocked_by` chain assumes slices that are no longer sequenced.
+
+**Known defect, from the 2026-09-05 adversarial review.** The brief requires the reconciled audit
+population to be carried in production source comments alongside assertions and constants. That
+recreates a decaying inventory in `src/` after the PRD correctly rejected the same pattern in planning
+prose. If revived, keep comments to invariants, units and ownership; evidence belongs in this record.
 
 ## Agent Brief
 

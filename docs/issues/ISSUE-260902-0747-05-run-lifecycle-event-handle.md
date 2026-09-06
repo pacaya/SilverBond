@@ -2,13 +2,44 @@
 id: ISSUE-260902-0747-05
 kind: issue
 category: enhancement
-status: needs-info
+status: needs-triage
 summary: Every run-lifecycle entry point registers, spawns and only then returns, so a caller cannot subscribe before the first event is emitted and tests can only observe a run's progress by polling persisted state against a wall-clock deadline
-prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01]
 terms: [Run, Runtime Event, Logic Tier, Integration Tier]
-blocked_by: [ISSUE-260902-0747-01, ISSUE-260902-0747-13]
+blocked_by: [PRD-260902-0301-01]
 ---
+
+## Deferral note
+
+Deferred 2026-09-05, out of `PRD-260902-0301-01`'s delivery scope and into the backlog, following the
+maintainer's decision to narrow that epic to the reproduced failure plus the forward-facing tier rule.
+The narrowed epic delivers `-01`, `-11`, `-04`, `-03`, `-14` and a scoped `-10`; this record is good
+work that is not that task.
+
+Deferring it does not retire the problem it describes. It is retained debt under
+`docs/adr/260902-0312-deterministic-test-tiers.md` § Retained debt: the tests it would have repaired
+stay in the Integration Tier, stay in the non-gating job, and must not be described as fixed.
+
+**Do not implement this brief as written without re-triage.** It was authored against the pre-narrowing
+ADR and PRD, and its `blocked_by` chain assumes slices that are no longer sequenced.
+
+**Known blocking defect, from the 2026-09-05 adversarial review.** The brief's core instruction — await
+the corresponding event, then read persisted state once — is unsound for approvals as written.
+`queue_approval` mutates the in-memory queue and emits `approval_queued`; `activate_next_approval` emits
+`approval_required` after installing the response sender; the executor persists the checkpoint later,
+and `emit_event` commits the event journal, not the checkpoint (`src/runtime.rs:3608`, `:3618`, `:3640`,
+`:3645`, `:2946`, `:6985`). A consumer can therefore receive both events, read the database once, and
+still observe the earlier checkpoint. This is a different race from the subscribe-after-spawn race the
+brief already addresses; subscribing earlier fixes acquisition, not the commit ordering.
+
+Before revival this record must name, per removed state predicate, the exact event or snapshot that
+establishes it — or introduce a checkpoint-committed notification with a defined order. Note that `done`
+and `log_saved` *do* follow their persistence (`src/runtime.rs:6606`, `:6622`, `:6632`); the contract
+must not be generalised from them to every event.
+
+Secondary: the brief permits a raw live receiver while promising no missed events. Registration uses a
+bounded broadcast channel of 512 (`src/runtime.rs:924`), which can lag if a consumer is descheduled.
+Pin lag and closure behavior if revived.
 
 ## Agent Brief
 

@@ -2,13 +2,32 @@
 id: ISSUE-260902-0747-08
 kind: issue
 category: enhancement
-status: needs-info
+status: needs-triage
 summary: The interactive agent poll loops interleave capture, decision and sleep, so the decision logic is reachable only by spawning a process and waiting out real poll intervals — one test already had to hand-inline the loop body to reach an invariant without one
-prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01]
 terms: [Logic Tier]
-blocked_by: [ISSUE-260902-0747-01, ISSUE-260902-0747-02]
+blocked_by: [PRD-260902-0301-01]
 ---
+
+## Deferral note
+
+Deferred 2026-09-05, out of `PRD-260902-0301-01`'s delivery scope and into the backlog, following the
+maintainer's decision to narrow that epic to the reproduced failure plus the forward-facing tier rule.
+The narrowed epic delivers `-01`, `-11`, `-04`, `-03`, `-14` and a scoped `-10`; this record is good
+work that is not that task.
+
+Deferring it does not retire the problem it describes. It is retained debt under
+`docs/adr/260902-0312-deterministic-test-tiers.md` § Retained debt: the tests it would have repaired
+stay in the Integration Tier, stay in the non-gating job, and must not be described as fixed.
+
+**Do not implement this brief as written without re-triage.** It was authored against the pre-narrowing
+ADR and PRD, and its `blocked_by` chain assumes slices that are no longer sequenced.
+
+**Scope note, from the 2026-09-05 adversarial review.** This record is limited to interactive agent poll
+loops and does not reach the multi-second shell delays in the pane-stream timeout tests
+(`src/api.rs:4403`, `:4445`); those are owned by `ISSUE-260905-2136-03`. Its relationship to
+`ISSUE-260902-0747-02` was also challenged — this record removes some of the fixtures that one would
+move, so the two should be resequenced or merged if revived.
 
 ## Agent Brief
 

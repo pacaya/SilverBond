@@ -29,6 +29,17 @@ the constraint over the genus precisely because the encoding is one decision rat
 dependency. This record names no count of the guards; derive the set yourself with the discovery
 command below and read each hit.
 
+**Bounded 2026-09-05.** Deriving the set stays as written — a runnable predicate outlives any list.
+What is bounded is the *work per hit*: choose the encoding once, then apply it mechanically to every
+hit. A guard that resists the shared encoding — because deciding whether its dependency is "expected"
+needs a judgement this slice has no basis to make — is **recorded on this record and left alone**,
+not resolved here. The slice is done when every hit either carries the encoding or carries a one-line
+note saying why it could not.
+
+This keeps a suite-wide sweep from becoming a suite-wide redesign. The epic was narrowed on
+2026-09-05 to the reproduced failure plus the tier rule; this record stayed in scope because a test
+that reports green without running defeats the rule, not because the sweep is cheap.
+
 **Current behavior:**
 Three defects, two of them at the tmux boundary.
 

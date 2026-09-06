@@ -2,13 +2,46 @@
 id: ISSUE-260902-0747-13
 kind: issue
 category: enhancement
-status: needs-info
+status: needs-triage
 summary: The run registry drops a run's entry before cancelling its completion token, so a run that finishes quickly leaves no edge to await and every test waiting for a run to reach a terminal state polls persisted state against a wall-clock deadline
-prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01]
 terms: [Run, Logic Tier, Integration Tier]
-blocked_by: [ISSUE-260902-0747-01, ISSUE-260902-0747-06]
+blocked_by: [PRD-260902-0301-01]
 ---
+
+## Deferral note
+
+Deferred 2026-09-05, out of `PRD-260902-0301-01`'s delivery scope and into the backlog, following the
+maintainer's decision to narrow that epic to the reproduced failure plus the forward-facing tier rule.
+The narrowed epic delivers `-01`, `-11`, `-04`, `-03`, `-14` and a scoped `-10`; this record is good
+work that is not that task.
+
+Deferring it does not retire the problem it describes. It is retained debt under
+`docs/adr/260902-0312-deterministic-test-tiers.md` § Retained debt: the tests it would have repaired
+stay in the Integration Tier, stay in the non-gating job, and must not be described as fixed.
+
+**Do not implement this brief as written without re-triage.** It was authored against the pre-narrowing
+ADR and PRD, and its `blocked_by` chain assumes slices that are no longer sequenced.
+
+**Known blocking defect, from the 2026-09-05 adversarial review.** Completion is underspecified in two
+ways.
+
+*What completed?* `clear` cancels `drained_token`, but `abort_and_wait` also calls `clear` when drain
+times out, `start_run` clears after a failed initial store write, and normal finalization clears even
+when its persistence block returns an error (`src/runtime.rs:975`, `:989`, `:1432`, `:1118`, `:6605`,
+`:6647`). So cancellation means registry removal, not successful terminal persistence. Replacing a
+terminal-state poll with "token cancelled, therefore terminal" is unsound without a separate status
+check.
+
+*Which activation?* `resume_run` can register the same persisted run ID again (`src/runtime.rs:1443`,
+`:1456`), so a completed-entry cache must distinguish registrations, and a count- or time-bounded cache
+can evict a result before a descheduled first-time observer looks it up.
+
+The mandated tombstone cache was also challenged as an artifact of issue ordering rather than a code
+constraint: it exists so that `-05`, sequenced later, would not have to change a signature twice. If
+revived, reverse that relationship — settle the completion interface first (a handle handed out per
+accepted registration, retained by its caller, distinguishing executor completion from forced registry
+clearing), then slice its adoption.
 
 ## Agent Brief
 

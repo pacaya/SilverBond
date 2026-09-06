@@ -110,7 +110,22 @@ here (`PRD-260902-0301-01` § Implementation Decisions, "HTTP endpoint tests are
 *Awaiting the stream, not the store.* Prefer awaiting the event that marks the state the test cares
 about over reading persisted state at all. Where a test genuinely asserts on persisted state, it
 awaits the corresponding event first and then reads once, rather than polling until the read
-succeeds. The run creation-and-approval test moves to the router helper that returns the database
+succeeds.
+
+**This is safe only where the event actually follows the persistence it stands for, and that is
+per-event, not general.** `done` and `log_saved` are emitted after their terminal checkpoint and log
+writes respectively (`src/runtime.rs:6606`, `:6622`, `:6632`), so awaiting them establishes what a
+test then reads. Approval events do not carry that guarantee: `queue_approval` emits
+`approval_queued` from the in-memory queue and `activate_next_approval` emits `approval_required`
+after installing the response sender, while the executor persists the checkpoint later, and
+`emit_event` commits the event journal rather than the checkpoint (`src/runtime.rs:3608`, `:3618`,
+`:3640`, `:3645`, `:6985`). A test that awaits an approval event and then reads once can still see
+the earlier checkpoint.
+
+So: for each converted assertion, name the event you await and confirm it is emitted after the state
+you read. Where no such event exists, keep the persisted-state assertion and await a terminal event
+that does carry the ordering, rather than weakening the assertion to "two notifications arrived".
+Reported 2026-09-05; the general form of this problem belongs to `ISSUE-260902-0747-05` (deferred). The run creation-and-approval test moves to the router helper that returns the database
 handle, so it has something to await instead of a sleep.
 
 *Deletion, not softening.* The polling helper is removed rather than given a longer deadline.
@@ -124,7 +139,12 @@ re-introducing it under a longer bound does not satisfy this record.
 
 *Tier.* The HTTP endpoint tests are **Logic Tier** tests: the unit is a use case reached
 at its API boundary, the per-test temporary-directory store is controlled data, and after this change
-no clock is read. They are in the gate, and they were never taken out of it: `ISSUE-260902-0747-01`
+no clock **ends a wait**. That is the tier's criterion, and it is the accurate claim. Clocks are still
+read on this path — `start_run` mints a time-ordered run id (`src/runtime.rs:1408`) and checkpoint
+persistence stamps `now_iso()` (`src/runtime.rs:7014`) — and both are permitted: a stamp written as
+data gates no control flow, and the run id is not load-bearing identity under the narrowed rule
+(`ADR-260902-0312-01`, amended 2026-09-05). Do not restate this as "no clock is read"; that was the
+earlier wording and it was false. They are in the gate, and they were never taken out of it: `ISSUE-260902-0747-01`
 leaves **the reproduction's tests** unmarked as its one named exception, because marking them would
 have carried the reproduced failure out of the gate. The exception is over tests, not over the target
 — `-01` is explicit about that, and it marks `test_node_accepts_v3_task_node` in this same file by the

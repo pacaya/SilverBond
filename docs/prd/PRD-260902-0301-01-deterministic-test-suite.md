@@ -4,7 +4,7 @@ scale: epic
 stakes: internal
 terms: [Run, Runtime Event, Workflow, Logic Tier, Integration Tier, Performance Check, Port, Double]
 adrs: [ADR-260902-0312-01, ADR-260622-0208-01]
-issues: [ISSUE-260902-0747-01, ISSUE-260902-0747-02, ISSUE-260902-0747-03, ISSUE-260902-0747-04, ISSUE-260902-0747-05, ISSUE-260902-0747-06, ISSUE-260902-0747-07, ISSUE-260902-0747-08, ISSUE-260902-0747-09, ISSUE-260902-0747-10, ISSUE-260902-0747-11, ISSUE-260902-0747-12, ISSUE-260902-0747-13, ISSUE-260902-0747-14]
+issues: [ISSUE-260902-0747-01, ISSUE-260902-0747-03, ISSUE-260902-0747-04, ISSUE-260902-0747-10, ISSUE-260902-0747-11, ISSUE-260902-0747-14]
 source: grilling 2026-09-02 (conversation-entered); diagnostic evidence ISSUE-260901-0216-03
 ---
 
@@ -65,19 +65,20 @@ A bound that only ever fires on a hang is a different construct, and § Testing 
 line. Reading the
 clock to stamp a record is not forbidden; a timestamp written as data gates no control flow and
 cannot flake under contention, so decision functions that stamp their log entries stay eligible, and
-tests simply never assert on those fields. **Deriving identity from the clock is a different matter**
-and is not covered by that allowance. The rule quantifies over **every clock-derived identifier that
-enters state or event identity**, and over every function that can reach one — not over a
-named mint and not over a list of functions. The slice that cuts the seam derives both levels itself
-— the mints, and the functions that reach them — and two derivation hazards are worth naming because
-each has defeated a search here before: a mint may be passed as a function *reference* rather than called
-(`.unwrap_or_else(…)`), so a call-syntax search misses it; and identifiers minted inline at their use
-site do not appear in any helper's call graph at all. Having derived the set, the slice gives every
-path in it an **injected generator**. There is no fork: an earlier draft let the slice choose between
-injecting and declaring the path "not Logic Tier eligible", and that second branch is withdrawn in
-`ADR-260902-0312-01`. The derivation is still owed and still comes first — it is what tells the slice
-how much to inject — but it no longer decides *whether*. A path that cannot take an injected
-generator is a re-decision the slice raises, not a tier it assigns itself.
+tests simply never assert on those fields. **Deriving identity from the clock is constrained only
+where identity is load-bearing** — where an id determines ordering, is asserted exactly, or must be
+reproduced on replay. Those paths take an injected generator. Elsewhere an opaque time-ordered id
+stands, and its tests assert uniqueness and referential relationships rather than the value.
+
+An earlier draft quantified this over every clock-derived identifier entering state or event identity
+and over every function reaching one. That requirement is withdrawn, and `ADR-260902-0312-01` records
+why: it was priced against a two-function closure, the real closure reaches most of the runtime's
+decision functions plus inline mints in `start_run` and `restart_from` and callers in out-of-crate
+targets, and no reproduced failure turns on an opaque identifier. It blocked the gate without buying
+determinism. The general injection is retained debt, not epic scope.
+
+What is not restored is the tier escape: a path that needs a supplied generator under the narrowed
+rule and cannot take one is a re-decision the slice raises, not a tier it assigns itself.
 
 **Controlled data counts as isolation.** A dependency the test fully owns and constructs for itself —
 a temporary-directory SQLite database, a committed file read read-only — is deterministic and
@@ -757,6 +758,24 @@ invoked an unbounded integration deadline would not have solved the stated probl
 - **The AI-rules harness migration.** Its own record (`ISSUE-260902-0306-01`); not a blocker.
 - **The `tmux-tools` tokio unification.** Its own record (`ISSUE-260902-0445-01`), sequenced after
   this epic. The root fix for the process boundary, but nothing this epic's acceptance can observe.
+- **The runtime observation seams, deferred 2026-09-05.** Event-handle, completion-signal,
+  abort-observability, fixture consolidation, poll-step extraction, retry-wait policy, identity
+  injection and controlled-runner migration left this epic's delivery scope when it was narrowed to
+  the reproduced failure plus the tier rule. Their records keep their briefs:
+  `ISSUE-260902-0747-02`, `-05`, `-06`, `-07`, `-08`, `-09`, `-12`, `-13`. Several are known to be
+  wrong as written; each carries its defect on the record and none may be implemented without
+  re-triage. The tests they would have repaired are retained debt under
+  `ADR-260902-0312-01` § Retained debt.
+- **Building the Performance Check.** The category stays defined in `ADR-260902-0312-01`; its
+  selector switch is not built here. A third category with no scheduled run and no named owner rots,
+  which is the same argument this epic uses to refuse hiding the Integration Tier from CI. The
+  large-workflow test's clock-free correctness half is separated out and stays in the gate; the
+  timing assertion waits for an owner.
+- **Latent flakes found after the plan was written.** The unlock throttle's production clock
+  (`ISSUE-260905-2136-01`), ambient registry configuration in driver tests
+  (`ISSUE-260905-2136-02`), pane-stream sequencing sleeps (`ISSUE-260905-2136-03`) and the
+  frontend's inner async wait budget (`ISSUE-260905-2136-04`). Real, none of them the reproduced
+  failure, none owned by a slice here.
 - **End-to-end Playwright tests.** Untouched.
 - **Any change to production tmux binary resolution.** `ADR-260622-0208-01` stands.
 - **Frontend test restructuring.** The frontend already asserts timing policy deterministically
@@ -765,8 +784,10 @@ invoked an unbounded integration deadline would not have solved the stated probl
 
 ## Open Questions
 
-None. `perf-test-tier` is resolved in § Testing Decisions: a third, non-gating performance category
-outside both correctness tiers, with the assertion's correctness half staying in the gate.
+None blocking. `perf-test-tier` is resolved in § Testing Decisions — a third, non-gating performance
+category outside both correctness tiers, with the assertion's correctness half staying in the gate —
+but building it is out of scope here and the category has no named owner. That ownership is the one
+question this epic hands forward rather than answers.
 
 ## Dimension Scan
 

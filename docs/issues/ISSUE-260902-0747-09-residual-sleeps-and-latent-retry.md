@@ -2,13 +2,42 @@
 id: ISSUE-260902-0747-09
 kind: issue
 category: bug
-status: needs-info
+status: needs-triage
 summary: A production retry sleep defaulting to two seconds sits unreached behind a loop bound that no test currently trips, so the first test to set a retry count silently buys a two-second wall-clock wait inside the gate
-prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01]
 terms: [Run, Logic Tier, Integration Tier]
-blocked_by: [ISSUE-260902-0747-01]
+blocked_by: [PRD-260902-0301-01]
 ---
+
+## Deferral note
+
+Deferred 2026-09-05, out of `PRD-260902-0301-01`'s delivery scope and into the backlog, following the
+maintainer's decision to narrow that epic to the reproduced failure plus the forward-facing tier rule.
+The narrowed epic delivers `-01`, `-11`, `-04`, `-03`, `-14` and a scoped `-10`; this record is good
+work that is not that task.
+
+Deferring it does not retire the problem it describes. It is retained debt under
+`docs/adr/260902-0312-deterministic-test-tiers.md` § Retained debt: the tests it would have repaired
+stay in the Integration Tier, stay in the non-gating job, and must not be described as fixed.
+
+**Do not implement this brief as written without re-triage.** It was authored against the pre-narrowing
+ADR and PRD, and its `blocked_by` chain assumes slices that are no longer sequenced.
+
+**Known blocking defect, from the 2026-09-05 adversarial review.** The brief requires the new
+default-executed retry test to match the existing build-profile timeout shims' test value and explicitly
+permits it to pay that delay. Those shims resolve to 250ms (`src/runtime.rs:44`, `src/api.rs:70`), and
+the retry loop performs a real `tokio::time::sleep` before the next attempt (`src/runtime.rs:3970`). A
+shorter sleep is still sequencing work with a timer, which the ADR forbids in the Logic Tier without
+exception — so this brief, implemented literally, adds a Logic Tier test that violates the rule the epic
+exists to establish.
+
+There is also a semantic trap in the literal-removal criterion: `unwrap_or(2)` appears both in the
+`node_retry.delay` event data and in the actual wait (`src/runtime.rs:3967`). A build-profile shortcut
+applied to both would make tests validate a different externally reported delay from production.
+
+If revived: separate delay *policy* from *waiting*. Keep the configured duration as data, give the test a
+controlled retry release or an immediately-completing wait adapter, and assert attempt outcomes and the
+reported duration independently. Do not add another `cfg(test)` policy fork.
 
 ## Agent Brief
 

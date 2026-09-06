@@ -23,8 +23,12 @@ logic regression from a loaded machine, which is the defect `PRD-260902-0301-01`
 Nothing in the tree names a tier, and no mechanism selects one. The testing document describes a
 single "Rust integration tests" layer and `CLAUDE.md` says nothing about timing rules in tests.
 
-The epic's acceptance recipe — the one that runs the suite repeatedly under CPU contention — is not
-in version control, while a sibling record's closing acceptance criterion depends on running it.
+The epic's acceptance recipe — `just test-under-load`, which runs the default command repeatedly
+under generated CPU contention — is this record's to own, because two sibling records close on running
+it (`ISSUE-260902-0747-11` as regression acceptance, `ISSUE-260902-0747-10` as the epic's closing
+criterion). Ownership is the durable fact and belongs here; whether the file happened to be committed
+on a given day is not, and earlier drafts of this brief carried that state as if it were a
+requirement.
 
 **Baseline:** this slice has no blockers, so every criterion below is read against the tree at the tip of the branch this epic lands on (`feature/tmux-panes`)
 as it stands — not against `main`, which is behind the tree this epic is written for. Later slices in this epic are read against the tree after *their* blockers land, which
@@ -106,9 +110,15 @@ rather than a statement about what a test isolates.
 
 **Split that test before marking it.** It asserts two properties: that validation finishes inside the
 budget, and that a large valid workflow produces no error issues. The second is clock-free logic and
-is Logic Tier by the ordinary rule. Separate it into its own test that stays in the gate, and move
-only the timing assertion into the Performance Check. Relocating the test whole would carry a
+is Logic Tier by the ordinary rule. Separate it into its own test that stays in the gate. Relocating the test whole would carry a
 correctness property out of the gate as a passenger.
+
+The timing half has nowhere built to go. The **Performance Check** category is defined in
+`ADR-260902-0312-01` but is not built by the narrowed epic (`PRD-260902-0301-01` § Out of Scope), so
+this record does **not** add a third selector for one test. Leave the timing assertion in place marked
+`#[ignore]`, carrying a comment naming `ISSUE-260905-2136-05` as the record that owns deciding its
+fate. This is honest rather than good: an ignored test does not run and will rot, which is exactly why
+that record exists and why the category is not being built on spec.
 
 *One exception, named and temporary.* Membership is per test, so this exception is over tests, not
 over the target. In the out-of-crate HTTP target (`tests/http_api.rs`), the tests whose Logic Tier
@@ -168,11 +178,13 @@ that boundary.
 *Commands.* The `test-rust` recipe keeps invoking the default command and therefore becomes the Logic
 Tier gate with no edit to its body. A sibling recipe named `test-integration` runs the Integration
 Tier via the opt-in switch. The `test-under-load` recipe — which runs the default command repeatedly
-under generated CPU contention and fails if any repetition fails — is **committed by this issue**: it
-is the epic's acceptance seam — `ISSUE-260902-0747-11` runs it as regression acceptance and
-`ISSUE-260902-0747-10` closes on it — so it cannot
-remain an uncommitted working-tree change. Its body needs no change, because narrowing the default
-narrows what it measures.
+under generated CPU contention and fails if any repetition fails — is the epic's acceptance seam, run
+by `ISSUE-260902-0747-11` as regression acceptance and by `ISSUE-260902-0747-10` as the epic's closing
+criterion. It is already tracked (committed 2026-09-05); this record **owns it, verifies it and hardens
+it**, and does not create it. Its body needs no change for the tier split, because narrowing the
+default narrows what it measures. It does need the argument hardening in the acceptance criteria
+below: the recipe currently checks its load workers once at startup and accepts a zero-repetition
+invocation as a zero-failure success.
 
 *CI.* The Rust workflow carries two jobs: a **gating** job running the Logic Tier via the default
 command, and a **separate, non-gating** job running the Integration Tier via the switch, so a red
@@ -266,8 +278,12 @@ source of the tier and timing rules — a pointer, not a copy of the rules.
       report success.
 - [ ] `rg -n '^test-integration' justfile` returns the recipe introduced by this change; no matches
       before it.
-- [ ] `git show HEAD:justfile | rg -n '^test-under-load'` returns the recipe once this change is
-      committed; it returns nothing and exits non-zero before it.
+- [ ] `git show HEAD:justfile | rg -n '^test-under-load'` returns the recipe. This is a **precondition
+      to verify, not work to do** — it has been tracked since 2026-09-05. If it does not hold, stop and
+      report rather than re-adding the recipe.
+- [ ] The recipe rejects a non-positive repetition count instead of reporting success. `just
+      test-under-load 0` exits non-zero after this change; before it, the loop body never runs and the
+      recipe reports zero failures, which is a passing acceptance run that measured nothing.
 - [ ] The committed recipe **verifies the load it claims to apply**: after starting its workers it
       confirms each is alive and exits non-zero if fewer are running than were requested, and it
       reports the count it actually established alongside the count requested. A recipe that records a

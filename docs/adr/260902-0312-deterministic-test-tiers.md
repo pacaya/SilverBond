@@ -33,17 +33,27 @@ only on a hang is a different construct; § Liveness below draws that line.
 
 Reading the clock to *stamp* a record is not forbidden: a timestamp written as data gates no control
 flow and cannot flake under contention, so decision functions that stamp their log entries stay
-eligible, and tests simply never assert on those fields. Deriving *identity* from the clock is not
-covered by that allowance — a time-ordered id that enters state or event identity **needs an injected
-generator**. There is no second branch: an earlier draft allowed "or its path is not Logic Tier
-eligible", and that escape is withdrawn. It was priced when the closure was assumed to be two
-functions; the derivation puts it at most of the runtime's decision functions, and a tier that sheds
-them is not the gate this decision exists to build. A path that cannot take an injected generator is
-therefore not a tier assignment but a **re-decision**: the slice stops and says so, rather than
-marking the tests and moving on. This is deliberate — it makes the exception visible instead of
-silent, and nothing in this ADR gives such a path a home in the Integration Tier, whose membership is
-decided by isolation of the external world, or in a Performance Check, whose subject must be elapsed
-time.
+eligible, and tests simply never assert on those fields.
+
+Deriving *identity* from the clock is constrained where identity is **load-bearing**: an id that
+determines ordering, is asserted exactly, or must be reproduced on replay needs an injected
+generator. Elsewhere an opaque time-ordered id may stand, and its tests assert uniqueness and
+referential relationships rather than the value.
+
+An earlier draft quantified this over every clock-derived identifier entering state or event
+identity. That is withdrawn as a gate condition, on two grounds. It was priced when the closure was
+assumed to be two functions, and the derivation puts it at most of the runtime's decision functions
+plus callers outside any single extraction boundary — `start_run` and `restart_from` mint inline, and
+an out-of-crate target cannot be served by an in-crate test constructor. And no reproduced failure
+turns on an opaque identifier: the demonstrated mechanism is a clock ending a wait, not an id
+carrying a timestamp. A requirement that broad, owned by no slice, blocks the gate without buying
+determinism. The general injection stays desirable and is recorded in § Retained debt.
+
+What is *not* restored is the tier escape. A path that needs a supplied generator under the narrowed
+rule and cannot take one is not a tier assignment but a **re-decision**: the slice stops and says so,
+rather than marking the tests and moving on. Nothing here gives such a path a home in the Integration
+Tier, whose membership is decided by isolation of the external world, or in a Performance Check,
+whose subject must be elapsed time.
 
 **Controlled data counts as isolation.** A dependency the test fully owns and constructs for itself —
 a temporary-directory SQLite database, a committed file read read-only — is controlled, deterministic
@@ -86,9 +96,12 @@ passing path — `pane_stream_pump_honors_explicit_drain_with_receiver_alive` wr
 drain in a one-second timeout, which a loaded machine cannot close. Such a guard is sized so that
 exceeding it means a genuine hang, and carries a comment at the site naming the hang it guards. The
 sizing and the comment are review-enforced; only the structural pair is mechanically checkable.
-Hangs are otherwise the job timeout's concern. Sleeping to sequence work is forbidden in both tiers;
-asserting on elapsed time is forbidden in the Logic Tier, and permitted only as the Integration Tier's
-narrow exception below.
+Hangs are otherwise the job timeout's concern. Sleeping to sequence work is forbidden in the Logic
+Tier without exception. It is forbidden in the Integration Tier **for tests written from now on**;
+Integration Tier tests that sleep to sequence work today are **retained timing debt** — itemised in
+§ Retained debt, held in the non-gating job, and never described as fixed. The prohibition binds what
+is written next; the backlog drains what already exists. Asserting on elapsed time is forbidden in the
+Logic Tier, and permitted only as the Integration Tier's narrow exception below.
 
 Asserting on elapsed time is permitted only in the Integration Tier, and only where the property genuinely *is*
 temporal — a promptness guarantee the system owes — with a generous bound and a note saying why.
@@ -224,5 +237,51 @@ check; it is not an implementer's preference.
 **`ADR-260622-0208-01` is unaffected.** Resolving the tmux binary through an interactive login shell
 remains the accepted production behavior. The defect this decision addresses is that tests asserting
 only struct fields went through that path; they use the existing non-resolving constructor instead.
+
+## Retained debt
+
+Amended 2026-09-05. This decision was authored alongside a fourteen-slice delivery plan that would
+have repaired every known violation before the rule took effect. That plan was narrowed to the
+reproduced failure plus the rule itself, on the maintainer's decision that a determinism programme
+was not worth blocking feature work behind. The decision's *content* is unchanged; what changed is
+that the rule now takes effect over a suite it does not yet fully describe.
+
+That gap is named here rather than hidden. **The prohibition binds what is written next; this list
+is what already exists and has not been drained.** An item on this list is not a fixed test, is not
+a permitted exception, and may not be cited as precedent for writing a new one.
+
+- **Sequencing sleeps in pane-stream timeout tests.** Multi-second shell delays and a fixed negative
+  observation window (`src/api.rs:4403`, `:4445`). Owner: `ISSUE-260905-2136-03`. That record also
+  carries the stronger objection — a negative observation over a fixed window is unsound at any
+  sleep length, independent of load.
+- **Filesystem-fingerprint timing in the registry cache test.** `src/driver.rs:1190`. Owner:
+  `ISSUE-260905-2136-03`.
+- **Production clock reached from tests that contain no timing construct.** The unlock throttle's
+  five-second window (`src/app.rs:129`, `:150`). Owner: `ISSUE-260905-2136-01`. This is the known
+  counterexample to mechanical enforcement: § Enforcement is scoped, or advisory anticipated that a
+  check conditioned on the tier boundary cannot see every violation, and this is the property that
+  defeats it. The checker ships against test sources; call-path isolation stays a review obligation.
+- **Ambient configuration reaching driver capability tests** through a process-global registry cache
+  (`src/driver.rs:727`, `:1837`). Owner: `ISSUE-260905-2136-02`. Same class as the item above —
+  isolation broken below the test body, invisible to a source scan.
+- **General identity injection.** The withdrawn global quantifier above remains desirable where it
+  would make replay reproducible; it is no longer a gate condition. Owner:
+  `ISSUE-260902-0747-07` (deferred).
+- **Runtime observation seams.** Event-handle, completion-signal, abort-observability, poll-step
+  extraction and controlled-runner migration are deferred with their briefs intact and their known
+  specification defects recorded on each: `ISSUE-260902-0747-02`, `-05`, `-06`, `-07`, `-08`, `-09`,
+  `-12`, `-13`. Several of those briefs are known to be wrong as written and are marked so; none may
+  be implemented without re-triage.
+- **The frontend's inner async wait budget** is a second deadline that the outer-timeout patch does
+  not move (`ui/src/features/editor/InspectorPanel.test.ts:145`). Owner: `ISSUE-260905-2136-04`.
+
+The Performance Check stays defined above and is **not built in this pass**. Its third selector
+switch is apparatus the narrowed epic does not need, and a category with no scheduled run and no
+named owner is a test that rots — the same argument this decision uses to refuse hiding the
+Integration Tier from CI. Where the large-workflow test asserts a clock-free correctness property,
+that property is separated out and stays in the gate; the timing assertion is left `#[ignore]`d and
+waits for someone willing to own running it. Owner for that decision: `ISSUE-260905-2136-05`, which
+records the three live options including deleting the assertion outright. An ignored test does not
+run and will rot — that is the cost of not building the category, and it is named rather than hidden.
 
 Delivery is tracked by `PRD-260902-0301-01`.

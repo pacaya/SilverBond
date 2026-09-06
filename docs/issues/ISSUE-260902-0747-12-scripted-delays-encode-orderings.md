@@ -2,13 +2,31 @@
 id: ISSUE-260902-0747-12
 kind: issue
 category: bug
-status: needs-info
+status: needs-triage
 summary: The scripted runner double sleeps for real to encode the concurrency orderings its tests assert, so the workflow decision logic at the heart of the gate is deterministic only while the machine is quiet
-prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01]
 terms: [Run, Logic Tier, Integration Tier, Port, Double]
-blocked_by: [ISSUE-260902-0747-01, ISSUE-260902-0747-05, ISSUE-260902-0747-06, ISSUE-260902-0747-13]
+blocked_by: [PRD-260902-0301-01]
 ---
+
+## Deferral note
+
+Deferred 2026-09-05, out of `PRD-260902-0301-01`'s delivery scope and into the backlog, following the
+maintainer's decision to narrow that epic to the reproduced failure plus the forward-facing tier rule.
+The narrowed epic delivers `-01`, `-11`, `-04`, `-03`, `-14` and a scoped `-10`; this record is good
+work that is not that task.
+
+Deferring it does not retire the problem it describes. It is retained debt under
+`docs/adr/260902-0312-deterministic-test-tiers.md` § Retained debt: the tests it would have repaired
+stay in the Integration Tier, stay in the non-gating job, and must not be described as fixed.
+
+**Do not implement this brief as written without re-triage.** It was authored against the pre-narrowing
+ADR and PRD, and its `blocked_by` chain assumes slices that are no longer sequenced.
+
+**Known defect, from the 2026-09-05 adversarial review.** The brief carries repeated warnings about
+counts reported in earlier gate rounds. Those are adjudication history, not instructions; if revived,
+state the ordering and failure constraints once and link the prior reports for the discarded readings.
+The controlled-runner migration itself was assessed as coherent and correctly sized.
 
 ## Agent Brief
 

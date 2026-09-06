@@ -2,12 +2,31 @@
 id: ISSUE-260902-0747-02
 kind: issue
 category: enhancement
-status: needs-info
+status: needs-triage
 summary: Executable fake-process fixtures are built in the test body across three modules — inline, or with only the permission step delegated to a mechanism-named helper — so nothing declares what each test is faking or whether it needs a process at all
-prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01]
 terms: [Logic Tier]
+blocked_by: [PRD-260902-0301-01]
 ---
+
+## Deferral note
+
+Deferred 2026-09-05, out of `PRD-260902-0301-01`'s delivery scope and into the backlog, following the
+maintainer's decision to narrow that epic to the reproduced failure plus the forward-facing tier rule.
+The narrowed epic delivers `-01`, `-11`, `-04`, `-03`, `-14` and a scoped `-10`; this record is good
+work that is not that task.
+
+Deferring it does not retire the problem it describes. It is retained debt under
+`docs/adr/260902-0312-deterministic-test-tiers.md` § Retained debt: the tests it would have repaired
+stay in the Integration Tier, stay in the non-gating job, and must not be described as fixed.
+
+**Do not implement this brief as written without re-triage.** It was authored against the pre-narrowing
+ADR and PRD, and its `blocked_by` chain assumes slices that are no longer sequenced.
+
+**Known defect, from the 2026-09-05 adversarial review.** Consolidating fixtures ahead of the seam work
+was challenged as unnecessary sequencing: this record changes no assertion, process dependency or tier,
+and `ISSUE-260902-0747-08` then removes some of the fixtures it would move. If revived, consolidate the
+*surviving* shared infrastructure after the seam work rather than before it.
 
 ## Agent Brief
 

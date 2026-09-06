@@ -7,7 +7,7 @@ summary: The tier rule survives only as prose, so a hurried afternoon can put a 
 prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01]
 terms: [Logic Tier, Integration Tier]
-blocked_by: [ISSUE-260902-0747-01, ISSUE-260902-0747-02, ISSUE-260902-0747-04, ISSUE-260902-0747-05, ISSUE-260902-0747-06, ISSUE-260902-0747-07, ISSUE-260902-0747-08, ISSUE-260902-0747-09, ISSUE-260902-0747-11, ISSUE-260902-0747-12, ISSUE-260902-0747-13, ISSUE-260902-0747-14]
+blocked_by: [ISSUE-260902-0747-01, ISSUE-260902-0747-04, ISSUE-260902-0747-11, ISSUE-260902-0747-14]
 ---
 
 ## Agent Brief
@@ -80,14 +80,35 @@ narrowed, never satisfied by weakening those assertions.
 - The testing document's tier section, which gains the statement of what is checked and what is left to
   review.
 
-**Baseline:** this slice is the join node — blocked by every slice that changes Rust test code or
-moves a test between tiers — so every criterion below is read against the tree **after all of them
-have landed**. That is what makes it the first point at which the gate's contents are settled.
+**Baseline:** this slice is the join node **of the narrowed epic** — blocked by `-01`, `-04`, `-11`
+and `-14`, the remaining slices that change Rust test code or move a test between tiers — so every
+criterion below is read against the tree after those four have landed.
 
-**The check knows three categories, not two.** Beyond the two correctness tiers there is the
-**Performance Check** (`ADR-260902-0312-01`, § "A third, non-gating category holds performance
-assertions"), whose members assert elapsed time by design. A check that flags a Performance Check
-member for asserting elapsed time is wrong and is narrowed, not accepted.
+Amended 2026-09-05. This record was originally blocked by all thirteen siblings, on the premise that
+the check could only run once every violation was repaired. Eight of those slices were deferred, so
+that premise is gone and it is not restored by waiting: **the check enforces the Logic Tier, not a
+clean suite.** Known violations that remain live in the Integration Tier as retained debt
+(`ADR-260902-0312-01` § Retained debt) and are outside what this check examines. A criterion below
+that reads as "the suite is clean" is to be read as "the Logic Tier is clean".
+
+**The check knows two categories.** The **Performance Check** is defined in `ADR-260902-0312-01` but
+is **not built in this pass** (`PRD-260902-0301-01` § Out of Scope), so no member exists for the check
+to misclassify and no third selector is read. If that category is ever built, teaching the check about
+it is that work's problem, not this record's.
+
+**How the controls are produced.** Every criterion below that calls for a "mechanically produced"
+working copy differing from the tree in one dimension is discharged instead by a **fixture suite**: a
+directory of small, checked-in source examples, each a minimal test file exercising exactly one
+accepted or rejected shape, with the expected verdict recorded beside it. The check runs over the
+fixture directory as part of its own test.
+
+This is a deliberate simplification, taken 2026-09-05. Mutating a copy of the whole repository per
+control was specified when this record was the join node behind thirteen slices; it is expensive to
+build, slow to run, and no more convincing than a fixture whose expected verdict is written down. The
+guarantee that matters is unchanged and is retained in full: **a clean result counts as evidence only
+when the same invocation also reports the paired violation.** A check that examines nothing must not
+be able to discharge a criterion by silence. Keep every paired-run requirement below; change only how
+the input is produced.
 
 **Acceptance criteria:**
 - [ ] Either a check exists and is invoked from a recipe, or the record states that the boundary was
@@ -127,9 +148,10 @@ member for asserting elapsed time is wrong and is narrowed, not accepted.
       it is blocked by every slice that changes Rust test code or moves a test between tiers, so it is
       the first point at which the default command's contents are settled. `ISSUE-260902-0747-11` runs
       the same recipe when it removes the reproduced failure, and that criterion stays — but `-11` is
-      blocked only by `-01`, so seven later slices promote tests into the gate after it passes. Without
-      this criterion no record ever runs the epic's acceptance against the population the epic
-      actually ships. Run the Integration Tier once as well, so a test promoted out of the gate is
+      blocked only by `-01`, so `-04` and `-14` still move tests into the gate after it passes. Without
+      this criterion no record runs the epic's acceptance against the population the epic actually
+      ships. (Before 2026-09-05 this read "seven later slices"; those eight are deferred and the point
+      now rests on two.) Run the Integration Tier once as well, so a test promoted out of the gate is
       still known to pass somewhere. Both branches of this record owe this criterion — it is about the
       suite, not about the check.
 
@@ -165,16 +187,33 @@ member for asserting elapsed time is wrong and is narrowed, not accepted.
       the point a developer writing a test will read it. Observable at the testing document's tier
       section and at this record's `## Triage Notes`.
 
-- [ ] **The glossary stops calling this practice planned.** `grep '(planned' CONTEXT.md` returns no
-      entry carrying `_(planned — ADR-260902-0312-01)_` after this change, and returns every one of
-      that ADR's terms before it. `CONTEXT.md` states that the marker comes off in the epic that makes
+- [ ] **The glossary stops calling this practice planned, for the terms this epic makes real.**
+      After this change, `grep '(planned' CONTEXT.md` returns no `_(planned — ADR-260902-0312-01)_`
+      entry for **Logic Tier**, **Integration Tier**, **Port** or **Double**, and returns every one of
+      them before it. **Performance Check keeps its planned marker**: the narrowed epic defines the
+      category but does not build it (`PRD-260902-0301-01` § Out of Scope), and removing the marker
+      would assert a practice that is not in force. Amended 2026-09-05; before that this criterion
+      covered every term the ADR names. `CONTEXT.md` states that the marker comes off in the epic that makes
       a practice real and that the epic owns the terms its ADR names, so the removal belongs to the
       slice at which the practice actually comes into force — this one, the join node behind every
       slice that changes Rust test code. Removing a marker is not editing a definition: if an entry's
       text is no longer true of the tree, that is a finding to report, not a rewrite to make here.
 
+- [ ] **The check states what it cannot see, and the testing document repeats it.** This check reads
+      test sources. It therefore cannot detect a Logic Tier test whose timing or isolation dependence
+      lives in production code reached from the test body, and two such cases are already known and
+      filed: the unlock throttle's five-second production window, reached from endpoint tests that
+      contain no timing construct at all (`ISSUE-260905-2136-01`), and driver capability tests reading
+      the developer's own `agents.toml` through a process-global cache (`ISSUE-260905-2136-02`). Name
+      both as the concrete evidence that call-path isolation is a **review obligation** rather than a
+      checked property. `ADR-260902-0312-01` § Enforcement is scoped, or advisory requires an honest
+      negative finding to name the property that defeated the check; these are it, and a record that
+      claims the boundary is fully mechanical is wrong.
+
 **Out of scope:**
 - Changing any test's tier. This issue observes the boundary; it does not move it.
+- Detecting dependence on a clock or on ambient configuration reached through production code. Known
+  unreachable, filed as `ISSUE-260905-2136-01` and `-02`, and stated as a review obligation above.
 - Deciding isolation in general. The check hunts the timing forms and the mechanically recognizable
   isolation shapes named above; a process reached indirectly through production code is out of reach
   and is a review obligation, not a check failure.

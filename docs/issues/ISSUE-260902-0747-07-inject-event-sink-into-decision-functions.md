@@ -2,13 +2,46 @@
 id: ISSUE-260902-0747-07
 kind: issue
 category: enhancement
-status: needs-info
+status: needs-triage
 summary: Six large runtime functions carry decision logic reachable only through a real database, because they emit events through a context that owns the store; parameterize the sink so the decisions are callable from a test without one
-prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01]
 terms: [Run, Runtime Event, Logic Tier]
-blocked_by: [ISSUE-260902-0747-01]
+blocked_by: [PRD-260902-0301-01]
 ---
+
+## Deferral note
+
+Deferred 2026-09-05, out of `PRD-260902-0301-01`'s delivery scope and into the backlog, following the
+maintainer's decision to narrow that epic to the reproduced failure plus the forward-facing tier rule.
+The narrowed epic delivers `-01`, `-11`, `-04`, `-03`, `-14` and a scoped `-10`; this record is good
+work that is not that task.
+
+Deferring it does not retire the problem it describes. It is retained debt under
+`docs/adr/260902-0312-deterministic-test-tiers.md` § Retained debt: the tests it would have repaired
+stay in the Integration Tier, stay in the non-gating job, and must not be described as fixed.
+
+**Do not implement this brief as written without re-triage.** It was authored against the pre-narrowing
+ADR and PRD, and its `blocked_by` chain assumes slices that are no longer sequenced.
+
+**Known blocking defect, and a changed premise, from the 2026-09-05 adversarial review.**
+
+The premise changed: the ADR's global identity requirement was narrowed on 2026-09-05 to identity that
+is *load-bearing* — determining ordering, asserted exactly, or replayed. Much of this brief's identity
+work is no longer required by any accepted decision, and reviving it needs the narrowed rule applied
+first.
+
+The defect stands regardless: the brief derives its closure from six decision functions, while the
+requirement it cites quantifies over every function reaching a clock-derived identity mint. `start_run`
+and `restart_from` mint inline (`src/runtime.rs:1408`, `:1564`), initial-checkpoint cursor creation sits
+outside the root set (`:2206`), and out-of-crate callers (`tests/http_api.rs:1206`) cannot be served by
+replacing an in-crate test constructor. A six-function boundary cannot satisfy a global quantifier.
+
+Also challenged as excess: requiring all six functions to be callable with no database at all does not
+follow from determinism, since the brief itself concedes that direct decision tests with a controlled
+per-test store already qualify as Logic Tier. If revived, separate identity injection from event-sink
+extraction — their callers and outcomes differ — and test the production sink adapter's
+commit-before-broadcast ordering separately from a fake sink, since a fake asserting its own recorded
+behavior proves nothing about the real adapter (`src/runtime.rs:6985`).
 
 ## Agent Brief
 

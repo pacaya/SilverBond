@@ -8,6 +8,23 @@ prd: PRD-260902-0301-01
 adrs: [ADR-260902-0312-01]
 ---
 
+## Scope note
+
+Amended 2026-09-05. This record stays what it is: a small configuration patch raising the outer
+Vitest per-test timeout, with its existing justification intact.
+
+**It is not a determinism claim, and must not be written as one.** Testing Library's
+`asyncUtilTimeout` is a separate deadline defaulting to 1000ms, consumed by `waitFor` and the
+`findBy*` queries, and `ui/src/test/setup.ts` does not override it — so raising the Vitest timeout
+leaves the convergence-wait budgets in the same test untouched
+(`ui/src/features/editor/InspectorPanel.test.ts:145`, `:150`). Reconciling that nested wait policy is
+`ISSUE-260905-2136-04` and is deliberately not in this patch.
+
+Two consequences for the wording of this record: state that it buys resilience headroom rather than
+determinism, and drop any claim that the frontend suite is uniformly deterministic under fake timers.
+It is not — the pane-stream timing-policy tests use fake timers; this InspectorPanel test uses real
+Testing Library waits.
+
 ## Agent Brief
 
 **Category:** bug
