@@ -51,6 +51,33 @@ test-rust:
 test-ui:
     npm test
 
+# Run the Rust suite repeatedly under CPU contention (PRD-260902-0301-01 acceptance)
+test-under-load RUNS="3" LOAD="":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    load="{{LOAD}}"
+    if [ -z "$load" ]; then load=$(( $(getconf _NPROCESSORS_ONLN) * 2 )); fi
+    pids=()
+    cleanup() { for p in "${pids[@]:-}"; do kill "$p" 2>/dev/null || true; done; }
+    trap cleanup EXIT INT TERM
+    for _ in $(seq 1 "$load"); do yes > /dev/null & pids+=($!); done
+    alive=0
+    for p in "${pids[@]:-}"; do
+        if kill -0 "$p" 2>/dev/null; then alive=$((alive+1)); fi
+    done
+    if [ "$alive" -ne "$load" ]; then
+        echo "error: requested $load load processes but only $alive are running; not a valid acceptance run" >&2
+        exit 1
+    fi
+    echo "load: $alive busy processes (requested $load); runs: {{RUNS}}"
+    failed=0
+    for r in $(seq 1 {{RUNS}}); do
+        echo "=== run $r/{{RUNS}} ==="
+        if cargo test --locked; then echo "run $r: PASS"; else echo "run $r: FAIL"; failed=$((failed+1)); fi
+    done
+    echo "=== $failed of {{RUNS}} runs failed ==="
+    [ "$failed" -eq 0 ]
+
 # Frontend freshness pre-commit hook regression
 test-pre-commit:
     bash scripts/test-pre-commit-frontend-freshness.sh
